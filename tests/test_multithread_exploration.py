@@ -195,7 +195,7 @@ class MultithreadUnitTests(unittest.TestCase):
             self.assertIn("SNAPSHOT", res["safe_alternatives"])
 
             # Test AgentRuntime wrapping
-            runtime = AgentRuntime(controller=ctrl, corpus_dir=tmp_corpus)
+            runtime = AgentRuntime(controller=ctrl, corpus_dir=tmp_corpus, allow_mutation=True)
             agent_res = runtime.explore(max_steps=5)
             self.assertFalse(agent_res.success)
             self.assertEqual(agent_res.error.code, "MULTITHREAD_BRANCH_ISOLATION_UNSUPPORTED")
@@ -321,7 +321,7 @@ class MultithreadUnitTests(unittest.TestCase):
                 return self.restorer.verify_restart_determinism(checkpoint)
 
         ctrl = DetController()
-        runtime = AgentRuntime(controller=ctrl)
+        runtime = AgentRuntime(controller=ctrl, allow_mutation=True)
         res = runtime.dispatch_action({"action": "VERIFY_RESTART_DETERMINISM"})
         self.assertTrue(res.success)
         self.assertEqual(res.action, "VERIFY_RESTART_DETERMINISM")

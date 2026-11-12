@@ -74,6 +74,13 @@ from extractor.investigation import (
 from extractor.raw_snapshot import RawRuntimeSnapshot
 
 
+def _approved_full_plan():
+    """These scenarios validate stopped (FULL, COMPLETE/STOPPED-consistency) capture, which since
+    IMP-002 is no longer the default and requires explicit stop approval."""
+    from extractor.capture_plan import CaptureMode, CapturePlan
+    return CapturePlan(mode=CaptureMode.FULL.value, allow_stop=True)
+
+
 class BasePhase11ProcessTestCase(unittest.TestCase):
     """Shared base setup for Phase 11 C++ tests."""
 
@@ -160,14 +167,14 @@ class TestPhase11RealTargetMatrix(BasePhase11ProcessTestCase):
         proc = self._start_process(self.stripped_bin)
         try:
             backend = ProcessVmCaptureBackend() if ProcessVmCaptureBackend().is_available(proc.pid) else ProcfsCaptureBackend()
-            snap1 = backend.capture(pid=proc.pid)
+            snap1 = backend.capture(pid=proc.pid, plan=_approved_full_plan())
             snap1_dir = os.path.join(self.work_dir, "snap1_case1")
             snap1.save(snap1_dir)
 
             res = self._send_command(proc, "MUTATE_ACTIVE")
             self.assertEqual(res, "ACTIVE_MUTATED")
 
-            snap2 = backend.capture(pid=proc.pid)
+            snap2 = backend.capture(pid=proc.pid, plan=_approved_full_plan())
             snap2_dir = os.path.join(self.work_dir, "snap2_case1")
             snap2.save(snap2_dir)
         finally:
@@ -209,14 +216,14 @@ class TestPhase11RealTargetMatrix(BasePhase11ProcessTestCase):
         proc = self._start_process(self.stripped_bin)
         try:
             backend = ProcessVmCaptureBackend() if ProcessVmCaptureBackend().is_available(proc.pid) else ProcfsCaptureBackend()
-            snap1 = backend.capture(pid=proc.pid)
+            snap1 = backend.capture(pid=proc.pid, plan=_approved_full_plan())
             snap1_dir = os.path.join(self.work_dir, "snap1_case2")
             snap1.save(snap1_dir)
 
             res = self._send_command(proc, "NOOP")
             self.assertEqual(res, "NOOP_DONE")
 
-            snap2 = backend.capture(pid=proc.pid)
+            snap2 = backend.capture(pid=proc.pid, plan=_approved_full_plan())
             snap2_dir = os.path.join(self.work_dir, "snap2_case2")
             snap2.save(snap2_dir)
         finally:
@@ -279,14 +286,14 @@ class TestPhase11RealTargetMatrix(BasePhase11ProcessTestCase):
         proc = self._start_process(self.stripped_bin)
         try:
             backend = ProcessVmCaptureBackend() if ProcessVmCaptureBackend().is_available(proc.pid) else ProcfsCaptureBackend()
-            snap1 = backend.capture(pid=proc.pid)
+            snap1 = backend.capture(pid=proc.pid, plan=_approved_full_plan())
             snap1_dir = os.path.join(self.work_dir, "snap1_case3")
             snap1.save(snap1_dir)
 
             res = self._send_command(proc, "MUTATE_AMBIGUOUS_BOTH")
             self.assertEqual(res, "AMBIGUOUS_MUTATED")
 
-            snap2 = backend.capture(pid=proc.pid)
+            snap2 = backend.capture(pid=proc.pid, plan=_approved_full_plan())
             snap2_dir = os.path.join(self.work_dir, "snap2_case3")
             snap2.save(snap2_dir)
         finally:
@@ -327,7 +334,7 @@ class TestPhase11RealTargetMatrix(BasePhase11ProcessTestCase):
         proc = self._start_process(self.stripped_bin)
         try:
             backend = ProcessVmCaptureBackend() if ProcessVmCaptureBackend().is_available(proc.pid) else ProcfsCaptureBackend()
-            snap = backend.capture(pid=proc.pid)
+            snap = backend.capture(pid=proc.pid, plan=_approved_full_plan())
             snap_dir = os.path.join(self.work_dir, "snap_case4")
             snap.save(snap_dir)
         finally:
@@ -442,7 +449,7 @@ class TestPhase11RealTargetMatrix(BasePhase11ProcessTestCase):
         proc = self._start_process(self.stripped_bin)
         try:
             backend = ProcessVmCaptureBackend() if ProcessVmCaptureBackend().is_available(proc.pid) else ProcfsCaptureBackend()
-            snap = backend.capture(pid=proc.pid)
+            snap = backend.capture(pid=proc.pid, plan=_approved_full_plan())
             snap_dir = os.path.join(self.work_dir, "snap_tamper_c9")
             snap.save(snap_dir)
         finally:
@@ -476,7 +483,7 @@ class TestPhase11MultithreadAndCausalAttributionControls(BasePhase11ProcessTestC
             backend = ProcessVmCaptureBackend() if ProcessVmCaptureBackend().is_available(proc.pid) else ProcfsCaptureBackend()
 
             # 1. State 1 (before)
-            snap1 = backend.capture(pid=proc.pid)
+            snap1 = backend.capture(pid=proc.pid, plan=_approved_full_plan())
             snap1_dir = os.path.join(self.work_dir, "snap1_pos_attr")
             snap1.save(snap1_dir)
 
@@ -485,7 +492,7 @@ class TestPhase11MultithreadAndCausalAttributionControls(BasePhase11ProcessTestC
             self.assertEqual(res, "ACTIVE_MUTATED")
 
             # 3. State 2 (after)
-            snap2 = backend.capture(pid=proc.pid)
+            snap2 = backend.capture(pid=proc.pid, plan=_approved_full_plan())
             snap2_dir = os.path.join(self.work_dir, "snap2_pos_attr")
             snap2.save(snap2_dir)
         finally:
@@ -575,14 +582,14 @@ class TestPhase11MultithreadAndCausalAttributionControls(BasePhase11ProcessTestC
         proc = self._start_process(self.stripped_bin)
         try:
             backend = ProcessVmCaptureBackend() if ProcessVmCaptureBackend().is_available(proc.pid) else ProcfsCaptureBackend()
-            snap1 = backend.capture(pid=proc.pid)
+            snap1 = backend.capture(pid=proc.pid, plan=_approved_full_plan())
             snap1_dir = os.path.join(self.work_dir, "snap1_drift")
             snap1.save(snap1_dir)
 
             res = self._send_command(proc, "MUTATE_ACTIVE")
             self.assertEqual(res, "ACTIVE_MUTATED")
 
-            snap2 = backend.capture(pid=proc.pid)
+            snap2 = backend.capture(pid=proc.pid, plan=_approved_full_plan())
             snap2_dir = os.path.join(self.work_dir, "snap2_drift")
             snap2.save(snap2_dir)
         finally:
@@ -672,14 +679,14 @@ class TestPhase11MultithreadAndCausalAttributionControls(BasePhase11ProcessTestC
         proc = self._start_process(self.stripped_bin)
         try:
             backend = ProcessVmCaptureBackend() if ProcessVmCaptureBackend().is_available(proc.pid) else ProcfsCaptureBackend()
-            snap1 = backend.capture(pid=proc.pid)
+            snap1 = backend.capture(pid=proc.pid, plan=_approved_full_plan())
             snap1_dir = os.path.join(self.work_dir, "snap1_comp")
             snap1.save(snap1_dir)
 
             res = self._send_command(proc, "MUTATE_COMPETING")
             self.assertEqual(res, "COMPETING_MUTATED")
 
-            snap2 = backend.capture(pid=proc.pid)
+            snap2 = backend.capture(pid=proc.pid, plan=_approved_full_plan())
             snap2_dir = os.path.join(self.work_dir, "snap2_comp")
             snap2.save(snap2_dir)
         finally:
@@ -769,14 +776,14 @@ class TestPhase11MultithreadAndCausalAttributionControls(BasePhase11ProcessTestC
         proc = self._start_process(self.stripped_bin)
         try:
             backend = ProcessVmCaptureBackend() if ProcessVmCaptureBackend().is_available(proc.pid) else ProcfsCaptureBackend()
-            snap1 = backend.capture(pid=proc.pid)
+            snap1 = backend.capture(pid=proc.pid, plan=_approved_full_plan())
             snap1_dir = os.path.join(self.work_dir, "snap1_trace")
             snap1.save(snap1_dir)
 
             res = self._send_command(proc, "MUTATE_ACTIVE")
             self.assertEqual(res, "ACTIVE_MUTATED")
 
-            snap2 = backend.capture(pid=proc.pid)
+            snap2 = backend.capture(pid=proc.pid, plan=_approved_full_plan())
             snap2_dir = os.path.join(self.work_dir, "snap2_trace")
             snap2.save(snap2_dir)
         finally:
@@ -905,7 +912,7 @@ class TestPhase11CaptureLifecycleAndPerformance(BasePhase11ProcessTestCase):
             stop_latencies = []
 
             for i in range(5):
-                snap = backend.capture(pid=proc.pid)
+                snap = backend.capture(pid=proc.pid, plan=_approved_full_plan())
                 self.assertEqual(snap.completeness, "COMPLETE")
                 self.assertEqual(snap.provenance["bytes_requested"], snap.provenance["bytes_read"])
                 self.assertGreater(snap.provenance["bytes_read"], 0)
@@ -941,7 +948,7 @@ class TestPhase11CaptureLifecycleAndPerformance(BasePhase11ProcessTestCase):
                 return real_send_signal(handle_self, sig)
 
             with unittest.mock.patch.object(ProcessTargetHandle, "send_signal", _slow_resume):
-                snap = backend.capture(pid=proc.pid, policy=policy)
+                snap = backend.capture(pid=proc.pid, policy=policy, plan=_approved_full_plan())
 
             # Completeness demoted to PARTIAL due to stop budget exceeded
             self.assertEqual(snap.completeness, "PARTIAL")
@@ -958,7 +965,7 @@ class TestPhase11CaptureLifecycleAndPerformance(BasePhase11ProcessTestCase):
             self.assertEqual(res, "COMPETING_THREAD_ENABLED")
 
             backend = ProcessVmCaptureBackend() if ProcessVmCaptureBackend().is_available(proc.pid) else ProcfsCaptureBackend()
-            snap = backend.capture(pid=proc.pid)
+            snap = backend.capture(pid=proc.pid, plan=_approved_full_plan())
             self.assertEqual(snap.completeness, "COMPLETE")
             self.assertGreaterEqual(len(snap.thread_metadata), 2, "Thread enumeration must capture all active threads")
         finally:

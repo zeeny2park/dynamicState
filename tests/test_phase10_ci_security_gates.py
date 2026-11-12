@@ -98,6 +98,13 @@ from extractor.investigation import InvestigationManager, TrustedCausalVerifier
 from extractor.raw_snapshot import RawRuntimeSnapshot
 
 
+def _approved_full_plan():
+    """These scenarios validate stopped (FULL, COMPLETE/STOPPED-consistency) capture, which since
+    IMP-002 is no longer the default and requires explicit stop approval."""
+    from extractor.capture_plan import CaptureMode, CapturePlan
+    return CapturePlan(mode=CaptureMode.FULL.value, allow_stop=True)
+
+
 class TestTrustBoundaryIngressGates(unittest.TestCase):
     """Gate 1: Verification boundary enforcement against untrusted caller input."""
 
@@ -927,7 +934,7 @@ class TestRealWorldCppCrossProcessAcceptanceGate(unittest.TestCase):
                 self.skipTest("No available capture backend for live process")
 
             # Capture baseline
-            snap1 = backend.capture(pid=proc.pid)
+            snap1 = backend.capture(pid=proc.pid, plan=_approved_full_plan())
             snap1_dir = os.path.join(temp_dir, "snap1")
             snap1.save(snap1_dir)
 
@@ -938,7 +945,7 @@ class TestRealWorldCppCrossProcessAcceptanceGate(unittest.TestCase):
             self.assertEqual(mut_line, "MUTATED")
 
             # Capture treatment
-            snap2 = backend.capture(pid=proc.pid)
+            snap2 = backend.capture(pid=proc.pid, plan=_approved_full_plan())
             snap2_dir = os.path.join(temp_dir, "snap2")
             snap2.save(snap2_dir)
 

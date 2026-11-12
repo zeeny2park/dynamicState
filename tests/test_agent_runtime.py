@@ -145,7 +145,7 @@ class AgentRuntimeTests(unittest.TestCase):
     def setUp(self):
         self.tmp_dir = tempfile.mkdtemp()
         self.controller = MockController()
-        self.runtime = AgentRuntime(self.controller, corpus_dir=self.tmp_dir)
+        self.runtime = AgentRuntime(self.controller, corpus_dir=self.tmp_dir, allow_mutation=True)
 
     def test_observe(self):
         res = self.runtime.observe()

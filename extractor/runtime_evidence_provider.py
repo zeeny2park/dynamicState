@@ -1279,48 +1279,79 @@ class RuntimeEvidenceProvider:
                     reobserve_delay = float(recipe.thresholds_and_conditions.get("reobserve_interval_sec", 0.05))
                     if reobserve_delay > 0:
                         time.sleep(min(reobserve_delay, 0.25))
-                    callstacks_info_2 = self.watch_manager.inspect_thread_callstacks_and_locks(
-                        pid=pid,
-                        companion_elf_path=companion_elf or "",
-                        adapter=self.adapter,
-                    )
-                    rec_2 = RuntimeEvidenceRecord(
-                        evidence_id=f"ev_{uuid.uuid4().hex[:12]}",
-                        collection_method="watch_manager.inspect_thread_callstacks_and_locks",
-                        target_pid=pid,
-                        observed_value={
-                            "deadlock_detected": callstacks_info_2.get("deadlock_detected", False),
-                            "threads_analyzed": len(callstacks_info_2.get("threads", [])),
-                            "sample_index": 2,
-                        },
-                        collection_scope="THREAD_LOCK_GRAPH",
-                        collection_status=COLLECTION_STATUS_SUCCESS,
-                        provenance_class=PROVENANCE_LIVE_RUNTIME_CAPTURE,
-                        raw_details=callstacks_info_2,
-                    )
-                    all_records.append(rec_2)
-                    observation_data["observation_count"] = 2
-                    observation_data["historical_observations"] = 2
-
-                    dl_cycles_2 = callstacks_info_2.get("deadlock_cycles", [])
-                    dl_first_2 = callstacks_info_2.get("deadlock_cycle") or (dl_cycles_2[0] if dl_cycles_2 else [])
-                    second_cycle_edges = {
-                        (
-                            int(c.get("waiter_tid") or c.get("tid") or 0),
-                            str(c.get("lock_address") or c.get("lock_name") or ""),
-                            int(c.get("owner_tid") or 0),
+                    callstacks_info_2: Any = None
+                    second_error: Optional[str] = None
+                    try:
+                        callstacks_info_2 = self.watch_manager.inspect_thread_callstacks_and_locks(
+                            pid=pid,
+                            companion_elf_path=companion_elf or "",
+                            adapter=self.adapter,
                         )
-                        for c in dl_first_2 if isinstance(c, dict)
-                    }
-                    same_cycle_persisted = bool(
-                        callstacks_info_2.get("deadlock_detected")
-                        and first_cycle_edges
-                        and first_cycle_edges == second_cycle_edges
-                    )
-                    observation_data["cycle_persistent"] = same_cycle_persisted
-                    observation_data["is_persistent"] = same_cycle_persisted
-                    if not same_cycle_persisted and not callstacks_info_2.get("deadlock_detected"):
-                        observation_data["transient_cycle_resolved"] = True
+                    except Exception as e2:
+                        second_error = f"{type(e2).__name__}: {e2}"
+                    if second_error is None:
+                        if not isinstance(callstacks_info_2, dict):
+                            second_error = f"unexpected result type {type(callstacks_info_2).__name__}"
+                        elif callstacks_info_2.get("error") or callstacks_info_2.get("success") is False:
+                            second_error = str(callstacks_info_2.get("error") or "inspection reported success=False")
+                        elif (
+                            callstacks_info_2.get("status") == "INCONCLUSIVE"
+                            and not callstacks_info_2.get("deadlock_detected")
+                        ):
+                            second_error = "; ".join(str(x) for x in (callstacks_info_2.get("limitations") or [])[:3]) or "inspection INCONCLUSIVE"
+
+                    if second_error is not None:
+                        # A failed re-read is neither an observation nor evidence that the cycle resolved.
+                        all_records.append(RuntimeEvidenceRecord(
+                            evidence_id=f"ev_{uuid.uuid4().hex[:12]}",
+                            collection_method="watch_manager.inspect_thread_callstacks_and_locks",
+                            target_pid=pid,
+                            observed_value={"sample_index": 2},
+                            collection_scope="THREAD_LOCK_GRAPH",
+                            collection_status=COLLECTION_STATUS_FAILED,
+                            limitations=[f"Deadlock persistence re-observation (sample 2) failed: {second_error}"],
+                            provenance_class=PROVENANCE_LIVE_RUNTIME_CAPTURE,
+                            raw_details=callstacks_info_2 if isinstance(callstacks_info_2, dict) else {},
+                        ))
+                        observation_data["reobservation_error"] = second_error
+                    else:
+                        rec_2 = RuntimeEvidenceRecord(
+                            evidence_id=f"ev_{uuid.uuid4().hex[:12]}",
+                            collection_method="watch_manager.inspect_thread_callstacks_and_locks",
+                            target_pid=pid,
+                            observed_value={
+                                "deadlock_detected": callstacks_info_2.get("deadlock_detected", False),
+                                "threads_analyzed": len(callstacks_info_2.get("threads", [])),
+                                "sample_index": 2,
+                            },
+                            collection_scope="THREAD_LOCK_GRAPH",
+                            collection_status=COLLECTION_STATUS_SUCCESS,
+                            provenance_class=PROVENANCE_LIVE_RUNTIME_CAPTURE,
+                            raw_details=callstacks_info_2,
+                        )
+                        all_records.append(rec_2)
+                        observation_data["observation_count"] = 2
+                        observation_data["historical_observations"] = 2
+
+                        dl_cycles_2 = callstacks_info_2.get("deadlock_cycles", [])
+                        dl_first_2 = callstacks_info_2.get("deadlock_cycle") or (dl_cycles_2[0] if dl_cycles_2 else [])
+                        second_cycle_edges = {
+                            (
+                                int(c.get("waiter_tid") or c.get("tid") or 0),
+                                str(c.get("lock_address") or c.get("lock_name") or ""),
+                                int(c.get("owner_tid") or 0),
+                            )
+                            for c in dl_first_2 if isinstance(c, dict)
+                        }
+                        same_cycle_persisted = bool(
+                            callstacks_info_2.get("deadlock_detected")
+                            and first_cycle_edges
+                            and first_cycle_edges == second_cycle_edges
+                        )
+                        observation_data["cycle_persistent"] = same_cycle_persisted
+                        observation_data["is_persistent"] = same_cycle_persisted
+                        if not same_cycle_persisted and not callstacks_info_2.get("deadlock_detected"):
+                            observation_data["transient_cycle_resolved"] = True
                 else:
                     blocked = callstacks_info.get("blocked_threads", [])
                     if blocked:

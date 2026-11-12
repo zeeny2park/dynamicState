@@ -200,7 +200,7 @@ class AgentSemanticContractTests(unittest.TestCase):
     def setUp(self):
         self.tmp_dir = tempfile.mkdtemp(prefix="agent_contract_")
         self.controller = ContractMockRuntimeController()
-        self.runtime = AgentRuntime(self.controller, corpus_dir=self.tmp_dir)
+        self.runtime = AgentRuntime(self.controller, corpus_dir=self.tmp_dir, allow_mutation=True)
 
     def tearDown(self):
         import shutil

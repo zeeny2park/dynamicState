@@ -2109,6 +2109,7 @@ class AdaptiveInvestigationSession:
         remaining_steps = self.plan.steps[self.plan.current_step_index + 1:]
         if eval_result.status == RECIPE_STATUS_SUPPORTED:
             # If RSS growth was observed, dynamically schedule heap growth and object accumulation
+            dynamic_followups: List[InvestigationStep] = []
             if "MEMORY_GROWTH" in recipe.recipe_id or "GROWTH" in recipe.recipe_id:
                 followup_ids = ["RECIPE_HEAP_GROWTH", "RECIPE_LONG_LIVED_OBJECT_ACCUMULATION"]
                 for fid in reversed(followup_ids):
@@ -2128,6 +2129,7 @@ class AdaptiveInvestigationSession:
                                 rationale_override=f"Dynamic follow-up: isolated from confirmed {recipe.recipe_id}",
                             )
                             remaining_steps.insert(0, new_step)
+                            dynamic_followups.append(new_step)
 
             # Prioritize relevant follow-up steps for this category
             related_steps = [s for s in remaining_steps if s.category == recipe.problem_category]
@@ -2140,8 +2142,9 @@ class AdaptiveInvestigationSession:
                 for s in remaining_steps:
                     if s.category != recipe.problem_category:
                         s.status = "SKIPPED"
-                has_pending_related = any(s.status == "PENDING" for s in related_steps)
-                if not has_pending_related:
+                # IMP-004: dynamically scheduled growth follow-ups must still execute; otherwise keep the
+                # original early stop.
+                if not any(s.status == "PENDING" for s in dynamic_followups):
                     self.state = STATE_ANALYZING
                     self.plan.current_step_index += 1
                     return {"action": "COLLECT_STEP", "step_id": step.step_id, "eval_result": asdict(eval_result), "adaptive_action": "EARLY_ANOMALY_CONFIRMED"}
@@ -2656,7 +2659,7 @@ class AdaptiveInvestigationSession:
 
         remediations: List[str] = []
         if (
-            agg.overall_result in (OverallVerdict.INCONCLUSIVE, OverallVerdict.ABORTED, "INCONCLUSIVE", "ABORTED")
+            agg.overall_result in (VERDICT_INCONCLUSIVE, VERDICT_ABORTED)
             or self.state in (STATE_INCONCLUSIVE, STATE_BLOCKED, STATE_FAILED, STATE_BUDGET_EXHAUSTED)
         ):
             remediations.append(
@@ -2683,7 +2686,7 @@ class AdaptiveInvestigationSession:
                 remediations.append("No active remediation required: runtime state verified clean within investigated scope.")
             else:
                 remediations.append("Review state transition logic and enforce assertions for valid enum state transitions.")
-        elif agg.overall_result in (OverallVerdict.HEALTHY, "HEALTHY"):
+        elif agg.overall_result == VERDICT_HEALTHY:
             remediations.append("No active remediation required: runtime state verified clean within investigated scope.")
         else:
             remediations.append(

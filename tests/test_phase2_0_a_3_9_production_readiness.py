@@ -43,6 +43,13 @@ from extractor.verdict_engine import sanitize_report_output_path
 from extractor.watch_session import WatchSessionManager, calculate_load_bias
 
 
+def _approved_full_plan():
+    """These scenarios validate stopped (FULL, COMPLETE/STOPPED-consistency) capture, which since
+    IMP-002 is no longer the default and requires explicit stop approval."""
+    from extractor.capture_plan import CaptureMode, CapturePlan
+    return CapturePlan(mode=CaptureMode.FULL.value, allow_stop=True)
+
+
 class TestPhase20A39ProductionReadiness(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -193,7 +200,7 @@ class TestPhase20A39ProductionReadiness(unittest.TestCase):
 
             # 3. Measure stopped snapshot capture overhead
             backend = ProcessVmCaptureBackend()
-            snap = backend.capture(proc.pid)
+            snap = backend.capture(proc.pid, plan=_approved_full_plan())
             stop_ms = snap.provenance.get("stop_duration_ms", 0.0)
             total_ms = snap.provenance.get("total_capture_duration_ms", 0.0)
             snap_bytes = snap.provenance.get("captured_bytes", 0)
@@ -228,7 +235,7 @@ class TestPhase20A39ProductionReadiness(unittest.TestCase):
         try:
             backend = ProcessVmCaptureBackend()
             # 1. Collector interruption / fail-open resume guarantee
-            snap_ok = backend.capture(proc.pid)
+            snap_ok = backend.capture(proc.pid, plan=_approved_full_plan())
             self.assertTrue(snap_ok.provenance["lifecycle_guarantees"]["resume_confirmed"])
 
             # 4 & 5 & 6 & 7. Snapshot save, partial transfer, corrupted file, invalid receipt, and Build ID mismatch
@@ -276,7 +283,7 @@ class TestPhase20A39ProductionReadiness(unittest.TestCase):
 
             # Scenario 11: Repeated collection on the same process (5 consecutive captures)
             for _ in range(5):
-                s_rep = backend.capture(proc.pid)
+                s_rep = backend.capture(proc.pid, plan=_approved_full_plan())
                 self.assertEqual(s_rep.completeness, "COMPLETE")
 
             # Scenario 12: Concurrent investigation requests across 4 worker threads

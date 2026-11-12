@@ -94,6 +94,13 @@ from extractor.web.server import WebApiAdapter
 
 
 
+def _approved_full_plan():
+    """These scenarios validate stopped (FULL, COMPLETE/STOPPED-consistency) capture, which since
+    IMP-002 is no longer the default and requires explicit stop approval."""
+    from extractor.capture_plan import CaptureMode, CapturePlan
+    return CapturePlan(mode=CaptureMode.FULL.value, allow_stop=True)
+
+
 def _build_corrupted_cyclic_scenario_h():
     """Scenario H (ev_h_1 <-> ev_h_2) built the only way still possible.
 
@@ -2047,7 +2054,7 @@ class TestAttestationIssuanceSecurityAndCausality(unittest.TestCase):
                 backend = ProcessVmCaptureBackend() if ProcessVmCaptureBackend().is_available(proc.pid) else ProcfsCaptureBackend()
 
                 # Capture State A
-                snap_a = backend.capture(pid=proc.pid)
+                snap_a = backend.capture(pid=proc.pid, plan=_approved_full_plan())
                 self.assertEqual(snap_a.completeness, "COMPLETE")
                 snap_a_dir = os.path.join(corpus_dir, "memory_snapshots", "snap_live_a")
                 snap_a.save(snap_a_dir)
@@ -2059,7 +2066,7 @@ class TestAttestationIssuanceSecurityAndCausality(unittest.TestCase):
                 self.assertEqual(line, "MUTATED")
 
                 # Capture State B
-                snap_b = backend.capture(pid=proc.pid)
+                snap_b = backend.capture(pid=proc.pid, plan=_approved_full_plan())
                 self.assertEqual(snap_b.completeness, "COMPLETE")
                 snap_b_dir = os.path.join(corpus_dir, "memory_snapshots", "snap_live_b")
                 snap_b.save(snap_b_dir)
@@ -4344,7 +4351,7 @@ class TestPhase8RuntimeEvidenceAuthenticity(unittest.TestCase):
                 self.skipTest("No available capture backend for live process")
 
             # Capture baseline snapshot (State A: counter == 42, flags == 7)
-            snap1 = backend.capture(pid=proc.pid)
+            snap1 = backend.capture(pid=proc.pid, plan=_approved_full_plan())
             self.assertEqual(snap1.completeness, "COMPLETE")
             snap1_dir = os.path.join(temp_dir, "snap_j1")
             snap1.save(snap1_dir)
@@ -4392,7 +4399,7 @@ class TestPhase8RuntimeEvidenceAuthenticity(unittest.TestCase):
             self.assertEqual(mut_line, "MUTATED")
 
             # Capture treatment snapshot (State B: counter == 100, flags == 15)
-            snap2 = backend.capture(pid=proc.pid)
+            snap2 = backend.capture(pid=proc.pid, plan=_approved_full_plan())
             self.assertEqual(snap2.completeness, "COMPLETE")
             snap2_dir = os.path.join(temp_dir, "snap_j2")
             snap2.save(snap2_dir)
@@ -4484,7 +4491,7 @@ class TestPhase8RuntimeEvidenceAuthenticity(unittest.TestCase):
                 self.skipTest("No available capture backend for live process")
 
             # Capture baseline
-            snap1 = backend.capture(pid=proc.pid)
+            snap1 = backend.capture(pid=proc.pid, plan=_approved_full_plan())
             snap1_dir = os.path.join(temp_dir, "snap_k1")
             snap1.save(snap1_dir)
 
@@ -4505,7 +4512,7 @@ class TestPhase8RuntimeEvidenceAuthenticity(unittest.TestCase):
             self.assertEqual(mut_line, "MUTATED")
 
             # Capture treatment
-            snap2 = backend.capture(pid=proc.pid)
+            snap2 = backend.capture(pid=proc.pid, plan=_approved_full_plan())
             snap2_dir = os.path.join(temp_dir, "snap_k2")
             snap2.save(snap2_dir)
 
@@ -5109,7 +5116,7 @@ class TestPhase9CrossProcessEvidenceTrust(unittest.TestCase):
                 self.skipTest("No available capture backend for live process")
 
             # Capture baseline snapshot
-            snap1 = backend.capture(pid=proc.pid)
+            snap1 = backend.capture(pid=proc.pid, plan=_approved_full_plan())
             snap1_dir = os.path.join(temp_dir, "snap1")
             snap1.save(snap1_dir)
 
@@ -5144,7 +5151,7 @@ class TestPhase9CrossProcessEvidenceTrust(unittest.TestCase):
             self.assertEqual(mut_line, "MUTATED")
 
             # Capture treatment snapshot
-            snap2 = backend.capture(pid=proc.pid)
+            snap2 = backend.capture(pid=proc.pid, plan=_approved_full_plan())
             snap2_dir = os.path.join(temp_dir, "snap2")
             snap2.save(snap2_dir)
 

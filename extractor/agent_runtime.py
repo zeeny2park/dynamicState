@@ -72,8 +72,12 @@ class AgentRuntime:
         # Phase 5.1 Low-Impact Memory Snapshot support
         self.memory_snapshots: Dict[str, Any] = {}
         self.raw_snapshots_dir: str = os.path.join(self.corpus_dir, "memory_snapshots")
+        # IMP-019: live mutation/state-changing operations are gated ONLY by allow_mutation, which is
+        # fixed at construction. A request can never enable it, and observe(mode=...) cannot raise a
+        # LOW_IMPACT runtime into CONSISTENT (stop-the-world) mode unless the operator started it so.
         self.allow_mutation: bool = bool(allow_mutation)
         self.observation_mode: str = "CONSISTENT" if (allow_mutation and observation_mode == "LOW_IMPACT") else observation_mode
+        self._consistent_mode_permitted: bool = self.allow_mutation or self.observation_mode == "CONSISTENT"
         self._memory_capturer: Any = None
         self._offline_analyzer: Any = None
 
@@ -327,7 +331,7 @@ class AgentRuntime:
     # Observation & Snapshot Operations
     # -------------------------------------------------------------------------
 
-    def observe(self, mode: str = "LOW_IMPACT", pid: Optional[int] = None,
+    def observe(self, mode: Optional[str] = None, pid: Optional[int] = None,
                 policy: str = "ALL_READABLE", max_bytes: Optional[int] = None,
                 debug_image: Optional[str] = None) -> AgentActionResult:
         """Return a compact semantic summary of the current runtime state.
@@ -335,7 +339,8 @@ class AgentRuntime:
         Supports CONSISTENT (GDB-based stop-the-world) and LOW_IMPACT (process_vm_readv without stopping).
         """
         t0 = time.monotonic()
-        if mode.upper() == "LOW_IMPACT":
+        mode = (mode or self.observation_mode or "LOW_IMPACT").upper()
+        if mode == "LOW_IMPACT":
             self.observation_mode = "LOW_IMPACT"
             target_pid = pid
             if target_pid is None and self.controller and hasattr(self.controller, "process_info"):
@@ -358,6 +363,14 @@ class AgentRuntime:
             ana_res = self.analyze_memory_snapshot(ms_id, debug_image=debug_image)
             return ana_res
 
+        if not getattr(self, "_consistent_mode_permitted", False):
+            return self._error(
+                "CAPABILITY_UNSUPPORTED",
+                f"Observation mode '{mode}' is not permitted: this runtime was started in read-only LOW_IMPACT mode "
+                "and a request cannot raise it (restart with --mode CONSISTENT or --allow-mutation).",
+                "OBSERVE",
+                t0,
+            )
         self.observation_mode = "CONSISTENT"
         if not self.controller:
             return self._error("RUNTIME_ERROR", "No active runtime controller attached", "OBSERVE", t0)
@@ -542,8 +555,9 @@ class AgentRuntime:
     def list_mutation_candidates(self, snapshot_id: Optional[str] = None) -> AgentActionResult:
         """Discover and rank type-safe mutation candidates for a snapshot."""
         t0 = time.monotonic()
-        if getattr(self, "observation_mode", "CONSISTENT") == "LOW_IMPACT":
-            return self._error("CAPABILITY_UNSUPPORTED", "Mutation candidates are not supported in LOW_IMPACT observation mode", "LIST_MUTATION_CANDIDATES", t0)
+        refused = self._mutation_refused("LIST_MUTATION_CANDIDATES", t0)
+        if refused:
+            return refused
         snap, err = self._resolve_snapshot(snapshot_id)
         if err:
             return self._error(err[0], err[1], "LIST_MUTATION_CANDIDATES", t0)
@@ -583,8 +597,9 @@ class AgentRuntime:
     def checkpoint(self, checkpoint_id: Optional[str] = None) -> AgentActionResult:
         """Capture a branch-safe process checkpoint (GDB fork backend)."""
         t0 = time.monotonic()
-        if getattr(self, "observation_mode", "CONSISTENT") == "LOW_IMPACT":
-            return self._error("CAPABILITY_UNSUPPORTED", "Checkpoint is not supported in LOW_IMPACT observation mode", "CHECKPOINT", t0)
+        refused = self._mutation_refused("CHECKPOINT", t0)
+        if refused:
+            return refused
         if not self.controller or not hasattr(self.controller, "checkpoint"):
             return self._error("CAPABILITY_UNSUPPORTED", "Checkpoint is not supported by runtime backend", "CHECKPOINT", t0)
 
@@ -604,8 +619,9 @@ class AgentRuntime:
     def restore(self, checkpoint_id: str) -> AgentActionResult:
         """Restore process state to an exact parent checkpoint."""
         t0 = time.monotonic()
-        if getattr(self, "observation_mode", "CONSISTENT") == "LOW_IMPACT":
-            return self._error("CAPABILITY_UNSUPPORTED", "Restore is not supported in LOW_IMPACT observation mode", "RESTORE", t0)
+        refused = self._mutation_refused("RESTORE", t0)
+        if refused:
+            return refused
         if not self.controller or not hasattr(self.controller, "restore"):
             return self._error("CAPABILITY_UNSUPPORTED", "Restore is not supported by runtime backend", "RESTORE", t0)
 
@@ -632,6 +648,9 @@ class AgentRuntime:
     def verify_restart_determinism(self, checkpoint_id: Optional[str] = None) -> AgentActionResult:
         """Verify deterministic reproducibility of state across inferior restarts."""
         t0 = time.monotonic()
+        refused = self._mutation_refused("VERIFY_RESTART_DETERMINISM", t0, low_impact_gate=False)
+        if refused:
+            return refused
         if not self.controller:
             return self._error("RUNTIME_ERROR", "No active runtime controller attached", "VERIFY_RESTART_DETERMINISM", t0)
         cp = None
@@ -661,8 +680,9 @@ class AgentRuntime:
         mutations must map to a valid MutationCandidate targeting a verified semantic field.
         """
         t0 = time.monotonic()
-        if getattr(self, "observation_mode", "CONSISTENT") == "LOW_IMPACT":
-            return self._error("CAPABILITY_UNSUPPORTED", "Mutation and transitions are not supported in LOW_IMPACT observation mode", "EXECUTE_TRANSITION", t0)
+        refused = self._mutation_refused("EXECUTE_TRANSITION", t0)
+        if refused:
+            return refused
 
         if not self.controller:
             return self._error("RUNTIME_ERROR", "No active runtime controller attached", "EXECUTE_TRANSITION", t0)
@@ -865,8 +885,9 @@ class AgentRuntime:
                 max_states: int = 20) -> AgentActionResult:
         """Run the autonomous branch-safe state exploration loop."""
         t0 = time.monotonic()
-        if getattr(self, "observation_mode", "CONSISTENT") == "LOW_IMPACT":
-            return self._error("CAPABILITY_UNSUPPORTED", "Exploration loop is not supported in LOW_IMPACT observation mode", "EXPLORE", t0)
+        refused = self._mutation_refused("EXPLORE", t0)
+        if refused:
+            return refused
         if not self.controller:
             return self._error("RUNTIME_ERROR", "No active runtime controller attached", "EXPLORE", t0)
 
@@ -1496,6 +1517,30 @@ class AgentRuntime:
             return "<pointer>"
         return val
 
+    def _mutation_refused(self, action: str, t_start: float, low_impact_gate: bool = True) -> Optional[AgentActionResult]:
+        """IMP-019: refuse every live state-changing operation unless the runtime was started with allow_mutation=True.
+
+        allow_mutation is fixed at construction and is the only switch; the observation mode cannot enable
+        mutation. A mutation-enabled runtime that is currently observing in LOW_IMPACT mode still refuses
+        the GDB-backed operations (pre-existing LOW_IMPACT capability gate).
+        """
+        if not getattr(self, "allow_mutation", False):
+            return self._error(
+                "CAPABILITY_UNSUPPORTED",
+                f"{action} is not supported in LOW_IMPACT / read-only operation: it changes live target state and "
+                "the runtime was started without allow_mutation (restart with allow_mutation=True / --allow-mutation).",
+                action,
+                t_start,
+            )
+        if low_impact_gate and getattr(self, "observation_mode", "LOW_IMPACT") == "LOW_IMPACT":
+            return self._error(
+                "CAPABILITY_UNSUPPORTED",
+                f"{action} is not supported in LOW_IMPACT observation mode",
+                action,
+                t_start,
+            )
+        return None
+
     @staticmethod
     def _error(code: str, message: str, action: str, t_start: float) -> AgentActionResult:
         return AgentActionResult(
@@ -1706,8 +1751,9 @@ class AgentRuntime:
     ) -> AgentActionResult:
         """Attempt replay of a snapshot mutation onto a live process."""
         t0 = time.monotonic()
-        if getattr(self, "observation_mode", "LOW_IMPACT") == "LOW_IMPACT" and not getattr(self, "allow_mutation", False):
-            return self._error("CAPABILITY_UNSUPPORTED", "Live mutation replay is not supported in LOW_IMPACT observation mode", "REPLAY_MUTATION", t0)
+        refused = self._mutation_refused("REPLAY_MUTATION", t0, low_impact_gate=False)
+        if refused:
+            return refused
         res = StateReplayer.replay(
             controller=self.controller,
             target_object_id=target_object_id,

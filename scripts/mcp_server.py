@@ -1402,7 +1402,7 @@ def runtime_eval_memory_path(
     ssh_proxy_jump: Optional[str] = None,
 ) -> str:
     """Evaluate C/C++ symbol path expressions (including structs, pointer dereferences `->`, and array indices `[i]`)
-    directly from live local or remote embedded target memory with 0.00ms process stop time.
+    directly from live local or remote embedded target memory without stopping the process (zero-stop read).
 
     Examples of expressions:
       - "g_session" (decodes entire struct hierarchy)
@@ -1736,7 +1736,7 @@ def runtime_scan_memory_pool(
     ssh_proxy_jump: Optional[str] = None,
 ) -> str:
     """Scan an entire memory pool or buffer array (e.g. '*gpMem', 'gpMem->buffers', 'g_buffers')
-    in a single 0.00ms zero-stop batch read and return slot-by-slot allocation status ('IN_USE' vs 'FREE'),
+    in a single zero-stop batch read and return slot-by-slot allocation status ('IN_USE' vs 'FREE'),
     utilization summary, allocation_bitmap, and a visual ascii_map_chart.
     """
     try:
@@ -1775,7 +1775,7 @@ def runtime_find_symbol_owners(
     ssh_proxy_jump: Optional[str] = None,
 ) -> str:
     """Find which thread(s) or global worker contexts are currently using or holding a pointer to
-    a specific buffer slot or C/C++ symbol (e.g. 'gpMem->buffers[9]' or 'gpMem[9]') with 0.00ms stop time.
+    a specific buffer slot or C/C++ symbol (e.g. 'gpMem->buffers[9]' or 'gpMem[9]') without stopping the target (zero-stop read).
     Checks: (1) struct owner/TID fields, (2) global worker/context tables, and (3) active thread stack memory.
     """
     try:
@@ -1815,7 +1815,7 @@ def runtime_watch_until_condition(
     ssh_key: Optional[str] = None,
     ssh_proxy_jump: Optional[str] = None,
 ) -> str:
-    """Zero-stop conditional watchpoint & anomaly snapshot catcher (0.00ms stop time).
+    """Zero-stop conditional watchpoint & anomaly snapshot catcher (zero-stop read; the target is not suspended).
     Polls target expressions until `condition_expression` becomes true (or stays true for `hold_duration_ms`,
     or `ANY_CHANGE` occurs), and immediately captures before/after diffs plus optional thread owner lookup.
     """
@@ -1859,7 +1859,7 @@ def runtime_traverse_linked_structure(
     ssh_proxy_jump: Optional[str] = None,
 ) -> str:
     """Traverse a non-contiguous linked list, queue, or tree pointer chain (`node->next`) in a single
-    0.00ms zero-stop MCP call. Automatically detects pointer cycles (infinite loops) and corrupted/unmapped links.
+    zero-stop MCP call. Automatically detects pointer cycles (infinite loops) and corrupted/unmapped links.
     """
     try:
         if pid is None or companion_elf is None or runtime.watch_session_manager.get_active_target_context().get('pid') == pid:
@@ -1897,7 +1897,7 @@ def runtime_inspect_thread_callstack_and_locks(
     ssh_key: Optional[str] = None,
     ssh_proxy_jump: Optional[str] = None,
 ) -> str:
-    """Zero-stop replacement for `gdb thread apply all bt` + mutex deadlock detector (0.00ms stop time).
+    """Zero-stop replacement for `gdb thread apply all bt` + mutex deadlock detector (zero-stop read; the target is not suspended).
     Unwinds active thread callstacks via stack return addresses & DWARF subprograms, decodes `pthread_mutex_t`
     (`__owner` TID), matches `futex` wait addresses to mutexes, and detects circular deadlock cycles.
     """
@@ -1934,7 +1934,7 @@ def runtime_audit_memory_integrity(
     ssh_key: Optional[str] = None,
     ssh_proxy_jump: Optional[str] = None,
 ) -> str:
-    """Automated DWARF-guided memory corruption & pointer health auditor (0.00ms stop time).
+    """Automated DWARF-guided memory corruption & pointer health auditor (zero-stop read; the target is not suspended).
     Detects dangling/unmapped pointers, corrupted bool bytes (buffer overflow), out-of-range enums,
     memory pool header counter drift, and orphaned thread owner TIDs.
     """
@@ -1971,7 +1971,7 @@ def runtime_resolve_code_pointers(
     ssh_proxy_jump: Optional[str] = None,
 ) -> str:
     """Resolve function pointers, callback struct fields, or C++ polymorphic object `_vptr` / `vtable`
-    slots to exact C/C++ function names and DWARF source `file:line` locations (0.00ms stop time).
+    slots to exact C/C++ function names and DWARF source `file:line` locations (zero-stop read; the target is not suspended).
     """
     try:
         if pid is None or companion_elf is None or runtime.watch_session_manager.get_active_target_context().get('pid') == pid:
@@ -2009,7 +2009,7 @@ def runtime_inspect_shared_memory_ipc(
     ssh_proxy_jump: Optional[str] = None,
 ) -> str:
     """Inspect POSIX shared memory (`/dev/shm/*`, shared `mmap`) or overlay a DWARF struct type (`cast_type`)
-    onto any arbitrary runtime address, and discover peer processes sharing the same IPC mapping (0.00ms stop time).
+    onto any arbitrary runtime address, and discover peer processes sharing the same IPC mapping (zero-stop read; the target is not suspended).
     """
     try:
         if pid is None or companion_elf is None or runtime.watch_session_manager.get_active_target_context().get('pid') == pid:
@@ -2047,7 +2047,7 @@ def runtime_inspect_thread_locals_and_frame_vars(
     ssh_proxy_jump: Optional[str] = None,
 ) -> str:
     """Decode formal parameters and local variables (`DW_TAG_formal_parameter`, `DW_TAG_variable`)
-    on active thread callstack frames using DWARF `DW_OP_fbreg` / frame-pointer unwinding in 0.00ms zero-stop mode.
+    on active thread callstack frames using DWARF `DW_OP_fbreg` / frame-pointer unwinding in zero-stop mode.
     """
     try:
         if pid is None or companion_elf is None or runtime.watch_session_manager.get_active_target_context().get('pid') == pid:
@@ -2080,7 +2080,7 @@ def runtime_auto_triage_incident(
     ssh_key: Optional[str] = None,
     ssh_proxy_jump: Optional[str] = None,
 ) -> str:
-    """1-Call Composite Zero-Stop Incident Auto-Triage & Root-Cause Correlator (0.00ms stop time).
+    """1-Call Composite Zero-Stop Incident Auto-Triage & Root-Cause Correlator (zero-stop read; the target is not suspended).
     Combines Memory Integrity Audit, Thread Callstacks & Mutex Deadlock Check, Memory Pool Pressure Sweep,
     and Linked-List Cycle Detection into a ranked root-cause scorecard (`findings`, `health_score`).
     """
@@ -2116,7 +2116,7 @@ def runtime_trace_ipc_pipeline(
     ssh_key: Optional[str] = None,
     ssh_proxy_jump: Optional[str] = None,
 ) -> str:
-    """Cross-process shared memory (`shm` / `MAP_SHARED`) & IPC FD pipeline bottleneck analyzer (0.00ms stop).
+    """Cross-process shared memory (`shm` / `MAP_SHARED`) & IPC FD pipeline bottleneck analyzer (zero-stop read).
     Auto-detects or overlays DWARF struct types onto shared memory, calculates producer/consumer sequence lag
     (`pending_backlog`, `backlog_utilization_pct`), and maps connected peer processes and their states.
     """
@@ -2155,7 +2155,7 @@ def runtime_scan_heap_objects(
     ssh_key: Optional[str] = None,
     ssh_proxy_jump: Optional[str] = None,
 ) -> str:
-    """Zero-stop C++ polymorphic `vtable` (`_ZTV*`) heap & data segment object census + leak detector (0.00ms stop).
+    """Zero-stop C++ polymorphic `vtable` (`_ZTV*`) heap & data segment object census + leak detector (zero-stop read).
     Scans `[heap]` and `.data` for live C++ class instances via relocated `_vptr` signatures, decodes their DWARF fields,
     and flags unreferenced heap objects (`is_leaked_candidate = True`).
     """
@@ -2195,7 +2195,7 @@ def runtime_build_dependency_graph(
 ) -> str:
     """Synthesize a directed cross-entity dependency & causal graph across:
     `[Process] ➔ [Thread] ➔ [Mutex Lock / Stack Frame] ➔ [Memory Pool Slot / Heap Object] ➔ [Shared Memory Peer]`
-    in 0.00ms zero-stop mode, and identify `root_blocker_nodes` and `causal_chains`.
+    in zero-stop mode, and identify `root_blocker_nodes` and `causal_chains`.
     """
     try:
         if pid is None or companion_elf is None or runtime.watch_session_manager.get_active_target_context().get('pid') == pid:
@@ -2232,7 +2232,7 @@ def runtime_correlate_source_and_state(
 ) -> str:
     """Correlate DWARF `file:line` source locations and active stack frames with real C/C++
     source code files on disk, overlaying live runtime values of parameters, local variables,
-    and referenced global symbols inline (`annotated_lines`) in 0.00ms zero-stop mode.
+    and referenced global symbols inline (`annotated_lines`) in zero-stop mode.
     """
     try:
         if pid is None or companion_elf is None or runtime.watch_session_manager.get_active_target_context().get('pid') == pid:
@@ -2268,7 +2268,7 @@ def runtime_investigate_symptom(
     ssh_key: Optional[str] = None,
     ssh_proxy_jump: Optional[str] = None,
 ) -> str:
-    """Autonomous Symptom-Driven Multi-Stage Root-Cause Investigator (0.00ms stop time).
+    """Autonomous Symptom-Driven Multi-Stage Root-Cause Investigator (zero-stop read; the target is not suspended).
     Accepts any simple, high-level user symptom question (e.g. '왜 멈췄지?', '버벅거려', '메모리가 새는 것 같아',
     '왜 응답이 없지?') and automatically orchestrates Triage + Causal Dependency Graph + Heap Leak Scan +
     Source-to-Runtime Inline Code Correlation in a single call.
@@ -2307,7 +2307,7 @@ def runtime_sample_statistical_hotspots(
     ssh_key: Optional[str] = None,
     ssh_proxy_jump: Optional[str] = None,
 ) -> str:
-    """Zero-stop statistical CPU & callstack hotspot profiler (`0.00ms` stop time).
+    """Zero-stop statistical CPU & callstack hotspot profiler (zero-stop read; the target is not suspended).
     Replacement for `perf top` / `gdb` sampling on stripped or embedded targets: samples thread CPU tick
     deltas (`utime + stime`), callstack residency (`hotspot_functions`, `flame_stacks`), and counter mutation
     velocity (`counter_rates`) across `samples_count * interval_ms`.
@@ -2345,7 +2345,7 @@ def runtime_resolve_fuzzy_intent(
     ssh_key: Optional[str] = None,
     ssh_proxy_jump: Optional[str] = None,
 ) -> str:
-    """Semantic / Fuzzy Intent-to-Symbol Resolver (`0.00ms` stop time).
+    """Semantic / Fuzzy Intent-to-Symbol Resolver (zero-stop read; the target is not suspended).
     Translates vague natural-language concepts (e.g. '버퍼 풀', '워커 스레드', '세션 객체', '작업 리스트',
     '카운터') into concrete DWARF symbols & member paths, and evaluates their live runtime values immediately.
     """
@@ -2385,7 +2385,7 @@ def runtime_flight_recorder_time_machine(
     ssh_key: Optional[str] = None,
     ssh_proxy_jump: Optional[str] = None,
 ) -> str:
-    """Zero-stop Anomaly Time-Machine Flight Recorder (`0.00ms` stop time).
+    """Zero-stop Anomaly Time-Machine Flight Recorder (zero-stop read; the target is not suspended).
     Maintains a per-PID circular blackbox ring buffer of micro-snapshots (`frames_count` samples across `interval_ms`),
     detects transient spikes/glitches (A -> B -> A value reversals), and reconstructs `pre_anomaly_frame`,
     `peak_anomaly_frame`, and `post_anomaly_frame`.
@@ -2424,7 +2424,7 @@ def runtime_detect_behavioral_drift(
     ssh_key: Optional[str] = None,
     ssh_proxy_jump: Optional[str] = None,
 ) -> str:
-    """Zero-Stop Behavioral Drift Detector (`0.00ms` stop time).
+    """Zero-Stop Behavioral Drift Detector (zero-stop read; the target is not suspended).
     Compares a multi-dimensional behavioral fingerprint (scalar symbols, memory pool utilization %,
     active thread count, mutex locks, and C++ heap object/leak counts) against a saved or learned baseline
     and reports `drift_score` (0..100), `drift_status`, and `drifted_dimensions`.
@@ -2462,7 +2462,7 @@ def runtime_inspect_thread_local_storage(
     ssh_key: Optional[str] = None,
     ssh_proxy_jump: Optional[str] = None,
 ) -> str:
-    """Zero-Stop Per-Thread TLS (`__thread` / `thread_local`) Variable Decoder (`0.00ms` stop time).
+    """Zero-Stop Per-Thread TLS (`__thread` / `thread_local`) Variable Decoder (zero-stop read; the target is not suspended).
     Resolves ELF `PT_TLS` segment geometry (`memsz`, `align`) and DWARF `DW_OP_form_tls_address` /
     `DW_OP_gnu_push_tls_address` offsets, locates each thread's glibc TCB (`struct pthread *`) via
     its `tcbhead_t` self-pointer + TID signature, and decodes per-thread TLS variable values across
@@ -2502,7 +2502,7 @@ def runtime_verify_concurrent_read_consistency(
     ssh_key: Optional[str] = None,
     ssh_proxy_jump: Optional[str] = None,
 ) -> str:
-    """Optimistic Seqlock Double-Read Concurrency Verifier (`0.00ms` stop time).
+    """Optimistic Seqlock Double-Read Concurrency Verifier (zero-stop read; the target is not suspended).
     Reads target structs, pointers, and state variables twice (`Read 1 -> delay -> Read 2`, with up to `retries` attempts)
     to verify zero-stop snapshot atomicity, detect torn reads or concurrent mutations in flight, and classify each symbol as:
     `ATOMIC_CONSISTENT`, `TORN_READ_RECOVERED`, or `CONCURRENTLY_MUTATING`.
@@ -2543,7 +2543,7 @@ def runtime_inspect_dpdk_lcores_and_rings(
     ssh_proxy_jump: Optional[str] = None,
 ) -> str:
     """Zero-Stop DPDK Isolated-Core (`isolcpus`) Dedicated Lcore, PMD Poll-Loop, Lockless Ring (`rte_ring`)
-    & User-Space Spinlock (`rte_spinlock_t`) Inspector (`0.00ms` stop time).
+    & User-Space Spinlock (`rte_spinlock_t`) Inspector (zero-stop read; the target is not suspended).
     Engineered for DPDK / poll-mode dedicated threads running 100% in user space (`state == 'R'`,
     `syscall == 'running'`, `kstkesp == 0`): decodes CPU core pinning, kernel isolation jitter,
     `per_lcore_*` TLS variables, pure leaf poll-loop callstacks/locals via `CALL rel32` target recovery,
@@ -2589,7 +2589,7 @@ def runtime_coerce_expression(
     pid: Optional[int] = None,
     companion_elf: Optional[str] = None,
 ) -> str:
-    """Forgiving C/C++ Expression Auto-Coercer (`0.00ms` stop time).
+    """Forgiving C/C++ Expression Auto-Coercer (zero-stop read; the target is not suspended).
     Resolves `.` <-> `->` operator mismatches (e.g., `gpMem.buffers[2].seq` -> `gpMem->buffers[2].seq`),
     bare struct member names without root globals (e.g., `buffers[2].seq` -> `gpMem->buffers[2].seq`),
     and root/member symbol typos against the target's DWARF index.
@@ -2618,7 +2618,7 @@ def runtime_ask(
     ssh_key: Optional[str] = None,
     ssh_proxy_jump: Optional[str] = None,
 ) -> str:
-    """Universal 1-Call Zero-Stop Intent Gateway (`0.00ms` stop time).
+    """Universal 1-Call Zero-Stop Intent Gateway (zero-stop read; the target is not suspended).
     Accepts any C/C++ expression (automatically coercing `.` <-> `->`, bare member names, and typos)
     OR any natural-language diagnostic question (e.g., 'gpMem.buffers[2].seq', 'buffers[2] 누가 잡고 있어?',
     'dpdk lcore 상태는?', 'tls 변수 보여줘', '왜 멈췄지?'). Automatically inherits or heals `(pid, companion_elf)`
@@ -2657,7 +2657,7 @@ def runtime_smart_compact_query(
     ssh_key: Optional[str] = None,
     ssh_proxy_jump: Optional[str] = None,
 ) -> str:
-    """LLM Context-Window Budgeter & Anomaly-First Smart Compactor (`0.00ms` stop time).
+    """LLM Context-Window Budgeter & Anomaly-First Smart Compactor (zero-stop read; the target is not suspended).
     Strips repetitive `FREE` slots and zero/NULL struct fields (`drop_zero_or_free=True`), preserves 100%
     of `IN_USE` / anomalous / non-zero items first, and supports cursor pagination (`cursor_offset`, `page_size`)
     with `token_reduction_pct` telemetry so massive pools or structs never overflow the LLM context window.
@@ -2697,7 +2697,7 @@ def runtime_batch_execute(
     ssh_key: Optional[str] = None,
     ssh_proxy_jump: Optional[str] = None,
 ) -> str:
-    """1-Call Multi-Tool Composite Batch Macro Executor (`0.00ms` stop time).
+    """1-Call Multi-Tool Composite Batch Macro Executor (zero-stop read; the target is not suspended).
     Executes multiple heterogeneous zero-stop steps (`eval`, `scan_pool`, `find_owners`, `tls`,
     `dpdk_lcores`, `triage`, `ask`) in a single MCP round-trip while sharing target context,
     ASLR load-bias cache, and DWARF index.
@@ -2737,7 +2737,7 @@ def runtime_verify_hypothesis(
     ssh_key: Optional[str] = None,
     ssh_proxy_jump: Optional[str] = None,
 ) -> str:
-    """Declarative Multi-Assertion Hypothesis Verifier (`0.00ms` stop time).
+    """Declarative Multi-Assertion Hypothesis Verifier (zero-stop read; the target is not suspended).
     Can verify hypotheses within an active expert investigation (`investigation_id`, `hypothesis_id`),
     or evaluate a root-cause hypothesis and a list of forgiving C/C++ assertions (`==`, `!=`, `>=`, `<=`,
     `>`, `<`, `IS_NULL`, `NOT_NULL`), returning `verdict` (`CONFIRMED`, `PARTIALLY_CONFIRMED`, `REFUTED`),
@@ -2799,7 +2799,7 @@ def runtime_export_incident_report(
     ssh_key: Optional[str] = None,
     ssh_proxy_jump: Optional[str] = None,
 ) -> str:
-    """1-Call Comprehensive Incident Report & Remediation Exporter (`0.00ms` stop time).
+    """1-Call Comprehensive Incident Report & Remediation Exporter (zero-stop read; the target is not suspended).
     Exports either an active expert investigation (`investigation_id`) as Markdown/JSON, or
     combines Target Identity, Auto-Triage Scorecard, Thread Callstacks & Locks, and Hypothesis
     Verification into a structured Markdown + JSON report (`report_markdown`, `remediation_checklist`).
@@ -2891,7 +2891,7 @@ def runtime_get_playbook() -> str:
             "   - Scenario J (Function Pointer / C++ vtable Symbolization): Call `runtime_resolve_code_pointers`.",
             "   - Scenario K (Shared Memory IPC & Type Overlay Casting): Call `runtime_inspect_shared_memory_ipc`."
         ],
-        "zero_stop_guarantee": "All recommended tools read memory non-intrusively (0.00ms target stop time) and never inject code into the target process.",
+        "zero_stop_guarantee": "All recommended tools read memory non-intrusively without suspending the target and never inject code into the target process.",
     })
 
 

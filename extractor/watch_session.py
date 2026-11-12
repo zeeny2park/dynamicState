@@ -2573,7 +2573,7 @@ class WatchSessionManager:
         max_pointer_depth: int = 8,
     ) -> Dict[str, Any]:
         """Evaluates high-level C/C++ symbol path expressions (including pointer dereferences and arrays)
-        directly against live local or remote embedded target memory with zero-stop process suspension.
+        directly against live local or remote embedded target memory without suspending the process (zero-stop).
         Automatically inherits/heals `(pid, companion_elf_path)` from active context and auto-coerces
         forgiving C/C++ expressions (`.` <-> `->`, bare member names, and symbol typos).
         """
@@ -2996,7 +2996,7 @@ class WatchSessionManager:
         ssh_proxy_command: Optional[str] = None,
         adapter: Optional[TargetExecutionAdapter] = None,
     ) -> Dict[str, Any]:
-        """Samples a set of symbol expressions twice separated by `wait_ms` (with zero-stop stop time)
+        """Samples a set of symbol expressions twice separated by `wait_ms` (without stopping the target)
         and returns a structured comparison of changed, unchanged, and unreadable fields.
         """
         target_adapter = self._resolve_adapter(
@@ -3288,7 +3288,7 @@ class WatchSessionManager:
         ssh_proxy_jump: Optional[str] = None,
         adapter: Optional[TargetExecutionAdapter] = None,
     ) -> Dict[str, Any]:
-        """Compares current live process state against a saved Golden Baseline with zero-stop stop time."""
+        """Compares current live process state against a saved Golden Baseline without stopping the target."""
         baseline = self.get_golden_baseline(baseline_id)
         if not baseline:
             raise ValueError(f"Golden baseline '{baseline_id}' not found")
@@ -4183,7 +4183,7 @@ class WatchSessionManager:
         adapter: Optional[TargetExecutionAdapter] = None,
     ) -> Dict[str, Any]:
         """Identifies which thread(s) or global worker contexts are currently using or referencing
-        a target C/C++ symbol/slot (e.g. `gpMem->buffers[9]` or `gpMem[9]`) with zero-stop stop time.
+        a target C/C++ symbol/slot (e.g. `gpMem->buffers[9]` or `gpMem[9]`) without stopping the target.
 
         Executes a 3-stage non-intrusive reverse-lookup pipeline:
         1. Direct Struct Owner Field Check (`owner_tid`, `tid`, `thread_id`, `worker_id` inside target object).
@@ -4881,7 +4881,7 @@ class WatchSessionManager:
         adapter: Optional[TargetExecutionAdapter] = None,
     ) -> Dict[str, Any]:
         """Zero-stop conditional watchpoint & anomaly snapshot catcher.
-        Polls target symbol expressions at `poll_interval_ms` without stopping the target process (zero-stop stop),
+        Polls target symbol expressions at `poll_interval_ms` without stopping the target process (zero-stop),
         evaluates `condition_expression` (or waits until it holds continuously for `hold_duration_ms`),
         and immediately captures a before/after state diff + optional thread owner reverse-lookup on hit.
         """
@@ -5060,7 +5060,7 @@ class WatchSessionManager:
         ssh_proxy_jump: Optional[str] = None,
         adapter: Optional[TargetExecutionAdapter] = None,
     ) -> Dict[str, Any]:
-        """Walks a non-contiguous pointer chain / linked list / tree (`node->next`) in zero-stop zero-stop mode.
+        """Walks a non-contiguous pointer chain / linked list / tree (`node->next`) in zero-stop mode.
         Automatically detects pointer cycles (infinite loops) and corrupted/unmapped links (dangling pointers).
         """
         target_adapter = self._resolve_adapter(
@@ -5295,7 +5295,7 @@ class WatchSessionManager:
                 else (
                     f"CRITICAL: Corrupted/dangling link pointer {corrupted_address} detected at node #{len(nodes) - 1} in '{head_expr}'!"
                     if corrupted_link_detected
-                    else f"Successfully traversed {len(nodes)} node(s) in '{head_expr}' ({termination_reason}) with zero-stop stop."
+                    else f"Successfully traversed {len(nodes)} node(s) in '{head_expr}' ({termination_reason}) without stopping the target."
                 )
             ),
         }
@@ -5766,7 +5766,7 @@ class WatchSessionManager:
         ssh_proxy_jump: Optional[str] = None,
         adapter: Optional[TargetExecutionAdapter] = None,
     ) -> Dict[str, Any]:
-        """Automated DWARF-guided memory corruption & pointer integrity auditor (zero-stop stop).
+        """Automated DWARF-guided memory corruption & pointer integrity auditor (zero-stop).
         Detects:
         1. `DANGLING_OR_UNMAPPED_POINTER`: Non-null pointers pointing outside valid `/proc/<pid>/maps` VMAs.
         2. `CORRUPTED_BOOL_VALUE`: `bool` / `_Bool` fields containing raw byte values other than `0` or `1`.
@@ -6102,7 +6102,7 @@ class WatchSessionManager:
         adapter: Optional[TargetExecutionAdapter] = None,
     ) -> Dict[str, Any]:
         """Resolves function pointers, callback struct fields, or C++ polymorphic object `_vptr` / `vtable`
-        entries to exact C/C++ function names and DWARF source `file:line` locations (zero-stop stop).
+        entries to exact C/C++ function names and DWARF source `file:line` locations (zero-stop).
         """
         target_adapter = self._resolve_adapter(
             pid=pid,
@@ -6445,7 +6445,7 @@ class WatchSessionManager:
         adapter: Optional[TargetExecutionAdapter] = None,
     ) -> Dict[str, Any]:
         """Decodes function formal parameters and local variables (`DW_TAG_formal_parameter`, `DW_TAG_variable`)
-        on each active thread's stack frames in zero-stop zero-stop mode using DWARF `DW_OP_fbreg` / frame-pointer unwinding,
+        on each active thread's stack frames in zero-stop mode using DWARF `DW_OP_fbreg` / frame-pointer unwinding,
         plus function-scoped static variables (`DW_OP_addr`).
         """
         target_adapter = self._resolve_adapter(
@@ -6683,7 +6683,7 @@ class WatchSessionManager:
             "evaluation_latency_us": latency_us,
             "threads_count": len(thread_results),
             "threads": thread_results,
-            "llm_next_step_hint": f"Decoded stack frame parameters and local variables across {len(thread_results)} thread(s) with zero-stop stop.",
+            "llm_next_step_hint": f"Decoded stack frame parameters and local variables across {len(thread_results)} thread(s) without stopping the target.",
         }
 
     def auto_triage_incident(
@@ -6698,7 +6698,7 @@ class WatchSessionManager:
         adapter: Optional[TargetExecutionAdapter] = None,
     ) -> Dict[str, Any]:
         """1-Call Composite Zero-Stop Incident Auto-Triage & Root-Cause Correlator.
-        Executes in a single pass with zero-stop stop time:
+        Executes in a single pass without stopping the target:
         1. Process X-Ray Blueprint discovery
         2. Memory & Pointer Integrity Audit (`audit_memory_integrity`)
         3. Thread Callstacks, Mutex Contention & Deadlock Check (`inspect_thread_callstacks_and_locks`)
@@ -6942,7 +6942,7 @@ class WatchSessionManager:
         ssh_proxy_jump: Optional[str] = None,
         adapter: Optional[TargetExecutionAdapter] = None,
     ) -> Dict[str, Any]:
-        """Cross-process shared memory (`shm` / `MAP_SHARED`) & IPC FD pipeline bottleneck analyzer (zero-stop stop).
+        """Cross-process shared memory (`shm` / `MAP_SHARED`) & IPC FD pipeline bottleneck analyzer (zero-stop).
         1. Auto-detects or overlays `cast_type` onto shared memory regions.
         2. Computes producer vs consumer sequence lag (`pending_backlog`, `backlog_utilization_pct`).
         3. Maps peer processes sharing the same SHM or pipe/socket inodes and inspects their thread states.
@@ -7103,7 +7103,7 @@ class WatchSessionManager:
         ssh_proxy_jump: Optional[str] = None,
         adapter: Optional[TargetExecutionAdapter] = None,
     ) -> Dict[str, Any]:
-        """Zero-stop C++ polymorphic `vtable` (`_ZTV*`) heap & data segment object census + leak detector (zero-stop stop).
+        """Zero-stop C++ polymorphic `vtable` (`_ZTV*`) heap & data segment object census + leak detector (zero-stop).
         1. Discovers all C++ `vtable for <ClassName>` symbols in the ELF binary and computes their relocated runtime `_vptr` addresses.
         2. Scans `[heap]` (and `.data`/`.bss`) for matching `_vptr` headers to locate live polymorphic objects and decodes their DWARF fields.
         3. Checks whether each `[heap]` object is referenced by any global pointer, thread stack, or other heap object; flags unreferenced heap objects as `is_leaked_candidate = True`.
@@ -7368,7 +7368,7 @@ class WatchSessionManager:
     ) -> Dict[str, Any]:
         """Synthesizes a directed cross-entity dependency & causal graph across:
         `[Process] ➔ [Thread] ➔ [Mutex Lock / Stack Frame] ➔ [Memory Pool Slot / Heap Object] ➔ [Shared Memory Peer]`
-        with zero-stop stop time, and identifies `root_blocker_nodes` and `causal_chains`.
+        without stopping the target, and identifies `root_blocker_nodes` and `causal_chains`.
         """
         target_adapter = self._resolve_adapter(
             pid=pid,
@@ -7689,7 +7689,7 @@ class WatchSessionManager:
     ) -> Dict[str, Any]:
         """Correlates DWARF `file:line` source locations and active stack frames with real C/C++
         source code files on disk, overlaying live runtime values of parameters, local variables,
-        and referenced global symbols inline (`annotated_lines`) with zero-stop stop time.
+        and referenced global symbols inline (`annotated_lines`) without stopping the target.
         """
         target_adapter = self._resolve_adapter(
             pid=pid,
@@ -7885,7 +7885,7 @@ class WatchSessionManager:
         ssh_proxy_jump: Optional[str] = None,
         adapter: Optional[TargetExecutionAdapter] = None,
     ) -> Dict[str, Any]:
-        """Autonomous Symptom-Driven Multi-Stage Root-Cause Investigator (zero-stop stop time).
+        """Autonomous Symptom-Driven Multi-Stage Root-Cause Investigator (zero-stop; the target is not suspended).
         Accepts a simple, high-level user symptom question (e.g. '왜 멈췄지?', '버벅거려', '메모리가 새는 것 같아',
         '왜 응답이 없지?') and automatically orchestrates:
         1. Symptom Classification (`HANG_OR_DEADLOCK`, `MEMORY_LEAK_OR_EXHAUSTION`, `MEMORY_CORRUPTION`, `IPC_BOTTLENECK`, `GENERAL_ANOMALY`)
@@ -7983,7 +7983,8 @@ class WatchSessionManager:
                         "source_location": top_hs.get("source_location"),
                         "recommended_action": f"Inspect loop termination condition and sleep/yield intervals inside `{top_hs['function_name']}()`.",
                     })
-            except Exception:
+            except Exception as hs_exc:
+                legacy_sweep_errors.append({"stage": "sample_statistical_hotspots", "error_type": type(hs_exc).__name__, "error": str(hs_exc)})
                 hotspot_report = None
 
         # Correlate source code with runtime variables at top remediation target or active thread frame
@@ -8076,8 +8077,6 @@ class WatchSessionManager:
             # Never represent fallback legacy findings as successful adaptive verification
             confidence_score = min(confidence_score, 0.35)
 
-        if legacy_sweep_errors:
-            adaptive_error_details = list(legacy_sweep_errors) + list(adaptive_error_details)
         all_symp_limitations = list(triage.get("limitations") or []) + [
             f"{e.get('stage')}: {e.get('error')}" for e in legacy_sweep_errors
         ]
@@ -8085,11 +8084,23 @@ class WatchSessionManager:
             if exec_status not in ("FAILED", "INCONCLUSIVE"):
                 exec_status = "INCONCLUSIVE"
             confidence_score = min(confidence_score, 0.20)
-        eff_health_score = (
-            None
-            if (exec_status in ("INCONCLUSIVE", "FAILED") or triage.get("overall_status") == "INCONCLUSIVE") and not findings
-            else triage.get("health_score")
-        )
+        # Status/score are derived from the FINAL findings list (triage findings plus heap/hotspot findings
+        # added above), not copied from triage, so a finding added after triage can never be reported HEALTHY/100.
+        if findings:
+            crit_cnt = sum(1 for f in findings if f.get("severity") == "CRITICAL")
+            high_cnt = sum(1 for f in findings if f.get("severity") == "HIGH")
+            eff_health_score = max(0, 100 - crit_cnt * 30 - high_cnt * 15 - (len(findings) - crit_cnt - high_cnt) * 5)
+            eff_overall_status = "CRITICAL_ISSUES_FOUND" if crit_cnt > 0 else "WARNINGS_FOUND"
+        elif exec_status in ("INCONCLUSIVE", "FAILED") or triage.get("overall_status") == "INCONCLUSIVE" or all_symp_limitations:
+            eff_health_score = None
+            eff_overall_status = "INCONCLUSIVE"
+        else:
+            eff_health_score = triage.get("health_score")
+            eff_overall_status = triage.get("overall_status") or "INCONCLUSIVE"
+            if eff_health_score is None:
+                eff_overall_status = "INCONCLUSIVE"
+        if eff_overall_status == "INCONCLUSIVE" and stop_reason == "SUFFICIENT_EVIDENCE":
+            stop_reason = "NO_USEFUL_SAFE_OBSERVATION_REMAINS"
 
         latency_us = round((time.monotonic_ns() - t_start_ns) / 1000.0, 2)
         return {
@@ -8100,11 +8111,12 @@ class WatchSessionManager:
             "evaluation_latency_us": latency_us,
             "symptom_query": symptom_query,
             "execution_status": exec_status,
-            "overall_status": "INCONCLUSIVE" if eff_health_score is None and not findings else triage.get("overall_status", "HEALTHY"),
+            "overall_status": eff_overall_status,
             "failure_category": fail_category,
             "stop_reason": stop_reason,
             "limitations": all_symp_limitations,
             "diagnostic_error_details": adaptive_error_details,
+            "collection_error_details": list(legacy_sweep_errors),
             "actual_observation_count": actual_obs_cnt,
             "successful_observation_count": succ_obs_cnt,
             "failed_observation_count": fail_obs_cnt,
@@ -8413,7 +8425,7 @@ class WatchSessionManager:
             "flame_stacks": flame_stacks,
             "counter_rates": counter_rates,
             "llm_next_step_hint": (
-                f"Statistical hotspot profiling ({clamped_samples} samples over {elapsed_ms}ms, zero-stop stop): "
+                f"Statistical hotspot profiling ({clamped_samples} samples over {elapsed_ms}ms, zero-stop): "
                 + (f"Top hotspot function is `{top_fn['function_name']}()` ({top_fn['inclusive_pct']}% inclusive, {top_fn['source_location']}) " if top_fn else "")
                 + (f"on thread TID {top_th['tid']} ({top_th['name']}, CPU share {top_th['cpu_share_pct']}%)." if top_th else "")
             ),
@@ -8432,7 +8444,7 @@ class WatchSessionManager:
         ssh_proxy_jump: Optional[str] = None,
         adapter: Optional[TargetExecutionAdapter] = None,
     ) -> Dict[str, Any]:
-        """Semantic / Fuzzy Intent-to-Symbol Resolver (zero-stop stop time).
+        """Semantic / Fuzzy Intent-to-Symbol Resolver (zero-stop; the target is not suspended).
         Maps vague natural-language user descriptions (e.g. '버퍼 풀', '워커 스레드', '세션 객체',
         '뮤텍스 락', '작업 리스트', '카운터') to concrete DWARF symbols & member paths, and evaluates
         their live values immediately.
@@ -9022,7 +9034,7 @@ class WatchSessionManager:
         ptr_size: int = 8,
         endian: str = "<",
     ) -> Dict[int, int]:
-        """Discovers each thread's glibc TCB (`struct pthread *` / `fs_base`) in zero-stop zero-stop mode.
+        """Discovers each thread's glibc TCB (`struct pthread *` / `fs_base`) in zero-stop mode.
         
         Uses the deterministic glibc `tcbhead_t` self-pointer invariant:
         - `*(uint64_t *)(tcb_addr + 0x00) == tcb_addr` (`header.tcb`)
@@ -9278,7 +9290,7 @@ class WatchSessionManager:
             "threads": thread_reports,
             "llm_next_step_hint": (
                 f"Decoded {len(tls_vars)} TLS (`__thread` / `thread_local`) variable(s) across "
-                f"{len(tcb_by_tid)}/{len(thread_reports)} thread TCB(s) in zero-stop zero-stop mode."
+                f"{len(tcb_by_tid)}/{len(thread_reports)} thread TCB(s) in zero-stop mode."
             ),
         }
 
@@ -9481,7 +9493,7 @@ class WatchSessionManager:
             "symbols": symbol_reports,
             "llm_next_step_hint": (
                 f"Seqlock Concurrency Verification: {overall_status} "
-                f"({atomic_count} atomic consistent, {recovered_count} torn-read recovered, {mutating_count} concurrently mutating in zero-stop stop)."
+                f"({atomic_count} atomic consistent, {recovered_count} torn-read recovered, {mutating_count} concurrently mutating in zero-stop mode)."
             ),
         }
 
@@ -9890,7 +9902,7 @@ class WatchSessionManager:
             "global_counter_deltas": global_counter_deltas,
             "llm_next_step_hint": (
                 f"DPDK Isolated-Core & PMD Audit: {overall_status} across {dedicated_count} dedicated PMD lcore(s) "
-                f"and {len(ring_reports)} lockless ring(s) in zero-stop zero-stop mode."
+                f"and {len(ring_reports)} lockless ring(s) in zero-stop mode."
             ),
         }
 
@@ -10493,7 +10505,7 @@ class WatchSessionManager:
         ssh_proxy_jump: Optional[str] = None,
         adapter: Optional[TargetExecutionAdapter] = None,
     ) -> Dict[str, Any]:
-        """Universal 1-Call Intent Gateway (`runtime_ask`) in zero-stop zero-stop mode.
+        """Universal 1-Call Intent Gateway (`runtime_ask`) in zero-stop mode.
         Accepts any C/C++ expression (even with `.` vs `->` mistakes, omitted root globals, or typos)
         OR any natural-language diagnostic question in Korean/English, automatically resolves/heals
         the active `(pid, companion_elf)` context, routes to the optimal zero-stop engine, and returns
@@ -10998,7 +11010,7 @@ class WatchSessionManager:
         ssh_proxy_jump: Optional[str] = None,
         adapter: Optional[TargetExecutionAdapter] = None,
     ) -> Dict[str, Any]:
-        """1-Call Multi-Tool Composite Batch Macro Executor (`runtime_batch_execute`) in zero-stop zero-stop mode.
+        """1-Call Multi-Tool Composite Batch Macro Executor (`runtime_batch_execute`) in zero-stop mode.
         Executes multiple heterogeneous diagnostic steps (`eval`, `scan_pool`, `find_owners`, `tls`,
         `dpdk_lcores`, `verify_consistency`, `triage`, `ask`) in a single round-trip while sharing
         the bound target context, ASLR load-bias cache, and DWARF index.
@@ -11138,7 +11150,7 @@ class WatchSessionManager:
             "cross_step_highlights": cross_step_highlights,
             "step_results": step_results,
             "llm_next_step_hint": (
-                f"Executed {succeeded_count}/{len(normalized_steps)} batch diagnostic step(s) in {total_latency_us}us with zero-stop target stop time."
+                f"Executed {succeeded_count}/{len(normalized_steps)} batch diagnostic step(s) in {total_latency_us}us without stopping the target."
             ),
         }
 
@@ -11435,6 +11447,7 @@ class WatchSessionManager:
             provenance_class="LIVE_RUNTIME_CAPTURE",
             target_identity={"pid": eff_pid, "companion_elf": eff_elf},
             limitations=[],
+            stop_reason="NO_USEFUL_SAFE_OBSERVATION_REMAINS" if diag_label == DIAG_INCONCLUSIVE else "SUFFICIENT_EVIDENCE",
             budget_usage={
                 "metrics": {
                     "target_stop_duration_ms": 0.0,
@@ -11506,7 +11519,7 @@ class WatchSessionManager:
             "save_html_error": save_html_error,
             "llm_next_step_hint": (
                 f"Hypothesis '{hypothesis}' is {verdict} ({passed_count}/{total_cnt} assertions passed, "
-                f"confidence {round(pass_ratio * 100, 1)}%) in zero-stop zero-stop mode."
+                f"confidence {round(pass_ratio * 100, 1)}%) in zero-stop mode."
             ),
         }
 
@@ -11626,7 +11639,7 @@ class WatchSessionManager:
                     companion_elf_path=eff_elf,
                     adapter=adapter,
                 )
-                if hyp_res.get("verdict") == DIAG_INCONCLUSIVE:
+                if hyp_res.get("verdict") in (DIAG_INCONCLUSIVE, "ABSTAIN"):
                     for ar in hyp_res.get("assertion_results", []):
                         if ar.get("verdict") == "ABSTAIN" and ar.get("reason"):
                             if ar["reason"] not in limitations:
@@ -11729,9 +11742,15 @@ class WatchSessionManager:
         report_markdown = "\n".join(md_lines) + "\n"
         latency_us = round((time.monotonic_ns() - t_start_ns) / 1000.0, 2)
 
+        # IMP-001: map the hypothesis verifier's assertion-level vocabulary onto the diagnosis vocabulary
+        # (ABSTAIN -> INCONCLUSIVE), and never let a passing hypothesis override a failed collection.
+        hyp_diag = None
+        if hyp_res:
+            hyp_diag = DIAG_INCONCLUSIVE if hyp_res.get("verdict") == "ABSTAIN" else hyp_res.get("verdict")
+        collection_failed = bool(limitations) or overall_status == "INCONCLUSIVE"
         diag_verdict = (
-            hyp_res["verdict"]
-            if hyp_res
+            hyp_diag
+            if hyp_diag
             else (
                 DIAG_CONFIRMED
                 if any(f.get("severity") in ("CRITICAL", "HIGH") for f in findings)
@@ -11742,11 +11761,20 @@ class WatchSessionManager:
                 )
             )
         )
+        if collection_failed and diag_verdict in (
+            DIAG_CONFIRMED, DIAG_PARTIALLY_CONFIRMED, DIAG_NO_ISSUE_DETECTED, DIAG_NO_ISSUE_DETECTED_WITHIN_SCOPE, DIAG_REFUTED,
+        ) and not any(f.get("severity") in ("CRITICAL", "HIGH") for f in findings):
+            diag_verdict = DIAG_INCONCLUSIVE
+        verdict_confidence = (
+            hyp_res["confidence_score"] if hyp_res else (0.2 if diag_verdict == DIAG_INCONCLUSIVE else (0.9 if not findings else 0.8))
+        )
+        if diag_verdict == DIAG_INCONCLUSIVE:
+            verdict_confidence = min(float(verdict_confidence or 0.0), 0.2)
         dv = DiagnosticVerdict(
             hypothesis=hypothesis or title,
             final_diagnosis=diag_verdict,
             hypothesis_state="SUPPORTED" if diag_verdict in (DIAG_CONFIRMED, DIAG_NO_ISSUE_DETECTED) else "INCONCLUSIVE",
-            confidence_score=hyp_res["confidence_score"] if hyp_res else (0.2 if diag_verdict == DIAG_INCONCLUSIVE else (0.9 if not findings else 0.8)),
+            confidence_score=verdict_confidence,
             total_assertions=hyp_res["total_assertions"] if hyp_res else 0,
             passed_count=hyp_res["passed_assertions"] if hyp_res else 0,
             failed_count=hyp_res["failed_assertions"] if hyp_res else 0,
@@ -11758,6 +11786,13 @@ class WatchSessionManager:
             target_identity={"pid": eff_pid, "companion_elf": eff_elf},
             limitations=list(limitations),
             collection_limitations=list(limitations),
+            stop_reason=(
+                "REPEATED_OBSERVATION_FAILURE" if (diag_verdict == DIAG_INCONCLUSIVE and collection_failed)
+                else ("NO_USEFUL_SAFE_OBSERVATION_REMAINS" if diag_verdict == DIAG_INCONCLUSIVE else "SUFFICIENT_EVIDENCE")
+            ),
+            stop_explanation=(
+                f"Collection failed: {'; '.join(limitations[:3])}" if (diag_verdict == DIAG_INCONCLUSIVE and limitations) else ""
+            ),
             budget_usage={
                 "metrics": {
                     "target_stop_duration_ms": measured_stop_ms,
@@ -11841,7 +11876,8 @@ class WatchSessionManager:
                 + (f" and saved to {saved_path}." if saved_path else ".")
                 if overall_status == "INCONCLUSIVE"
                 else (
-                    f"Generated incident report for PID {eff_pid} (Health Score: {health_score}/100, "
+                    f"Generated incident report for PID {eff_pid} (Health Score: "
+                    f"{(str(health_score) + '/100') if health_score is not None else 'N/A'}, "
                     f"{len(findings)} finding(s))" + (f" and saved to {saved_path}." if saved_path else ".")
                 )
             ),

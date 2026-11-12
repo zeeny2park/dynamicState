@@ -96,7 +96,7 @@ class TestInvestigationUI(unittest.TestCase):
         shutil.rmtree(cls.tmp_dir, ignore_errors=True)
 
     def _get_raw(self, path: str):
-        req = urllib.request.Request(f"{self.base_url}{path}")
+        req = urllib.request.Request(f"{self.base_url}{path}", headers={"X-Session-Token": self.server.session_token})
         try:
             with urllib.request.urlopen(req) as resp:
                 return resp.status, resp.headers.get_content_type(), resp.read()
@@ -112,7 +112,7 @@ class TestInvestigationUI(unittest.TestCase):
         req = urllib.request.Request(
             f"{self.base_url}{path}",
             data=body,
-            headers={"Content-Type": "application/json"},
+            headers={"Content-Type": "application/json", "X-Session-Token": self.server.session_token},
             method="POST",
         )
         try:

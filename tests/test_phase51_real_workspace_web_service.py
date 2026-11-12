@@ -162,7 +162,7 @@ class TestPhase51RealWorkspaceWebService(unittest.TestCase):
         shutil.rmtree(cls.tmpdir, ignore_errors=True)
 
     def _http_get(self, path: str) -> str:
-        req = urllib.request.Request(f"{self.base_url}{path}", method="GET")
+        req = urllib.request.Request(f"{self.base_url}{path}", headers={"X-Session-Token": self.server.session_token}, method="GET")
         with urllib.request.urlopen(req, timeout=5) as resp:
             self.assertEqual(resp.status, 200)
             return resp.read().decode("utf-8")
@@ -172,7 +172,7 @@ class TestPhase51RealWorkspaceWebService(unittest.TestCase):
         req = urllib.request.Request(
             f"{self.base_url}{path}",
             data=body,
-            headers={"Content-Type": "application/json"},
+            headers={"Content-Type": "application/json", "X-Session-Token": self.server.session_token},
             method="POST",
         )
         with urllib.request.urlopen(req, timeout=10) as resp:

@@ -158,7 +158,7 @@ class TestPhase28MemoryExplorerUX(unittest.TestCase):
 
     def _http_get(self, path: str) -> Tuple[int, Dict[str, Any]]:
         url = f"http://127.0.0.1:{self.server_port}{path}"
-        req = urllib.request.Request(url, method="GET")
+        req = urllib.request.Request(url, headers={"X-Session-Token": self.server.session_token}, method="GET")
         try:
             with urllib.request.urlopen(req, timeout=5.0) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
@@ -170,7 +170,7 @@ class TestPhase28MemoryExplorerUX(unittest.TestCase):
     def _http_post(self, path: str, payload: Dict[str, Any]) -> Tuple[int, Dict[str, Any]]:
         url = f"http://127.0.0.1:{self.server_port}{path}"
         body = json.dumps(payload).encode("utf-8")
-        req = urllib.request.Request(url, data=body, headers={"Content-Type": "application/json"}, method="POST")
+        req = urllib.request.Request(url, data=body, headers={"Content-Type": "application/json", "X-Session-Token": self.server.session_token}, method="POST")
         try:
             with urllib.request.urlopen(req, timeout=5.0) as resp:
                 data = json.loads(resp.read().decode("utf-8"))

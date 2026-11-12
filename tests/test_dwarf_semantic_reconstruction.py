@@ -32,6 +32,13 @@ from extractor.state_lab import SnapshotMutator, StateLaboratory, compute_semant
 from extractor.typed_memory_reader import TypedMemoryReader
 
 
+def _approved_full_plan():
+    """These scenarios validate stopped (FULL, COMPLETE/STOPPED-consistency) capture, which since
+    IMP-002 is no longer the default and requires explicit stop approval."""
+    from extractor.capture_plan import CaptureMode, CapturePlan
+    return CapturePlan(mode=CaptureMode.FULL.value, allow_stop=True)
+
+
 class TestDwarfSemanticReconstruction(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -110,7 +117,7 @@ class TestDwarfSemanticReconstruction(unittest.TestCase):
             if not backend.is_available(proc.pid):
                 backend = ProcfsCaptureBackend()
 
-            snapshot = backend.capture(pid=proc.pid)
+            snapshot = backend.capture(pid=proc.pid, plan=_approved_full_plan())
             self.assertEqual(snapshot.pid, proc.pid)
             self.assertGreater(len(snapshot._buffers), 0)
 
@@ -193,7 +200,7 @@ class TestDwarfSemanticReconstruction(unittest.TestCase):
             if not backend.is_available(proc.pid):
                 backend = ProcfsCaptureBackend()
 
-            snapshot = backend.capture(pid=proc.pid)
+            snapshot = backend.capture(pid=proc.pid, plan=_approved_full_plan())
 
             resolver = DwarfRuntimeResolver(snapshot, self.pie_bin)
             index = DwarfIndexer.get_index(self.pie_bin)
@@ -232,7 +239,7 @@ class TestDwarfSemanticReconstruction(unittest.TestCase):
             if not backend.is_available(proc.pid):
                 backend = ProcfsCaptureBackend()
 
-            snapshot = backend.capture(pid=proc.pid)
+            snapshot = backend.capture(pid=proc.pid, plan=_approved_full_plan())
 
             engine = OfflineSemanticEngine()
             state = engine.reconstruct(snapshot, debug_image=self.cycle_bin)
@@ -274,7 +281,7 @@ class TestDwarfSemanticReconstruction(unittest.TestCase):
             if not backend.is_available(proc.pid):
                 backend = ProcfsCaptureBackend()
 
-            snapshot = backend.capture(pid=proc.pid)
+            snapshot = backend.capture(pid=proc.pid, plan=_approved_full_plan())
 
             engine = OfflineSemanticEngine()
             # Reconstruction must terminate cleanly and deterministically

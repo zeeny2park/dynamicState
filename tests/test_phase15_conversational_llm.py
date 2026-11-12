@@ -392,7 +392,7 @@ class TestWebAPIAndRuntimeDispatch(unittest.TestCase):
         shutil.rmtree(cls.tmp_dir, ignore_errors=True)
 
     def _get_json(self, path: str):
-        req = urllib.request.Request(f"{self.base_url}{path}")
+        req = urllib.request.Request(f"{self.base_url}{path}", headers={"X-Session-Token": self.server.session_token})
         try:
             with urllib.request.urlopen(req) as resp:
                 return resp.status, json.loads(resp.read().decode("utf-8"))
@@ -404,7 +404,7 @@ class TestWebAPIAndRuntimeDispatch(unittest.TestCase):
         req = urllib.request.Request(
             f"{self.base_url}{path}",
             data=body,
-            headers={"Content-Type": "application/json"},
+            headers={"Content-Type": "application/json", "X-Session-Token": self.server.session_token},
             method="POST",
         )
         try:

@@ -28,7 +28,7 @@ def main():
                         choices=["CONSISTENT", "LOW_IMPACT"],
                         help="Initial observation mode (default: LOW_IMPACT)")
     parser.add_argument("--allow-mutation", action="store_true", default=False,
-                        help="Explicitly enable CONSISTENT mutation mode")
+                        help="Explicitly enable live state-changing operations (checkpoint/restore/transition/explore/replay); without it the runtime is read-only regardless of --mode")
     parser.add_argument("--binary", type=str, default=None,
                         help="Path to target binary (optional)")
     parser.add_argument("--debug-image", type=str, default=None,
@@ -50,7 +50,7 @@ def main():
     print("========================================")
     print(" dynamicState Web UI")
     print(f" {url}")
-    print(" Mode: " + runtime.observation_mode)
+    print(" Mode: " + runtime.observation_mode + (" (mutation enabled)" if runtime.allow_mutation else " (read-only)"))
     print(" Corpus: " + corpus_dir)
     print(" Press Ctrl+C to terminate.")
     print("========================================")

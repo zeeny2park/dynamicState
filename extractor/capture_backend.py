@@ -2209,6 +2209,9 @@ class RuntimeCaptureBackend(ABC):
         policy: Optional[CaptureSafetyPolicy] = None,
         snapshot_id: Optional[str] = None,
         observation_point: Optional[Dict[str, Any]] = None,
+        handle: Optional["ProcessTargetHandle"] = None,
+        allow_stop: bool = False,
+        authorize_stop: bool = False,
     ) -> RawRuntimeSnapshot:
         pass
 
@@ -5527,9 +5530,15 @@ class PtraceCaptureBackend(RuntimeCaptureBackend):
         policy: Optional[CaptureSafetyPolicy] = None,
         snapshot_id: Optional[str] = None,
         observation_point: Optional[Dict[str, Any]] = None,
+        handle: Optional[ProcessTargetHandle] = None,
+        allow_stop: bool = False,
+        authorize_stop: bool = False,
     ) -> RawRuntimeSnapshot:
         backend = ProcessVmCaptureBackend()
-        snap = backend.capture(pid, plan=plan, policy=policy, snapshot_id=snapshot_id, observation_point=observation_point)
+        snap = backend.capture(
+            pid, plan=plan, policy=policy, snapshot_id=snapshot_id, observation_point=observation_point,
+            handle=handle, allow_stop=allow_stop, authorize_stop=authorize_stop,
+        )
         snap.capture_backend = self.name
         snap.provenance["capture_backend"] = self.name
         snap.provenance["capabilities"] = self.capabilities
@@ -5568,9 +5577,15 @@ class GdbCaptureBackend(RuntimeCaptureBackend):
         policy: Optional[CaptureSafetyPolicy] = None,
         snapshot_id: Optional[str] = None,
         observation_point: Optional[Dict[str, Any]] = None,
+        handle: Optional[ProcessTargetHandle] = None,
+        allow_stop: bool = False,
+        authorize_stop: bool = False,
     ) -> RawRuntimeSnapshot:
         backend = ProcessVmCaptureBackend()
-        snap = backend.capture(pid, plan=plan, policy=policy, snapshot_id=snapshot_id, observation_point=observation_point)
+        snap = backend.capture(
+            pid, plan=plan, policy=policy, snapshot_id=snapshot_id, observation_point=observation_point,
+            handle=handle, allow_stop=allow_stop, authorize_stop=authorize_stop,
+        )
         snap.capture_backend = self.name
         snap.provenance["capture_backend"] = self.name
         snap.provenance["capabilities"] = self.capabilities

@@ -1135,7 +1135,7 @@ class WebApiAdapter:
     # -------------------------------------------------------------------------
 
     def observe(self, params: Dict[str, Any]) -> Dict[str, Any]:
-        mode = params.get("mode", "CONSISTENT")
+        mode = params.get("mode")  # None -> runtime's configured mode (IMP-019: never implicitly CONSISTENT)
         pid = params.get("pid")
         policy = params.get("policy", "ALL_READABLE")
         max_bytes = params.get("max_bytes")
@@ -2129,7 +2129,7 @@ class WebApiAdapter:
                         "data": bp_data,
                     })
                     reply_parts.append(
-                        f"PID {pid} 프로세스에 무정지(zero-stop)로 연결하여 활성 스레드 {bp_data.get('threads_count', 0)}개와 "
+                        f"PID {pid} 프로세스에 무정지로 연결하여 활성 스레드 {bp_data.get('threads_count', 0)}개와 "
                         f"메모리 풀 {len(pools_list)}개를 포함한 DWARF 전역 심볼 구조를 워크스페이스에 추가했습니다."
                     )
 
@@ -2248,7 +2248,7 @@ class WebApiAdapter:
                     )
                     trace_cards.append({
                         "card_type": "INCIDENT_REPORT",
-                        "title": f"원클릭 인시던트 분석 리포트 (Health {rep_res['health_score']}/100 · {rep_res['overall_status']})",
+                        "title": f"원클릭 인시던트 분석 리포트 (Health {(str(rep_res.get('health_score')) + '/100') if rep_res.get('health_score') is not None else 'N/A'} · {rep_res.get('overall_status')})",
                         "data": rep_res,
                     })
                     reply_parts.append(rep_res.get("llm_next_step_hint", "인시던트 리포트 생성을 완료했습니다."))
@@ -2307,7 +2307,7 @@ class WebApiAdapter:
                     )
                     trace_cards.append({
                         "card_type": "BATCH_MACRO",
-                        "title": f"1-Call 복합 배치 매크로 실행 ({bm_res.get('steps_succeeded', 0)}/{bm_res.get('steps_requested', 0)} steps · zero-stop stop)",
+                        "title": f"1-Call 복합 배치 매크로 실행 ({bm_res.get('steps_succeeded', 0)}/{bm_res.get('steps_requested', 0)} steps · zero-stop)",
                         "data": bm_res,
                     })
                     reply_parts.append(bm_res.get("llm_next_step_hint", "복합 배치 매크로 실행을 완료했습니다."))
@@ -2627,7 +2627,7 @@ class WebApiAdapter:
                     )
                     trace_cards.append({
                         "card_type": "AUTO_TRIAGE",
-                        "title": f"원클릭 종합 진단 리포트 (Health {tr_res['health_score']}/100 · {tr_res['overall_status']})",
+                        "title": f"원클릭 종합 진단 리포트 (Health {(str(tr_res.get('health_score')) + '/100') if tr_res.get('health_score') is not None else 'N/A'} · {tr_res.get('overall_status')})",
                         "data": tr_res,
                     })
                     reply_parts.append(tr_res.get("llm_next_step_hint", "원클릭 종합 진단을 완료했습니다."))
@@ -2848,7 +2848,7 @@ class WebApiAdapter:
                         "title": f"심볼 평가: {', '.join(cand_exprs[:3])}",
                         "data": ev_res,
                     })
-                    reply_parts.append(f"요청하신 심볼({', '.join(cand_exprs[:3])})을 무정지(zero-stop)로 해독하여 워크스페이스에 추가했습니다.")
+                    reply_parts.append(f"요청하신 심볼({', '.join(cand_exprs[:3])})을 무정지로 해독하여 워크스페이스에 추가했습니다.")
                 else:
                     trace_cards.append({
                         "card_type": "XRAY_BLUEPRINT",
@@ -2862,7 +2862,7 @@ class WebApiAdapter:
             return {
                 "success": True,
                 "data": {
-                    "title": "프로세스 메모리 트레이스 완료 (zero-stop 무정지)",
+                    "title": "프로세스 메모리 트레이스 완료 (무정지)",
                     "reply_markdown": " ".join(reply_parts),
                     "trace_cards": trace_cards,
                     "telemetry": {
@@ -2894,7 +2894,7 @@ class WebApiAdapter:
             return {"success": False, "error": {"code": "XRAY_BLUEPRINT_ERROR", "message": str(e)}}
 
     def watch_until_condition_api(self, params: Dict[str, Any]) -> Dict[str, Any]:
-        """Polls target expressions until a condition triggers or times out (zero-stop stop)."""
+        """Polls target expressions until a condition triggers or times out (zero-stop)."""
         try:
             pid, companion_elf, _rh, _su, _sp, _sk, _spj = self._resolve_watch_target(params)
             cond_expr = (params.get("condition_expression") or params.get("condition") or "ANY_CHANGE").strip()
@@ -2918,7 +2918,7 @@ class WebApiAdapter:
             return {"success": False, "error": {"code": "WATCH_CONDITION_ERROR", "message": str(e)}}
 
     def traverse_linked_structure_api(self, params: Dict[str, Any]) -> Dict[str, Any]:
-        """Traverses a linked list or pointer chain in zero-stop zero-stop mode."""
+        """Traverses a linked list or pointer chain in zero-stop mode."""
         try:
             pid, companion_elf, _rh, _su, _sp, _sk, _spj = self._resolve_watch_target(params)
             head_expr = (params.get("head_expression") or "").strip()
@@ -2940,7 +2940,7 @@ class WebApiAdapter:
             return {"success": False, "error": {"code": "TRAVERSE_LIST_ERROR", "message": str(e)}}
 
     def inspect_thread_callstacks_api(self, params: Dict[str, Any]) -> Dict[str, Any]:
-        """Unwinds thread callstacks and decodes mutex owners / deadlock cycles in zero-stop zero-stop mode."""
+        """Unwinds thread callstacks and decodes mutex owners / deadlock cycles in zero-stop mode."""
         try:
             pid, companion_elf, _rh, _su, _sp, _sk, _spj = self._resolve_watch_target(params)
             res = self.watch_manager.inspect_thread_callstacks_and_locks(
@@ -3021,7 +3021,7 @@ class WebApiAdapter:
             return {"success": False, "error": {"code": "INSPECT_SHM_ERROR", "message": str(e)}}
 
     def inspect_thread_locals_api(self, params: Dict[str, Any]) -> Dict[str, Any]:
-        """Decodes function parameters and local variables across active thread stack frames (zero-stop stop)."""
+        """Decodes function parameters and local variables across active thread stack frames (zero-stop)."""
         try:
             pid, companion_elf, _rh, _su, _sp, _sk, _spj = self._resolve_watch_target(params)
             res = self.watch_manager.inspect_thread_locals_and_frame_vars(
@@ -3057,7 +3057,7 @@ class WebApiAdapter:
             return {"success": False, "error": {"code": "AUTO_TRIAGE_ERROR", "message": str(e)}}
 
     def trace_ipc_pipeline_api(self, params: Dict[str, Any]) -> Dict[str, Any]:
-        """Analyzes cross-process shared memory & IPC pipeline lag/bottlenecks (zero-stop stop)."""
+        """Analyzes cross-process shared memory & IPC pipeline lag/bottlenecks (zero-stop)."""
         try:
             pid, companion_elf, _rh, _su, _sp, _sk, _spj = self._resolve_watch_target(params)
             res = self.watch_manager.trace_ipc_pipeline(
@@ -3097,7 +3097,7 @@ class WebApiAdapter:
             return {"success": False, "error": {"code": "SCAN_HEAP_ERROR", "message": str(e)}}
 
     def build_dependency_graph_api(self, params: Dict[str, Any]) -> Dict[str, Any]:
-        """Synthesizes directed cross-entity dependency graph and causal chains (zero-stop stop)."""
+        """Synthesizes directed cross-entity dependency graph and causal chains (zero-stop)."""
         try:
             pid, companion_elf, _rh, _su, _sp, _sk, _spj = self._resolve_watch_target(params)
             res = self.watch_manager.build_dependency_graph(
@@ -3135,7 +3135,7 @@ class WebApiAdapter:
             return {"success": False, "error": {"code": "SOURCE_CORRELATE_ERROR", "message": str(e)}}
 
     def investigate_symptom_api(self, params: Dict[str, Any]) -> Dict[str, Any]:
-        """Autonomous symptom-driven root-cause investigator (zero-stop stop)."""
+        """Autonomous symptom-driven root-cause investigator (zero-stop)."""
         try:
             pid, companion_elf, _rh, _su, _sp, _sk, _spj = self._resolve_watch_target(params)
             symptom_query = str(params.get("symptom_query") or params.get("query") or params.get("message") or "왜 멈췄지?").strip()
@@ -3154,7 +3154,7 @@ class WebApiAdapter:
             return {"success": False, "error": {"code": "INVESTIGATE_SYMPTOM_ERROR", "message": str(e)}}
 
     def sample_statistical_hotspots_api(self, params: Dict[str, Any]) -> Dict[str, Any]:
-        """Samples statistical CPU & callstack hotspots with zero-stop stop time."""
+        """Samples statistical CPU & callstack hotspots without stopping the target."""
         try:
             pid, companion_elf, _rh, _su, _sp, _sk, _spj = self._resolve_watch_target(params)
             res = self.watch_manager.sample_statistical_hotspots(
@@ -3193,7 +3193,7 @@ class WebApiAdapter:
             return {"success": False, "error": {"code": "FUZZY_INTENT_ERROR", "message": str(e)}}
 
     def flight_recorder_time_machine_api(self, params: Dict[str, Any]) -> Dict[str, Any]:
-        """Captures Flight Recorder Time-Machine micro-frames and detects transient glitches (zero-stop stop)."""
+        """Captures Flight Recorder Time-Machine micro-frames and detects transient glitches (zero-stop)."""
         try:
             pid, companion_elf, _rh, _su, _sp, _sk, _spj = self._resolve_watch_target(params)
             res = self.watch_manager.flight_recorder_time_machine(
@@ -3213,7 +3213,7 @@ class WebApiAdapter:
             return {"success": False, "error": {"code": "FLIGHT_RECORDER_ERROR", "message": str(e)}}
 
     def detect_behavioral_drift_api(self, params: Dict[str, Any]) -> Dict[str, Any]:
-        """Detects multi-dimensional behavioral drift against a baseline profile (zero-stop stop)."""
+        """Detects multi-dimensional behavioral drift against a baseline profile (zero-stop)."""
         try:
             pid, companion_elf, _rh, _su, _sp, _sk, _spj = self._resolve_watch_target(params)
             res = self.watch_manager.detect_behavioral_drift(
@@ -3232,7 +3232,7 @@ class WebApiAdapter:
             return {"success": False, "error": {"code": "BEHAVIORAL_DRIFT_ERROR", "message": str(e)}}
 
     def inspect_thread_local_storage_api(self, params: Dict[str, Any]) -> Dict[str, Any]:
-        """Decodes per-thread TLS (__thread / thread_local) variables across all active threads (zero-stop stop)."""
+        """Decodes per-thread TLS (__thread / thread_local) variables across all active threads (zero-stop)."""
         try:
             pid, companion_elf, _rh, _su, _sp, _sk, _spj = self._resolve_watch_target(params)
             var_names = params.get("variable_names")
@@ -3254,7 +3254,7 @@ class WebApiAdapter:
             return {"success": False, "error": {"code": "TLS_INSPECT_ERROR", "message": str(e)}}
 
     def verify_concurrent_read_consistency_api(self, params: Dict[str, Any]) -> Dict[str, Any]:
-        """Verifies concurrent read consistency using optimistic Seqlock double-reads (zero-stop stop)."""
+        """Verifies concurrent read consistency using optimistic Seqlock double-reads (zero-stop)."""
         try:
             pid, companion_elf, _rh, _su, _sp, _sk, _spj = self._resolve_watch_target(params)
             exprs = params.get("expressions")
@@ -3277,7 +3277,7 @@ class WebApiAdapter:
             return {"success": False, "error": {"code": "VERIFY_CONSISTENCY_ERROR", "message": str(e)}}
 
     def inspect_dpdk_lcores_and_rings_api(self, params: Dict[str, Any]) -> Dict[str, Any]:
-        """Inspects DPDK isolated-core dedicated lcores, PMD poll loops, lockless rings, and spinlocks (zero-stop stop)."""
+        """Inspects DPDK isolated-core dedicated lcores, PMD poll loops, lockless rings, and spinlocks (zero-stop)."""
         try:
             pid, companion_elf, _rh, _su, _sp, _sk, _spj = self._resolve_watch_target(params)
             r_exprs = params.get("ring_expressions")
@@ -4209,6 +4209,11 @@ class DynamicStateRequestHandler(http.server.BaseHTTPRequestHandler):
         return host_only in allowed_hosts
 
     def _get_validated_origin(self) -> Tuple[bool, Optional[str]]:
+        """Accept an Origin only when it is exactly this server's own origin (scheme + host + port).
+
+        The host must be an allowed loopback/bound host AND equal to the Host header the request was sent
+        to, and the port must equal the port this server is listening on (the server speaks plain HTTP).
+        """
         origin_hdr = (self.headers.get("Origin") or "").strip()
         if not origin_hdr:
             return True, None
@@ -4216,17 +4221,36 @@ class DynamicStateRequestHandler(http.server.BaseHTTPRequestHandler):
             return False, None
         try:
             parsed = urllib.parse.urlparse(origin_hdr)
+            origin_port = parsed.port or (80 if parsed.scheme == "http" else 443)
         except Exception:
             return False, None
-        if parsed.scheme not in ("http", "https") or not parsed.hostname:
+        if parsed.scheme != "http" or not parsed.hostname:
+            return False, None
+        if parsed.path not in ("", "/") or parsed.query or parsed.username or parsed.password:
+            return False, None
+        server_port = int(self.server.server_address[1])
+        if origin_port != server_port:
             return False, None
         bound_host = str(self.server.server_address[0]).lower()
         allowed_hosts = {"127.0.0.1", "localhost", "::1", bound_host}
-        if parsed.hostname.lower() not in allowed_hosts:
+        origin_host = parsed.hostname.lower()
+        if origin_host not in allowed_hosts:
             return False, None
+        host_hdr = (self.headers.get("Host") or "").strip()
+        if host_hdr:
+            try:
+                h_parsed = urllib.parse.urlparse("http://" + host_hdr)
+                h_host = (h_parsed.hostname or "").lower()
+                h_port = h_parsed.port or 80
+            except Exception:
+                return False, None
+            if h_host != origin_host or h_port != origin_port:
+                return False, None
         return True, origin_hdr
 
-    def _extract_session_token(self, query: Optional[Dict[str, List[str]]] = None) -> Optional[str]:
+    def _extract_session_token(self) -> Optional[str]:
+        # Tokens are accepted only from headers or the HttpOnly session cookie; never from the URL query
+        # string (which leaks into logs, browser history and Referer headers).
         hdr_tok = self.headers.get("X-Session-Token") or self.headers.get("X-API-Token")
         if hdr_tok:
             return hdr_tok.strip()
@@ -4238,10 +4262,6 @@ class DynamicStateRequestHandler(http.server.BaseHTTPRequestHandler):
             part = part.strip()
             if part.startswith("dynamicstate_session="):
                 return part[len("dynamicstate_session="):].strip()
-        if query:
-            q_tok = query.get("token") or query.get("session_token")
-            if q_tok and q_tok[0]:
-                return q_tok[0].strip()
         return None
 
     def _verify_api_request(self, method: str, query: Optional[Dict[str, List[str]]] = None) -> bool:
@@ -4259,8 +4279,11 @@ class DynamicStateRequestHandler(http.server.BaseHTTPRequestHandler):
             )
             return False
         expected_tok = getattr(self.server, "session_token", None)
-        provided_tok = self._extract_session_token(query)
-        if not expected_tok or not provided_tok or not hmac.compare_digest(str(provided_tok), str(expected_tok)):
+        provided_tok = self._extract_session_token()
+        if not expected_tok or not provided_tok or not hmac.compare_digest(
+            str(provided_tok).encode("utf-8", "replace"),
+            str(expected_tok).encode("utf-8", "replace"),
+        ):
             self._send_json(
                 {"success": False, "error": {"code": "UNAUTHORIZED", "message": "Valid session token is required for API access"}},
                 status=401,

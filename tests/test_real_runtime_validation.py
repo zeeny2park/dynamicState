@@ -1,4 +1,3 @@
-from extractor.capture_plan import CapturePlan, CaptureMode
 """End-to-End Real Runtime Validation Suite for Dynamic State.
 
 Validates the full production pipeline against a real stripped C++ process:
@@ -41,7 +40,12 @@ from extractor.capture_backend import (
     ProcessVmCaptureBackend,
     ProcfsCaptureBackend,
 )
-from extractor.capture_plan import CapturePlan
+from extractor.capture_plan import CaptureMode, CapturePlan
+
+
+def _approved_full_plan() -> CapturePlan:
+    """This suite validates the stopped (FULL) capture pipeline, which since IMP-002 requires explicit stop approval."""
+    return CapturePlan(mode=CaptureMode.FULL.value, allow_stop=True)
 from extractor.cpp_decoder import DwarfRuntimeResolver
 from extractor.debug_image import inspect_elf
 from extractor.dwarf_indexer import DwarfIndexer
@@ -143,7 +147,7 @@ class TestRealRuntimeValidation(unittest.TestCase):
             backend = ProcessVmCaptureBackend()
             self.assertTrue(backend.is_available(proc.pid))
 
-            snap = backend.capture(pid=proc.pid)
+            snap = backend.capture(pid=proc.pid, plan=_approved_full_plan())
             self.assertEqual(snap.capture_backend, "process_vm_readv")
             self.assertGreater(snap.bytes_captured, 0)
             self.assertGreater(len(snap._buffers), 0)
@@ -161,7 +165,7 @@ class TestRealRuntimeValidation(unittest.TestCase):
         proc = self._start_target_process(self.pie_stripped)
         try:
             backend = ProcessVmCaptureBackend()
-            snap = backend.capture(pid=proc.pid)
+            snap = backend.capture(pid=proc.pid, plan=_approved_full_plan())
 
             # 1. Target process is still alive and running
             self.assertIsNone(proc.poll(), "Target process must remain running after capture")
@@ -184,7 +188,7 @@ class TestRealRuntimeValidation(unittest.TestCase):
         proc = self._start_target_process(self.pie_stripped)
         try:
             backend = ProcessVmCaptureBackend()
-            snap = backend.capture(pid=proc.pid)
+            snap = backend.capture(pid=proc.pid, plan=_approved_full_plan())
 
             engine = OfflineSemanticEngine()
             state = engine.reconstruct(raw_snapshot=snap, debug_image=self.pie_debug)
@@ -233,7 +237,7 @@ class TestRealRuntimeValidation(unittest.TestCase):
         proc = self._start_target_process(self.pie_stripped)
         try:
             backend = ProcessVmCaptureBackend()
-            snap = backend.capture(pid=proc.pid)
+            snap = backend.capture(pid=proc.pid, plan=_approved_full_plan())
 
             engine = OfflineSemanticEngine()
             state = engine.reconstruct(raw_snapshot=snap, debug_image=self.pie_debug)
@@ -265,7 +269,7 @@ class TestRealRuntimeValidation(unittest.TestCase):
         proc = self._start_target_process(self.pie_stripped)
         try:
             backend = ProcessVmCaptureBackend()
-            snap = backend.capture(pid=proc.pid)
+            snap = backend.capture(pid=proc.pid, plan=_approved_full_plan())
 
             t0 = time.monotonic()
             engine = OfflineSemanticEngine()
@@ -299,7 +303,7 @@ class TestRealRuntimeValidation(unittest.TestCase):
         proc = self._start_target_process(self.pie_stripped)
         try:
             backend = ProcessVmCaptureBackend()
-            snap = backend.capture(pid=proc.pid)
+            snap = backend.capture(pid=proc.pid, plan=_approved_full_plan())
 
             resolver = DwarfRuntimeResolver(snapshot=snap, debug_image_path=self.pie_debug)
             res = resolver.resolve()
@@ -316,7 +320,7 @@ class TestRealRuntimeValidation(unittest.TestCase):
         proc = self._start_target_process(self.nonpie_stripped)
         try:
             backend = ProcessVmCaptureBackend()
-            snap = backend.capture(pid=proc.pid)
+            snap = backend.capture(pid=proc.pid, plan=_approved_full_plan())
 
             resolver = DwarfRuntimeResolver(snapshot=snap, debug_image_path=self.nonpie_debug)
             res = resolver.resolve()
@@ -359,7 +363,7 @@ class TestRealRuntimeValidation(unittest.TestCase):
         proc = self._start_target_process(self.pie_stripped)
         try:
             backend = ProcessVmCaptureBackend()
-            snap = backend.capture(pid=proc.pid)
+            snap = backend.capture(pid=proc.pid, plan=_approved_full_plan())
 
             # Attempt resolution with mismatched non-PIE debug binary
             resolver = DwarfRuntimeResolver(snapshot=snap, debug_image_path=self.nonpie_debug)
@@ -377,7 +381,7 @@ class TestRealRuntimeValidation(unittest.TestCase):
         proc = self._start_target_process(self.pie_stripped)
         try:
             backend = ProcessVmCaptureBackend()
-            snap = backend.capture(pid=proc.pid)
+            snap = backend.capture(pid=proc.pid, plan=_approved_full_plan())
 
             # Strip out heap buffers to simulate partial capture where heap wasn't captured
             filtered_buffers = {}
@@ -423,7 +427,7 @@ class TestRealRuntimeValidation(unittest.TestCase):
         proc = self._start_target_process(self.pie_stripped)
         try:
             backend = ProcessVmCaptureBackend()
-            snap = backend.capture(pid=proc.pid)
+            snap = backend.capture(pid=proc.pid, plan=_approved_full_plan())
 
             self.assertGreaterEqual(len(snap.thread_metadata), 3, "Target process must have at least 3 threads (main + 2 workers)")
             for t in snap.thread_metadata:
@@ -448,7 +452,7 @@ class TestRealRuntimeValidation(unittest.TestCase):
         proc = self._start_target_process(self.pie_stripped)
         try:
             backend = ProcessVmCaptureBackend()
-            snap = backend.capture(pid=proc.pid)
+            snap = backend.capture(pid=proc.pid, plan=_approved_full_plan())
 
             engine = OfflineSemanticEngine()
             s1 = engine.reconstruct(raw_snapshot=snap, debug_image=self.pie_debug)
@@ -468,7 +472,7 @@ class TestRealRuntimeValidation(unittest.TestCase):
         proc = self._start_target_process(self.pie_stripped)
         try:
             backend = ProcessVmCaptureBackend()
-            snap = backend.capture(pid=proc.pid)
+            snap = backend.capture(pid=proc.pid, plan=_approved_full_plan())
 
             engine = OfflineSemanticEngine()
             parent = engine.reconstruct(raw_snapshot=snap, debug_image=self.pie_debug)
@@ -531,7 +535,7 @@ class TestRealRuntimeValidation(unittest.TestCase):
         proc = self._start_target_process(self.pie_stripped)
         try:
             backend = ProcessVmCaptureBackend()
-            snap = backend.capture(pid=proc.pid)
+            snap = backend.capture(pid=proc.pid, plan=_approved_full_plan())
 
             engine = OfflineSemanticEngine()
             state = engine.reconstruct(raw_snapshot=snap, debug_image=self.pie_debug)
@@ -567,7 +571,7 @@ class TestRealRuntimeValidation(unittest.TestCase):
 
             iterations = 25
             for _ in range(iterations):
-                snap = backend.capture(pid=proc.pid)
+                snap = backend.capture(pid=proc.pid, plan=_approved_full_plan())
                 stop_latencies.append(snap.stop_latency_us)
                 read_latencies.append(snap.memory_read_latency_us)
                 resume_latencies.append(snap.resume_latency_us)
@@ -609,7 +613,7 @@ class TestRealRuntimeValidation(unittest.TestCase):
         proc = self._start_target_process(self.pie_stripped)
         try:
             backend = ProcfsCaptureBackend()
-            snap = backend.capture(pid=proc.pid)
+            snap = backend.capture(pid=proc.pid, plan=_approved_full_plan())
 
             self.assertGreater(snap.bytes_captured, 0, "Procfs backend must capture memory bytes")
             self.assertEqual(snap.pid, proc.pid)
@@ -638,7 +642,7 @@ class TestRealRuntimeValidation(unittest.TestCase):
             engine = OfflineSemanticEngine()
 
             # First capture
-            snap1 = backend.capture(pid=proc.pid)
+            snap1 = backend.capture(pid=proc.pid, plan=_approved_full_plan())
             self.assertEqual(snap1.completeness, "COMPLETE")
             state1 = engine.reconstruct(raw_snapshot=snap1, debug_image=self.pie_debug)
             obj_t_a_1 = state1.get_object_by_path("g_thread_a")
@@ -648,7 +652,7 @@ class TestRealRuntimeValidation(unittest.TestCase):
             time.sleep(0.02)
 
             # Second capture
-            snap2 = backend.capture(pid=proc.pid)
+            snap2 = backend.capture(pid=proc.pid, plan=_approved_full_plan())
             self.assertEqual(snap2.completeness, "COMPLETE")
             state2 = engine.reconstruct(raw_snapshot=snap2, debug_image=self.pie_debug)
             obj_t_a_2 = state2.get_object_by_path("g_thread_a")
@@ -672,7 +676,7 @@ class TestRealRuntimeValidation(unittest.TestCase):
             backend = ProcessVmCaptureBackend()
 
             for i in range(5):
-                snap = backend.capture(pid=proc.pid)
+                snap = backend.capture(pid=proc.pid, plan=_approved_full_plan())
                 self.assertEqual(snap.completeness, "COMPLETE")
                 # Immediately check /proc/<pid>/stat
                 with open(f"/proc/{proc.pid}/stat", "r", encoding="utf-8") as f:

@@ -42,6 +42,13 @@ from extractor.static_analyzer import (
 )
 
 
+def _approved_full_plan():
+    """These scenarios validate stopped (FULL, COMPLETE/STOPPED-consistency) capture, which since
+    IMP-002 is no longer the default and requires explicit stop approval."""
+    from extractor.capture_plan import CaptureMode, CapturePlan
+    return CapturePlan(mode=CaptureMode.FULL.value, allow_stop=True)
+
+
 class TestCppE2EInvestigation(unittest.TestCase):
     """End-to-end test suite verifying Scenarios A, B, C, D, and E."""
 
@@ -129,7 +136,7 @@ class TestCppE2EInvestigation(unittest.TestCase):
         proc = self._start_process(self.debug_bin)
         try:
             backend = ProcessVmCaptureBackend() if ProcessVmCaptureBackend().is_available(proc.pid) else ProcfsCaptureBackend()
-            snap = backend.capture(pid=proc.pid)
+            snap = backend.capture(pid=proc.pid, plan=_approved_full_plan())
             # Explicitly assert snapshot capture quality contract before saving/decoding
             self.assertEqual(snap.completeness, "COMPLETE")
             self.assertEqual(snap.provenance["capture_status"], "COMPLETED")
@@ -208,7 +215,7 @@ class TestCppE2EInvestigation(unittest.TestCase):
         proc = self._start_process(self.stripped_bin)
         try:
             backend = ProcessVmCaptureBackend() if ProcessVmCaptureBackend().is_available(proc.pid) else ProcfsCaptureBackend()
-            snap = backend.capture(pid=proc.pid)
+            snap = backend.capture(pid=proc.pid, plan=_approved_full_plan())
             # Explicitly assert snapshot quality contract before investigation/decoding
             self.assertEqual(snap.completeness, "COMPLETE")
             self.assertEqual(snap.provenance["capture_status"], "COMPLETED")
@@ -264,7 +271,7 @@ class TestCppE2EInvestigation(unittest.TestCase):
             backend = ProcessVmCaptureBackend() if ProcessVmCaptureBackend().is_available(proc.pid) else ProcfsCaptureBackend()
 
             # Capture Snapshot 1 (State A)
-            snap1 = backend.capture(pid=proc.pid)
+            snap1 = backend.capture(pid=proc.pid, plan=_approved_full_plan())
             self.assertEqual(snap1.completeness, "COMPLETE")
             self.assertEqual(snap1.provenance["capture_status"], "COMPLETED")
             self.assertEqual(snap1.provenance["bytes_requested"], snap1.provenance["bytes_read"])
@@ -280,7 +287,7 @@ class TestCppE2EInvestigation(unittest.TestCase):
             self._mutate_process(proc)
 
             # Capture Snapshot 2 (State B)
-            snap2 = backend.capture(pid=proc.pid)
+            snap2 = backend.capture(pid=proc.pid, plan=_approved_full_plan())
             self.assertEqual(snap2.completeness, "COMPLETE")
             self.assertEqual(snap2.provenance["capture_status"], "COMPLETED")
             self.assertEqual(snap2.provenance["bytes_requested"], snap2.provenance["bytes_read"])
@@ -446,7 +453,7 @@ class TestCppE2EInvestigation(unittest.TestCase):
         proc = self._start_process(self.debug_bin)
         try:
             backend = ProcessVmCaptureBackend() if ProcessVmCaptureBackend().is_available(proc.pid) else ProcfsCaptureBackend()
-            snap = backend.capture(pid=proc.pid)
+            snap = backend.capture(pid=proc.pid, plan=_approved_full_plan())
             # Explicitly assert snapshot quality contract before verifying thread records
             self.assertEqual(snap.completeness, "COMPLETE")
             self.assertEqual(snap.provenance["capture_status"], "COMPLETED")

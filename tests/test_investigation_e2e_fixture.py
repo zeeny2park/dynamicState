@@ -21,6 +21,13 @@ from extractor.raw_snapshot import RawRuntimeSnapshot
 from extractor.static_analyzer import DwarfStaticAnalysisProvider
 
 
+def _approved_full_plan():
+    """These scenarios validate stopped (FULL, COMPLETE/STOPPED-consistency) capture, which since
+    IMP-002 is no longer the default and requires explicit stop approval."""
+    from extractor.capture_plan import CaptureMode, CapturePlan
+    return CapturePlan(mode=CaptureMode.FULL.value, allow_stop=True)
+
+
 class TestInvestigationE2EFixture(unittest.TestCase):
     """End-to-end integration test of investigation pipeline on a real compiled C++ process."""
 
@@ -79,7 +86,7 @@ class TestInvestigationE2EFixture(unittest.TestCase):
             # 1. Capture first runtime memory snapshot (procfs fallback if process_vm_readv restricted)
             backend = ProcessVmCaptureBackend() if ProcessVmCaptureBackend().is_available(proc.pid) else ProcfsCaptureBackend()
             cap_policy = CaptureSafetyPolicy(max_region_bytes=32 * 1024 * 1024)
-            snap1 = backend.capture(pid=proc.pid, policy=cap_policy)
+            snap1 = backend.capture(pid=proc.pid, policy=cap_policy, plan=_approved_full_plan())
             self.assertGreater(snap1.bytes_captured, 0)
 
             # Save snapshot to corpus
@@ -90,7 +97,7 @@ class TestInvestigationE2EFixture(unittest.TestCase):
             time.sleep(0.08)
 
             # Capture second snapshot for observation comparison
-            snap2 = backend.capture(pid=proc.pid, policy=cap_policy)
+            snap2 = backend.capture(pid=proc.pid, policy=cap_policy, plan=_approved_full_plan())
             snap2_dir = os.path.join(self.corpus_dir, "memory_snapshots", "snap_e2e_02")
             snap2.save(snap2_dir)
 

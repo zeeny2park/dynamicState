@@ -160,7 +160,8 @@ class TestWebApi(unittest.TestCase):
         cls.tmp_dir = tempfile.mkdtemp()
         cls.corpus_dir = os.path.join(cls.tmp_dir, "corpus")
         cls.controller = MockWebRuntimeController()
-        cls.runtime = AgentRuntime(controller=cls.controller, corpus_dir=cls.corpus_dir)
+        # This suite exercises the mutation/transition API, which IMP-019 makes opt-in.
+        cls.runtime = AgentRuntime(controller=cls.controller, corpus_dir=cls.corpus_dir, allow_mutation=True)
 
         # Seed initial state into corpus
         cls.runtime.corpus.add(cls.controller._sample_snap, metadata={"interesting_reasons": ["SEED"]})
@@ -182,7 +183,7 @@ class TestWebApi(unittest.TestCase):
         shutil.rmtree(cls.tmp_dir, ignore_errors=True)
 
     def _get(self, path):
-        req = urllib.request.Request(self.base_url + path)
+        req = urllib.request.Request(self.base_url + path, headers={"X-Session-Token": self.server.session_token})
         try:
             with urllib.request.urlopen(req) as resp:
                 content = resp.read().decode("utf-8")
@@ -198,7 +199,8 @@ class TestWebApi(unittest.TestCase):
     def _post(self, path, payload):
         data_bytes = json.dumps(payload).encode("utf-8")
         req = urllib.request.Request(self.base_url + path, data=data_bytes,
-                                     headers={"Content-Type": "application/json"})
+                                     headers={"Content-Type": "application/json",
+                                              "X-Session-Token": self.server.session_token})
         try:
             with urllib.request.urlopen(req) as resp:
                 content = resp.read().decode("utf-8")

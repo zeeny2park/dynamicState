@@ -117,7 +117,7 @@ class TestPhase22ZeroConfigLiveCapture(unittest.TestCase):
         req = urllib.request.Request(
             f"{self.base_url}{path}",
             data=json.dumps(data).encode("utf-8"),
-            headers={"Content-Type": "application/json"},
+            headers={"Content-Type": "application/json", "X-Session-Token": self.server.session_token},
             method="POST",
         )
         try:
@@ -127,7 +127,7 @@ class TestPhase22ZeroConfigLiveCapture(unittest.TestCase):
             return json.loads(e.read().decode("utf-8"))
 
     def _get_raw(self, path: str) -> str:
-        req = urllib.request.Request(f"{self.base_url}{path}")
+        req = urllib.request.Request(f"{self.base_url}{path}", headers={"X-Session-Token": self.server.session_token})
         with urllib.request.urlopen(req, timeout=5.0) as resp:
             return resp.read().decode("utf-8")
 

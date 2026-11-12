@@ -424,7 +424,7 @@ class TestEndToEndWebAPIAndCancellation(unittest.TestCase):
         req = urllib.request.Request(
             f"http://127.0.0.1:{self.port}{path}",
             data=json.dumps(data).encode("utf-8"),
-            headers={"Content-Type": "application/json"},
+            headers={"Content-Type": "application/json", "X-Session-Token": self.server.session_token},
         )
         try:
             with urllib.request.urlopen(req, timeout=10.0) as resp:

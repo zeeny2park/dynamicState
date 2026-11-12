@@ -278,7 +278,7 @@
               <strong data-i18n="lbl_ops_guarantees">ℹ️ Operations &amp; Access Guarantees:</strong>
               <div class="text-muted mt-1">
                 • <strong>Process Metadata &amp; Maps:</strong> Read non-intrusively from <code>/proc/&lt;pid&gt;/</code> without stopping target threads.<br>
-                • <strong>Memory Inspection &amp; Captures:</strong> Read via <code>process_vm_readv</code> (or procfs) with <strong>0.00 ms stop time (Zero-Stop)</strong>.<br>
+                • <strong>Memory Inspection &amp; Captures:</strong> Read via <code>process_vm_readv</code> (or procfs) without stopping the target by default (<strong>Zero-Stop</strong>); stopping capture modes require explicit approval and report the measured stop time.<br>
                 • <strong>DWARF Resolution:</strong> Kept strictly host-side; no debug artifacts or LLM binaries injected into inferior.
               </div>
             </div>
@@ -332,7 +332,7 @@
               <div class="d-flex justify-content-between align-items-center mb-2">
                 <div>
                   <span class="font-bold text-xs" style="color: var(--text-main);">🩺 Quick Diagnostic Recipes (언제 어떤 분석을 쓸지 선택하세요)</span>
-                  <span class="text-muted text-xs ms-2">One-click guided workflows with 0.00 ms target interruption</span>
+                  <span class="text-muted text-xs ms-2">One-click guided zero-stop workflows (no process suspension requested)</span>
                 </div>
               </div>
               <div style="display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px;">
@@ -740,7 +740,7 @@
               </div>
               <div class="te-metric-box">
                 <span class="text-xs text-muted">Stop Duration</span>
-                <span class="font-mono text-xs font-bold text-success" id="te-stat-stoptime">0.00 ms (Zero-Stop)</span>
+                <span class="font-mono text-xs font-bold text-success" id="te-stat-stoptime">—</span>
               </div>
               <div class="te-metric-box">
                 <span class="text-xs text-muted">Last Latency</span>
@@ -986,7 +986,7 @@
                 <span class="context-chip mono" id="bic-snapshot-chip">Snapshots: None compared</span>
                 <span class="context-chip mono" id="bic-watch-chip">Watched: 0 items</span>
               </div>
-              <span class="badge badge-neutral text-xs" id="bic-quality-badge">Zero-Stop (0.00 ms)</span>
+              <span class="badge badge-neutral text-xs" id="bic-quality-badge">Zero-Stop</span>
             </div>
           </div>
 
@@ -3188,8 +3188,8 @@
             <label data-i18n="lbl_capture_mode">Capture Mode:</label>
             <div class="radio-group">
               <label class="radio-label">
-                <input type="radio" name="cap-mode" value="FULL" checked>
-                <span><strong>FULL</strong> — Capture all readable state regions (target &lt;10ms stop time).</span>
+                <input type="radio" name="cap-mode" value="FULL">
+                <span><strong>FULL</strong> — Capture all readable state regions (suspends the target with SIGSTOP; requires approval below).</span>
               </label>
               <label class="radio-label">
                 <input type="radio" name="cap-mode" value="TARGETED">
@@ -3200,8 +3200,8 @@
                 <span><strong>THREAD</strong> — Thread stack & TLS memory only.</span>
               </label>
               <label class="radio-label">
-                <input type="radio" name="cap-mode" value="ZERO_STOP">
-                <span><strong>ZERO_STOP</strong> — Non-blocking capture without suspending the process.</span>
+                <input type="radio" name="cap-mode" value="ZERO_STOP" checked>
+                <span><strong>ZERO_STOP</strong> (default) — Non-blocking capture without suspending the process.</span>
               </label>
             </div>
           </div>
@@ -3214,6 +3214,13 @@
           <div class="form-group">
             <label for="cap-pid">Target PID (Leave blank to use active runtime PID):</label>
             <input type="number" id="cap-pid" class="input-text" placeholder="Auto-detect from runtime">
+          </div>
+
+          <div class="form-group">
+            <label class="radio-label" for="cap-allow-stop">
+              <input type="checkbox" id="cap-allow-stop">
+              <span>I approve suspending (SIGSTOP) the target process for FULL / TARGETED / THREAD capture. The measured stop time is reported after capture.</span>
+            </label>
           </div>
 
           <div class="form-group">

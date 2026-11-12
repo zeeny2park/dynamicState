@@ -50,6 +50,22 @@ def is_port_available(host: str, port: int) -> bool:
             return False
 
 
+# IMP-019: the API requires the server's session token; pin it via the documented env var.
+_TEST_SESSION_TOKEN = "lifecycle-test-token"
+
+
+def _server_env() -> dict:
+    env = dict(os.environ)
+    env["DYNAMICSTATE_SESSION_TOKEN"] = _TEST_SESSION_TOKEN
+    return env
+
+
+def _health_request(port: int) -> urllib.request.Request:
+    return urllib.request.Request(
+        f"http://127.0.0.1:{port}/api/health", headers={"X-Session-Token": _TEST_SESSION_TOKEN}
+    )
+
+
 class TestWebServerLifecycle(unittest.TestCase):
     """Subprocess integration tests for Linux signal handling and process shutdown."""
 
@@ -62,7 +78,8 @@ class TestWebServerLifecycle(unittest.TestCase):
             cmd,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            text=True
+            text=True,
+            env=_server_env(),
         )
 
         try:
@@ -71,7 +88,7 @@ class TestWebServerLifecycle(unittest.TestCase):
             self.assertTrue(listening, "Web server failed to listen on port within timeout")
 
             # 2. Verify HTTP health check works
-            with urllib.request.urlopen(f"http://127.0.0.1:{port}/api/health", timeout=2.0) as resp:
+            with urllib.request.urlopen(_health_request(port), timeout=2.0) as resp:
                 self.assertEqual(resp.status, 200)
 
             # 3. Process is alive
@@ -105,7 +122,8 @@ class TestWebServerLifecycle(unittest.TestCase):
             cmd,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            text=True
+            text=True,
+            env=_server_env(),
         )
 
         try:
@@ -114,7 +132,7 @@ class TestWebServerLifecycle(unittest.TestCase):
             self.assertTrue(listening, "Web server failed to listen on port within timeout")
 
             # 2. Verify HTTP health check works
-            with urllib.request.urlopen(f"http://127.0.0.1:{port}/api/health", timeout=2.0) as resp:
+            with urllib.request.urlopen(_health_request(port), timeout=2.0) as resp:
                 self.assertEqual(resp.status, 200)
 
             # 3. Process is alive

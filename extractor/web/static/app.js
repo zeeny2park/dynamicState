@@ -609,6 +609,7 @@
     capTargetPath: document.getElementById('cap-target-path'),
     capPid: document.getElementById('cap-pid'),
     capTimeout: document.getElementById('cap-timeout'),
+    capAllowStop: document.getElementById('cap-allow-stop'),
     modalSnapshotMutate: document.getElementById('modal-snapshot-mutate'),
     btnCloseSnapMutateModal: document.getElementById('btn-close-snap-mutate-modal'),
     btnCancelSnapMutate: document.getElementById('btn-cancel-snap-mutate'),
@@ -4475,22 +4476,27 @@
   // Tab 7: State Laboratory & Fast Runtime Capture
   // --------------------------------------------------------------------------
 
+  // Render only values the backend actually measured; never substitute a fabricated zero.
+  function fmtMeasuredMs(v) {
+    return (typeof v === 'number' && isFinite(v)) ? `${v.toFixed(2)} ms` : '—';
+  }
+
   function renderCaptureLatencyReport(rep) {
     if (!rep) return;
-    if (el.latStopTime) el.latStopTime.textContent = `${(rep.stop_time_ms || 0).toFixed(2)} ms`;
-    if (el.latThreadTime) el.latThreadTime.textContent = `${(rep.thread_metadata_time_ms || 0).toFixed(2)} ms`;
-    if (el.latMemoryTime) el.latMemoryTime.textContent = `${(rep.memory_capture_time_ms || 0).toFixed(2)} ms`;
-    if (el.latResumeTime) el.latResumeTime.textContent = `${(rep.resume_time_ms || 0).toFixed(2)} ms`;
+    if (el.latStopTime) el.latStopTime.textContent = fmtMeasuredMs(rep.stop_time_ms);
+    if (el.latThreadTime) el.latThreadTime.textContent = fmtMeasuredMs(rep.thread_metadata_time_ms);
+    if (el.latMemoryTime) el.latMemoryTime.textContent = fmtMeasuredMs(rep.memory_capture_time_ms);
+    if (el.latResumeTime) el.latResumeTime.textContent = fmtMeasuredMs(rep.resume_time_ms);
     if (el.latTotalStopTime) {
-      el.latTotalStopTime.textContent = `${(rep.total_stop_time_ms || 0).toFixed(2)} ms`;
-      if (rep.total_stop_time_ms < 10) {
+      el.latTotalStopTime.textContent = fmtMeasuredMs(rep.total_stop_time_ms);
+      if (typeof rep.total_stop_time_ms === 'number' && rep.total_stop_time_ms < 10) {
         el.latTotalStopTime.style.color = 'var(--accent)';
       } else {
         el.latTotalStopTime.style.color = 'var(--warning)';
       }
     }
     if (el.statelabStopTime) {
-      el.statelabStopTime.textContent = `${(rep.total_stop_time_ms || 0).toFixed(2)} ms`;
+      el.statelabStopTime.textContent = fmtMeasuredMs(rep.total_stop_time_ms);
     }
   }
 
@@ -4580,12 +4586,13 @@
         renderCaptureLatencyReport(lat);
       } else if (snap.parent_id) {
         // Logical branch mutation
-        if (el.statelabStopTime) el.statelabStopTime.textContent = '0.00 ms (Offline)';
-        if (el.latStopTime) el.latStopTime.textContent = '0.00 ms';
-        if (el.latThreadTime) el.latThreadTime.textContent = '0.00 ms';
-        if (el.latMemoryTime) el.latMemoryTime.textContent = '0.00 ms';
-        if (el.latResumeTime) el.latResumeTime.textContent = '0.00 ms';
-        if (el.latTotalStopTime) el.latTotalStopTime.textContent = '0.00 ms (Offline Logical State)';
+        // Offline logical branch: no live process was touched, so there is no stop time to report.
+        if (el.statelabStopTime) el.statelabStopTime.textContent = 'N/A (offline branch)';
+        if (el.latStopTime) el.latStopTime.textContent = '—';
+        if (el.latThreadTime) el.latThreadTime.textContent = '—';
+        if (el.latMemoryTime) el.latMemoryTime.textContent = '—';
+        if (el.latResumeTime) el.latResumeTime.textContent = '—';
+        if (el.latTotalStopTime) el.latTotalStopTime.textContent = 'N/A (offline logical state)';
       }
 
       const memSize = prov.captured_bytes || snap.captured_bytes || 0;
@@ -4698,19 +4705,25 @@
     if (el.formFastCapture) {
       el.formFastCapture.addEventListener('submit', async (e) => {
         e.preventDefault();
-        const mode = el.formFastCapture.elements['cap-mode'].value || 'FULL';
+        const mode = el.formFastCapture.elements['cap-mode'].value || 'ZERO_STOP';
+        const allowStop = Boolean(el.capAllowStop && el.capAllowStop.checked);
+        if (mode !== 'ZERO_STOP' && !allowStop) {
+          showToast(`${mode} capture suspends the target process. Tick the stop-approval box to proceed, or use ZERO_STOP.`, 'warning');
+          return;
+        }
         const targetPath = el.capTargetPath ? el.capTargetPath.value.trim() : '';
         const pid = el.capPid && el.capPid.value ? parseInt(el.capPid.value, 10) : (state.runtime && state.runtime.pid);
         const timeoutMs = el.capTimeout ? parseInt(el.capTimeout.value, 10) : 1000;
 
-        showToast(`Initiating ${mode} capture (<10ms stop time)...`, 'info');
+        showToast(`Initiating ${mode} capture...`, 'info');
         el.modalFastCapture.style.display = 'none';
 
         const res = await apiPost('/api/capture', {
           mode,
           target_path: targetPath,
           pid,
-          timeout_ms: timeoutMs
+          timeout_ms: timeoutMs,
+          allow_stop: mode !== 'ZERO_STOP' && allowStop
         });
 
         if (!res.success) {
@@ -4719,8 +4732,13 @@
         }
 
         const snapData = res.data;
-        const stopTime = snapData.latency_report ? snapData.latency_report.total_stop_time_ms.toFixed(2) : '0';
-        showToast(`Snapshot ${snapData.snapshot_id} captured in ${stopTime} ms stop time!`, 'success');
+        const measuredStop = snapData.latency_report ? snapData.latency_report.total_stop_time_ms : undefined;
+        showToast(
+          (typeof measuredStop === 'number' && isFinite(measuredStop))
+            ? `Snapshot ${snapData.snapshot_id} captured (measured stop time ${measuredStop.toFixed(2)} ms).`
+            : `Snapshot ${snapData.snapshot_id} captured.`,
+          'success'
+        );
 
         if (snapData.latency_report) {
           renderCaptureLatencyReport(snapData.latency_report);
@@ -10082,7 +10100,7 @@
       <h4 class="text-xs uppercase text-muted font-bold mb-2">Capture Quality & Transport Provenance</h4>
       <div style="background: var(--bg-input); padding: 12px; border-radius: 6px; border: 1px solid var(--border-color); margin-bottom: 16px;">
         <div class="text-xs mb-1"><strong>Verified PID:</strong> <code>${escapeHtml(String(verifiedPid))}</code> &bull; <strong>Verified Build ID:</strong> <code>${escapeHtml(String(verifiedBuildId))}</code></div>
-        <div class="text-xs mb-1"><strong>Backend:</strong> <code>${escapeHtml(backend)}</code> (Zero-Stop, 0.00 ms process pause time)</div>
+        <div class="text-xs mb-1"><strong>Backend:</strong> <code>${escapeHtml(backend)}</code> (Zero-Stop read, no process suspension requested)</div>
         <div class="text-xs mb-1"><strong>Consistency Level:</strong> <span class="badge badge-success text-xs">CONSISTENT</span> (Kernel direct memory read)</div>
         <div class="text-xs mb-1"><strong>Snapshot A (#${lastComparisonResult.seq_a}):</strong> Time: ${escapeHtml(snapATime)} &bull; Latency: ${latencyA}</div>
         <div class="text-xs mb-1"><strong>Snapshot B (#${lastComparisonResult.seq_b}):</strong> Time: ${escapeHtml(snapBTime)} &bull; Latency: ${latencyB}</div>

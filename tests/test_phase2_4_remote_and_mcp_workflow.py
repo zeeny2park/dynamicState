@@ -211,7 +211,9 @@ class TestPhase24RemoteAndMcpWorkflow(unittest.TestCase):
             )
             recipe_res = json.loads(recipe_res_raw)
             self.assertTrue(recipe_res.get("success", False))
-            self.assertEqual(recipe_res.get("outcome"), "COMPLETED")
+            # IMP-001: a run whose only check is INCONCLUSIVE now ends INCONCLUSIVE instead of being
+            # sealed as a confirmed-clean COMPLETED session.
+            self.assertIn(recipe_res.get("outcome"), ("COMPLETED", "INCONCLUSIVE"))
             self.assertIn(recipe_res.get("status"), ("COMPLETED", "INCONCLUSIVE", "PASS"))
 
             # 4. Start investigation with vague goal

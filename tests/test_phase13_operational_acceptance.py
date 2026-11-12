@@ -122,6 +122,13 @@ from extractor.state_diff import StateDiffEngine
 from extractor.web.server import WebApiAdapter
 
 
+def _approved_full_plan():
+    """These scenarios validate stopped (FULL, COMPLETE/STOPPED-consistency) capture, which since
+    IMP-002 is no longer the default and requires explicit stop approval."""
+    from extractor.capture_plan import CaptureMode, CapturePlan
+    return CapturePlan(mode=CaptureMode.FULL.value, allow_stop=True)
+
+
 class BasePhase13ProcessTestCase(unittest.TestCase):
     """Shared fixture compilation and process lifecycle management."""
 
@@ -211,14 +218,14 @@ class TestPhase13RealCppOperationalAcceptance(BasePhase13ProcessTestCase):
         proc = self._start_process(self.stripped_bin)
         try:
             backend = ProcessVmCaptureBackend() if ProcessVmCaptureBackend().is_available(proc.pid) else ProcfsCaptureBackend()
-            snap1 = backend.capture(pid=proc.pid)
+            snap1 = backend.capture(pid=proc.pid, plan=_approved_full_plan())
             snap1_dir = os.path.join(self.work_dir, "snap1_s1")
             snap1.save(snap1_dir)
 
             res = self._send_command(proc, "MUTATE_ACTIVE")
             self.assertEqual(res, "ACTIVE_MUTATED")
 
-            snap2 = backend.capture(pid=proc.pid)
+            snap2 = backend.capture(pid=proc.pid, plan=_approved_full_plan())
             snap2_dir = os.path.join(self.work_dir, "snap2_s1")
             snap2.save(snap2_dir)
         finally:
@@ -260,14 +267,14 @@ class TestPhase13RealCppOperationalAcceptance(BasePhase13ProcessTestCase):
         proc = self._start_process(self.stripped_bin)
         try:
             backend = ProcessVmCaptureBackend() if ProcessVmCaptureBackend().is_available(proc.pid) else ProcfsCaptureBackend()
-            snap1 = backend.capture(pid=proc.pid)
+            snap1 = backend.capture(pid=proc.pid, plan=_approved_full_plan())
             snap1_dir = os.path.join(self.work_dir, "snap1_s2")
             snap1.save(snap1_dir)
 
             res = self._send_command(proc, "NOOP")
             self.assertEqual(res, "NOOP_DONE")
 
-            snap2 = backend.capture(pid=proc.pid)
+            snap2 = backend.capture(pid=proc.pid, plan=_approved_full_plan())
             snap2_dir = os.path.join(self.work_dir, "snap2_s2")
             snap2.save(snap2_dir)
         finally:
@@ -300,13 +307,13 @@ class TestPhase13RealCppOperationalAcceptance(BasePhase13ProcessTestCase):
         proc = self._start_process(self.stripped_bin)
         try:
             backend = ProcessVmCaptureBackend() if ProcessVmCaptureBackend().is_available(proc.pid) else ProcfsCaptureBackend()
-            snap1 = backend.capture(pid=proc.pid)
+            snap1 = backend.capture(pid=proc.pid, plan=_approved_full_plan())
             snap1_dir = os.path.join(self.work_dir, "snap1_s3")
             snap1.save(snap1_dir)
 
             self._send_command(proc, "MUTATE_ACTIVE")
 
-            snap2 = backend.capture(pid=proc.pid)
+            snap2 = backend.capture(pid=proc.pid, plan=_approved_full_plan())
             snap2_dir = os.path.join(self.work_dir, "snap2_s3")
             snap2.save(snap2_dir)
         finally:
@@ -346,13 +353,13 @@ class TestPhase13RealCppOperationalAcceptance(BasePhase13ProcessTestCase):
         proc = self._start_process(self.stripped_bin)
         try:
             backend = ProcessVmCaptureBackend() if ProcessVmCaptureBackend().is_available(proc.pid) else ProcfsCaptureBackend()
-            snap1 = backend.capture(pid=proc.pid)
+            snap1 = backend.capture(pid=proc.pid, plan=_approved_full_plan())
             snap1_dir = os.path.join(self.work_dir, "snap1_s4")
             snap1.save(snap1_dir)
 
             self._send_command(proc, "MUTATE_ACTIVE")
 
-            snap2 = backend.capture(pid=proc.pid)
+            snap2 = backend.capture(pid=proc.pid, plan=_approved_full_plan())
             snap2_dir = os.path.join(self.work_dir, "snap2_s4")
             snap2.save(snap2_dir)
         finally:
@@ -393,13 +400,13 @@ class TestPhase13RealCppOperationalAcceptance(BasePhase13ProcessTestCase):
         proc = self._start_process(self.stripped_bin)
         try:
             backend = ProcessVmCaptureBackend() if ProcessVmCaptureBackend().is_available(proc.pid) else ProcfsCaptureBackend()
-            snap1 = backend.capture(pid=proc.pid)
+            snap1 = backend.capture(pid=proc.pid, plan=_approved_full_plan())
             snap1_dir = os.path.join(self.work_dir, "snap1_s5")
             snap1.save(snap1_dir)
 
             self._send_command(proc, "MUTATE_ACTIVE")
 
-            snap2 = backend.capture(pid=proc.pid)
+            snap2 = backend.capture(pid=proc.pid, plan=_approved_full_plan())
             snap2_dir = os.path.join(self.work_dir, "snap2_s5")
             snap2.save(snap2_dir)
         finally:
@@ -524,7 +531,7 @@ class TestPhase13RealCppOperationalAcceptance(BasePhase13ProcessTestCase):
         proc = self._start_process(self.stripped_bin)
         try:
             backend = ProcessVmCaptureBackend() if ProcessVmCaptureBackend().is_available(proc.pid) else ProcfsCaptureBackend()
-            snap = backend.capture(pid=proc.pid)
+            snap = backend.capture(pid=proc.pid, plan=_approved_full_plan())
             snap_dir = os.path.join(self.work_dir, "snap_s6")
             snap.save(snap_dir)
         finally:
@@ -560,7 +567,7 @@ class TestPhase13RealCppOperationalAcceptance(BasePhase13ProcessTestCase):
         proc = self._start_process(self.stripped_bin)
         try:
             backend = ProcessVmCaptureBackend() if ProcessVmCaptureBackend().is_available(proc.pid) else ProcfsCaptureBackend()
-            snap1 = backend.capture(pid=proc.pid)
+            snap1 = backend.capture(pid=proc.pid, plan=_approved_full_plan())
             snap1_dir = os.path.join(self.work_dir, "snap1_s8")
             snap1.save(snap1_dir)
 
@@ -569,7 +576,7 @@ class TestPhase13RealCppOperationalAcceptance(BasePhase13ProcessTestCase):
             self.assertEqual(res, "COMPETING_THREAD_ENABLED")
             time.sleep(0.05)
 
-            snap2 = backend.capture(pid=proc.pid)
+            snap2 = backend.capture(pid=proc.pid, plan=_approved_full_plan())
             snap2_dir = os.path.join(self.work_dir, "snap2_s8")
             snap2.save(snap2_dir)
         finally:

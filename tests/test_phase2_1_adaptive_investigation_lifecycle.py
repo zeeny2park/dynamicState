@@ -9,6 +9,8 @@ Verifies:
 """
 
 import os
+import subprocess
+import time
 import unittest
 
 from extractor.expert_diagnostic_engine import (
@@ -30,11 +32,28 @@ class TestPhase21AdaptiveInvestigationLifecycle(unittest.TestCase):
     def setUp(self):
         self.engine = ExpertDiagnosticEngine(corpus_dir="/tmp/phase2_1_test_corpus")
 
+    def _spawn_healthy_target(self) -> int:
+        # IMP-001: an investigation only reaches COMPLETED when checks really pass, so the full
+        # lifecycle runs against the matching healthy fixture process (not the test interpreter
+        # paired with an unrelated companion ELF, whose checks are all INCONCLUSIVE).
+        if not os.path.exists("/tmp/expert_diagnostic_debug.elf"):
+            subprocess.run(
+                "g++ -g -O0 -fno-inline -fno-omit-frame-pointer "
+                "tests/fixtures/real_runtime/expert_diagnostic_scenarios.cpp "
+                "-o /tmp/expert_diagnostic_debug.elf -lpthread",
+                shell=True,
+                check=True,
+            )
+        proc = subprocess.Popen(["/tmp/expert_diagnostic_debug.elf", "healthy"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        self.addCleanup(lambda: (proc.kill(), proc.wait(timeout=5)))
+        time.sleep(0.2)
+        return proc.pid
+
     def test_step_by_step_lifecycle_execution(self):
         """Verifies step-by-step manual stepping through the full state machine."""
         session = self.engine.start_investigation(
             problem_statement="0x7fff0038 주소에서 세그폴트 및 메모리 오염 의심",
-            pid=os.getpid(),
+            pid=self._spawn_healthy_target(),
             companion_elf="/tmp/expert_diagnostic_debug.elf",
         )
         self.assertEqual(session.state, STATE_CREATED)
