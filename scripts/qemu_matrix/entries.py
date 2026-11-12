@@ -15,7 +15,7 @@ KERNEL_ARM64 = "linux-image-6.12.107+deb13-arm64"
 _NS = "NOT_SUPPORTED_ON_TARGET"
 _OK = "SUPPORTED"
 EXPECTED_SUPPORT = {
-    "aarch64-glibc": {"mutex_owner": _OK, "allocator_chunks": _OK, "syscall_names": _OK, "tcb_scan": _NS,
+    "aarch64-glibc": {"mutex_owner": _OK, "allocator_chunks": _OK, "syscall_names": _OK, "tcb_scan": _OK,
                       "frame_layout": _OK, "cfi_unwind": _OK},
 }
 

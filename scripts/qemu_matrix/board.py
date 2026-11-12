@@ -26,7 +26,7 @@ LIBC = "glibc"  # the only supported libc (musl / ARM32 targets are refused by e
 def expected_support_for(arch: str) -> Dict[str, str]:
     return {
         "mutex_owner": _OK, "allocator_chunks": _OK, "syscall_names": _OK,
-        "tcb_scan": _OK if arch == "x86_64" else _NS,
+        "tcb_scan": _OK,  # x86_64 self-pointer scan and aarch64 dtv-validated discovery (glibc)
         "frame_layout": _OK, "cfi_unwind": _OK,
     }
 

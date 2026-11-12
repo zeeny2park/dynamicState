@@ -244,7 +244,10 @@ class TestImp008LeakOwner(unittest.TestCase):
         self.assertLess(mi_bytes, 4 * 1024 * 1024)
         self.assertLess(r["collection_impact"]["bytes_read"] - mi_bytes, 256 * 1024)
         # previous envelope ~1.1-1.3 s on this class of host; generous bound for loaded CI machines
-        self.assertLess(r["duration_s"], 3.0)
+        # Envelope for an idle default diagnose: ~2 s on a quiet 4-core host (thread window, fd probe, memory trend,
+        # heap integrity/UAF re-reads); the per-file baseline runs 2-3 files in parallel, so allow load slack.
+        # The real property under test is "no heap walk" (bytes), asserted above.
+        self.assertLess(r["duration_s"], 6.0)
         self.assertEqual(self._leak_findings(r), [])
 
     # ------------------------------------------------------------------------------------------ h
