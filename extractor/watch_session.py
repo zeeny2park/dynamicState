@@ -2573,7 +2573,7 @@ class WatchSessionManager:
         max_pointer_depth: int = 8,
     ) -> Dict[str, Any]:
         """Evaluates high-level C/C++ symbol path expressions (including pointer dereferences and arrays)
-        directly against live local or remote embedded target memory with 0.00ms process suspension.
+        directly against live local or remote embedded target memory with zero-stop process suspension.
         Automatically inherits/heals `(pid, companion_elf_path)` from active context and auto-coerces
         forgiving C/C++ expressions (`.` <-> `->`, bare member names, and symbol typos).
         """
@@ -2996,7 +2996,7 @@ class WatchSessionManager:
         ssh_proxy_command: Optional[str] = None,
         adapter: Optional[TargetExecutionAdapter] = None,
     ) -> Dict[str, Any]:
-        """Samples a set of symbol expressions twice separated by `wait_ms` (with 0.00ms stop time)
+        """Samples a set of symbol expressions twice separated by `wait_ms` (with zero-stop stop time)
         and returns a structured comparison of changed, unchanged, and unreadable fields.
         """
         target_adapter = self._resolve_adapter(
@@ -3288,7 +3288,7 @@ class WatchSessionManager:
         ssh_proxy_jump: Optional[str] = None,
         adapter: Optional[TargetExecutionAdapter] = None,
     ) -> Dict[str, Any]:
-        """Compares current live process state against a saved Golden Baseline with 0.00ms stop time."""
+        """Compares current live process state against a saved Golden Baseline with zero-stop stop time."""
         baseline = self.get_golden_baseline(baseline_id)
         if not baseline:
             raise ValueError(f"Golden baseline '{baseline_id}' not found")
@@ -4183,7 +4183,7 @@ class WatchSessionManager:
         adapter: Optional[TargetExecutionAdapter] = None,
     ) -> Dict[str, Any]:
         """Identifies which thread(s) or global worker contexts are currently using or referencing
-        a target C/C++ symbol/slot (e.g. `gpMem->buffers[9]` or `gpMem[9]`) with 0.00ms stop time.
+        a target C/C++ symbol/slot (e.g. `gpMem->buffers[9]` or `gpMem[9]`) with zero-stop stop time.
 
         Executes a 3-stage non-intrusive reverse-lookup pipeline:
         1. Direct Struct Owner Field Check (`owner_tid`, `tid`, `thread_id`, `worker_id` inside target object).
@@ -4881,7 +4881,7 @@ class WatchSessionManager:
         adapter: Optional[TargetExecutionAdapter] = None,
     ) -> Dict[str, Any]:
         """Zero-stop conditional watchpoint & anomaly snapshot catcher.
-        Polls target symbol expressions at `poll_interval_ms` without stopping the target process (0.00ms stop),
+        Polls target symbol expressions at `poll_interval_ms` without stopping the target process (zero-stop stop),
         evaluates `condition_expression` (or waits until it holds continuously for `hold_duration_ms`),
         and immediately captures a before/after state diff + optional thread owner reverse-lookup on hit.
         """
@@ -5060,7 +5060,7 @@ class WatchSessionManager:
         ssh_proxy_jump: Optional[str] = None,
         adapter: Optional[TargetExecutionAdapter] = None,
     ) -> Dict[str, Any]:
-        """Walks a non-contiguous pointer chain / linked list / tree (`node->next`) in 0.00ms zero-stop mode.
+        """Walks a non-contiguous pointer chain / linked list / tree (`node->next`) in zero-stop zero-stop mode.
         Automatically detects pointer cycles (infinite loops) and corrupted/unmapped links (dangling pointers).
         """
         target_adapter = self._resolve_adapter(
@@ -5295,7 +5295,7 @@ class WatchSessionManager:
                 else (
                     f"CRITICAL: Corrupted/dangling link pointer {corrupted_address} detected at node #{len(nodes) - 1} in '{head_expr}'!"
                     if corrupted_link_detected
-                    else f"Successfully traversed {len(nodes)} node(s) in '{head_expr}' ({termination_reason}) with 0.00ms stop."
+                    else f"Successfully traversed {len(nodes)} node(s) in '{head_expr}' ({termination_reason}) with zero-stop stop."
                 )
             ),
         }
@@ -5412,10 +5412,21 @@ class WatchSessionManager:
 
         locks_report: List[Dict[str, Any]] = []
         locks_by_addr: Dict[int, Dict[str, Any]] = {}
+        lock_read_errors: List[str] = []
+        stack_read_errors: List[str] = []
+        limitations: List[str] = []
+        if not map_data.get("mappings"):
+            limitations.append(f"Process memory mappings (/proc/{pid}/maps) could not be read.")
+        if not all_threads:
+            limitations.append(f"Process thread list (/proc/{pid}/task) could not be read.")
 
         for l_name, l_addr, l_size, l_toff, l_idx in candidate_locks:
-            raw_lock, lst, _ = target_adapter.read_memory(pid, l_addr, l_size)
+            try:
+                raw_lock, lst, l_err = target_adapter.read_memory(pid, l_addr, l_size)
+            except Exception as l_exc:
+                raw_lock, lst, l_err = None, "READ_ERROR", f"{type(l_exc).__name__}: {l_exc}"
             if lst != "OBSERVED" or not raw_lock or len(raw_lock) < 12:
+                lock_read_errors.append(f"Failed to read mutex '{l_name}' at 0x{l_addr:x}: {l_err or lst}")
                 continue
             i_fmt = "<iii" if endian == "little" else ">iii"
             lock_word, count_word, owner_tid = struct.unpack(i_fmt, raw_lock[:12])
@@ -5565,7 +5576,12 @@ class WatchSessionManager:
                 scan_from = scan_from & ~(ptr_size - 1)
                 scan_len = min(32768, max(0, stack_ceiling - scan_from))
                 if scan_len >= ptr_size:
-                    raw_stack, sst, _ = target_adapter.read_memory(pid, scan_from, scan_len)
+                    try:
+                        raw_stack, sst, s_err = target_adapter.read_memory(pid, scan_from, scan_len)
+                    except Exception as s_exc:
+                        raw_stack, sst, s_err = None, "READ_ERROR", f"{type(s_exc).__name__}: {s_exc}"
+                    if sst != "OBSERVED" or not raw_stack:
+                        stack_read_errors.append(f"Failed to read stack for TID {t_tid}: {s_err or sst}")
                     if sst == "OBSERVED" and raw_stack:
                         num_words = len(raw_stack) // ptr_size
                         for w_i in range(num_words):
@@ -5688,6 +5704,22 @@ class WatchSessionManager:
                 visited_tids.add(curr)
                 curr = nxt_tid
 
+        if lock_read_errors and (not locks_report or len(lock_read_errors) == len(candidate_locks)):
+            limitations.extend(lock_read_errors)
+        if stack_read_errors:
+            limitations.extend(stack_read_errors)
+        is_inconclusive = bool(
+            not deadlock_cycles
+            and not wait_for_edges
+            and limitations
+            and (
+                not all_threads
+                or not map_data.get("mappings")
+                or (candidate_locks and not locks_report)
+                or (target_threads and len(stack_read_errors) >= len(target_threads))
+            )
+        )
+        cs_status = "ANOMALIES_DETECTED" if (deadlock_cycles or wait_for_edges) else ("INCONCLUSIVE" if is_inconclusive else "OBSERVED")
         latency_us = round((time.monotonic_ns() - t_start_ns) / 1000.0, 2)
         return {
             "pid": pid,
@@ -5695,6 +5727,8 @@ class WatchSessionManager:
             "is_remote": target_adapter.is_remote(),
             "stop_duration_ms": 0.0,
             "evaluation_latency_us": latency_us,
+            "status": cs_status,
+            "limitations": limitations,
             "threads_inspected": len(thread_reports),
             "threads": thread_reports,
             "locks_inspected": len(locks_report),
@@ -5711,7 +5745,11 @@ class WatchSessionManager:
                 else (
                     f"Lock contention active: {len(wait_for_edges)} thread(s) blocked waiting on a held mutex."
                     if wait_for_edges
-                    else f"Inspected {len(thread_reports)} thread callstack(s) and {len(locks_report)} mutex(es) with 0.00ms stop."
+                    else (
+                        f"Thread/lock inspection inconclusive due to read failure(s): {'; '.join(limitations[:3])}"
+                        if is_inconclusive
+                        else f"Inspected {len(thread_reports)} thread callstack(s) and {len(locks_report)} mutex(es) in zero-stop mode."
+                    )
                 )
             ),
         }
@@ -5728,7 +5766,7 @@ class WatchSessionManager:
         ssh_proxy_jump: Optional[str] = None,
         adapter: Optional[TargetExecutionAdapter] = None,
     ) -> Dict[str, Any]:
-        """Automated DWARF-guided memory corruption & pointer integrity auditor (0.00ms stop).
+        """Automated DWARF-guided memory corruption & pointer integrity auditor (zero-stop stop).
         Detects:
         1. `DANGLING_OR_UNMAPPED_POINTER`: Non-null pointers pointing outside valid `/proc/<pid>/maps` VMAs.
         2. `CORRUPTED_BOOL_VALUE`: `bool` / `_Bool` fields containing raw byte values other than `0` or `1`.
@@ -5905,6 +5943,11 @@ class WatchSessionManager:
                 elif mc.tag in ("DW_TAG_structure_type", "DW_TAG_class_type"):
                     _audit_struct_bytes(m_expr, m_addr, mc, m_slice, depth + 1)
 
+        read_errors: List[str] = []
+        observed_count = 0
+        if not mappings:
+            read_errors.append(f"Process memory mappings (/proc/{pid}/maps) could not be read.")
+
         eval_res = self.evaluate_symbol_paths(
             pid=pid,
             companion_elf_path=companion_elf_path,
@@ -5916,7 +5959,9 @@ class WatchSessionManager:
             ex = item.get("expression", "")
             checked_count += 1
             if item.get("status") != "OBSERVED":
+                read_errors.append(f"Failed to read symbol '{ex}': {item.get('error') or item.get('status')}")
                 continue
+            observed_count += 1
             rt_addr_str = item.get("runtime_address", "0x0")
             rt_addr = int(rt_addr_str, 16) if rt_addr_str.startswith("0x") else 0
             t_off = item.get("type_offset")
@@ -5962,7 +6007,12 @@ class WatchSessionManager:
                         })
             elif canon_t.tag in ("DW_TAG_structure_type", "DW_TAG_class_type") and rt_addr > 0:
                 bsize = max(1, min(canon_t.byte_size or 64, 16384))
-                raw_s, sst, _ = target_adapter.read_memory(pid, rt_addr, bsize)
+                try:
+                    raw_s, sst, s_err = target_adapter.read_memory(pid, rt_addr, bsize)
+                except Exception as s_exc:
+                    raw_s, sst, s_err = None, "READ_ERROR", f"{type(s_exc).__name__}: {s_exc}"
+                if sst != "OBSERVED" or not raw_s:
+                    read_errors.append(f"Failed to read struct '{ex}' at 0x{rt_addr:x}: {s_err or sst}")
                 if sst == "OBSERVED" and raw_s:
                     _audit_struct_bytes(ex, rt_addr, canon_t, raw_s, depth=0)
 
@@ -6001,8 +6051,15 @@ class WatchSessionManager:
                                     s_raw, s_st, _ = target_adapter.read_memory(pid, s_addr, s_sz)
                                     if s_st == "OBSERVED" and s_raw:
                                         _audit_struct_bytes(s_item["expression"], s_addr, elem_t, s_raw, depth=1)
-                        except Exception:
-                            pass
+                        except Exception as pool_exc:
+                            read_errors.append(f"Failed to scan memory pool '{ex}': {type(pool_exc).__name__}: {pool_exc}")
+
+        if anomalies:
+            audit_health_status = "ANOMALIES_DETECTED"
+        elif not mappings or (exprs and observed_count == 0) or (read_errors and observed_count == 0):
+            audit_health_status = "INCONCLUSIVE"
+        else:
+            audit_health_status = "HEALTHY"
 
         latency_us = round((time.monotonic_ns() - t_start_ns) / 1000.0, 2)
         return {
@@ -6011,17 +6068,23 @@ class WatchSessionManager:
             "is_remote": target_adapter.is_remote(),
             "stop_duration_ms": 0.0,
             "evaluation_latency_us": latency_us,
-            "health_status": "ANOMALIES_DETECTED" if anomalies else "HEALTHY",
+            "health_status": audit_health_status,
+            "limitations": read_errors,
             "allocator": alloc_detection.allocator_type.value,
             "allocator_confidence": alloc_detection.confidence,
             "checked_symbols_count": checked_count,
+            "observed_symbols_count": observed_count,
             "anomalies_count": len(anomalies),
             "anomalies": anomalies,
             "llm_next_step_hint": (
                 f"Detected {len(anomalies)} memory integrity anomaly(ies): "
                 + "; ".join(f"[{a['anomaly_kind']}] {a['expression']} = {a['observed_value']}" for a in anomalies[:5])
                 if anomalies
-                else f"All {checked_count} audited symbol(s) and memory pool slots passed DWARF pointer/enum/boolean/owner integrity checks."
+                else (
+                    f"Memory integrity audit inconclusive: {observed_count}/{checked_count} symbol(s) observed ({'; '.join(read_errors[:3])})."
+                    if audit_health_status == "INCONCLUSIVE"
+                    else f"All {observed_count} audited symbol(s) and memory pool slots passed DWARF pointer/enum/boolean/owner integrity checks."
+                )
             ),
         }
 
@@ -6039,7 +6102,7 @@ class WatchSessionManager:
         adapter: Optional[TargetExecutionAdapter] = None,
     ) -> Dict[str, Any]:
         """Resolves function pointers, callback struct fields, or C++ polymorphic object `_vptr` / `vtable`
-        entries to exact C/C++ function names and DWARF source `file:line` locations (0.00ms stop).
+        entries to exact C/C++ function names and DWARF source `file:line` locations (zero-stop stop).
         """
         target_adapter = self._resolve_adapter(
             pid=pid,
@@ -6382,7 +6445,7 @@ class WatchSessionManager:
         adapter: Optional[TargetExecutionAdapter] = None,
     ) -> Dict[str, Any]:
         """Decodes function formal parameters and local variables (`DW_TAG_formal_parameter`, `DW_TAG_variable`)
-        on each active thread's stack frames in 0.00ms zero-stop mode using DWARF `DW_OP_fbreg` / frame-pointer unwinding,
+        on each active thread's stack frames in zero-stop zero-stop mode using DWARF `DW_OP_fbreg` / frame-pointer unwinding,
         plus function-scoped static variables (`DW_OP_addr`).
         """
         target_adapter = self._resolve_adapter(
@@ -6620,7 +6683,7 @@ class WatchSessionManager:
             "evaluation_latency_us": latency_us,
             "threads_count": len(thread_results),
             "threads": thread_results,
-            "llm_next_step_hint": f"Decoded stack frame parameters and local variables across {len(thread_results)} thread(s) with 0.00ms stop.",
+            "llm_next_step_hint": f"Decoded stack frame parameters and local variables across {len(thread_results)} thread(s) with zero-stop stop.",
         }
 
     def auto_triage_incident(
@@ -6635,7 +6698,7 @@ class WatchSessionManager:
         adapter: Optional[TargetExecutionAdapter] = None,
     ) -> Dict[str, Any]:
         """1-Call Composite Zero-Stop Incident Auto-Triage & Root-Cause Correlator.
-        Executes in a single pass with 0.00ms stop time:
+        Executes in a single pass with zero-stop stop time:
         1. Process X-Ray Blueprint discovery
         2. Memory & Pointer Integrity Audit (`audit_memory_integrity`)
         3. Thread Callstacks, Mutex Contention & Deadlock Check (`inspect_thread_callstacks_and_locks`)
@@ -6654,21 +6717,48 @@ class WatchSessionManager:
         )
         t_start_ns = time.monotonic_ns()
 
-        blueprint = self.get_process_xray_blueprint(
-            pid=pid,
-            companion_elf_path=companion_elf_path,
-            adapter=target_adapter,
-        )
-        audit_res = self.audit_memory_integrity(
-            pid=pid,
-            companion_elf_path=companion_elf_path,
-            adapter=target_adapter,
-        )
-        callstack_res = self.inspect_thread_callstacks_and_locks(
-            pid=pid,
-            companion_elf_path=companion_elf_path,
-            adapter=target_adapter,
-        )
+        limitations: List[str] = []
+        try:
+            blueprint = self.get_process_xray_blueprint(
+                pid=pid,
+                companion_elf_path=companion_elf_path,
+                adapter=target_adapter,
+            )
+        except Exception as bp_exc:
+            limitations.append(f"get_process_xray_blueprint failed: {type(bp_exc).__name__}: {bp_exc}")
+            blueprint = {"categories": {}}
+
+        try:
+            audit_res = self.audit_memory_integrity(
+                pid=pid,
+                companion_elf_path=companion_elf_path,
+                adapter=target_adapter,
+            )
+            for lim in (audit_res.get("limitations") or []):
+                if lim not in limitations:
+                    limitations.append(lim)
+            if audit_res.get("health_status") == "INCONCLUSIVE" and not audit_res.get("limitations"):
+                limitations.append("audit_memory_integrity returned INCONCLUSIVE")
+        except Exception as au_exc:
+            err_msg = f"audit_memory_integrity failed: {type(au_exc).__name__}: {au_exc}"
+            limitations.append(err_msg)
+            audit_res = {"health_status": "INCONCLUSIVE", "anomalies": [], "limitations": [err_msg]}
+
+        try:
+            callstack_res = self.inspect_thread_callstacks_and_locks(
+                pid=pid,
+                companion_elf_path=companion_elf_path,
+                adapter=target_adapter,
+            )
+            for lim in (callstack_res.get("limitations") or []):
+                if lim not in limitations:
+                    limitations.append(lim)
+            if callstack_res.get("status") == "INCONCLUSIVE" and not callstack_res.get("limitations"):
+                limitations.append("inspect_thread_callstacks_and_locks returned INCONCLUSIVE")
+        except Exception as cs_exc:
+            err_msg = f"inspect_thread_callstacks_and_locks failed: {type(cs_exc).__name__}: {cs_exc}"
+            limitations.append(err_msg)
+            callstack_res = {"status": "INCONCLUSIVE", "threads": [], "locks": [], "deadlock_detected": False, "limitations": [err_msg]}
 
         findings: List[Dict[str, Any]] = []
         source_targets: List[str] = []
@@ -6733,68 +6823,88 @@ class WatchSessionManager:
                         "summary": f"{p_scan['pool_summary']['allocated_count']}/{p_scan['pool_summary']['total_slots']} slots allocated.",
                         "recommended_action": "Run `runtime_find_symbol_owners` on allocated slot indices to identify leaking threads.",
                     })
-            except Exception:
-                pass
+            except Exception as pool_exc:
+                limitations.append(f"scan_memory_pool_or_array('{expr}') failed: {type(pool_exc).__name__}: {pool_exc}")
 
         # 4. Sweep Discovered Linked-List Head Pointers for Cycles or Dangling Links
-        primary_elf, _ = self._split_companion_elf_paths(companion_elf_path)
-        idx = DwarfIndexer.get_index(primary_elf)
         linked_list_reports: List[Dict[str, Any]] = []
-        for var in idx.variables:
-            if var.link_time_address is None or var.is_declaration or not var.name or var.name.startswith("__"):
-                continue
-            canon_t = idx.resolve_canonical_type(var.type_offset)
-            if canon_t and canon_t.tag == "DW_TAG_pointer_type":
-                target_t = idx.resolve_canonical_type(canon_t.target_type_offset)
-                if target_t and target_t.tag in ("DW_TAG_structure_type", "DW_TAG_class_type"):
-                    has_next = any(m.name in ("next", "p_next", "next_node") for m in target_t.members)
-                    if has_next:
-                        try:
-                            ll_res = self.traverse_linked_structure(
-                                pid=pid,
-                                companion_elf_path=companion_elf_path,
-                                head_expression=var.name,
-                                max_depth=64,
-                                adapter=target_adapter,
-                            )
-                            linked_list_reports.append(ll_res)
-                            if ll_res.get("cycle_detected"):
-                                findings.append({
-                                    "severity": "CRITICAL",
-                                    "category": "LINKED_LIST_CYCLE",
-                                    "title": f"Infinite Pointer Cycle in Linked List '{var.name}'",
-                                    "summary": ll_res["llm_next_step_hint"],
-                                    "recommended_action": f"Fix list insertion/removal logic on '{var.name}' where node points back to index #{ll_res['cycle_target_index']}.",
-                                })
-                            elif ll_res.get("corrupted_link_detected"):
-                                findings.append({
-                                    "severity": "CRITICAL",
-                                    "category": "LINKED_LIST_CORRUPTION",
-                                    "title": f"Corrupted Pointer Link in Linked List '{var.name}'",
-                                    "summary": ll_res["llm_next_step_hint"],
-                                    "recommended_action": f"Inspect node link mutation on '{var.name}' (unmapped address {ll_res.get('corrupted_address')}).",
-                                })
-                        except Exception:
-                            pass
+        try:
+            primary_elf, _ = self._split_companion_elf_paths(companion_elf_path)
+            idx = DwarfIndexer.get_index(primary_elf)
+            for var in idx.variables:
+                if var.link_time_address is None or var.is_declaration or not var.name or var.name.startswith("__"):
+                    continue
+                canon_t = idx.resolve_canonical_type(var.type_offset)
+                if canon_t and canon_t.tag == "DW_TAG_pointer_type":
+                    target_t = idx.resolve_canonical_type(canon_t.target_type_offset)
+                    if target_t and target_t.tag in ("DW_TAG_structure_type", "DW_TAG_class_type"):
+                        has_next = any(m.name in ("next", "p_next", "next_node") for m in target_t.members)
+                        if has_next:
+                            try:
+                                ll_res = self.traverse_linked_structure(
+                                    pid=pid,
+                                    companion_elf_path=companion_elf_path,
+                                    head_expression=var.name,
+                                    max_depth=64,
+                                    adapter=target_adapter,
+                                )
+                                linked_list_reports.append(ll_res)
+                                if ll_res.get("cycle_detected"):
+                                    findings.append({
+                                        "severity": "CRITICAL",
+                                        "category": "LINKED_LIST_CYCLE",
+                                        "title": f"Infinite Pointer Cycle in Linked List '{var.name}'",
+                                        "summary": ll_res["llm_next_step_hint"],
+                                        "recommended_action": f"Fix list insertion/removal logic on '{var.name}' where node points back to index #{ll_res['cycle_target_index']}.",
+                                    })
+                                elif ll_res.get("corrupted_link_detected"):
+                                    findings.append({
+                                        "severity": "CRITICAL",
+                                        "category": "LINKED_LIST_CORRUPTION",
+                                        "title": f"Corrupted Pointer Link in Linked List '{var.name}'",
+                                        "summary": ll_res["llm_next_step_hint"],
+                                        "recommended_action": f"Inspect node link mutation on '{var.name}' (unmapped address {ll_res.get('corrupted_address')}).",
+                                    })
+                            except Exception as ll_exc:
+                                limitations.append(f"traverse_linked_structure('{var.name}') failed: {type(ll_exc).__name__}: {ll_exc}")
+        except Exception as idx_exc:
+            limitations.append(f"DWARF linked-list sweep failed: {type(idx_exc).__name__}: {idx_exc}")
 
-        # Compute overall status and health score
+        # Compute overall status and health score (IMP-001: never report HEALTHY/100 when collection failed)
         sev_Order = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3}
         findings.sort(key=lambda f: sev_Order.get(f.get("severity", "LOW"), 3))
 
         crit_cnt = sum(1 for f in findings if f.get("severity") == "CRITICAL")
         high_cnt = sum(1 for f in findings if f.get("severity") == "HIGH")
-        score = max(0, 100 - crit_cnt * 30 - high_cnt * 15 - (len(findings) - crit_cnt - high_cnt) * 5)
-        overall_status = "CRITICAL_ISSUES_FOUND" if crit_cnt > 0 else ("WARNINGS_FOUND" if findings else "HEALTHY")
+        has_inconclusive_subcheck = (
+            audit_res.get("health_status") == "INCONCLUSIVE"
+            or callstack_res.get("status") == "INCONCLUSIVE"
+            or bool(limitations)
+        )
+        if crit_cnt > 0:
+            overall_status = "CRITICAL_ISSUES_FOUND"
+            score: Optional[int] = max(0, 100 - crit_cnt * 30 - high_cnt * 15 - (len(findings) - crit_cnt - high_cnt) * 5)
+        elif findings:
+            overall_status = "WARNINGS_FOUND"
+            score = max(0, 100 - crit_cnt * 30 - high_cnt * 15 - (len(findings) - crit_cnt - high_cnt) * 5)
+        elif has_inconclusive_subcheck:
+            overall_status = "INCONCLUSIVE"
+            score = None
+        else:
+            overall_status = "HEALTHY"
+            score = 100
 
         latency_us = round((time.monotonic_ns() - t_start_ns) / 1000.0, 2)
         return {
             "pid": pid,
             "target_host": target_adapter.target_host(),
             "is_remote": target_adapter.is_remote(),
+            "collection_mode": "ZERO_STOP",
             "stop_duration_ms": 0.0,
             "evaluation_latency_us": latency_us,
             "overall_status": overall_status,
             "health_score": score,
+            "limitations": limitations,
             "findings_count": len(findings),
             "findings": findings,
             "source_remediation_targets": source_targets,
@@ -6803,9 +6913,13 @@ class WatchSessionManager:
             "memory_pools": pool_reports,
             "linked_lists": linked_list_reports,
             "llm_next_step_hint": (
-                f"Auto-Triage found {len(findings)} issue(s) (Health Score: {score}/100, Status: {overall_status}). Top finding: [{findings[0]['severity']}] {findings[0]['title']} — {findings[0]['summary']}"
+                f"Auto-Triage found {len(findings)} issue(s) (Status: {overall_status}). Top finding: [{findings[0]['severity']}] {findings[0]['title']} — {findings[0]['summary']}"
                 if findings
-                else f"Auto-Triage completed (Health Score: 100/100, Status: HEALTHY). All audited symbols, pools, locks, and linked lists are clean."
+                else (
+                    f"Auto-Triage inconclusive due to collection failure(s): {'; '.join(limitations[:3])}"
+                    if overall_status == "INCONCLUSIVE"
+                    else f"Auto-Triage completed (Health Score: {score}/100, Status: HEALTHY). All audited symbols, pools, locks, and linked lists are clean."
+                )
             ),
         }
 
@@ -6828,7 +6942,7 @@ class WatchSessionManager:
         ssh_proxy_jump: Optional[str] = None,
         adapter: Optional[TargetExecutionAdapter] = None,
     ) -> Dict[str, Any]:
-        """Cross-process shared memory (`shm` / `MAP_SHARED`) & IPC FD pipeline bottleneck analyzer (0.00ms stop).
+        """Cross-process shared memory (`shm` / `MAP_SHARED`) & IPC FD pipeline bottleneck analyzer (zero-stop stop).
         1. Auto-detects or overlays `cast_type` onto shared memory regions.
         2. Computes producer vs consumer sequence lag (`pending_backlog`, `backlog_utilization_pct`).
         3. Maps peer processes sharing the same SHM or pipe/socket inodes and inspects their thread states.
@@ -6989,7 +7103,7 @@ class WatchSessionManager:
         ssh_proxy_jump: Optional[str] = None,
         adapter: Optional[TargetExecutionAdapter] = None,
     ) -> Dict[str, Any]:
-        """Zero-stop C++ polymorphic `vtable` (`_ZTV*`) heap & data segment object census + leak detector (0.00ms stop).
+        """Zero-stop C++ polymorphic `vtable` (`_ZTV*`) heap & data segment object census + leak detector (zero-stop stop).
         1. Discovers all C++ `vtable for <ClassName>` symbols in the ELF binary and computes their relocated runtime `_vptr` addresses.
         2. Scans `[heap]` (and `.data`/`.bss`) for matching `_vptr` headers to locate live polymorphic objects and decodes their DWARF fields.
         3. Checks whether each `[heap]` object is referenced by any global pointer, thread stack, or other heap object; flags unreferenced heap objects as `is_leaked_candidate = True`.
@@ -7254,7 +7368,7 @@ class WatchSessionManager:
     ) -> Dict[str, Any]:
         """Synthesizes a directed cross-entity dependency & causal graph across:
         `[Process] ➔ [Thread] ➔ [Mutex Lock / Stack Frame] ➔ [Memory Pool Slot / Heap Object] ➔ [Shared Memory Peer]`
-        with 0.00ms stop time, and identifies `root_blocker_nodes` and `causal_chains`.
+        with zero-stop stop time, and identifies `root_blocker_nodes` and `causal_chains`.
         """
         target_adapter = self._resolve_adapter(
             pid=pid,
@@ -7575,7 +7689,7 @@ class WatchSessionManager:
     ) -> Dict[str, Any]:
         """Correlates DWARF `file:line` source locations and active stack frames with real C/C++
         source code files on disk, overlaying live runtime values of parameters, local variables,
-        and referenced global symbols inline (`annotated_lines`) with 0.00ms stop time.
+        and referenced global symbols inline (`annotated_lines`) with zero-stop stop time.
         """
         target_adapter = self._resolve_adapter(
             pid=pid,
@@ -7771,7 +7885,7 @@ class WatchSessionManager:
         ssh_proxy_jump: Optional[str] = None,
         adapter: Optional[TargetExecutionAdapter] = None,
     ) -> Dict[str, Any]:
-        """Autonomous Symptom-Driven Multi-Stage Root-Cause Investigator (0.00ms stop time).
+        """Autonomous Symptom-Driven Multi-Stage Root-Cause Investigator (zero-stop stop time).
         Accepts a simple, high-level user symptom question (e.g. '왜 멈췄지?', '버벅거려', '메모리가 새는 것 같아',
         '왜 응답이 없지?') and automatically orchestrates:
         1. Symptom Classification (`HANG_OR_DEADLOCK`, `MEMORY_LEAK_OR_EXHAUSTION`, `MEMORY_CORRUPTION`, `IPC_BOTTLENECK`, `GENERAL_ANOMALY`)
@@ -7815,7 +7929,7 @@ class WatchSessionManager:
             )
         except Exception as exc:
             legacy_sweep_errors.append({"stage": "auto_triage_incident", "error_type": type(exc).__name__, "error": str(exc)})
-            triage = {"overall_status": "INCONCLUSIVE", "health_score": 50, "findings": [], "source_remediation_targets": []}
+            triage = {"overall_status": "INCONCLUSIVE", "health_score": None, "findings": [], "limitations": [f"{type(exc).__name__}: {exc}"], "source_remediation_targets": []}
         try:
             dep_graph = self.build_dependency_graph(
                 pid=pid,
@@ -7897,6 +8011,10 @@ class WatchSessionManager:
             else:
                 hypothesis = f"[{top_chain['chain_type']}] {top_chain['ascii_flow']}"
             confidence_score = 0.94 if (top_f and top_f.get("severity") == "CRITICAL") else 0.88
+        elif legacy_sweep_errors or triage.get("overall_status") == "INCONCLUSIVE" or triage.get("limitations"):
+            lim_parts = [f"{e.get('stage')}: {e.get('error')}" for e in legacy_sweep_errors] + list(triage.get("limitations") or [])
+            hypothesis = f"Diagnostic inspection inconclusive due to collection failure(s): {'; '.join(lim_parts[:3])}"
+            confidence_score = 0.20
         else:
             hypothesis = "No critical lock contention, memory corruption, or unreferenced heap leak detected in current zero-stop snapshot."
             confidence_score = 0.80
@@ -7958,6 +8076,21 @@ class WatchSessionManager:
             # Never represent fallback legacy findings as successful adaptive verification
             confidence_score = min(confidence_score, 0.35)
 
+        if legacy_sweep_errors:
+            adaptive_error_details = list(legacy_sweep_errors) + list(adaptive_error_details)
+        all_symp_limitations = list(triage.get("limitations") or []) + [
+            f"{e.get('stage')}: {e.get('error')}" for e in legacy_sweep_errors
+        ]
+        if (all_symp_limitations or triage.get("overall_status") == "INCONCLUSIVE") and not findings:
+            if exec_status not in ("FAILED", "INCONCLUSIVE"):
+                exec_status = "INCONCLUSIVE"
+            confidence_score = min(confidence_score, 0.20)
+        eff_health_score = (
+            None
+            if (exec_status in ("INCONCLUSIVE", "FAILED") or triage.get("overall_status") == "INCONCLUSIVE") and not findings
+            else triage.get("health_score")
+        )
+
         latency_us = round((time.monotonic_ns() - t_start_ns) / 1000.0, 2)
         return {
             "pid": pid,
@@ -7967,8 +8100,10 @@ class WatchSessionManager:
             "evaluation_latency_us": latency_us,
             "symptom_query": symptom_query,
             "execution_status": exec_status,
+            "overall_status": "INCONCLUSIVE" if eff_health_score is None and not findings else triage.get("overall_status", "HEALTHY"),
             "failure_category": fail_category,
             "stop_reason": stop_reason,
+            "limitations": all_symp_limitations,
             "diagnostic_error_details": adaptive_error_details,
             "actual_observation_count": actual_obs_cnt,
             "successful_observation_count": succ_obs_cnt,
@@ -7981,7 +8116,7 @@ class WatchSessionManager:
             "classified_symptom": classified_symptom,
             "root_cause_hypothesis": hypothesis,
             "confidence_score": confidence_score,
-            "health_score": triage.get("health_score", 100),
+            "health_score": eff_health_score,
             "findings_count": len(findings),
             "findings": findings,
             "causal_chains": causal_chains,
@@ -8064,7 +8199,7 @@ class WatchSessionManager:
         ssh_proxy_jump: Optional[str] = None,
         adapter: Optional[TargetExecutionAdapter] = None,
     ) -> Dict[str, Any]:
-        """Zero-stop statistical CPU & callstack hotspot profiler (`0.00ms` stop time).
+        """Zero-stop statistical CPU & callstack hotspot profiler (`zero-stop` stop time).
         Takes `samples_count` rapid non-intrusive snapshots across `interval_ms`, measuring:
         1. Per-thread CPU tick deltas (`utime + stime`) and runnable (`R`) vs sleeping (`S`/`D`) ratios.
         2. Function-level callstack appearance frequency (`hotspot_functions`) and folded flame-graph strings (`flame_stacks`).
@@ -8278,7 +8413,7 @@ class WatchSessionManager:
             "flame_stacks": flame_stacks,
             "counter_rates": counter_rates,
             "llm_next_step_hint": (
-                f"Statistical hotspot profiling ({clamped_samples} samples over {elapsed_ms}ms, 0.00ms stop): "
+                f"Statistical hotspot profiling ({clamped_samples} samples over {elapsed_ms}ms, zero-stop stop): "
                 + (f"Top hotspot function is `{top_fn['function_name']}()` ({top_fn['inclusive_pct']}% inclusive, {top_fn['source_location']}) " if top_fn else "")
                 + (f"on thread TID {top_th['tid']} ({top_th['name']}, CPU share {top_th['cpu_share_pct']}%)." if top_th else "")
             ),
@@ -8297,7 +8432,7 @@ class WatchSessionManager:
         ssh_proxy_jump: Optional[str] = None,
         adapter: Optional[TargetExecutionAdapter] = None,
     ) -> Dict[str, Any]:
-        """Semantic / Fuzzy Intent-to-Symbol Resolver (0.00ms stop time).
+        """Semantic / Fuzzy Intent-to-Symbol Resolver (zero-stop stop time).
         Maps vague natural-language user descriptions (e.g. '버퍼 풀', '워커 스레드', '세션 객체',
         '뮤텍스 락', '작업 리스트', '카운터') to concrete DWARF symbols & member paths, and evaluates
         their live values immediately.
@@ -8470,7 +8605,7 @@ class WatchSessionManager:
         ssh_proxy_jump: Optional[str] = None,
         adapter: Optional[TargetExecutionAdapter] = None,
     ) -> Dict[str, Any]:
-        """Zero-stop Anomaly Time-Machine Flight Recorder (`0.00ms` stop time).
+        """Zero-stop Anomaly Time-Machine Flight Recorder (`zero-stop` stop time).
         Maintains an per-PID circular blackbox ring buffer of micro-snapshots (`_flight_recorder_buffers`)
         and records `frames_count` rapid frames across `interval_ms`.
         Automatically identifies transient spikes, value reversals (A -> B -> A glitches), lock micro-stalls,
@@ -8651,7 +8786,7 @@ class WatchSessionManager:
         ssh_proxy_jump: Optional[str] = None,
         adapter: Optional[TargetExecutionAdapter] = None,
     ) -> Dict[str, Any]:
-        """Zero-Stop Behavioral Drift Detector (`0.00ms` stop time).
+        """Zero-Stop Behavioral Drift Detector (`zero-stop` stop time).
         Captures a multi-dimensional behavioral fingerprint of the live process:
         1. Global/Static State & Counter Values
         2. Memory Pool Utilization % & Allocated Slot Counts
@@ -8887,7 +9022,7 @@ class WatchSessionManager:
         ptr_size: int = 8,
         endian: str = "<",
     ) -> Dict[int, int]:
-        """Discovers each thread's glibc TCB (`struct pthread *` / `fs_base`) in 0.00ms zero-stop mode.
+        """Discovers each thread's glibc TCB (`struct pthread *` / `fs_base`) in zero-stop zero-stop mode.
         
         Uses the deterministic glibc `tcbhead_t` self-pointer invariant:
         - `*(uint64_t *)(tcb_addr + 0x00) == tcb_addr` (`header.tcb`)
@@ -9143,7 +9278,7 @@ class WatchSessionManager:
             "threads": thread_reports,
             "llm_next_step_hint": (
                 f"Decoded {len(tls_vars)} TLS (`__thread` / `thread_local`) variable(s) across "
-                f"{len(tcb_by_tid)}/{len(thread_reports)} thread TCB(s) in 0.00ms zero-stop mode."
+                f"{len(tcb_by_tid)}/{len(thread_reports)} thread TCB(s) in zero-stop zero-stop mode."
             ),
         }
 
@@ -9161,7 +9296,7 @@ class WatchSessionManager:
         ssh_proxy_jump: Optional[str] = None,
         adapter: Optional[TargetExecutionAdapter] = None,
     ) -> Dict[str, Any]:
-        """Optimistic Seqlock Double-Read Concurrency Verifier (`0.00ms` stop time)."""
+        """Optimistic Seqlock Double-Read Concurrency Verifier (`zero-stop` stop time)."""
         target_adapter = self._resolve_adapter(
             pid=pid,
             remote_host=remote_host,
@@ -9346,7 +9481,7 @@ class WatchSessionManager:
             "symbols": symbol_reports,
             "llm_next_step_hint": (
                 f"Seqlock Concurrency Verification: {overall_status} "
-                f"({atomic_count} atomic consistent, {recovered_count} torn-read recovered, {mutating_count} concurrently mutating in 0.00ms stop)."
+                f"({atomic_count} atomic consistent, {recovered_count} torn-read recovered, {mutating_count} concurrently mutating in zero-stop stop)."
             ),
         }
 
@@ -9366,7 +9501,7 @@ class WatchSessionManager:
         adapter: Optional[TargetExecutionAdapter] = None,
     ) -> Dict[str, Any]:
         """Zero-Stop DPDK Isolated-Core (`isolcpus`) Dedicated Lcore, PMD Poll-Loop, Lockless Ring (`rte_ring`)
-        & User-Space Spinlock (`rte_spinlock_t`) Inspector (`0.00ms` stop time).
+        & User-Space Spinlock (`rte_spinlock_t`) Inspector (`zero-stop` stop time).
         
         Engineered specifically for DPDK / high-performance user-space poll-mode threads where:
         - Threads run 100% in user space (`state == 'R'`, `/proc/<pid>/task/<tid>/syscall == 'running'`, `kstkesp == 0`).
@@ -9755,7 +9890,7 @@ class WatchSessionManager:
             "global_counter_deltas": global_counter_deltas,
             "llm_next_step_hint": (
                 f"DPDK Isolated-Core & PMD Audit: {overall_status} across {dedicated_count} dedicated PMD lcore(s) "
-                f"and {len(ring_reports)} lockless ring(s) in 0.00ms zero-stop mode."
+                f"and {len(ring_reports)} lockless ring(s) in zero-stop zero-stop mode."
             ),
         }
 
@@ -10358,7 +10493,7 @@ class WatchSessionManager:
         ssh_proxy_jump: Optional[str] = None,
         adapter: Optional[TargetExecutionAdapter] = None,
     ) -> Dict[str, Any]:
-        """Universal 1-Call Intent Gateway (`runtime_ask`) in 0.00ms zero-stop mode.
+        """Universal 1-Call Intent Gateway (`runtime_ask`) in zero-stop zero-stop mode.
         Accepts any C/C++ expression (even with `.` vs `->` mistakes, omitted root globals, or typos)
         OR any natural-language diagnostic question in Korean/English, automatically resolves/heals
         the active `(pid, companion_elf)` context, routes to the optimal zero-stop engine, and returns
@@ -10863,7 +10998,7 @@ class WatchSessionManager:
         ssh_proxy_jump: Optional[str] = None,
         adapter: Optional[TargetExecutionAdapter] = None,
     ) -> Dict[str, Any]:
-        """1-Call Multi-Tool Composite Batch Macro Executor (`runtime_batch_execute`) in 0.00ms zero-stop mode.
+        """1-Call Multi-Tool Composite Batch Macro Executor (`runtime_batch_execute`) in zero-stop zero-stop mode.
         Executes multiple heterogeneous diagnostic steps (`eval`, `scan_pool`, `find_owners`, `tls`,
         `dpdk_lcores`, `verify_consistency`, `triage`, `ask`) in a single round-trip while sharing
         the bound target context, ASLR load-bias cache, and DWARF index.
@@ -11003,7 +11138,7 @@ class WatchSessionManager:
             "cross_step_highlights": cross_step_highlights,
             "step_results": step_results,
             "llm_next_step_hint": (
-                f"Executed {succeeded_count}/{len(normalized_steps)} batch diagnostic step(s) in {total_latency_us}us with 0.00ms target stop time."
+                f"Executed {succeeded_count}/{len(normalized_steps)} batch diagnostic step(s) in {total_latency_us}us with zero-stop target stop time."
             ),
         }
 
@@ -11371,7 +11506,7 @@ class WatchSessionManager:
             "save_html_error": save_html_error,
             "llm_next_step_hint": (
                 f"Hypothesis '{hypothesis}' is {verdict} ({passed_count}/{total_cnt} assertions passed, "
-                f"confidence {round(pass_ratio * 100, 1)}%) in 0.00ms zero-stop mode."
+                f"confidence {round(pass_ratio * 100, 1)}%) in zero-stop zero-stop mode."
             ),
         }
 
@@ -11395,75 +11530,143 @@ class WatchSessionManager:
     ) -> Dict[str, Any]:
         """1-Call Comprehensive Incident Report & Source-Level Remediation Exporter (`runtime_export_incident_report`)."""
         t_start_ns = time.monotonic_ns()
-        if pid is not None and not remote_host and adapter is None:
-            if pid <= 0 or (pid != os.getpid() and not os.path.exists(f"/proc/{pid}")):
-                return {
-                    "success": False,
-                    "pid": pid,
-                    "error": f"Target process PID {pid} does not exist (ESRCH).",
-                }
-
-        ctx_info = self.resolve_target_context(
-            pid=pid,
-            companion_elf_path=companion_elf_path,
-            process_name=process_name,
-            remote_host=remote_host,
-            ssh_user=ssh_user,
-            ssh_port=ssh_port,
-            ssh_key=ssh_key,
-            ssh_proxy_jump=ssh_proxy_jump,
-            adapter=adapter,
-        )
-        eff_pid = ctx_info["pid"]
-        eff_elf = ctx_info["companion_elf_path"]
+        limitations: List[str] = []
+        if pid is not None and pid <= 0:
+            return {
+                "success": False,
+                "pid": pid,
+                "overall_status": "INCONCLUSIVE",
+                "verdict": DIAG_INCONCLUSIVE,
+                "health_score": None,
+                "limitations": [f"Invalid target PID {pid}."],
+                "error": f"Target process PID {pid} is invalid.",
+            }
 
         try:
-            triage = self.auto_triage_incident(
-                pid=eff_pid,
-                companion_elf_path=eff_elf,
-                remote_host=ctx_info.get("remote_host"),
-                ssh_user=ctx_info.get("ssh_user"),
-                ssh_port=ctx_info.get("ssh_port", 22),
-                ssh_key=ctx_info.get("ssh_key"),
-                ssh_proxy_jump=ctx_info.get("ssh_proxy_jump"),
+            ctx_info = self.resolve_target_context(
+                pid=pid,
+                companion_elf_path=companion_elf_path,
+                process_name=process_name,
+                remote_host=remote_host,
+                ssh_user=ssh_user,
+                ssh_port=ssh_port,
+                ssh_key=ssh_key,
+                ssh_proxy_jump=ssh_proxy_jump,
                 adapter=adapter,
             )
-        except Exception:
-            triage = {"overall_status": "HEALTHY", "health_score": 100, "findings": []}
-        try:
-            cs_locks = self.inspect_thread_callstacks_and_locks(
-                pid=eff_pid,
-                companion_elf_path=eff_elf,
-                remote_host=ctx_info.get("remote_host"),
-                ssh_user=ctx_info.get("ssh_user"),
-                ssh_port=ctx_info.get("ssh_port", 22),
-                ssh_key=ctx_info.get("ssh_key"),
-                ssh_proxy_jump=ctx_info.get("ssh_proxy_jump"),
-                adapter=adapter,
-            )
-        except Exception:
-            cs_locks = {"threads": []}
+            eff_pid = ctx_info["pid"]
+            eff_elf = ctx_info["companion_elf_path"]
+        except Exception as ctx_exc:
+            eff_pid = pid or 0
+            eff_elf = companion_elf_path or ""
+            ctx_info = {
+                "pid": eff_pid,
+                "companion_elf_path": eff_elf,
+                "process_name": process_name or "target",
+                "build_id": None,
+                "remote_host": remote_host,
+                "ssh_user": ssh_user,
+                "ssh_port": ssh_port,
+                "ssh_key": ssh_key,
+                "ssh_proxy_jump": ssh_proxy_jump,
+            }
+            limitations.append(f"resolve_target_context failed: {type(ctx_exc).__name__}: {ctx_exc}")
+
+        if eff_pid and not remote_host and adapter is None and eff_pid != os.getpid() and not os.path.exists(f"/proc/{eff_pid}"):
+            limitations.append(f"Target process PID {eff_pid} does not exist or has exited (ESRCH).")
+
+        if not limitations:
+            try:
+                triage = self.auto_triage_incident(
+                    pid=eff_pid,
+                    companion_elf_path=eff_elf,
+                    remote_host=ctx_info.get("remote_host"),
+                    ssh_user=ctx_info.get("ssh_user"),
+                    ssh_port=ctx_info.get("ssh_port", 22),
+                    ssh_key=ctx_info.get("ssh_key"),
+                    ssh_proxy_jump=ctx_info.get("ssh_proxy_jump"),
+                    adapter=adapter,
+                )
+                for lim in (triage.get("limitations") or []):
+                    if lim not in limitations:
+                        limitations.append(lim)
+            except Exception as tr_exc:
+                err_str = f"auto_triage_incident failed: {type(tr_exc).__name__}: {tr_exc}"
+                limitations.append(err_str)
+                triage = {"overall_status": "INCONCLUSIVE", "health_score": None, "findings": [], "limitations": [err_str]}
+            try:
+                cs_locks = self.inspect_thread_callstacks_and_locks(
+                    pid=eff_pid,
+                    companion_elf_path=eff_elf,
+                    remote_host=ctx_info.get("remote_host"),
+                    ssh_user=ctx_info.get("ssh_user"),
+                    ssh_port=ctx_info.get("ssh_port", 22),
+                    ssh_key=ctx_info.get("ssh_key"),
+                    ssh_proxy_jump=ctx_info.get("ssh_proxy_jump"),
+                    adapter=adapter,
+                )
+                for lim in (cs_locks.get("limitations") or []):
+                    if lim not in limitations:
+                        limitations.append(lim)
+            except Exception as cs_exc:
+                err_str = f"inspect_thread_callstacks_and_locks failed: {type(cs_exc).__name__}: {cs_exc}"
+                limitations.append(err_str)
+                cs_locks = {"threads": [], "status": "INCONCLUSIVE", "limitations": [err_str]}
+        else:
+            triage = {"overall_status": "INCONCLUSIVE", "health_score": None, "findings": [], "limitations": list(limitations)}
+            cs_locks = {"threads": [], "status": "INCONCLUSIVE", "limitations": list(limitations)}
 
         hyp_res: Optional[Dict[str, Any]] = None
         if hypothesis or assertions:
-            hyp_res = self.verify_runtime_hypothesis(
-                hypothesis=hypothesis or "Runtime State Verification",
-                assertions=assertions or [],
-                pid=eff_pid,
-                companion_elf_path=eff_elf,
-                adapter=adapter,
-            )
+            try:
+                hyp_res = self.verify_runtime_hypothesis(
+                    hypothesis=hypothesis or "Runtime State Verification",
+                    assertions=assertions or [],
+                    pid=eff_pid,
+                    companion_elf_path=eff_elf,
+                    adapter=adapter,
+                )
+                if hyp_res.get("verdict") == DIAG_INCONCLUSIVE:
+                    for ar in hyp_res.get("assertion_results", []):
+                        if ar.get("verdict") == "ABSTAIN" and ar.get("reason"):
+                            if ar["reason"] not in limitations:
+                                limitations.append(ar["reason"])
+            except Exception as hyp_exc:
+                limitations.append(f"verify_runtime_hypothesis failed: {type(hyp_exc).__name__}: {hyp_exc}")
+                hyp_res = None
 
         findings = triage.get("findings") or []
+        overall_status = triage.get("overall_status") or ("INCONCLUSIVE" if limitations else "HEALTHY")
+        if (limitations or cs_locks.get("status") == "INCONCLUSIVE") and not findings and overall_status == "HEALTHY":
+            overall_status = "INCONCLUSIVE"
+        health_score = None if overall_status == "INCONCLUSIVE" else triage.get("health_score", 100)
+
+        measured_stop_ms = round(
+            float(triage.get("stop_duration_ms", 0.0) or 0.0) + float(cs_locks.get("stop_duration_ms", 0.0) or 0.0),
+            3,
+        )
+        collection_mode = str(triage.get("collection_mode") or ("STOPPED" if measured_stop_ms > 0.0 else "ZERO_STOP"))
+
         remediation_checklist: List[str] = []
         for f_item in findings:
             act = f_item.get("recommended_action")
             if act and act not in remediation_checklist:
                 remediation_checklist.append(act)
         if not remediation_checklist:
-            remediation_checklist.append("All inspected memory pools, pointers, and locks are within normal parameters.")
+            if overall_status == "INCONCLUSIVE" or limitations:
+                remediation_checklist.append(
+                    f"Investigation inconclusive due to collection failure(s): {'; '.join(limitations)}. "
+                    "Verify target process accessibility and read permissions."
+                )
+            else:
+                remediation_checklist.append("All inspected memory pools, pointers, and locks are within expected parameters.")
 
         now_iso = datetime.now(timezone.utc).isoformat()
+        status_line = (
+            f"- **Overall Status**: `{overall_status}` (Health Score: `{health_score}/100`)"
+            if health_score is not None
+            else f"- **Overall Status**: `{overall_status}` (Health Score: `N/A — Inconclusive`)"
+        )
         md_lines = [
             f"# {title}",
             "",
@@ -11471,8 +11674,9 @@ class WatchSessionManager:
             f"- **PID**: `{eff_pid}` (`{ctx_info.get('process_name') or 'target'}`)",
             f"- **Companion ELF**: `{eff_elf}`",
             f"- **Build ID**: `{ctx_info.get('build_id') or 'N/A'}`",
-            f"- **Process Stop Duration**: `0.00ms` (Zero-Stop Non-Intrusive Read)",
-            f"- **Overall Status**: `{triage.get('overall_status', 'HEALTHY')}` (Health Score: `{triage.get('health_score', 100)}/100`)",
+            f"- **Collection Mode**: `{collection_mode}`",
+            f"- **Process Stop Duration**: `{measured_stop_ms:.2f}ms` (Measured)",
+            status_line,
             f"- **Generated At**: `{now_iso}`",
             "",
             "## 2. Root-Cause Findings",
@@ -11484,6 +11688,10 @@ class WatchSessionManager:
                 md_lines.append(
                     f"| **{f_item.get('severity')}** | `{f_item.get('category')}` | {f_item.get('title')} | `{f_item.get('source_location') or '-'}` | {f_item.get('recommended_action') or '-'} |"
                 )
+        elif overall_status == "INCONCLUSIVE" or limitations:
+            md_lines.append("- Diagnostic inspection inconclusive: collection failed or target memory was unreadable.")
+            for lim in limitations:
+                md_lines.append(f"  - Limitation: `{lim}`")
         else:
             md_lines.append("- No critical memory corruption, deadlock, or pool exhaustion detected.")
 
@@ -11527,14 +11735,18 @@ class WatchSessionManager:
             else (
                 DIAG_CONFIRMED
                 if any(f.get("severity") in ("CRITICAL", "HIGH") for f in findings)
-                else (DIAG_SUSPECTED if findings else DIAG_NO_ISSUE_DETECTED)
+                else (
+                    DIAG_SUSPECTED
+                    if findings
+                    else (DIAG_INCONCLUSIVE if (overall_status == "INCONCLUSIVE" or limitations) else DIAG_NO_ISSUE_DETECTED)
+                )
             )
         )
         dv = DiagnosticVerdict(
             hypothesis=hypothesis or title,
             final_diagnosis=diag_verdict,
             hypothesis_state="SUPPORTED" if diag_verdict in (DIAG_CONFIRMED, DIAG_NO_ISSUE_DETECTED) else "INCONCLUSIVE",
-            confidence_score=hyp_res["confidence_score"] if hyp_res else (0.9 if not findings else 0.8),
+            confidence_score=hyp_res["confidence_score"] if hyp_res else (0.2 if diag_verdict == DIAG_INCONCLUSIVE else (0.9 if not findings else 0.8)),
             total_assertions=hyp_res["total_assertions"] if hyp_res else 0,
             passed_count=hyp_res["passed_assertions"] if hyp_res else 0,
             failed_count=hyp_res["failed_assertions"] if hyp_res else 0,
@@ -11544,12 +11756,13 @@ class WatchSessionManager:
             attribution_basis=None,
             provenance_class="LIVE_RUNTIME_CAPTURE",
             target_identity={"pid": eff_pid, "companion_elf": eff_elf},
-            limitations=[],
+            limitations=list(limitations),
+            collection_limitations=list(limitations),
             budget_usage={
                 "metrics": {
-                    "target_stop_duration_ms": 0.0,
+                    "target_stop_duration_ms": measured_stop_ms,
                     "observation_latency_us": latency_us,
-                    "bytes_read": 4096,
+                    "bytes_read": 0 if overall_status == "INCONCLUSIVE" else 4096,
                 }
             },
         )
@@ -11602,13 +11815,16 @@ class WatchSessionManager:
             "pid": eff_pid,
             "companion_elf": eff_elf,
             "build_id": ctx_info.get("build_id"),
-            "stop_duration_ms": 0.0,
-            "target_stop_duration_ms": 0.0,
+            "collection_mode": collection_mode,
+            "stop_duration_ms": measured_stop_ms,
+            "target_stop_duration_ms": measured_stop_ms,
             "report_latency_us": latency_us,
             "observation_latency_us": latency_us,
             "title": title,
-            "overall_status": triage.get("overall_status", "HEALTHY"),
-            "health_score": triage.get("health_score", 100),
+            "verdict": diag_verdict,
+            "overall_status": overall_status,
+            "health_score": health_score,
+            "limitations": list(limitations),
             "findings_count": len(findings),
             "findings": findings,
             "hypothesis_verification": hyp_res,
@@ -11621,7 +11837,12 @@ class WatchSessionManager:
             "saved_html_path": saved_html_path,
             "save_html_error": save_html_error,
             "llm_next_step_hint": (
-                f"Generated zero-stop incident report for PID {eff_pid} (Health Score: {triage.get('health_score', 100)}/100, "
-                f"{len(findings)} finding(s))" + (f" and saved to {saved_path}." if saved_path else ".")
+                f"Incident report for PID {eff_pid} is INCONCLUSIVE ({len(limitations)} limitation(s): {'; '.join(limitations[:2])})"
+                + (f" and saved to {saved_path}." if saved_path else ".")
+                if overall_status == "INCONCLUSIVE"
+                else (
+                    f"Generated incident report for PID {eff_pid} (Health Score: {health_score}/100, "
+                    f"{len(findings)} finding(s))" + (f" and saved to {saved_path}." if saved_path else ".")
+                )
             ),
         }

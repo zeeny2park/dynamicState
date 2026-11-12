@@ -76,7 +76,7 @@
         <div>
           <div class="flex items-center gap-2">
             <h1 class="text-sm font-semibold tracking-tight text-slate-900">dynamicState Workspace</h1>
-            <span class="px-2 py-0.5 text-[11px] font-medium rounded-full bg-emerald-50 text-emerald-700 border border-emerald-200 mono">0.00ms Zero-Stop</span>
+            <span class="px-2 py-0.5 text-[11px] font-medium rounded-full bg-emerald-50 text-emerald-700 border border-emerald-200 mono">zero-stop Zero-Stop</span>
             <span id="badge-conn-mode" class="px-2 py-0.5 text-[11px] font-medium rounded-full bg-blue-50 text-blue-700 border border-blue-200 mono">READY</span>
           </div>
           <p class="text-[11px] text-slate-500">대화형 프로세스 메모리 분석 & 실시간 트레이스 시각화 워크스페이스</p>
@@ -421,9 +421,13 @@
       const controller = new AbortController();
       const timerId = setTimeout(() => controller.abort(), timeoutMs);
       try {
+        const reqHeaders = { 'Content-Type': 'application/json' };
+        if (typeof window !== 'undefined' && window.__DYNAMICSTATE_SESSION_TOKEN__) {
+          reqHeaders['X-Session-Token'] = window.__DYNAMICSTATE_SESSION_TOKEN__;
+        }
         const res = await fetch(getApiUrl(endpoint), {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: reqHeaders,
           body: JSON.stringify(payload || {}),
           signal: controller.signal,
         });
@@ -986,7 +990,7 @@
             <div class="flex items-center gap-2.5 text-xs">
               <span class="px-2 py-0.5 rounded-md bg-amber-50 text-amber-800 border border-amber-200 mono font-semibold">변경됨(CHANGED): ${changed.length}</span>
               <span class="px-2 py-0.5 rounded-md bg-slate-100 text-slate-600 border border-slate-200 mono">유지됨(UNCHANGED): ${unchanged.length}</span>
-              <span class="text-slate-500 text-[11px] mono">Window: ${d.wait_ms || 500}ms (0.00ms stop)</span>
+              <span class="text-slate-500 text-[11px] mono">Window: ${d.wait_ms || 500}ms (zero-stop stop)</span>
             </div>
             ${changed.length > 0 ? `
               <div class="bg-white border border-slate-200 rounded-xl overflow-hidden">
@@ -1050,7 +1054,7 @@
                 <div class="text-[10px] text-indigo-300">DPDK Isolated-Core PMD & Lockless Ring Audit (Window ${d.sample_window_ms || 40}ms · Hugepages ${huges.length} · Isolated CPUs [${(d.kernel_isolated_cpus || []).join(",")}])</div>
                 <div class="font-bold text-xs sm:text-sm mt-0.5">${escapeHtml(d.overall_dpdk_status)} · Dedicated PMD ${d.dedicated_pmd_lcores_count || 0}개 · Ring ${rings.length}개</div>
               </div>
-              <span class="px-2.5 py-0.5 rounded-full bg-indigo-500/30 text-indigo-200 border border-indigo-400/30 text-[11px] font-bold">0.00ms Zero-Jitter</span>
+              <span class="px-2.5 py-0.5 rounded-full bg-indigo-500/30 text-indigo-200 border border-indigo-400/30 text-[11px] font-bold">zero-stop Zero-Jitter</span>
             </div>
             <div class="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
               ${lcores.map(lc => {
@@ -1100,7 +1104,7 @@
                 <div class="text-[10px] text-cyan-300">ELF PT_TLS Block Geometry (memsz=${geom.tls_memsz || 0}B · align=${geom.tls_align || 8}B · aligned=${geom.aligned_tls_memsz || 0}B)</div>
                 <div class="font-bold text-xs sm:text-sm mt-0.5">스레드별 독립 TLS(__thread / thread_local) 변수 ${d.tls_variables_discovered || 0}개 · TCB ${d.tcb_resolved_count || 0}/${d.threads_count || 0}개 해독</div>
               </div>
-              <span class="px-2.5 py-0.5 rounded-full bg-cyan-500/30 text-cyan-200 border border-cyan-400/30 text-[11px] font-bold">0.00ms Zero-Stop TLS</span>
+              <span class="px-2.5 py-0.5 rounded-full bg-cyan-500/30 text-cyan-200 border border-cyan-400/30 text-[11px] font-bold">zero-stop Zero-Stop TLS</span>
             </div>
             <div class="grid grid-cols-1 sm:grid-cols-3 gap-2.5">
               ${ths.map(t => `
@@ -1250,7 +1254,7 @@
                 <span class="mx-1.5">·</span>
                 <span class="text-slate-500">측정 구간:</span> <strong>${d.elapsed_ms || 0}ms</strong>
               </div>
-              <span class="px-2.5 py-0.5 rounded-full bg-rose-50 text-rose-700 border border-rose-200 font-bold">0.00ms Statistical Profiler</span>
+              <span class="px-2.5 py-0.5 rounded-full bg-rose-50 text-rose-700 border border-rose-200 font-bold">zero-stop Statistical Profiler</span>
             </div>
             <div class="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
               <div class="bg-white border border-slate-200 rounded-xl p-3 space-y-2">
@@ -1844,7 +1848,7 @@
           <div class="space-y-2.5 text-xs">
             <div class="bg-slate-50 border border-slate-200 rounded-xl p-3 flex flex-wrap items-center justify-between gap-2 mono">
               <span>실행된 배치 스텝: <strong>${d.steps_succeeded ?? 0}/${d.steps_requested ?? 0} 성공</strong></span>
-              <span class="text-emerald-700 font-bold">0.00ms stop (${d.batch_latency_us ?? 0}us elapsed)</span>
+              <span class="text-emerald-700 font-bold">zero-stop stop (${d.batch_latency_us ?? 0}us elapsed)</span>
             </div>
             <div class="space-y-2">
               ${steps.map(st => `
@@ -1967,7 +1971,7 @@
               <h3 class="text-xs sm:text-sm font-semibold text-slate-900">${escapeHtml(card.title)}</h3>
             </div>
             <div class="flex items-center gap-1.5 text-[11px] text-slate-400 mono">
-              <span class="text-emerald-700 font-medium">0.00ms stop</span>
+              <span class="text-emerald-700 font-medium">zero-stop stop</span>
               <span>•</span>
               <span>${escapeHtml(card.timestamp)}</span>
               <button type="button" onclick="refreshTraceCard('${escapeHtml(card.id)}')" title="즉시 새로고침" class="ml-1 px-1.5 py-0.5 rounded hover:bg-slate-100 text-slate-500">↻</button>
@@ -2011,7 +2015,7 @@
           updateTelemetryStrip(backendData.telemetry);
         }
         appendAssistantChatMessage(
-          backendData.title || '프로세스 트레이스 분석 완료 (0.00ms 무정지)',
+          backendData.title || '프로세스 트레이스 분석 완료 (zero-stop 무정지)',
           `<p>${escapeHtml(backendData.reply_markdown || '')}</p>`,
           addedCards,
           false
@@ -2255,7 +2259,7 @@
           const lines = [
             `# dynamicState Process Trace Report (PID ${wsState.pid || 'live'})`,
             `- Generated At: ${new Date().toISOString()}`,
-            `- Stop Duration: 0.00ms (Zero-Stop)`,
+            `- Stop Duration: zero-stop (Zero-Stop)`,
             `- Total Cards: ${wsState.cards.length}`,
             ``
           ];

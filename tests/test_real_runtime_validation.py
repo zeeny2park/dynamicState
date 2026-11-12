@@ -1,3 +1,4 @@
+from extractor.capture_plan import CapturePlan, CaptureMode
 """End-to-End Real Runtime Validation Suite for Dynamic State.
 
 Validates the full production pipeline against a real stripped C++ process:

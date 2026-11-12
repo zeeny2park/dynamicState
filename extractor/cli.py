@@ -81,7 +81,8 @@ def main():
     srv_parser.add_argument("--host", type=str, default="127.0.0.1", help="HTTP host to bind (default: 127.0.0.1)")
     srv_parser.add_argument("--port", type=int, default=8000, help="HTTP port to bind (default: 8000)")
     srv_parser.add_argument("--corpus", type=str, default="corpus", help="Path to State Corpus directory (default: corpus)")
-    srv_parser.add_argument("--mode", type=str, default="CONSISTENT", choices=["CONSISTENT", "LOW_IMPACT"], help="Observation mode (default: CONSISTENT)")
+    srv_parser.add_argument("--mode", type=str, default="LOW_IMPACT", choices=["CONSISTENT", "LOW_IMPACT"], help="Observation mode (default: LOW_IMPACT)")
+    srv_parser.add_argument("--allow-mutation", action="store_true", default=False, help="Explicitly enable CONSISTENT mutation mode")
     srv_parser.add_argument("--snapshot", type=str, default=None, help="Optional snapshot file to load into corpus")
     srv_parser.add_argument("--binary", type=str, default=None, help="Optional target binary path")
     srv_parser.add_argument("--debug-image", type=str, default=None, help="Optional external debug image path")
@@ -229,7 +230,7 @@ def main():
     rec_p.add_argument("--corpus", type=str, default="corpus", help="Corpus directory")
 
     # 15. Phase 10 CLI subcommands (watch-until, traverse-list, callstacks, audit, resolve-func, inspect-shm)
-    wu_p = subparsers.add_parser("watch-until", help="Poll target until condition expression triggers (0.00ms stop)")
+    wu_p = subparsers.add_parser("watch-until", help="Poll target until condition expression triggers (zero-stop stop)")
     wu_p.add_argument("-p", "--pid", type=int, required=True)
     wu_p.add_argument("-d", "--debug-image", "--companion-elf", dest="debug_image", type=str, required=True)
     wu_p.add_argument("-c", "--condition", type=str, required=True, help="Condition expression e.g. gpMem->active_buffers >= 5")
@@ -243,7 +244,7 @@ def main():
     wu_p.add_argument("--ssh-proxy-jump", type=str, default=None)
     wu_p.add_argument("--corpus", type=str, default="corpus")
 
-    tl_p = subparsers.add_parser("traverse-list", help="Traverse a non-contiguous linked list or pointer chain (0.00ms stop)")
+    tl_p = subparsers.add_parser("traverse-list", help="Traverse a non-contiguous linked list or pointer chain (zero-stop stop)")
     tl_p.add_argument("-p", "--pid", type=int, required=True)
     tl_p.add_argument("-d", "--debug-image", "--companion-elf", dest="debug_image", type=str, required=True)
     tl_p.add_argument("-e", "--expr", type=str, required=True, help="Head pointer/struct expression e.g. g_task_list")
@@ -256,7 +257,7 @@ def main():
     tl_p.add_argument("--ssh-proxy-jump", type=str, default=None)
     tl_p.add_argument("--corpus", type=str, default="corpus")
 
-    cs_p = subparsers.add_parser("callstacks", help="Unwind thread callstacks and inspect mutex locks / deadlocks (0.00ms stop)")
+    cs_p = subparsers.add_parser("callstacks", help="Unwind thread callstacks and inspect mutex locks / deadlocks (zero-stop stop)")
     cs_p.add_argument("-p", "--pid", type=int, required=True)
     cs_p.add_argument("-d", "--debug-image", "--companion-elf", dest="debug_image", type=str, required=True)
     cs_p.add_argument("--tid", type=int, default=None)
@@ -267,7 +268,7 @@ def main():
     cs_p.add_argument("--ssh-proxy-jump", type=str, default=None)
     cs_p.add_argument("--corpus", type=str, default="corpus")
 
-    au_p = subparsers.add_parser("audit", help="Audit DWARF pointers, bools, enums, and memory pools for corruption (0.00ms stop)")
+    au_p = subparsers.add_parser("audit", help="Audit DWARF pointers, bools, enums, and memory pools for corruption (zero-stop stop)")
     au_p.add_argument("-p", "--pid", type=int, required=True)
     au_p.add_argument("-d", "--debug-image", "--companion-elf", dest="debug_image", type=str, required=True)
     au_p.add_argument("-e", "--expr", type=str, default=None)
@@ -278,7 +279,7 @@ def main():
     au_p.add_argument("--ssh-proxy-jump", type=str, default=None)
     au_p.add_argument("--corpus", type=str, default="corpus")
 
-    rf_p = subparsers.add_parser("resolve-func", help="Resolve function pointers and C++ vtable slots to source file:line (0.00ms stop)")
+    rf_p = subparsers.add_parser("resolve-func", help="Resolve function pointers and C++ vtable slots to source file:line (zero-stop stop)")
     rf_p.add_argument("-p", "--pid", type=int, required=True)
     rf_p.add_argument("-d", "--debug-image", "--companion-elf", dest="debug_image", type=str, required=True)
     rf_p.add_argument("-e", "--expr", type=str, required=True)
@@ -289,7 +290,7 @@ def main():
     rf_p.add_argument("--ssh-proxy-jump", type=str, default=None)
     rf_p.add_argument("--corpus", type=str, default="corpus")
 
-    shm_p = subparsers.add_parser("inspect-shm", help="Inspect shared memory / IPC mappings with DWARF type overlay casting (0.00ms stop)")
+    shm_p = subparsers.add_parser("inspect-shm", help="Inspect shared memory / IPC mappings with DWARF type overlay casting (zero-stop stop)")
     shm_p.add_argument("-p", "--pid", type=int, required=True)
     shm_p.add_argument("-d", "--debug-image", "--companion-elf", dest="debug_image", type=str, required=True)
     shm_p.add_argument("--cast-type", type=str, default=None)
@@ -302,7 +303,7 @@ def main():
     shm_p.add_argument("--ssh-proxy-jump", type=str, default=None)
     shm_p.add_argument("--corpus", type=str, default="corpus")
 
-    fl_p = subparsers.add_parser("frame-locals", help="Decode active thread stack frame parameters and local variables (0.00ms stop)")
+    fl_p = subparsers.add_parser("frame-locals", help="Decode active thread stack frame parameters and local variables (zero-stop stop)")
     fl_p.add_argument("-p", "--pid", type=int, required=True)
     fl_p.add_argument("-d", "--debug-image", "--companion-elf", dest="debug_image", type=str, required=True)
     fl_p.add_argument("--tid", type=int, default=None)
@@ -323,7 +324,7 @@ def main():
     at_p.add_argument("--ssh-proxy-jump", type=str, default=None)
     at_p.add_argument("--corpus", type=str, default="corpus")
 
-    ipc_p = subparsers.add_parser("ipc-pipeline", help="Analyze cross-process shared memory & IPC pipeline bottlenecks (0.00ms stop)")
+    ipc_p = subparsers.add_parser("ipc-pipeline", help="Analyze cross-process shared memory & IPC pipeline bottlenecks (zero-stop stop)")
     ipc_p.add_argument("-p", "--pid", type=int, required=True)
     ipc_p.add_argument("-d", "--debug-image", "--companion-elf", dest="debug_image", type=str, required=True)
     ipc_p.add_argument("--cast-type", type=str, default=None)
@@ -336,7 +337,7 @@ def main():
     ipc_p.add_argument("--ssh-proxy-jump", type=str, default=None)
     ipc_p.add_argument("--corpus", type=str, default="corpus")
 
-    hp_p = subparsers.add_parser("scan-heap", help="Scan [heap] for C++ polymorphic objects via vtable and detect unreachable leaks (0.00ms stop)")
+    hp_p = subparsers.add_parser("scan-heap", help="Scan [heap] for C++ polymorphic objects via vtable and detect unreachable leaks (zero-stop stop)")
     hp_p.add_argument("-p", "--pid", type=int, required=True)
     hp_p.add_argument("-d", "--debug-image", "--companion-elf", dest="debug_image", type=str, required=True)
     hp_p.add_argument("--class-filter", type=str, default=None)
@@ -347,7 +348,7 @@ def main():
     hp_p.add_argument("--ssh-proxy-jump", type=str, default=None)
     hp_p.add_argument("--corpus", type=str, default="corpus")
 
-    dg_p = subparsers.add_parser("dependency-graph", help="Synthesize cross-entity dependency & causal graph (0.00ms stop)")
+    dg_p = subparsers.add_parser("dependency-graph", help="Synthesize cross-entity dependency & causal graph (zero-stop stop)")
     dg_p.add_argument("-p", "--pid", type=int, required=True)
     dg_p.add_argument("-d", "--debug-image", "--companion-elf", dest="debug_image", type=str, required=True)
     dg_p.add_argument("--remote-host", type=str, default=None)
@@ -357,7 +358,7 @@ def main():
     dg_p.add_argument("--ssh-proxy-jump", type=str, default=None)
     dg_p.add_argument("--corpus", type=str, default="corpus")
 
-    cs_p = subparsers.add_parser("correlate-source", help="Correlate DWARF source locations with C/C++ code and inline live variables (0.00ms stop)")
+    cs_p = subparsers.add_parser("correlate-source", help="Correlate DWARF source locations with C/C++ code and inline live variables (zero-stop stop)")
     cs_p.add_argument("-p", "--pid", type=int, required=True)
     cs_p.add_argument("-d", "--debug-image", "--companion-elf", dest="debug_image", type=str, required=True)
     cs_p.add_argument("--source-location", type=str, default=None)
@@ -370,7 +371,7 @@ def main():
     cs_p.add_argument("--ssh-proxy-jump", type=str, default=None)
     cs_p.add_argument("--corpus", type=str, default="corpus")
 
-    is_p = subparsers.add_parser("investigate-symptom", help="Autonomous symptom-driven root-cause investigator (0.00ms stop)")
+    is_p = subparsers.add_parser("investigate-symptom", help="Autonomous symptom-driven root-cause investigator (zero-stop stop)")
     is_p.add_argument("-p", "--pid", type=int, required=True)
     is_p.add_argument("-d", "--debug-image", "--companion-elf", dest="debug_image", type=str, required=True)
     is_p.add_argument("-q", "--query", "--symptom", dest="symptom_query", type=str, default="왜 멈췄지? 전체적인 문제를 종합 분석해줘")
@@ -381,7 +382,7 @@ def main():
     is_p.add_argument("--ssh-proxy-jump", type=str, default=None)
     is_p.add_argument("--corpus", type=str, default="corpus")
 
-    sh_p = subparsers.add_parser("hotspots", help="Zero-stop statistical CPU & callstack hotspot profiler (0.00ms stop)")
+    sh_p = subparsers.add_parser("hotspots", help="Zero-stop statistical CPU & callstack hotspot profiler (zero-stop stop)")
     sh_p.add_argument("-p", "--pid", type=int, required=True)
     sh_p.add_argument("-d", "--debug-image", "--companion-elf", dest="debug_image", type=str, required=True)
     sh_p.add_argument("--samples", dest="samples_count", type=int, default=6)
@@ -393,7 +394,7 @@ def main():
     sh_p.add_argument("--ssh-proxy-jump", type=str, default=None)
     sh_p.add_argument("--corpus", type=str, default="corpus")
 
-    fz_p = subparsers.add_parser("fuzzy-resolve", help="Resolve vague natural-language concepts to DWARF symbols and live values (0.00ms stop)")
+    fz_p = subparsers.add_parser("fuzzy-resolve", help="Resolve vague natural-language concepts to DWARF symbols and live values (zero-stop stop)")
     fz_p.add_argument("-p", "--pid", type=int, required=True)
     fz_p.add_argument("-d", "--debug-image", "--companion-elf", dest="debug_image", type=str, required=True)
     fz_p.add_argument("-q", "--query", dest="natural_query", type=str, required=True)
@@ -405,7 +406,7 @@ def main():
     fz_p.add_argument("--ssh-proxy-jump", type=str, default=None)
     fz_p.add_argument("--corpus", type=str, default="corpus")
 
-    fr_p = subparsers.add_parser("flight-recorder", help="Zero-stop Anomaly Time-Machine Flight Recorder ring buffer (0.00ms stop)")
+    fr_p = subparsers.add_parser("flight-recorder", help="Zero-stop Anomaly Time-Machine Flight Recorder ring buffer (zero-stop stop)")
     fr_p.add_argument("-p", "--pid", type=int, required=True)
     fr_p.add_argument("-d", "--debug-image", "--companion-elf", dest="debug_image", type=str, required=True)
     fr_p.add_argument("--frames", dest="frames_count", type=int, default=8)
@@ -417,7 +418,7 @@ def main():
     fr_p.add_argument("--ssh-proxy-jump", type=str, default=None)
     fr_p.add_argument("--corpus", type=str, default="corpus")
 
-    bd_p = subparsers.add_parser("behavioral-drift", help="Zero-stop multi-dimensional behavioral drift detector (0.00ms stop)")
+    bd_p = subparsers.add_parser("behavioral-drift", help="Zero-stop multi-dimensional behavioral drift detector (zero-stop stop)")
     bd_p.add_argument("-p", "--pid", type=int, required=True)
     bd_p.add_argument("-d", "--debug-image", "--companion-elf", dest="debug_image", type=str, required=True)
     bd_p.add_argument("--save-baseline", action="store_true")
@@ -428,7 +429,7 @@ def main():
     bd_p.add_argument("--ssh-proxy-jump", type=str, default=None)
     bd_p.add_argument("--corpus", type=str, default="corpus")
 
-    tls_p = subparsers.add_parser("tls-vars", help="Decode per-thread TLS (__thread / thread_local) variables in 0.00ms zero-stop mode")
+    tls_p = subparsers.add_parser("tls-vars", help="Decode per-thread TLS (__thread / thread_local) variables in zero-stop zero-stop mode")
     tls_p.add_argument("-p", "--pid", type=int, required=True)
     tls_p.add_argument("-d", "--debug-image", "--companion-elf", dest="debug_image", type=str, required=True)
     tls_p.add_argument("--tid", type=int, default=None)
@@ -440,7 +441,7 @@ def main():
     tls_p.add_argument("--ssh-proxy-jump", type=str, default=None)
     tls_p.add_argument("--corpus", type=str, default="corpus")
 
-    vc_p = subparsers.add_parser("verify-consistency", help="Optimistic Seqlock double-read concurrency verifier (0.00ms stop)")
+    vc_p = subparsers.add_parser("verify-consistency", help="Optimistic Seqlock double-read concurrency verifier (zero-stop stop)")
     vc_p.add_argument("-p", "--pid", type=int, required=True)
     vc_p.add_argument("-d", "--debug-image", "--companion-elf", dest="debug_image", type=str, required=True)
     vc_p.add_argument("-e", "--expressions", type=str, default=None, help="Comma-separated expressions to verify")
@@ -453,7 +454,7 @@ def main():
     vc_p.add_argument("--ssh-proxy-jump", type=str, default=None)
     vc_p.add_argument("--corpus", type=str, default="corpus")
 
-    dpdk_p = subparsers.add_parser("dpdk-lcores", help="Inspect DPDK isolated-core dedicated lcores, PMD poll loops, lockless rings, and spinlocks (0.00ms stop)")
+    dpdk_p = subparsers.add_parser("dpdk-lcores", help="Inspect DPDK isolated-core dedicated lcores, PMD poll loops, lockless rings, and spinlocks (zero-stop stop)")
     dpdk_p.add_argument("-p", "--pid", type=int, required=True)
     dpdk_p.add_argument("-d", "--debug-image", "--companion-elf", dest="debug_image", type=str, required=True)
     dpdk_p.add_argument("--window-ms", dest="sample_window_ms", type=int, default=40)
@@ -466,7 +467,7 @@ def main():
     dpdk_p.add_argument("--ssh-proxy-jump", type=str, default=None)
     dpdk_p.add_argument("--corpus", type=str, default="corpus")
 
-    ask_p = subparsers.add_parser("ask", help="Universal 1-Call Zero-Stop Intent Gateway with forgiving C/C++ expressions & auto-heal PID (0.00ms stop)")
+    ask_p = subparsers.add_parser("ask", help="Universal 1-Call Zero-Stop Intent Gateway with forgiving C/C++ expressions & auto-heal PID (zero-stop stop)")
     ask_p.add_argument("-q", "--question", type=str, required=True, help="C/C++ expression or natural-language diagnostic question")
     ask_p.add_argument("-p", "--pid", type=int, default=None, help="Optional target PID (auto-resolved if omitted)")
     ask_p.add_argument("-d", "--debug-image", "--companion-elf", dest="debug_image", type=str, default=None, help="Optional companion ELF (auto-discovered from /proc/<pid>/exe if omitted)")
@@ -484,7 +485,7 @@ def main():
     coerce_p.add_argument("-d", "--debug-image", "--companion-elf", dest="debug_image", type=str, default=None)
     coerce_p.add_argument("--corpus", type=str, default="corpus")
 
-    sc_p = subparsers.add_parser("smart-compact", help="LLM token-budgeted anomaly-first smart compactor & cursor paginator (0.00ms stop)")
+    sc_p = subparsers.add_parser("smart-compact", help="LLM token-budgeted anomaly-first smart compactor & cursor paginator (zero-stop stop)")
     sc_p.add_argument("-q", "--query", type=str, default="*gpMem")
     sc_p.add_argument("-m", "--mode", type=str, default="auto", choices=["auto", "pool", "eval", "ask"])
     sc_p.add_argument("-p", "--pid", type=int, default=None)
@@ -494,13 +495,13 @@ def main():
     sc_p.add_argument("--page-size", type=int, default=16)
     sc_p.add_argument("--corpus", type=str, default="corpus")
 
-    be_p = subparsers.add_parser("batch-exec", help="1-Call Multi-Tool Composite Batch Macro Executor (0.00ms stop)")
+    be_p = subparsers.add_parser("batch-exec", help="1-Call Multi-Tool Composite Batch Macro Executor (zero-stop stop)")
     be_p.add_argument("--steps-json", type=str, required=True, help="JSON list of step objects")
     be_p.add_argument("-p", "--pid", type=int, default=None)
     be_p.add_argument("-d", "--debug-image", "--companion-elf", dest="debug_image", type=str, default=None)
     be_p.add_argument("--corpus", type=str, default="corpus")
 
-    vh_p = subparsers.add_parser("verify-hypothesis", help="Declarative multi-assertion hypothesis verifier (0.00ms stop)")
+    vh_p = subparsers.add_parser("verify-hypothesis", help="Declarative multi-assertion hypothesis verifier (zero-stop stop)")
     vh_p.add_argument("--hypothesis", type=str, required=True)
     vh_p.add_argument("-a", "--assertions", type=str, required=True, help="Comma-separated assertions e.g. 'gpMem.active_buffers>=2,buffers[5].seq==5005'")
     vh_p.add_argument("--report-html", dest="report_html_path", type=str, default=None, help="Optional output path for standalone Zero-CDN HTML verification report")
@@ -671,8 +672,8 @@ def main():
         from .web.server import run_server, run_server_loop
         corpus_dir = os.path.abspath(args.corpus)
         os.makedirs(corpus_dir, exist_ok=True)
-        runtime = AgentRuntime(corpus_dir=corpus_dir)
-        runtime.observation_mode = args.mode
+        eff_mode = "CONSISTENT" if getattr(args, "allow_mutation", False) else args.mode
+        runtime = AgentRuntime(corpus_dir=corpus_dir, observation_mode=eff_mode, allow_mutation=getattr(args, "allow_mutation", False))
 
         if args.snapshot:
             if os.path.exists(args.snapshot):

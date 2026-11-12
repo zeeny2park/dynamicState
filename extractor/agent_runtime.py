@@ -55,7 +55,7 @@ class AgentRuntime:
     All operations are strictly bound by runtime safety boundaries.
     """
 
-    def __init__(self, controller: Optional[RuntimeController] = None, corpus_dir: str = "corpus"):
+    def __init__(self, controller: Optional[RuntimeController] = None, corpus_dir: str = "corpus", observation_mode: str = "LOW_IMPACT", allow_mutation: bool = False):
         self.controller = controller
         self.corpus_dir = os.path.abspath(corpus_dir)
         self.corpus = StateCorpus(self.corpus_dir)
@@ -72,7 +72,8 @@ class AgentRuntime:
         # Phase 5.1 Low-Impact Memory Snapshot support
         self.memory_snapshots: Dict[str, Any] = {}
         self.raw_snapshots_dir: str = os.path.join(self.corpus_dir, "memory_snapshots")
-        self.observation_mode: str = "CONSISTENT"
+        self.allow_mutation: bool = bool(allow_mutation)
+        self.observation_mode: str = "CONSISTENT" if (allow_mutation and observation_mode == "LOW_IMPACT") else observation_mode
         self._memory_capturer: Any = None
         self._offline_analyzer: Any = None
 
@@ -119,7 +120,7 @@ class AgentRuntime:
         try:
             if act == "OBSERVE":
                 return self.observe(
-                    mode=action.mode or "CONSISTENT",
+                    mode=action.mode or self.observation_mode or "LOW_IMPACT",
                     pid=action.pid,
                     policy=action.policy or "ALL_READABLE",
                     max_bytes=action.max_bytes,
@@ -326,7 +327,7 @@ class AgentRuntime:
     # Observation & Snapshot Operations
     # -------------------------------------------------------------------------
 
-    def observe(self, mode: str = "CONSISTENT", pid: Optional[int] = None,
+    def observe(self, mode: str = "LOW_IMPACT", pid: Optional[int] = None,
                 policy: str = "ALL_READABLE", max_bytes: Optional[int] = None,
                 debug_image: Optional[str] = None) -> AgentActionResult:
         """Return a compact semantic summary of the current runtime state.
@@ -1533,7 +1534,7 @@ class AgentRuntime:
             return self._error("PROCESS_NOT_FOUND", "Valid running PID required for fast state capture", "FAST_CAPTURE", t0)
 
         plan_obj = plan if isinstance(plan, CapturePlan) else (
-            CapturePlan.from_dict(plan) if isinstance(plan, dict) else CapturePlanBuilder.build_full_plan()
+            CapturePlan.from_dict(plan) if isinstance(plan, dict) else CapturePlanBuilder.build_zero_stop_plan()
         )
         policy_obj = policy if isinstance(policy, CaptureSafetyPolicy) else (
             CaptureSafetyPolicy(**policy) if isinstance(policy, dict) else CaptureSafetyPolicy()
@@ -1705,6 +1706,8 @@ class AgentRuntime:
     ) -> AgentActionResult:
         """Attempt replay of a snapshot mutation onto a live process."""
         t0 = time.monotonic()
+        if getattr(self, "observation_mode", "LOW_IMPACT") == "LOW_IMPACT" and not getattr(self, "allow_mutation", False):
+            return self._error("CAPABILITY_UNSUPPORTED", "Live mutation replay is not supported in LOW_IMPACT observation mode", "REPLAY_MUTATION", t0)
         res = StateReplayer.replay(
             controller=self.controller,
             target_object_id=target_object_id,

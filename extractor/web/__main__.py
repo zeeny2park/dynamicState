@@ -24,9 +24,11 @@ def main():
                         help="HTTP port to bind (default: 8000)")
     parser.add_argument("--corpus", type=str, default="corpus",
                         help="Path to State Corpus directory (default: corpus)")
-    parser.add_argument("--mode", type=str, default="CONSISTENT",
+    parser.add_argument("--mode", type=str, default="LOW_IMPACT",
                         choices=["CONSISTENT", "LOW_IMPACT"],
-                        help="Initial observation mode (default: CONSISTENT)")
+                        help="Initial observation mode (default: LOW_IMPACT)")
+    parser.add_argument("--allow-mutation", action="store_true", default=False,
+                        help="Explicitly enable CONSISTENT mutation mode")
     parser.add_argument("--binary", type=str, default=None,
                         help="Path to target binary (optional)")
     parser.add_argument("--debug-image", type=str, default=None,
@@ -39,8 +41,8 @@ def main():
     # Initialize AgentRuntime with corpus
     corpus_dir = os.path.abspath(args.corpus)
     os.makedirs(corpus_dir, exist_ok=True)
-    runtime = AgentRuntime(corpus_dir=corpus_dir)
-    runtime.observation_mode = args.mode
+    eff_mode = "CONSISTENT" if getattr(args, "allow_mutation", False) else args.mode
+    runtime = AgentRuntime(corpus_dir=corpus_dir, observation_mode=eff_mode, allow_mutation=getattr(args, "allow_mutation", False))
 
     server = run_server(runtime=runtime, host=args.host, port=args.port)
 

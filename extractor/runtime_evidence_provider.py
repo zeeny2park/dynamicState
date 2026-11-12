@@ -6,7 +6,7 @@ DWARF symbol paths, thread callstacks and mutex lock graphs, heap census).
 
 Guarantees:
 - Real target collection: NEVER fabricate values or report LIVE_RUNTIME_CAPTURE without an actual read.
-- Embedded friendliness: 0.00ms target stop time, zero Python/GDB on target.
+- Embedded friendliness: zero-stop target observation, zero Python/GDB on target.
 - Honest limitations: graceful degradation on missing DWARF, unreadable memory, or permission denial.
 """
 
@@ -1254,12 +1254,73 @@ class RuntimeEvidenceProvider:
                     observation_data["incomplete_lock_graph"] = True
                     observation_data["insufficient_lock_info"] = True
 
+                observation_data["cycle_persistent"] = False
+                observation_data["is_persistent"] = False
+                observation_data["observation_count"] = 1
+                observation_data["historical_observations"] = 1
+
                 if callstacks_info.get("deadlock_detected"):
                     cycle = observation_data["deadlock_cycle"]
-                    observation_data["cycle_tids"] = [
+                    first_cycle_tids = [
                         c.get("tid") or c.get("waiter_tid")
                         for c in cycle if isinstance(c, dict)
                     ]
+                    first_cycle_edges = {
+                        (
+                            int(c.get("waiter_tid") or c.get("tid") or 0),
+                            str(c.get("lock_address") or c.get("lock_name") or ""),
+                            int(c.get("owner_tid") or 0),
+                        )
+                        for c in cycle if isinstance(c, dict)
+                    }
+                    observation_data["cycle_tids"] = first_cycle_tids
+
+                    # IMP-003: Re-observe after a short interval to verify whether the circular wait persists
+                    reobserve_delay = float(recipe.thresholds_and_conditions.get("reobserve_interval_sec", 0.05))
+                    if reobserve_delay > 0:
+                        time.sleep(min(reobserve_delay, 0.25))
+                    callstacks_info_2 = self.watch_manager.inspect_thread_callstacks_and_locks(
+                        pid=pid,
+                        companion_elf_path=companion_elf or "",
+                        adapter=self.adapter,
+                    )
+                    rec_2 = RuntimeEvidenceRecord(
+                        evidence_id=f"ev_{uuid.uuid4().hex[:12]}",
+                        collection_method="watch_manager.inspect_thread_callstacks_and_locks",
+                        target_pid=pid,
+                        observed_value={
+                            "deadlock_detected": callstacks_info_2.get("deadlock_detected", False),
+                            "threads_analyzed": len(callstacks_info_2.get("threads", [])),
+                            "sample_index": 2,
+                        },
+                        collection_scope="THREAD_LOCK_GRAPH",
+                        collection_status=COLLECTION_STATUS_SUCCESS,
+                        provenance_class=PROVENANCE_LIVE_RUNTIME_CAPTURE,
+                        raw_details=callstacks_info_2,
+                    )
+                    all_records.append(rec_2)
+                    observation_data["observation_count"] = 2
+                    observation_data["historical_observations"] = 2
+
+                    dl_cycles_2 = callstacks_info_2.get("deadlock_cycles", [])
+                    dl_first_2 = callstacks_info_2.get("deadlock_cycle") or (dl_cycles_2[0] if dl_cycles_2 else [])
+                    second_cycle_edges = {
+                        (
+                            int(c.get("waiter_tid") or c.get("tid") or 0),
+                            str(c.get("lock_address") or c.get("lock_name") or ""),
+                            int(c.get("owner_tid") or 0),
+                        )
+                        for c in dl_first_2 if isinstance(c, dict)
+                    }
+                    same_cycle_persisted = bool(
+                        callstacks_info_2.get("deadlock_detected")
+                        and first_cycle_edges
+                        and first_cycle_edges == second_cycle_edges
+                    )
+                    observation_data["cycle_persistent"] = same_cycle_persisted
+                    observation_data["is_persistent"] = same_cycle_persisted
+                    if not same_cycle_persisted and not callstacks_info_2.get("deadlock_detected"):
+                        observation_data["transient_cycle_resolved"] = True
                 else:
                     blocked = callstacks_info.get("blocked_threads", [])
                     if blocked:

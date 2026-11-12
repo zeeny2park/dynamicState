@@ -110,6 +110,7 @@ class TargetContextSection:
     companion_elf: Optional[str] = None
     target_capabilities: List[str] = field(default_factory=list)
     collection_mode: str = "ZERO_STOP_LIVE_RUNTIME"
+    target_stop_duration_ms: float = 0.0
     observation_interval_sec: Optional[float] = None
     observation_duration_sec: Optional[float] = None
     investigation_start_time: str = ""
@@ -609,7 +610,7 @@ class DiagnosticReport:
                 f"- **Process Start Identity**: `{sec_b.process_start_identity or 'N/A'}`",
                 f"- **Binary / Build ID**: `{sec_b.binary_path}` | Build ID: `{sec_b.build_id or 'N/A'}`",
                 f"- **Companion ELF**: `{sec_b.companion_elf or 'N/A'}`",
-                f"- **Collection Mode**: `{sec_b.collection_mode}` (Interval: `{sec_b.observation_interval_sec}s`, Duration: `{sec_b.observation_duration_sec}s`)",
+                f"- **Collection Mode**: `{sec_b.collection_mode}` (Stop Duration: `{sec_b.target_stop_duration_ms:.2f}ms`, Interval: `{sec_b.observation_interval_sec}s`, Duration: `{sec_b.observation_duration_sec}s`)",
                 f"- **Timestamps**: Start: `{sec_b.investigation_start_time}` | End: `{sec_b.investigation_end_time}`",
                 f"- **Target Capabilities**: `{', '.join(sec_b.target_capabilities) if sec_b.target_capabilities else 'NONE'}`",
             ])
@@ -732,6 +733,8 @@ class DiagnosticReport:
                     if f.causal_relationships:
                         md.append(f"- **Causal Links**: {'; '.join(f.causal_relationships)}")
                     md.append("")
+            elif sec_a and sec_a.overall_result in ("INCONCLUSIVE", "ABORTED"):
+                md.append("- Investigation inconclusive: no findings confirmed due to insufficient evidence or collection failure.\n")
             else:
                 md.append("- No abnormal findings detected.\n")
 
@@ -984,7 +987,7 @@ class DiagnosticReport:
                 f"<tr><td><strong>Process / PID</strong></td><td><code>{html.escape(sec_b.target_process_name)}</code> (PID: {html.escape(str(sec_b.pid))}) | Start Identity: <code>{html.escape(str(sec_b.process_start_identity or 'N/A'))}</code></td></tr>",
                 f"<tr><td><strong>Binary / Build ID</strong></td><td><code>{html.escape(str(sec_b.binary_path))}</code> | Build ID: <code>{html.escape(str(sec_b.build_id))}</code></td></tr>",
                 f"<tr><td><strong>Companion ELF</strong></td><td><code>{html.escape(str(sec_b.companion_elf))}</code></td></tr>",
-                f"<tr><td><strong>Collection Mode</strong></td><td>{html.escape(sec_b.collection_mode)} (Interval: {sec_b.observation_interval_sec}s, Duration: {sec_b.observation_duration_sec}s)</td></tr>",
+                f"<tr><td><strong>Collection Mode</strong></td><td>{html.escape(sec_b.collection_mode)} (Stop Duration: {sec_b.target_stop_duration_ms:.2f}ms, Interval: {sec_b.observation_interval_sec}s, Duration: {sec_b.observation_duration_sec}s)</td></tr>",
                 f"<tr><td><strong>Execution Window</strong></td><td>Start: {html.escape(sec_b.investigation_start_time)}<br>End: {html.escape(sec_b.investigation_end_time)}</td></tr>",
                 f"<tr><td><strong>Target Capabilities</strong></td><td><code>{html.escape(', '.join(sec_b.target_capabilities))}</code></td></tr>",
                 f"<tr><td><strong>Collection Failures / Limitations</strong></td><td>{html.escape('; '.join(sec_b.collection_failures + sec_b.environmental_limitations)) or '<em>None</em>'}</td></tr>",
@@ -1066,6 +1069,8 @@ class DiagnosticReport:
                         "</div>",
                         "</details>",
                     ])
+            elif sec_a and sec_a.overall_result in ("INCONCLUSIVE", "ABORTED"):
+                html_out.append("<p><em>Investigation inconclusive: no findings confirmed due to insufficient evidence or collection failure.</em></p>")
             else:
                 html_out.append("<p><em>No abnormal findings recorded.</em></p>")
 

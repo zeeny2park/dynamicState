@@ -113,16 +113,19 @@ class TestPhase52WebAndMcpDefensiveHardening(unittest.TestCase):
                 cls.target_proc.kill()
         cls.tmp_dir.cleanup()
 
-    def _http_post_raw(self, path: str, raw_body: bytes, headers: dict = None) -> tuple:
+    def _http_post_raw(self, path: str, raw_body: bytes, headers: dict = None, include_token: bool = True) -> tuple:
         conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=10)
         hdrs = {"Content-Type": "application/json"}
+        if include_token:
+            hdrs["X-Session-Token"] = self.server.session_token
         if headers:
             hdrs.update(headers)
         conn.request("POST", path, body=raw_body, headers=hdrs)
         resp = conn.getresponse()
         data = resp.read().decode("utf-8", errors="replace")
+        resp_headers = {k.lower(): v for k, v in resp.getheaders()}
         conn.close()
-        return resp.status, json.loads(data)
+        return resp.status, (json.loads(data) if data else {}), resp_headers
 
     def test_01_mcp_rejects_reserved_and_invalid_pids_gracefully(self) -> None:
         """Verifies MCP tools never throw unhandled exceptions on pid=1, pid=0, negative PIDs, or booleans."""
@@ -193,28 +196,28 @@ class TestPhase52WebAndMcpDefensiveHardening(unittest.TestCase):
     def test_03_web_api_handles_malformed_json_and_adversarial_params(self) -> None:
         """Verifies Web API returns structured JSON errors on invalid JSON, non-dict bodies, and bad parameters."""
         # 1. Malformed JSON syntax
-        st, body = self._http_post_raw("/api/workspace/chat", b"{not valid json")
+        st, body, _ = self._http_post_raw("/api/workspace/chat", b"{not valid json")
         self.assertEqual(st, 400)
         self.assertFalse(body["success"])
         self.assertEqual(body["error"]["code"], "BAD_REQUEST")
 
         # 2. Non-object JSON payload (e.g. JSON array or string)
         for non_obj in (b"[1, 2, 3]", b'"just_a_string"', b"12345"):
-            st, body = self._http_post_raw("/api/workspace/chat", non_obj)
+            st, body, _ = self._http_post_raw("/api/workspace/chat", non_obj)
             self.assertEqual(st, 400)
             self.assertFalse(body["success"])
             self.assertEqual(body["error"]["code"], "BAD_REQUEST")
 
         # 3. Reserved/negative PIDs rejected cleanly
         for bad_pid in (1, -1936537, True):
-            st, body = self._http_post_raw(
+            st, body, _ = self._http_post_raw(
                 "/api/watch/scan-pool",
                 json.dumps({"pid": bad_pid, "companion_elf": self.bin_path, "base_expression": "*gpMem"}).encode("utf-8"),
             )
             self.assertFalse(body["success"])
 
         # 4. Non-numeric parameter strings coerced safely to defaults without ValueError
-        st, body = self._http_post_raw(
+        st, body, _ = self._http_post_raw(
             "/api/watch/smart-compact",
             json.dumps({
                 "pid": self.target_proc.pid,
@@ -232,7 +235,7 @@ class TestPhase52WebAndMcpDefensiveHardening(unittest.TestCase):
 
     def test_04_workspace_chat_isolates_per_card_errors_and_serves_hardened_ui(self) -> None:
         """Verifies /api/workspace/chat isolates per-card failures and /workspace serves hardened JS."""
-        st, body = self._http_post_raw(
+        st, body, _ = self._http_post_raw(
             "/api/workspace/chat",
             json.dumps({
                 "pid": self.target_proc.pid,
@@ -246,7 +249,7 @@ class TestPhase52WebAndMcpDefensiveHardening(unittest.TestCase):
         self.assertGreaterEqual(len(cards), 1)
 
         # Verify /api/watch/callstack-locks alias works
-        st2, body2 = self._http_post_raw(
+        st2, body2, _ = self._http_post_raw(
             "/api/watch/callstack-locks",
             json.dumps({"pid": self.target_proc.pid, "companion_elf": self.bin_path}).encode("utf-8"),
         )
@@ -262,6 +265,128 @@ class TestPhase52WebAndMcpDefensiveHardening(unittest.TestCase):
         self.assertEqual(resp.status, 200)
         self.assertIn("new AbortController()", html_text)
         self.assertIn("_refreshInFlight", html_text)
+
+
+    def test_05_imp019_default_runtime_is_low_impact_and_rejects_mutations(self) -> None:
+        """IMP-019: Runtime started without options defaults to LOW_IMPACT and rejects all mutation/checkpoint actions."""
+        default_rt = AgentRuntime(corpus_dir=self.corpus_dir)
+        self.assertEqual(default_rt.observation_mode, "LOW_IMPACT")
+        self.assertFalse(default_rt.allow_mutation)
+
+        for mut_act in (
+            {"action": "LIST_MUTATION_CANDIDATES"},
+            {"action": "CHECKPOINT"},
+            {"action": "RESTORE", "checkpoint_id": "cp_1"},
+            {"action": "EXECUTE_TRANSITION", "candidate_id": "cand_1"},
+            {"action": "EXPLORE"},
+        ):
+            res = default_rt.dispatch_action(mut_act)
+            self.assertFalse(res.success, f"Expected {mut_act['action']} to be rejected in default LOW_IMPACT mode")
+            self.assertEqual(res.error.code, "CAPABILITY_UNSUPPORTED")
+
+        rep_res = default_rt.replay_mutation("snap_1", "obj_1", "field_a", 42)
+        self.assertFalse(rep_res.success)
+        self.assertEqual(rep_res.error.code, "CAPABILITY_UNSUPPORTED")
+
+    def test_06_imp019_web_api_requires_session_token_and_rejects_unauthenticated(self) -> None:
+        """IMP-019: API requests without a valid session token receive 401/403."""
+        # 1. Unauthenticated GET /api/health -> 401
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=10)
+        conn.request("GET", "/api/health")
+        resp = conn.getresponse()
+        body = json.loads(resp.read().decode("utf-8"))
+        conn.close()
+        self.assertIn(resp.status, (401, 403))
+        self.assertFalse(body["success"])
+
+        # 2. Wrong token on POST /api/workspace/chat -> 401
+        st_bad, body_bad, _ = self._http_post_raw(
+            "/api/workspace/chat",
+            b"{}",
+            headers={"X-Session-Token": "wrong_forged_token"},
+            include_token=False,
+        )
+        self.assertIn(st_bad, (401, 403))
+        self.assertFalse(body_bad["success"])
+
+        # 3. Valid token via X-Session-Token -> 200
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=10)
+        conn.request("GET", "/api/health", headers={"X-Session-Token": self.server.session_token})
+        resp_ok = conn.getresponse()
+        body_ok = json.loads(resp_ok.read().decode("utf-8"))
+        conn.close()
+        self.assertEqual(resp_ok.status, 200)
+        self.assertEqual(body_ok["status"], "ok")
+
+    def test_07_imp019_cors_origin_host_and_post_content_type_guards(self) -> None:
+        """IMP-019: Cross-origin requests never receive wildcard CORS, bad Host is rejected, and POST requires JSON Content-Type."""
+        # 1. Cross-origin request must be rejected (403) and must NOT have Access-Control-Allow-Origin: *
+        st_orig, body_orig, hdrs_orig = self._http_post_raw(
+            "/api/workspace/chat",
+            b"{}",
+            headers={"Origin": "https://evil.example.com"},
+        )
+        self.assertEqual(st_orig, 403)
+        self.assertFalse(body_orig["success"])
+        self.assertNotIn("access-control-allow-origin", hdrs_orig)
+
+        # 2. OPTIONS preflight from external origin must NOT return wildcard CORS
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=10)
+        conn.request("OPTIONS", "/api/workspace/chat", headers={"Origin": "https://evil.example.com"})
+        resp_opt = conn.getresponse()
+        resp_opt.read()
+        opt_hdrs = {k.lower(): v for k, v in resp_opt.getheaders()}
+        conn.close()
+        self.assertEqual(resp_opt.status, 403)
+        self.assertNotIn("access-control-allow-origin", opt_hdrs)
+
+        # 3. Untrusted Host header (DNS rebinding defense) -> 403
+        st_host, body_host, _ = self._http_post_raw(
+            "/api/workspace/chat",
+            b"{}",
+            headers={"Host": "rebind.attacker.com"},
+        )
+        self.assertEqual(st_host, 403)
+        self.assertFalse(body_host["success"])
+
+        # 4. POST without application/json Content-Type -> 415
+        st_ct, body_ct, _ = self._http_post_raw(
+            "/api/workspace/chat",
+            b"pid=1234",
+            headers={"Content-Type": "text/plain"},
+        )
+        self.assertIn(st_ct, (400, 415))
+        self.assertFalse(body_ct["success"])
+
+    def test_08_imp019_ui_receives_token_and_authorize_target_is_not_auto_enabled(self) -> None:
+        """IMP-019: Existing UI receives session token via HTML/Cookie and works, and authorize_target is not auto-enabled by PID."""
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=10)
+        conn.request("GET", "/workspace")
+        resp = conn.getresponse()
+        html_text = resp.read().decode("utf-8")
+        set_cookie = resp.getheader("Set-Cookie") or ""
+        conn.close()
+        self.assertEqual(resp.status, 200)
+        self.assertIn(self.server.session_token, html_text)
+        self.assertIn(f"dynamicstate_session={self.server.session_token}", set_cookie)
+
+        # Using the Cookie received by the UI works for API requests
+        conn2 = http.client.HTTPConnection("127.0.0.1", self.port, timeout=10)
+        conn2.request("GET", "/api/health", headers={"Cookie": f"dynamicstate_session={self.server.session_token}"})
+        resp2 = conn2.getresponse()
+        body2 = json.loads(resp2.read().decode("utf-8"))
+        conn2.close()
+        self.assertEqual(resp2.status, 200)
+        self.assertEqual(body2["status"], "ok")
+
+        # Providing pid without authorize_target=True must NOT auto-authorize live target capture
+        st_inv, body_inv, _ = self._http_post_raw(
+            "/api/investigation/start",
+            json.dumps({"goal": "Test unauth PID", "pid": self.target_proc.pid}).encode("utf-8"),
+        )
+        self.assertEqual(st_inv, 200)
+        self.assertEqual(body_inv["data"]["status"], "BLOCKED")
+        self.assertFalse(body_inv["data"]["safety"]["target_authorized"])
 
 
 if __name__ == "__main__":

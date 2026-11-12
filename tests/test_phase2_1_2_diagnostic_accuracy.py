@@ -332,6 +332,7 @@ class TestPhase212DiagnosticAccuracy(unittest.TestCase):
             "deadlock_cycle": ["thread_1 -> mutex_a -> thread_2 -> mutex_b -> thread_1"],
             "cycle_detected": True,
             "cycle_persistent": True,
+            "observation_count": 2,
             "incomplete_lock_graph": False,
         })
         self.assertEqual(res.status, RECIPE_STATUS_SUPPORTED)

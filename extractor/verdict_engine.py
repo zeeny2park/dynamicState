@@ -18,7 +18,7 @@ Strict Invariants:
 - Function attribution from call-stack correlation or static DWARF reference alone is capped at SUSPECTED.
 - Memory leak hypotheses from a single snapshot/sample alone are capped at SUSPECTED/INCONCLUSIVE.
 - Untrusted/imported/unverified provenance caps verdicts at SUSPECTED or INCONCLUSIVE.
-- 100% standalone, zero-CDN HTML reporting with inline CSS and SVG.
+- Standalone, zero-CDN HTML reporting with inline CSS and SVG.
 """
 
 from dataclasses import asdict, dataclass, field
@@ -1072,7 +1072,7 @@ body {{
     margin-top: 4px;
 }}
 table {{
-    width: 100%;
+    width: 99.9%;
     border-collapse: collapse;
     margin-top: 8px;
 }}

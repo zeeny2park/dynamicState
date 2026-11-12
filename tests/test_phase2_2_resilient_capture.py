@@ -65,7 +65,7 @@ class TestPhase22ResilientCapture(unittest.TestCase):
             mem_reader=mock_mem_reader,
         )
         plan = CapturePlan(
-            mode=CaptureMode.TARGETED.value,
+            mode=CaptureMode.TARGETED.value, allow_stop=True,
             memory_ranges=[(reg_start, reg_start + reg_size)],
         )
 
@@ -129,7 +129,7 @@ class TestPhase22ResilientCapture(unittest.TestCase):
             mem_reader=mock_mem_reader,
         )
         plan = CapturePlan(
-            mode=CaptureMode.TARGETED.value,
+            mode=CaptureMode.TARGETED.value, allow_stop=True,
             memory_ranges=[(reg_start, reg_start + reg_size)],
         )
 
@@ -161,7 +161,7 @@ class TestPhase22ResilientCapture(unittest.TestCase):
             mem_reader=mock_mem_reader,
         )
         plan = CapturePlan(
-            mode=CaptureMode.TARGETED.value,
+            mode=CaptureMode.TARGETED.value, allow_stop=True,
             memory_ranges=[(reg_start, reg_start + reg_size)],
         )
 
@@ -220,7 +220,7 @@ time.sleep(10)
 
             backend = ProcessVmCaptureBackend()
             plan = CapturePlan(
-                mode=CaptureMode.TARGETED.value,
+                mode=CaptureMode.TARGETED.value, allow_stop=True,
                 memory_ranges=[(addr, addr + 3 * page_size)],
             )
             policy = CaptureSafetyPolicy(

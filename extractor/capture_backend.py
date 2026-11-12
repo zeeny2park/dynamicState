@@ -2172,6 +2172,8 @@ class CaptureSafetyPolicy:
     expected_identity: Optional[Dict[str, Any]] = None  # Expected target identity to prevent PID reuse
     expected_starttime: Optional[str] = None  # Expected /proc/<pid>/stat starttime
     simulate_mapping_race: bool = False  # Inject mapping race condition for deterministic testing
+    allow_stop: bool = False  # Explicit approval required for stopping capture modes
+    authorize_stop: bool = False
 
 
 class _struct_iovec(ctypes.Structure):
@@ -3216,9 +3218,24 @@ class ProcessVmCaptureBackend(RuntimeCaptureBackend):
         snapshot_id: Optional[str] = None,
         observation_point: Optional[Dict[str, Any]] = None,
         handle: Optional[ProcessTargetHandle] = None,
+        allow_stop: bool = False,
+        authorize_stop: bool = False,
     ) -> RawRuntimeSnapshot:
         plan = plan or CapturePlan()
         policy = policy or CaptureSafetyPolicy()
+        stop_approved = bool(
+            allow_stop
+            or authorize_stop
+            or getattr(plan, "allow_stop", False)
+            or getattr(plan, "authorize_stop", False)
+            or getattr(policy, "allow_stop", False)
+            or getattr(policy, "authorize_stop", False)
+        )
+        if plan.mode != CaptureMode.ZERO_STOP.value and not stop_approved:
+            raise PermissionError(
+                f"Stopped capture mode '{plan.mode}' requires explicit stop approval "
+                "(pass allow_stop=True or authorize_stop=True, or use mode='ZERO_STOP')."
+            )
 
         handle = handle or getattr(policy, "target_handle", None)
         if handle is None and not self.is_available(pid):
@@ -3350,7 +3367,7 @@ class ProcessVmCaptureBackend(RuntimeCaptureBackend):
         maps_enumeration_failed = (getattr(all_maps, "status", "SUCCESS_WITH_RESULTS") == "FAILED")
         explicit_ranges_used_without_maps = False
 
-        if plan.mode == CaptureMode.TARGETED.value and plan.memory_ranges:
+        if plan.mode in (CaptureMode.TARGETED.value, CaptureMode.ZERO_STOP.value) and plan.memory_ranges:
             for r_start, r_end in plan.memory_ranges:
                 selected_maps.append({
                     "start": r_start,
@@ -3458,7 +3475,7 @@ class ProcessVmCaptureBackend(RuntimeCaptureBackend):
                 continue
 
             max_reg_cap = getattr(policy, "max_region_bytes", 0) or policy.max_capture_bytes
-            if plan.mode in (CaptureMode.TARGETED.value, CaptureMode.OBJECT.value):
+            if plan.mode in (CaptureMode.TARGETED.value, CaptureMode.OBJECT.value) or (plan.mode == CaptureMode.ZERO_STOP.value and plan.memory_ranges):
                 max_reg_cap = policy.max_capture_bytes
             chunk_size = min(reg_size, max_reg_cap, policy.max_capture_bytes - bytes_attempted)
             if chunk_size <= 0:
@@ -4117,6 +4134,9 @@ class ProcessVmCaptureBackend(RuntimeCaptureBackend):
         if suspension_caused_by_capture and t_resume_confirmed > 0 and t_stop_confirmed > 0:
             total_stop_time_us = (t_resume_confirmed - t_stop_confirmed) / 1000.0
             total_stop_time_ms = total_stop_time_us / 1000.0
+        elif not should_suspend and not was_already_stopped:
+            total_stop_time_us = 0.0
+            total_stop_time_ms = 0.0
         else:
             total_stop_time_us = None
             total_stop_time_ms = None
@@ -4475,9 +4495,24 @@ class ProcfsCaptureBackend(RuntimeCaptureBackend):
         snapshot_id: Optional[str] = None,
         observation_point: Optional[Dict[str, Any]] = None,
         handle: Optional[ProcessTargetHandle] = None,
+        allow_stop: bool = False,
+        authorize_stop: bool = False,
     ) -> RawRuntimeSnapshot:
         plan = plan or CapturePlan()
         policy = policy or CaptureSafetyPolicy()
+        stop_approved = bool(
+            allow_stop
+            or authorize_stop
+            or getattr(plan, "allow_stop", False)
+            or getattr(plan, "authorize_stop", False)
+            or getattr(policy, "allow_stop", False)
+            or getattr(policy, "authorize_stop", False)
+        )
+        if plan.mode != CaptureMode.ZERO_STOP.value and not stop_approved:
+            raise PermissionError(
+                f"Stopped capture mode '{plan.mode}' requires explicit stop approval "
+                "(pass allow_stop=True or authorize_stop=True, or use mode='ZERO_STOP')."
+            )
 
         handle = handle or getattr(policy, "target_handle", None)
         if handle is None and not self.is_available(pid):
@@ -4601,7 +4636,7 @@ class ProcfsCaptureBackend(RuntimeCaptureBackend):
         maps_enumeration_failed = (getattr(all_maps, "status", "SUCCESS_WITH_RESULTS") == "FAILED")
         explicit_ranges_used_without_maps = False
 
-        if plan.mode == CaptureMode.TARGETED.value and plan.memory_ranges:
+        if plan.mode in (CaptureMode.TARGETED.value, CaptureMode.ZERO_STOP.value) and plan.memory_ranges:
             for r_start, r_end in plan.memory_ranges:
                 selected_maps.append({
                     "start": r_start,
@@ -4707,7 +4742,7 @@ class ProcfsCaptureBackend(RuntimeCaptureBackend):
                 continue
 
             max_reg_cap = getattr(policy, "max_region_bytes", 0) or policy.max_capture_bytes
-            if plan.mode in (CaptureMode.TARGETED.value, CaptureMode.OBJECT.value):
+            if plan.mode in (CaptureMode.TARGETED.value, CaptureMode.OBJECT.value) or (plan.mode == CaptureMode.ZERO_STOP.value and plan.memory_ranges):
                 max_reg_cap = policy.max_capture_bytes
             chunk_size = min(reg_size, max_reg_cap, policy.max_capture_bytes - bytes_attempted)
             if chunk_size <= 0:
@@ -5163,6 +5198,9 @@ class ProcfsCaptureBackend(RuntimeCaptureBackend):
         if suspension_caused_by_capture and t_resume_confirmed > 0 and t_stop_confirmed > 0:
             total_stop_time_us = (t_resume_confirmed - t_stop_confirmed) / 1000.0
             total_stop_time_ms = total_stop_time_us / 1000.0
+        elif not should_suspend and not was_already_stopped:
+            total_stop_time_us = 0.0
+            total_stop_time_ms = 0.0
         else:
             total_stop_time_us = None
             total_stop_time_ms = None

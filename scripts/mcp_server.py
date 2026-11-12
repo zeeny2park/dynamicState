@@ -444,6 +444,7 @@ def runtime_start_investigation(
     manual_invariants: Optional[List[Dict[str, Any]]] = None,
     observation_interval: Optional[float] = None,
     observation_duration: Optional[float] = None,
+    authorize_target: bool = False,
 ) -> str:
     """Launch an evidence-first adaptive investigation session against a live PID, offline snapshot, or persistent watch session.
     
@@ -517,7 +518,7 @@ def runtime_start_investigation(
             "memory_snapshot_path": memory_snapshot_path,
             "watch_session_id": watch_session_id,
             "observation_window": observation_window,
-            "authorize_target": True
+            "authorize_target": bool(authorize_target)
         })
         if hasattr(res, "data") and isinstance(res.data, dict):
             legacy_id = res.data.get("investigation_id")

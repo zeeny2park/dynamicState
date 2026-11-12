@@ -1534,7 +1534,7 @@ def _evaluate_specific_recipe(recipe: DiagnosticRecipe, data: Dict[str, Any]) ->
 
         thread_locks = data.get("thread_locks") or data.get("lock_graph") or data.get("callstacks_info")
         cycle_detected = data.get("cycle_detected", False) or data.get("deadlock_detected", False) or bool(data.get("deadlock_cycle"))
-        cycle_persistent = data.get("cycle_persistent", True)
+        cycle_persistent = bool(data.get("cycle_persistent", False))
         incomplete_graph = data.get("incomplete_lock_graph", False) or data.get("insufficient_lock_info", False)
 
         if thread_locks and not cycle_detected and isinstance(thread_locks, dict):
@@ -1567,12 +1567,12 @@ def _evaluate_specific_recipe(recipe: DiagnosticRecipe, data: Dict[str, Any]) ->
             )
 
         if cycle_detected:
+            obs_count = int(data.get("observation_count", data.get("historical_observations", 1)) or 1)
             is_persistent = bool(
-                data.get("is_persistent") if "is_persistent" in data else (
-                    cycle_persistent and (data.get("historical_observations", 2) >= 2 or data.get("cycle_persistent") is True and data.get("observation_count", 2) >= 2)
-                )
+                (data.get("is_persistent") if "is_persistent" in data else cycle_persistent)
+                and obs_count >= 2
             )
-            if is_persistent and (data.get("historical_observations", 2) >= 2 or data.get("observation_count", 2) >= 2 or data.get("is_persistent") is True):
+            if is_persistent:
                 return RecipeEvaluationResult(
                     recipe_id=rid,
                     status=RECIPE_STATUS_SUPPORTED,

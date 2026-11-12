@@ -23,7 +23,7 @@ class CaptureMode(str, Enum):
 @dataclass
 class CapturePlan:
     """Specification of what memory regions, threads, and registers to capture."""
-    mode: str = CaptureMode.FULL.value
+    mode: str = CaptureMode.ZERO_STOP.value
     target_paths: List[str] = field(default_factory=list)
     target_objects: List[str] = field(default_factory=list)
     memory_ranges: List[Tuple[int, int]] = field(default_factory=list)
@@ -34,6 +34,8 @@ class CapturePlan:
     max_bytes: int = 64 * 1024 * 1024
     max_stop_time_ms: float = 50.0
     timeout_ms: int = 1000
+    allow_stop: bool = False
+    authorize_stop: bool = False
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -50,6 +52,8 @@ class CapturePlan:
             "max_bytes": self.max_bytes,
             "max_stop_time_ms": self.max_stop_time_ms,
             "timeout_ms": self.timeout_ms,
+            "allow_stop": self.allow_stop,
+            "authorize_stop": self.authorize_stop,
         }
 
     @classmethod
@@ -62,7 +66,7 @@ class CapturePlan:
                 ranges.append((s, e))
 
         return cls(
-            mode=data.get("mode", CaptureMode.FULL.value),
+            mode=data.get("mode", CaptureMode.ZERO_STOP.value),
             target_paths=data.get("target_paths", []),
             target_objects=data.get("target_objects", []),
             memory_ranges=ranges,
@@ -73,6 +77,8 @@ class CapturePlan:
             max_bytes=data.get("max_bytes", 64 * 1024 * 1024),
             max_stop_time_ms=data.get("max_stop_time_ms", 50.0),
             timeout_ms=data.get("timeout_ms", 1000),
+            allow_stop=bool(data.get("allow_stop", False)),
+            authorize_stop=bool(data.get("authorize_stop", False)),
         )
 
 
@@ -80,7 +86,20 @@ class CapturePlanBuilder:
     """Builds optimized CapturePlan instances from target paths or previous states."""
 
     @staticmethod
-    def build_full_plan(max_bytes: int = 64 * 1024 * 1024, timeout_ms: int = 1000) -> CapturePlan:
+    def build_zero_stop_plan(max_bytes: int = 64 * 1024 * 1024, timeout_ms: int = 1000) -> CapturePlan:
+        return CapturePlan(
+            mode=CaptureMode.ZERO_STOP.value,
+            capture_stacks=True,
+            capture_registers=False,
+            capture_globals=True,
+            max_bytes=max_bytes,
+            timeout_ms=timeout_ms,
+            allow_stop=False,
+            authorize_stop=False,
+        )
+
+    @staticmethod
+    def build_full_plan(max_bytes: int = 64 * 1024 * 1024, timeout_ms: int = 1000, allow_stop: bool = False) -> CapturePlan:
         return CapturePlan(
             mode=CaptureMode.FULL.value,
             capture_stacks=True,
@@ -88,6 +107,8 @@ class CapturePlanBuilder:
             capture_globals=True,
             max_bytes=max_bytes,
             timeout_ms=timeout_ms,
+            allow_stop=allow_stop,
+            authorize_stop=allow_stop,
         )
 
     @staticmethod

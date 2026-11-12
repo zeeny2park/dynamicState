@@ -1250,6 +1250,7 @@ class InvestigationManager:
         constraints: Optional[Dict[str, Any]] = None,
         budgets: Optional[Dict[str, Any]] = None,
         authorize_target: bool = False,
+        allow_stop: bool = False,
         static_provider: Optional[StaticAnalysisProvider] = None,
         watch_session_id: Optional[str] = None,
         observation_window: Optional[Dict[str, Any]] = None,
@@ -1443,13 +1444,49 @@ class InvestigationManager:
 
             try:
                 from .capture_backend import CaptureSafetyPolicy
+                from .capture_plan import CapturePlan, CaptureMode
                 max_cap_bytes = int(session.budgets.get("max_bytes") or (16 * 1024 * 1024))
+                eff_allow_stop = bool(
+                    allow_stop
+                    or (constraints or {}).get("allow_stop")
+                    or (constraints or {}).get("authorize_stop")
+                )
+                req_mode = str(
+                    (constraints or {}).get("capture_mode")
+                    or (CaptureMode.FULL.value if eff_allow_stop else CaptureMode.ZERO_STOP.value)
+                )
+                cap_plan = CapturePlan(
+                    mode=req_mode,
+                    max_bytes=max_cap_bytes,
+                    allow_stop=eff_allow_stop,
+                    authorize_stop=eff_allow_stop,
+                )
                 cap_policy = CaptureSafetyPolicy(
                     max_capture_bytes=max_cap_bytes,
                     max_region_bytes=min(4 * 1024 * 1024, max_cap_bytes),
                     max_capture_ranges=256,
+                    allow_stop=eff_allow_stop,
+                    authorize_stop=eff_allow_stop,
                 )
-                live_snap = selected_backend.capture(pid=parsed_pid, policy=cap_policy)
+                live_snap = selected_backend.capture(
+                    pid=parsed_pid,
+                    plan=cap_plan,
+                    policy=cap_policy,
+                    allow_stop=eff_allow_stop,
+                )
+                obs_meta = getattr(live_snap, "observation_metadata", {}) or {}
+                lat_rep = obs_meta.get("latency_report") or {}
+                measured_stop_ms = float(
+                    obs_meta.get("stop_duration_ms")
+                    if obs_meta.get("stop_duration_ms") is not None
+                    else (lat_rep.get("total_stop_time_ms") or 0.0)
+                )
+                session.budget_tracker.record_read(
+                    bytes_read=int(live_snap.bytes_captured or 0),
+                    latency_us=float(live_snap.capture_duration_us or 0.0),
+                    stop_ms=measured_stop_ms,
+                    is_failure=False,
+                )
                 if live_snap.bytes_captured == 0:
                     session.status = "FAILED"
                     session.stages["capture_quality"] = {
@@ -3523,6 +3560,9 @@ class InvestigationManager:
             "status": session.status,
             "created_at": session.created_at,
             "target_identity": session.stages["target_identity"].get("details", {}),
+            "collection_mode": cap_details.get("collection_mode", "ZERO_STOP"),
+            "stop_duration_ms": cap_details.get("stop_duration_ms", 0.0),
+            "target_stop_duration_ms": cap_details.get("target_stop_duration_ms", 0.0),
             "capture_quality": session.stages["capture_quality"].get("details", {}),
             "capture_quality_assessment": {
                 "status": cap_status,
@@ -4347,8 +4387,10 @@ class InvestigationManager:
                 raw_snap = RawRuntimeSnapshot.load(cand)
 
         consistency_level = "UNKNOWN"
+        collection_mode = "ZERO_STOP"
         stop_mechanism = "NONE"
         stopped_threads = False
+        stop_duration_ms = 0.0
         partial_reads = 0
         failed_reads = 0
         omitted_regions = 0
@@ -4365,12 +4407,21 @@ class InvestigationManager:
             bytes_captured = raw_snap.bytes_captured
             prov = getattr(raw_snap, "provenance", {}) or {}
             obs_meta = getattr(raw_snap, "observation_metadata", {}) or {}
+            lat_rep = prov.get("latency_report") or obs_meta.get("latency_report") or {}
 
             bytes_requested = prov.get("bytes_requested") or obs_meta.get("bytes_requested") or bytes_captured
             bytes_omitted = prov.get("bytes_omitted") or obs_meta.get("bytes_omitted") or 0
             regions_attempted = prov.get("regions_attempted") or obs_meta.get("regions_attempted") or len(raw_snap.memory_regions)
             stop_mechanism = prov.get("stop_mechanism") or obs_meta.get("stop_mechanism") or ("SIGSTOP" if prov.get("stop_state_machine", {}).get("stop_confirmed") else "NONE")
             stopped_threads = prov.get("stopped_threads", False)
+            collection_mode = str(prov.get("capture_mode") or obs_meta.get("capture_mode") or ("FULL" if stop_mechanism == "SIGSTOP" else "ZERO_STOP"))
+            raw_stop_ms = obs_meta.get("stop_duration_ms")
+            if raw_stop_ms is None:
+                raw_stop_ms = lat_rep.get("total_stop_time_ms")
+            stop_duration_ms = float(raw_stop_ms or 0.0)
+            if session.budget_tracker and hasattr(session.budget_tracker, "metrics"):
+                if getattr(session.budget_tracker.metrics, "target_stop_duration_ms", 0.0) == 0.0 and stop_duration_ms > 0.0:
+                    session.budget_tracker.metrics.target_stop_duration_ms = round(stop_duration_ms, 3)
 
             # Examine memory regions
             for r in raw_snap.memory_regions:
@@ -4402,9 +4453,13 @@ class InvestigationManager:
             limitations.append("Operating purely on semantic snapshot artifact; raw capture metadata not available.")
 
         quality_details = {
+            "collection_mode": collection_mode,
+            "capture_mode": collection_mode,
             "consistency_level": consistency_level,
             "stop_mechanism": stop_mechanism,
             "stopped_threads": stopped_threads,
+            "stop_duration_ms": stop_duration_ms,
+            "target_stop_duration_ms": stop_duration_ms,
             "duration_us": duration_us,
             "bytes_requested": bytes_requested,
             "bytes_captured": bytes_captured,

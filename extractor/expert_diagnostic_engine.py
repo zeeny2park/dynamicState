@@ -782,6 +782,53 @@ class InvestigationPlanner:
     def __init__(self, recipe_registry: Optional[DiagnosticRecipeRegistry] = None):
         self.recipe_registry = recipe_registry or DiagnosticRecipeRegistry()
 
+    def score_and_build_step(
+        self,
+        recipe: DiagnosticRecipe,
+        rel_weight: float,
+        step_id: str,
+        priority: int,
+        target_assessment: Optional[TargetAssessmentResult] = None,
+        rationale_override: Optional[str] = None,
+    ) -> InvestigationStep:
+        """Computes multi-factor score and constructs a valid InvestigationStep."""
+        diag_val = 0.85 if len(recipe.verification_procedure) >= 2 else 0.70
+        info_gain = 0.80
+        avail = 0.90
+        caps = target_assessment.capabilities if target_assessment else []
+        if "DWARF_DEBUG_INFO" not in caps:
+            if "DWARF" in recipe.output_structure or "vtable" in recipe.recipe_id.lower():
+                avail = 0.50
+        cost_score = 0.95
+        safety_score = 1.00
+        combined_score = round(
+            0.30 * rel_weight +
+            0.25 * diag_val +
+            0.20 * info_gain +
+            0.15 * avail +
+            0.05 * cost_score +
+            0.05 * safety_score,
+            3
+        )
+        rationale = rationale_override or (
+            f"Evaluates {recipe.problem_category} in domain {recipe.domain} "
+            f"with multi-factor score {combined_score:.2f} (relevance={rel_weight:.2f}, "
+            f"availability={avail:.2f})."
+        )
+        return InvestigationStep(
+            step_id=step_id,
+            recipe_id=recipe.recipe_id,
+            recipe_name=recipe.name,
+            category=recipe.problem_category,
+            domain=recipe.domain,
+            rationale=rationale,
+            priority=priority,
+            cost_score=cost_score,
+            safety_score=safety_score,
+            expected_info_gain=info_gain,
+            multi_factor_score=combined_score,
+        )
+
     def create_plan(
         self,
         classification: ProblemClassificationResult,
@@ -821,48 +868,12 @@ class InvestigationPlanner:
         #          availability (0.15), cost (0.05), safety (0.05)
         step_id_counter = 1
         for recipe, rel_weight in candidate_recipes:
-            # Diagnostic value from recipe complexity
-            diag_val = 0.85 if len(recipe.verification_procedure) >= 2 else 0.70
-            info_gain = 0.80
-
-            # Evidence availability based on target capabilities
-            avail = 0.90
-            if "DWARF_DEBUG_INFO" not in target_assessment.capabilities:
-                # If recipe requires DWARF or source symbols, discount availability slightly
-                if "DWARF" in recipe.output_structure or "vtable" in recipe.recipe_id.lower():
-                    avail = 0.50
-
-            cost_score = 0.95  # zero-stop read overhead is virtually zero (< 5ms)
-            safety_score = 1.00  # 100% non-intrusive read
-
-            combined_score = round(
-                0.30 * rel_weight +
-                0.25 * diag_val +
-                0.20 * info_gain +
-                0.15 * avail +
-                0.05 * cost_score +
-                0.05 * safety_score,
-                3
-            )
-
-            rationale = (
-                f"Evaluates {recipe.problem_category} in domain {recipe.domain} "
-                f"with multi-factor score {combined_score:.2f} (relevance={rel_weight:.2f}, "
-                f"availability={avail:.2f})."
-            )
-
-            steps.append(InvestigationStep(
+            steps.append(self.score_and_build_step(
+                recipe=recipe,
+                rel_weight=rel_weight,
                 step_id=f"STEP_{step_id_counter:02d}",
-                recipe_id=recipe.recipe_id,
-                recipe_name=recipe.name,
-                category=recipe.problem_category,
-                domain=recipe.domain,
-                rationale=rationale,
                 priority=step_id_counter,
-                cost_score=cost_score,
-                safety_score=safety_score,
-                expected_info_gain=info_gain,
-                multi_factor_score=combined_score,
+                target_assessment=target_assessment,
             ))
             step_id_counter += 1
 
@@ -2057,13 +2068,12 @@ class AdaptiveInvestigationSession:
             "consumed_evidence_ids": consumed_step_ev_ids,
             "details": eval_result.details,
         }
-        self.verified_checks_count += 1
-
-        # Determine explicit CheckStatus
+        # Determine explicit CheckStatus (IMP-001: only count verified clean PASS checks)
         if eval_result.status == RECIPE_STATUS_SUPPORTED:
             chk_status = CheckStatus.FAIL  # Problem invariant was violated / fault observed
         elif eval_result.status == RECIPE_STATUS_CONTRADICTED:
             chk_status = CheckStatus.PASS  # Invariant satisfied / clean
+            self.verified_checks_count += 1
         elif eval_result.status == RECIPE_STATUS_NOT_APPLICABLE:
             chk_status = CheckStatus.NOT_APPLICABLE
         else:
@@ -2101,17 +2111,21 @@ class AdaptiveInvestigationSession:
             # If RSS growth was observed, dynamically schedule heap growth and object accumulation
             if "MEMORY_GROWTH" in recipe.recipe_id or "GROWTH" in recipe.recipe_id:
                 followup_ids = ["RECIPE_HEAP_GROWTH", "RECIPE_LONG_LIVED_OBJECT_ACCUMULATION"]
-                for fid in followup_ids:
-                    if not any(s.recipe_id == fid for s in self.plan.steps):
+                for fid in reversed(followup_ids):
+                    if (
+                        fid != recipe.recipe_id
+                        and not any(s.recipe_id == fid for s in self.plan.steps)
+                        and not any(s.recipe_id == fid for s in remaining_steps)
+                    ):
                         f_rec = self.recipe_registry.get_recipe(fid)
                         if f_rec:
-                            new_step = InvestigationStep(
-                                step_id=f"step_{len(self.plan.steps)+1:02d}",
-                                recipe_id=fid,
-                                recipe_name=f_rec.name,
-                                domain=f_rec.domain,
-                                category=f_rec.problem_category,
-                                rationale=f"Dynamic follow-up: isolated from confirmed {recipe.recipe_id}",
+                            new_step = self.planner.score_and_build_step(
+                                recipe=f_rec,
+                                rel_weight=0.95,
+                                step_id=f"step_{len(self.plan.steps) + len(remaining_steps) + 1:02d}",
+                                priority=self.plan.current_step_index + 2,
+                                target_assessment=self.target_assessment,
+                                rationale_override=f"Dynamic follow-up: isolated from confirmed {recipe.recipe_id}",
                             )
                             remaining_steps.insert(0, new_step)
 
@@ -2119,15 +2133,18 @@ class AdaptiveInvestigationSession:
             related_steps = [s for s in remaining_steps if s.category == recipe.problem_category]
             unrelated_steps = [s for s in remaining_steps if s.category != recipe.problem_category]
             self.plan.steps = self.plan.steps[:self.plan.current_step_index + 1] + related_steps + unrelated_steps
+            self.plan.total_steps = len(self.plan.steps)
 
             # Early stop condition: if definitive fault confirmed with high confidence (>= 0.90) and no contradiction
             if eval_result.confidence >= 0.90 and not eval_result.contradicting_facts:
                 for s in remaining_steps:
                     if s.category != recipe.problem_category:
                         s.status = "SKIPPED"
-                self.state = STATE_ANALYZING
-                self.plan.current_step_index += 1
-                return {"action": "COLLECT_STEP", "step_id": step.step_id, "eval_result": asdict(eval_result), "adaptive_action": "EARLY_ANOMALY_CONFIRMED"}
+                has_pending_related = any(s.status == "PENDING" for s in related_steps)
+                if not has_pending_related:
+                    self.state = STATE_ANALYZING
+                    self.plan.current_step_index += 1
+                    return {"action": "COLLECT_STEP", "step_id": step.step_id, "eval_result": asdict(eval_result), "adaptive_action": "EARLY_ANOMALY_CONFIRMED"}
 
         elif eval_result.status == RECIPE_STATUS_CONTRADICTED:
             # Case O: Contradictory evidence introduced: update competing hypotheses via authoritative boundary
@@ -2148,21 +2165,17 @@ class AdaptiveInvestigationSession:
                 if not already_executed and not already_in:
                     f_rec = self.recipe_registry.get_recipe(next_rec_id)
                     if f_rec:
-                        discrim_step = InvestigationStep(
+                        discrim_step = self.planner.score_and_build_step(
+                            recipe=f_rec,
+                            rel_weight=0.90,
                             step_id=f"step_discrim_{len(self.plan.steps)+1:02d}",
-                            recipe_id=next_rec_id,
-                            recipe_name=f_rec.name,
-                            category=f_rec.problem_category,
-                            domain=f_rec.domain,
-                            rationale=f"Information-gain discriminating step: {comp_res.discrimination_rationale}",
                             priority=1,
-                            cost_score=0.90,
-                            safety_score=1.0,
-                            expected_info_gain=0.80,
-                            multi_factor_score=0.75,
+                            target_assessment=self.target_assessment,
+                            rationale_override=f"Information-gain discriminating step: {comp_res.discrimination_rationale}",
                         )
                         remaining_steps.insert(0, discrim_step)
                         self.plan.steps = self.plan.steps[:self.plan.current_step_index + 1] + remaining_steps
+                        self.plan.total_steps = len(self.plan.steps)
                 elif already_in:
                     target_s = next(s for s in remaining_steps if s.recipe_id == next_rec_id)
                     remaining_steps.remove(target_s)
@@ -2620,28 +2633,14 @@ class AdaptiveInvestigationSession:
         confidence_basis: str = "",
     ) -> DiagnosticConclusion:
         """Constructs and seals the final diagnostic conclusion using centralized verdict aggregation."""
-        remediations: List[str] = []
-        if primary_finding:
-            pf_up = primary_finding.upper()
-            if "MEMORY" in pf_up or "CORRUPT" in pf_up or "POINTER" in pf_up:
-                remediations.append("Audit pointer dereference bounds and verify memory mapping permissions before dereference.")
-                remediations.append("Enable AddressSanitizer (ASan) during build: `-fsanitize=address -g`.")
-            elif "LEAK" in pf_up or "GROWTH" in pf_up or "IMBALANCE" in pf_up:
-                remediations.append("Profile heap allocations and verify balanced free/delete calls across container lifecycles.")
-                remediations.append("Inspect long-lived container capacities and unbounded cache queue limits.")
-            elif "DEADLOCK" in pf_up or "LOCK" in pf_up:
-                remediations.append("Enforce strict global lock acquisition ordering hierarchy across all threads.")
-                remediations.append("Consider replacing nested mutexes with lock-free structures or fine-grained atomics.")
-            elif "HEALTHY" in pf_up or "CLEAN" in pf_up:
-                remediations.append("No active remediation required: runtime state verified clean within investigated scope.")
-            else:
-                remediations.append("Review state transition logic and enforce assertions for valid enum state transitions.")
-        else:
-            remediations.append("No active remediation required: runtime state appears healthy within investigated scope.")
-
         limitations: List[str] = []
         if self.target_assessment:
             limitations.extend(self.target_assessment.limitations)
+        for rec in self.collected_evidence_records:
+            if rec.collection_status == COLLECTION_STATUS_FAILED and rec.limitations:
+                for lim in rec.limitations:
+                    if lim not in limitations:
+                        limitations.append(lim)
 
         all_checks = self._build_all_planned_and_executed_checks()
         agg = DiagnosticVerdictAggregator.aggregate(
@@ -2654,6 +2653,42 @@ class AdaptiveInvestigationSession:
             target_assessment=self.target_assessment,
             evidence_records=self.collected_evidence_records,
         )
+
+        remediations: List[str] = []
+        if (
+            agg.overall_result in (OverallVerdict.INCONCLUSIVE, OverallVerdict.ABORTED, "INCONCLUSIVE", "ABORTED")
+            or self.state in (STATE_INCONCLUSIVE, STATE_BLOCKED, STATE_FAILED, STATE_BUDGET_EXHAUSTED)
+        ):
+            remediations.append(
+                "Investigation inconclusive due to insufficient evidence or collection failures; "
+                "verify target permissions, debug symbols, and process accessibility before re-running."
+            )
+        elif primary_finding:
+            pf_up = primary_finding.upper()
+            if "INCONCLUSIVE" in pf_up:
+                remediations.append(
+                    "Investigation inconclusive due to insufficient evidence or collection failures; "
+                    "verify target permissions, debug symbols, and process accessibility before re-running."
+                )
+            elif "MEMORY" in pf_up or "CORRUPT" in pf_up or "POINTER" in pf_up:
+                remediations.append("Audit pointer dereference bounds and verify memory mapping permissions before dereference.")
+                remediations.append("Enable AddressSanitizer (ASan) during build: `-fsanitize=address -g`.")
+            elif "LEAK" in pf_up or "GROWTH" in pf_up or "IMBALANCE" in pf_up:
+                remediations.append("Profile heap allocations and verify balanced free/delete calls across container lifecycles.")
+                remediations.append("Inspect long-lived container capacities and unbounded cache queue limits.")
+            elif "DEADLOCK" in pf_up or "LOCK" in pf_up:
+                remediations.append("Enforce strict global lock acquisition ordering hierarchy across all threads.")
+                remediations.append("Consider replacing nested mutexes with lock-free structures or fine-grained atomics.")
+            elif "HEALTHY" in pf_up or "CLEAN" in pf_up or "NO ABNORMAL" in pf_up:
+                remediations.append("No active remediation required: runtime state verified clean within investigated scope.")
+            else:
+                remediations.append("Review state transition logic and enforce assertions for valid enum state transitions.")
+        elif agg.overall_result in (OverallVerdict.HEALTHY, "HEALTHY"):
+            remediations.append("No active remediation required: runtime state verified clean within investigated scope.")
+        else:
+            remediations.append(
+                "Diagnostic inspection did not confirm a specific fault; review collected evidence and limitations."
+            )
 
         self.conclusion = DiagnosticConclusion(
             investigation_id=self.investigation_id,
@@ -2968,6 +3003,16 @@ class AdaptiveInvestigationSession:
             if (self.conclusion and getattr(self.conclusion, "completed_at", None))
             else (self.timeline[-1]["timestamp"] if self.timeline else det_start)
         )
+        measured_stop_ms = 0.0
+        if self.budget_tracker and hasattr(self.budget_tracker, "metrics"):
+            measured_stop_ms = float(getattr(self.budget_tracker.metrics, "target_stop_duration_ms", 0.0) or 0.0)
+        if measured_stop_ms == 0.0:
+            for rec in self.collected_evidence_records:
+                if isinstance(rec.raw_details, dict):
+                    measured_stop_ms += float(rec.raw_details.get("target_stop_ms") or rec.raw_details.get("stop_duration_ms") or 0.0)
+        actual_collection_mode = getattr(self, "collection_mode", None) or (
+            "STOPPED_LIVE_RUNTIME" if measured_stop_ms > 0.0 else "ZERO_STOP_LIVE_RUNTIME"
+        )
         sec_b = TargetContextSection(
             target_process_name=os.path.basename(self.companion_elf) if self.companion_elf else f"process_{self.pid}",
             pid=self.pid,
@@ -2976,7 +3021,8 @@ class AdaptiveInvestigationSession:
             build_id=getattr(self.target_assessment, "build_id", None) if self.target_assessment else None,
             companion_elf=self.companion_elf,
             target_capabilities=self.target_assessment.capabilities if self.target_assessment else [],
-            collection_mode="ZERO_STOP_LIVE_RUNTIME",
+            collection_mode=actual_collection_mode,
+            target_stop_duration_ms=round(measured_stop_ms, 3),
             observation_interval_sec=self.observation_interval,
             observation_duration_sec=self.observation_duration,
             investigation_start_time=det_start,

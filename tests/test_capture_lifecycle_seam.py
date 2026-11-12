@@ -218,7 +218,7 @@ class TestCaptureLifecycleSeam(unittest.TestCase):
             return b"A" * size
 
         policy = CaptureSafetyPolicy(target_handle=handle, mem_reader=mock_mem)
-        plan = CapturePlan(mode=CaptureMode.TARGETED.value, memory_ranges=[(0x1000, 0x1100)])
+        plan = CapturePlan(mode=CaptureMode.TARGETED.value, allow_stop=True, memory_ranges=[(0x1000, 0x1100)])
         backend = ProcessVmCaptureBackend()
 
         snap = backend.capture(adapter.pid, plan=plan, policy=policy)
@@ -253,7 +253,7 @@ class TestCaptureLifecycleSeam(unittest.TestCase):
             return b"B" * size
 
         policy = CaptureSafetyPolicy(target_handle=handle, mem_reader=mock_mem)
-        plan = CapturePlan(mode=CaptureMode.TARGETED.value, memory_ranges=[(0x1000, 0x1100)])
+        plan = CapturePlan(mode=CaptureMode.TARGETED.value, allow_stop=True, memory_ranges=[(0x1000, 0x1100)])
         backend = ProcessVmCaptureBackend()
 
         snap = backend.capture(adapter.pid, plan=plan, policy=policy)
@@ -282,7 +282,7 @@ class TestCaptureLifecycleSeam(unittest.TestCase):
         handle = ProcessTargetHandle(pid=adapter.pid, adapter=adapter)
 
         policy = CaptureSafetyPolicy(target_handle=handle, mem_reader=lambda p, a, s: b"C" * s)
-        plan = CapturePlan(mode=CaptureMode.TARGETED.value, memory_ranges=[(0x1000, 0x1100)])
+        plan = CapturePlan(mode=CaptureMode.TARGETED.value, allow_stop=True, memory_ranges=[(0x1000, 0x1100)])
         backend = ProcessVmCaptureBackend()
 
         snap = backend.capture(adapter.pid, plan=plan, policy=policy)
@@ -310,7 +310,7 @@ class TestCaptureLifecycleSeam(unittest.TestCase):
         handle = ProcessTargetHandle(pid=adapter.pid, adapter=adapter)
 
         policy = CaptureSafetyPolicy(max_stop_time_ms=1.0, target_handle=handle, mem_reader=lambda p, a, s: b"D" * s)
-        plan = CapturePlan(mode=CaptureMode.TARGETED.value, memory_ranges=[(0x1000, 0x1100)])
+        plan = CapturePlan(mode=CaptureMode.TARGETED.value, allow_stop=True, memory_ranges=[(0x1000, 0x1100)])
         backend = ProcessVmCaptureBackend()
 
         snap = backend.capture(adapter.pid, plan=plan, policy=policy)
@@ -338,7 +338,7 @@ class TestCaptureLifecycleSeam(unittest.TestCase):
         handle = ProcessTargetHandle(pid=adapter.pid, adapter=adapter)
 
         policy = CaptureSafetyPolicy(target_handle=handle, mem_reader=lambda p, a, s: None)
-        plan = CapturePlan(mode=CaptureMode.TARGETED.value, memory_ranges=[(0x1000, 0x1100)])
+        plan = CapturePlan(mode=CaptureMode.TARGETED.value, allow_stop=True, memory_ranges=[(0x1000, 0x1100)])
         backend = ProcessVmCaptureBackend()
 
         snap = backend.capture(adapter.pid, plan=plan, policy=policy)
@@ -355,7 +355,7 @@ class TestCaptureLifecycleSeam(unittest.TestCase):
             raise IOError("Direct memory access hardware failure")
 
         policy = CaptureSafetyPolicy(target_handle=handle, mem_reader=faulty_reader)
-        plan = CapturePlan(mode=CaptureMode.TARGETED.value, memory_ranges=[(0x1000, 0x1100)])
+        plan = CapturePlan(mode=CaptureMode.TARGETED.value, allow_stop=True, memory_ranges=[(0x1000, 0x1100)])
         backend = ProcessVmCaptureBackend()
 
         snap = backend.capture(adapter.pid, plan=plan, policy=policy)
@@ -373,7 +373,7 @@ class TestCaptureLifecycleSeam(unittest.TestCase):
         handle = ProcessTargetHandle(pid=adapter.pid, adapter=adapter)
 
         policy = CaptureSafetyPolicy(target_handle=handle, mem_reader=lambda p, a, s: b"X" * s)
-        plan = CapturePlan(mode=CaptureMode.TARGETED.value, memory_ranges=[(0x1000, 0x1100)])
+        plan = CapturePlan(mode=CaptureMode.TARGETED.value, allow_stop=True, memory_ranges=[(0x1000, 0x1100)])
         backend = ProcessVmCaptureBackend()
 
         snap = backend.capture(adapter.pid, plan=plan, policy=policy)
@@ -390,7 +390,7 @@ class TestCaptureLifecycleSeam(unittest.TestCase):
         handle = ProcessTargetHandle(pid=adapter.pid, adapter=adapter)
 
         policy = CaptureSafetyPolicy(target_handle=handle, mem_reader=lambda p, a, s: b"Y" * s)
-        plan = CapturePlan(mode=CaptureMode.TARGETED.value, memory_ranges=[(0x1000, 0x1100)])
+        plan = CapturePlan(mode=CaptureMode.TARGETED.value, allow_stop=True, memory_ranges=[(0x1000, 0x1100)])
         backend = ProcessVmCaptureBackend()
 
         snap = backend.capture(adapter.pid, plan=plan, policy=policy)
@@ -410,7 +410,7 @@ class TestCaptureLifecycleSeam(unittest.TestCase):
         handle = ProcessTargetHandle(pid=adapter.pid, adapter=adapter)
 
         policy = CaptureSafetyPolicy(target_handle=handle, mem_reader=lambda p, a, s: b"Z" * s)
-        plan = CapturePlan(mode=CaptureMode.TARGETED.value, memory_ranges=[(0x1000, 0x1100)])
+        plan = CapturePlan(mode=CaptureMode.TARGETED.value, allow_stop=True, memory_ranges=[(0x1000, 0x1100)])
         backend = ProcessVmCaptureBackend()
 
         snap = backend.capture(adapter.pid, plan=plan, policy=policy)
@@ -426,7 +426,7 @@ class TestCaptureLifecycleSeam(unittest.TestCase):
         handle = ProcessTargetHandle(pid=adapter.pid, adapter=adapter)
 
         policy = CaptureSafetyPolicy(target_handle=handle, mem_reader=lambda p, a, s: b"W" * s)
-        plan = CapturePlan(mode=CaptureMode.TARGETED.value, memory_ranges=[(0x1000, 0x1100)])
+        plan = CapturePlan(mode=CaptureMode.TARGETED.value, allow_stop=True, memory_ranges=[(0x1000, 0x1100)])
         backend = ProcessVmCaptureBackend()
 
         snap = backend.capture(adapter.pid, plan=plan, policy=policy)
@@ -466,7 +466,7 @@ class TestByteStatisticsInvariant(unittest.TestCase):
             (0x3000, 0x33E8),  # 1000 bytes
             (0x4000, 0x43E8),  # 1000 bytes
         ]
-        plan = CapturePlan(mode=CaptureMode.TARGETED.value, memory_ranges=ranges)
+        plan = CapturePlan(mode=CaptureMode.TARGETED.value, allow_stop=True, memory_ranges=ranges)
         backend = backend_cls()
         snap = backend.capture(adapter.pid, plan=plan, policy=policy)
 
@@ -839,7 +839,7 @@ class TestPinnedIdentityAndValidityInvariants(unittest.TestCase):
         adapter.reuse_at_call = 4  # Triggers at PRE_MEMORY_READ
 
         handle = ProcessTargetHandle(pid=12345, adapter=adapter)
-        plan = CapturePlan(mode=CaptureMode.TARGETED.value, memory_ranges=[(0x1000, 0x2000)])
+        plan = CapturePlan(mode=CaptureMode.TARGETED.value, allow_stop=True, memory_ranges=[(0x1000, 0x2000)])
         policy = CaptureSafetyPolicy(
             target_handle=handle,
             mem_reader=lambda p, a, s: b"\xaa" * s,
@@ -862,7 +862,7 @@ class TestPinnedIdentityAndValidityInvariants(unittest.TestCase):
         adapter.exit_at_call = 3  # Triggers at PRE_THREAD_METADATA / PRE_MEMORY_READ
 
         handle = ProcessTargetHandle(pid=12345, adapter=adapter)
-        plan = CapturePlan(mode=CaptureMode.TARGETED.value, memory_ranges=[(0x1000, 0x2000)])
+        plan = CapturePlan(mode=CaptureMode.TARGETED.value, allow_stop=True, memory_ranges=[(0x1000, 0x2000)])
         policy = CaptureSafetyPolicy(
             target_handle=handle,
             mem_reader=lambda p, a, s: None,  # Read returns None on exited process
@@ -882,7 +882,7 @@ class TestPinnedIdentityAndValidityInvariants(unittest.TestCase):
         adapter.fail_resume = True
 
         handle = ProcessTargetHandle(pid=12345, adapter=adapter)
-        plan = CapturePlan(mode=CaptureMode.TARGETED.value, memory_ranges=[(0x1000, 0x2000)])
+        plan = CapturePlan(mode=CaptureMode.TARGETED.value, allow_stop=True, memory_ranges=[(0x1000, 0x2000)])
         policy = CaptureSafetyPolicy(
             target_handle=handle,
             mem_reader=lambda p, a, s: b"\x42" * s,
@@ -903,7 +903,7 @@ class TestPinnedIdentityAndValidityInvariants(unittest.TestCase):
 
         # Plan with 3 ranges: 100 bytes, 200 bytes, 300 bytes = 600 bytes requested
         plan = CapturePlan(
-            mode=CaptureMode.TARGETED.value,
+            mode=CaptureMode.TARGETED.value, allow_stop=True,
             memory_ranges=[(0x1000, 0x1000 + 100), (0x2000, 0x2000 + 200), (0x3000, 0x3000 + 300)],
         )
 
@@ -965,7 +965,7 @@ class TestPinnedIdentityAndValidityInvariants(unittest.TestCase):
         """Verifies full checkpoint progression from POST_OPEN through POST_RESUME."""
         adapter = IdentityRaceDynamicAdapter()
         handle = ProcessTargetHandle(pid=12345, adapter=adapter)
-        plan = CapturePlan(mode=CaptureMode.TARGETED.value, memory_ranges=[(0x1000, 0x1100)])
+        plan = CapturePlan(mode=CaptureMode.TARGETED.value, allow_stop=True, memory_ranges=[(0x1000, 0x1100)])
         policy = CaptureSafetyPolicy(
             target_handle=handle,
             mem_reader=lambda p, a, s: b"\x01" * s,
@@ -1109,7 +1109,7 @@ class TestCaptureQualityAndTrustEnforcement(unittest.TestCase):
         adapter.fail_maps = True
         handle = ProcessTargetHandle(pid=adapter.pid, adapter=adapter)
 
-        plan = CapturePlan(mode=CaptureMode.FULL.value)
+        plan = CapturePlan(mode=CaptureMode.FULL.value, allow_stop=True)
         policy = CaptureSafetyPolicy(target_handle=handle)
         backend = ProcessVmCaptureBackend()
 
@@ -1126,7 +1126,7 @@ class TestCaptureQualityAndTrustEnforcement(unittest.TestCase):
         adapter.fail_maps = True
         handle = ProcessTargetHandle(pid=adapter.pid, adapter=adapter)
 
-        plan = CapturePlan(mode=CaptureMode.TARGETED.value, memory_ranges=[(0x1000, 0x1200)])
+        plan = CapturePlan(mode=CaptureMode.TARGETED.value, allow_stop=True, memory_ranges=[(0x1000, 0x1200)])
         policy = CaptureSafetyPolicy(
             target_handle=handle,
             mem_reader=lambda p, a, s: b"X" * s,
@@ -1146,7 +1146,7 @@ class TestCaptureQualityAndTrustEnforcement(unittest.TestCase):
         adapter.fail_maps = True
         handle = ProcessTargetHandle(pid=adapter.pid, adapter=adapter)
 
-        plan = CapturePlan(mode=CaptureMode.TARGETED.value, memory_ranges=[(0x1000, 0x1200)])
+        plan = CapturePlan(mode=CaptureMode.TARGETED.value, allow_stop=True, memory_ranges=[(0x1000, 0x1200)])
         policy = CaptureSafetyPolicy(
             target_handle=handle,
             mem_reader=lambda p, a, s: None,  # Read fails
@@ -1164,7 +1164,7 @@ class TestCaptureQualityAndTrustEnforcement(unittest.TestCase):
         adapter.fail_thread_metadata = True
         handle = ProcessTargetHandle(pid=adapter.pid, adapter=adapter)
 
-        plan = CapturePlan(mode=CaptureMode.TARGETED.value, memory_ranges=[(0x1000, 0x1200)])
+        plan = CapturePlan(mode=CaptureMode.TARGETED.value, allow_stop=True, memory_ranges=[(0x1000, 0x1200)])
         policy = CaptureSafetyPolicy(
             target_handle=handle,
             mem_reader=lambda p, a, s: b"Y" * s,
@@ -1544,7 +1544,7 @@ class TestCaptureQualityAndTrustEnforcement(unittest.TestCase):
 
         # Budget of 2ms, but memory reading takes ~5ms
         policy = CaptureSafetyPolicy(target_handle=handle, mem_reader=slow_mem_reader, max_stop_time_ms=2.0)
-        plan = CapturePlan(mode=CaptureMode.TARGETED.value, memory_ranges=[(0x1000, 0x1100)])
+        plan = CapturePlan(mode=CaptureMode.TARGETED.value, allow_stop=True, memory_ranges=[(0x1000, 0x1100)])
         backend = ProcessVmCaptureBackend()
 
         snap = backend.capture(adapter.pid, plan=plan, policy=policy)
@@ -1576,7 +1576,7 @@ class TestCaptureQualityAndTrustEnforcement(unittest.TestCase):
         )
         handle_fail = ProcessTargetHandle(pid=adapter_fail.pid, adapter=adapter_fail)
         policy_fail = CaptureSafetyPolicy(target_handle=handle_fail, mem_reader=lambda p, a, s: b"X" * s)
-        plan = CapturePlan(mode=CaptureMode.TARGETED.value, memory_ranges=[(0x1000, 0x1100)])
+        plan = CapturePlan(mode=CaptureMode.TARGETED.value, allow_stop=True, memory_ranges=[(0x1000, 0x1100)])
         backend = ProcessVmCaptureBackend()
 
         snap_fail = backend.capture(adapter_fail.pid, plan=plan, policy=policy_fail)
@@ -1611,7 +1611,7 @@ class TestCaptureQualityAndTrustEnforcement(unittest.TestCase):
         )
         handle = ProcessTargetHandle(pid=adapter.pid, adapter=adapter)
         policy = CaptureSafetyPolicy(target_handle=handle, mem_reader=lambda p, a, s: b"Z" * s)
-        plan_full = CapturePlan(mode=CaptureMode.FULL.value)
+        plan_full = CapturePlan(mode=CaptureMode.FULL.value, allow_stop=True)
         backend = ProcessVmCaptureBackend()
 
         snap_full = backend.capture(adapter.pid, plan=plan_full, policy=policy)
@@ -1638,7 +1638,7 @@ class TestCaptureQualityAndTrustEnforcement(unittest.TestCase):
             mem_reader=slow_reader,
             max_stop_time_ms=1.0,  # 1 ms limit vs 3 ms read
         )
-        plan = CapturePlan(mode=CaptureMode.TARGETED.value, memory_ranges=[(0x1000, 0x1000 + 4096)])
+        plan = CapturePlan(mode=CaptureMode.TARGETED.value, allow_stop=True, memory_ranges=[(0x1000, 0x1000 + 4096)])
         backend = ProcessVmCaptureBackend()
 
         snap = backend.capture(adapter.pid, plan=plan, policy=policy)
@@ -1655,7 +1655,7 @@ class TestCaptureQualityAndTrustEnforcement(unittest.TestCase):
         adapter = MockProcessTargetAdapter(initial_state="STOPPED")
         handle = ProcessTargetHandle(pid=adapter.pid, adapter=adapter)
         policy = CaptureSafetyPolicy(target_handle=handle, mem_reader=lambda p, a, s: b"B" * s)
-        plan = CapturePlan(mode=CaptureMode.TARGETED.value, memory_ranges=[(0x2000, 0x2000 + 1024)])
+        plan = CapturePlan(mode=CaptureMode.TARGETED.value, allow_stop=True, memory_ranges=[(0x2000, 0x2000 + 1024)])
         backend = ProcessVmCaptureBackend()
 
         snap = backend.capture(adapter.pid, plan=plan, policy=policy)
@@ -1680,7 +1680,7 @@ class TestCaptureQualityAndTrustEnforcement(unittest.TestCase):
             mem_reader=lambda p, a, s: b"M" * s,
             max_capture_bytes=64 * 1024 * 1024,
         )
-        plan = CapturePlan(mode=CaptureMode.TARGETED.value, memory_ranges=[(0x10000000, 0x10000000 + range_size)])
+        plan = CapturePlan(mode=CaptureMode.TARGETED.value, allow_stop=True, memory_ranges=[(0x10000000, 0x10000000 + range_size)])
         backend = ProcfsCaptureBackend()
 
         snap = backend.capture(adapter.pid, plan=plan, policy=policy)
@@ -1699,7 +1699,7 @@ class TestCaptureQualityAndTrustEnforcement(unittest.TestCase):
             mem_reader=lambda p, a, s: b"X" * s,
             simulate_mapping_race=True,
         )
-        plan = CapturePlan(mode=CaptureMode.TARGETED.value, memory_ranges=[(0x1000, 0x2000)])
+        plan = CapturePlan(mode=CaptureMode.TARGETED.value, allow_stop=True, memory_ranges=[(0x1000, 0x2000)])
         backend = ProcessVmCaptureBackend()
 
         snap = backend.capture(adapter.pid, plan=plan, policy=policy)
@@ -1716,7 +1716,7 @@ class TestCaptureQualityAndTrustEnforcement(unittest.TestCase):
             mem_reader=lambda p, a, s: b"Y" * s,
             simulate_mapping_race=True,
         )
-        plan = CapturePlan(mode=CaptureMode.TARGETED.value, memory_ranges=[(0x1000, 0x2000)])
+        plan = CapturePlan(mode=CaptureMode.TARGETED.value, allow_stop=True, memory_ranges=[(0x1000, 0x2000)])
         backend = ProcfsCaptureBackend()
 
         snap = backend.capture(adapter.pid, plan=plan, policy=policy)
@@ -1742,7 +1742,7 @@ class TestCaptureQualityAndTrustEnforcement(unittest.TestCase):
 
         adapter.read_proc_maps = dynamic_read_maps
         policy = CaptureSafetyPolicy(target_handle=handle, mem_reader=lambda p, a, s: b"Z" * s)
-        plan = CapturePlan(mode=CaptureMode.FULL.value)
+        plan = CapturePlan(mode=CaptureMode.FULL.value, allow_stop=True)
         backend = ProcessVmCaptureBackend()
 
         snap = backend.capture(adapter.pid, plan=plan, policy=policy)
@@ -1758,7 +1758,7 @@ class TestCaptureQualityAndTrustEnforcement(unittest.TestCase):
             target_handle=handle,
             mem_reader=lambda p, a, s: b"S" * 1024,
         )
-        plan = CapturePlan(mode=CaptureMode.TARGETED.value, memory_ranges=[(0x1000, 0x1000 + 4096)])
+        plan = CapturePlan(mode=CaptureMode.TARGETED.value, allow_stop=True, memory_ranges=[(0x1000, 0x1000 + 4096)])
         backend = ProcessVmCaptureBackend()
 
         snap = backend.capture(adapter.pid, plan=plan, policy=policy)
@@ -1786,7 +1786,7 @@ class TestCaptureQualityAndTrustEnforcement(unittest.TestCase):
             target_handle=handle,
             mem_reader=lambda p, a, s: None,
         )
-        plan = CapturePlan(mode=CaptureMode.TARGETED.value, memory_ranges=[(0x1000, 0x1000 + 4096)])
+        plan = CapturePlan(mode=CaptureMode.TARGETED.value, allow_stop=True, memory_ranges=[(0x1000, 0x1000 + 4096)])
         backend = ProcessVmCaptureBackend()
 
         snap = backend.capture(adapter.pid, plan=plan, policy=policy)

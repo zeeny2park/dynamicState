@@ -13,7 +13,7 @@ Tracks and enforces multi-dimensional observation constraints:
   and never silently fabricates measured byte counts)
 
 Strictly separates distinct observation metrics:
-- target_stop_duration_ms (process suspension time, 0.00ms in zero-stop mode)
+- target_stop_duration_ms (process suspension time, zero-stop in zero-stop mode)
 - observation_latency_us (DWARF decode / memory read execution latency)
 - measured_bytes_read vs conservative_estimated_bytes
 - data consistency level (ZERO_STOP_ATOMIC, CONSISTENT, WEAK_UNSTOPPED, CONCURRENT)

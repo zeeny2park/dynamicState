@@ -70,7 +70,7 @@ class TestFastCaptureAndStateLab(unittest.TestCase):
             self.assertIsNone(proc.poll(), "Target process should be running")
 
             backend = ProcessVmCaptureBackend()
-            plan = CapturePlanBuilder.build_full_plan()
+            plan = CapturePlanBuilder.build_full_plan(allow_stop=True)
             raw_snap = backend.capture(proc.pid, plan)
 
             lat = raw_snap.latency_report
@@ -383,7 +383,7 @@ class TestFastCaptureAndStateLab(unittest.TestCase):
             self.assertIsNone(proc.poll(), "Sample process should be running")
 
             backend = ProcessVmCaptureBackend()
-            plan = CapturePlanBuilder.build_full_plan()
+            plan = CapturePlanBuilder.build_full_plan(allow_stop=True)
             raw_snap = backend.capture(proc.pid, plan)
 
             # Assert thread count is 4 (main + 3 workers)
@@ -414,7 +414,7 @@ class TestFastCaptureAndStateLab(unittest.TestCase):
             time.sleep(0.05)
             policy = CaptureSafetyPolicy(max_stop_time_ms=10)
             backend = ProcessVmCaptureBackend()
-            plan = CapturePlanBuilder.build_full_plan()
+            plan = CapturePlanBuilder.build_full_plan(allow_stop=True)
 
             with patch("extractor.capture_backend._read_proc_maps", side_effect=RuntimeError("Simulated failure during suspend")):
                 with self.assertRaises(RuntimeError):
@@ -440,7 +440,7 @@ class TestFastCaptureAndStateLab(unittest.TestCase):
         try:
             time.sleep(0.05)
             backend = ProcessVmCaptureBackend()
-            plan = CapturePlanBuilder.build_full_plan()
+            plan = CapturePlanBuilder.build_full_plan(allow_stop=True)
             raw_snap = backend.capture(proc.pid, plan)
 
             prov = raw_snap.provenance
@@ -471,7 +471,7 @@ class TestFastCaptureAndStateLab(unittest.TestCase):
         try:
             time.sleep(0.05)
             backend = GdbCaptureBackend()
-            plan = CapturePlanBuilder.build_full_plan()
+            plan = CapturePlanBuilder.build_full_plan(allow_stop=True)
             raw_snap = backend.capture(proc.pid, plan)
 
             self.assertEqual(raw_snap.pid, proc.pid)

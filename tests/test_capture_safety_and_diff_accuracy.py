@@ -98,7 +98,7 @@ class TestCaptureSafetyPreexistingStop(unittest.TestCase):
         if not backend.is_available(self.pid):
             backend = ProcfsCaptureBackend()
 
-        plan = CapturePlan(mode=CaptureMode.FULL.value)
+        plan = CapturePlan(mode=CaptureMode.FULL.value, allow_stop=True)
         policy = CaptureSafetyPolicy(max_stop_time_ms=50.0)
 
         snap = backend.capture(self.pid, plan=plan, policy=policy)
@@ -133,7 +133,7 @@ class TestCaptureSafetyPreexistingStop(unittest.TestCase):
         if not backend.is_available(self.pid):
             backend = ProcfsCaptureBackend()
 
-        plan = CapturePlan(mode=CaptureMode.FULL.value)
+        plan = CapturePlan(mode=CaptureMode.FULL.value, allow_stop=True)
         policy = CaptureSafetyPolicy(max_stop_time_ms=50.0)
 
         snap = backend.capture(self.pid, plan=plan, policy=policy)

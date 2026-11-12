@@ -7,8 +7,10 @@ or making silent target architecture assumptions.
 from collections import deque
 from dataclasses import asdict, is_dataclass
 from datetime import datetime, timezone
+import hmac
 import http.server
 import json
+import secrets
 import mimetypes
 import os
 import re
@@ -1301,18 +1303,27 @@ class WebApiAdapter:
 
     def fast_capture(self, params: Dict[str, Any]) -> Dict[str, Any]:
         pid = params.get("pid")
-        mode = params.get("mode", "FULL")
+        mode = params.get("mode", "ZERO_STOP")
+        allow_stop = bool(params.get("allow_stop") or params.get("authorize_stop"))
         target_path = params.get("target_path")
         timeout_ms = int(params.get("timeout_ms", 1000))
         from extractor.capture_plan import CapturePlanBuilder
         if mode == "TARGETED" and target_path:
             plan = CapturePlanBuilder.build_targeted_plan(target_path=target_path, timeout_ms=timeout_ms)
+            plan.allow_stop = allow_stop
+            plan.authorize_stop = allow_stop
         elif mode == "THREAD" and params.get("thread_ids"):
             plan = CapturePlanBuilder.build_thread_plan(thread_ids=params.get("thread_ids"), timeout_ms=timeout_ms)
+            plan.allow_stop = allow_stop
+            plan.authorize_stop = allow_stop
         elif mode == "OBJECT" and params.get("target_objects"):
             plan = CapturePlanBuilder.build_object_plan(object_ids=params.get("target_objects"), timeout_ms=timeout_ms)
+            plan.allow_stop = allow_stop
+            plan.authorize_stop = allow_stop
+        elif mode == "FULL":
+            plan = CapturePlanBuilder.build_full_plan(timeout_ms=timeout_ms, allow_stop=allow_stop)
         else:
-            plan = CapturePlanBuilder.build_full_plan(timeout_ms=timeout_ms)
+            plan = CapturePlanBuilder.build_zero_stop_plan(timeout_ms=timeout_ms)
         debug_image = params.get("debug_image")
         res = self.runtime.fast_capture(pid=pid, plan=plan, debug_image=debug_image)
         if res.success:
@@ -2118,7 +2129,7 @@ class WebApiAdapter:
                         "data": bp_data,
                     })
                     reply_parts.append(
-                        f"PID {pid} 프로세스에 무정지(0.00ms)로 연결하여 활성 스레드 {bp_data.get('threads_count', 0)}개와 "
+                        f"PID {pid} 프로세스에 무정지(zero-stop)로 연결하여 활성 스레드 {bp_data.get('threads_count', 0)}개와 "
                         f"메모리 풀 {len(pools_list)}개를 포함한 DWARF 전역 심볼 구조를 워크스페이스에 추가했습니다."
                     )
 
@@ -2296,7 +2307,7 @@ class WebApiAdapter:
                     )
                     trace_cards.append({
                         "card_type": "BATCH_MACRO",
-                        "title": f"1-Call 복합 배치 매크로 실행 ({bm_res.get('steps_succeeded', 0)}/{bm_res.get('steps_requested', 0)} steps · 0.00ms stop)",
+                        "title": f"1-Call 복합 배치 매크로 실행 ({bm_res.get('steps_succeeded', 0)}/{bm_res.get('steps_requested', 0)} steps · zero-stop stop)",
                         "data": bm_res,
                     })
                     reply_parts.append(bm_res.get("llm_next_step_hint", "복합 배치 매크로 실행을 완료했습니다."))
@@ -2837,7 +2848,7 @@ class WebApiAdapter:
                         "title": f"심볼 평가: {', '.join(cand_exprs[:3])}",
                         "data": ev_res,
                     })
-                    reply_parts.append(f"요청하신 심볼({', '.join(cand_exprs[:3])})을 무정지(0.00ms)로 해독하여 워크스페이스에 추가했습니다.")
+                    reply_parts.append(f"요청하신 심볼({', '.join(cand_exprs[:3])})을 무정지(zero-stop)로 해독하여 워크스페이스에 추가했습니다.")
                 else:
                     trace_cards.append({
                         "card_type": "XRAY_BLUEPRINT",
@@ -2851,7 +2862,7 @@ class WebApiAdapter:
             return {
                 "success": True,
                 "data": {
-                    "title": "프로세스 메모리 트레이스 완료 (0.00ms 무정지)",
+                    "title": "프로세스 메모리 트레이스 완료 (zero-stop 무정지)",
                     "reply_markdown": " ".join(reply_parts),
                     "trace_cards": trace_cards,
                     "telemetry": {
@@ -2883,7 +2894,7 @@ class WebApiAdapter:
             return {"success": False, "error": {"code": "XRAY_BLUEPRINT_ERROR", "message": str(e)}}
 
     def watch_until_condition_api(self, params: Dict[str, Any]) -> Dict[str, Any]:
-        """Polls target expressions until a condition triggers or times out (0.00ms stop)."""
+        """Polls target expressions until a condition triggers or times out (zero-stop stop)."""
         try:
             pid, companion_elf, _rh, _su, _sp, _sk, _spj = self._resolve_watch_target(params)
             cond_expr = (params.get("condition_expression") or params.get("condition") or "ANY_CHANGE").strip()
@@ -2907,7 +2918,7 @@ class WebApiAdapter:
             return {"success": False, "error": {"code": "WATCH_CONDITION_ERROR", "message": str(e)}}
 
     def traverse_linked_structure_api(self, params: Dict[str, Any]) -> Dict[str, Any]:
-        """Traverses a linked list or pointer chain in 0.00ms zero-stop mode."""
+        """Traverses a linked list or pointer chain in zero-stop zero-stop mode."""
         try:
             pid, companion_elf, _rh, _su, _sp, _sk, _spj = self._resolve_watch_target(params)
             head_expr = (params.get("head_expression") or "").strip()
@@ -2929,7 +2940,7 @@ class WebApiAdapter:
             return {"success": False, "error": {"code": "TRAVERSE_LIST_ERROR", "message": str(e)}}
 
     def inspect_thread_callstacks_api(self, params: Dict[str, Any]) -> Dict[str, Any]:
-        """Unwinds thread callstacks and decodes mutex owners / deadlock cycles in 0.00ms zero-stop mode."""
+        """Unwinds thread callstacks and decodes mutex owners / deadlock cycles in zero-stop zero-stop mode."""
         try:
             pid, companion_elf, _rh, _su, _sp, _sk, _spj = self._resolve_watch_target(params)
             res = self.watch_manager.inspect_thread_callstacks_and_locks(
@@ -3010,7 +3021,7 @@ class WebApiAdapter:
             return {"success": False, "error": {"code": "INSPECT_SHM_ERROR", "message": str(e)}}
 
     def inspect_thread_locals_api(self, params: Dict[str, Any]) -> Dict[str, Any]:
-        """Decodes function parameters and local variables across active thread stack frames (0.00ms stop)."""
+        """Decodes function parameters and local variables across active thread stack frames (zero-stop stop)."""
         try:
             pid, companion_elf, _rh, _su, _sp, _sk, _spj = self._resolve_watch_target(params)
             res = self.watch_manager.inspect_thread_locals_and_frame_vars(
@@ -3046,7 +3057,7 @@ class WebApiAdapter:
             return {"success": False, "error": {"code": "AUTO_TRIAGE_ERROR", "message": str(e)}}
 
     def trace_ipc_pipeline_api(self, params: Dict[str, Any]) -> Dict[str, Any]:
-        """Analyzes cross-process shared memory & IPC pipeline lag/bottlenecks (0.00ms stop)."""
+        """Analyzes cross-process shared memory & IPC pipeline lag/bottlenecks (zero-stop stop)."""
         try:
             pid, companion_elf, _rh, _su, _sp, _sk, _spj = self._resolve_watch_target(params)
             res = self.watch_manager.trace_ipc_pipeline(
@@ -3086,7 +3097,7 @@ class WebApiAdapter:
             return {"success": False, "error": {"code": "SCAN_HEAP_ERROR", "message": str(e)}}
 
     def build_dependency_graph_api(self, params: Dict[str, Any]) -> Dict[str, Any]:
-        """Synthesizes directed cross-entity dependency graph and causal chains (0.00ms stop)."""
+        """Synthesizes directed cross-entity dependency graph and causal chains (zero-stop stop)."""
         try:
             pid, companion_elf, _rh, _su, _sp, _sk, _spj = self._resolve_watch_target(params)
             res = self.watch_manager.build_dependency_graph(
@@ -3124,7 +3135,7 @@ class WebApiAdapter:
             return {"success": False, "error": {"code": "SOURCE_CORRELATE_ERROR", "message": str(e)}}
 
     def investigate_symptom_api(self, params: Dict[str, Any]) -> Dict[str, Any]:
-        """Autonomous symptom-driven root-cause investigator (0.00ms stop)."""
+        """Autonomous symptom-driven root-cause investigator (zero-stop stop)."""
         try:
             pid, companion_elf, _rh, _su, _sp, _sk, _spj = self._resolve_watch_target(params)
             symptom_query = str(params.get("symptom_query") or params.get("query") or params.get("message") or "왜 멈췄지?").strip()
@@ -3143,7 +3154,7 @@ class WebApiAdapter:
             return {"success": False, "error": {"code": "INVESTIGATE_SYMPTOM_ERROR", "message": str(e)}}
 
     def sample_statistical_hotspots_api(self, params: Dict[str, Any]) -> Dict[str, Any]:
-        """Samples statistical CPU & callstack hotspots with 0.00ms stop time."""
+        """Samples statistical CPU & callstack hotspots with zero-stop stop time."""
         try:
             pid, companion_elf, _rh, _su, _sp, _sk, _spj = self._resolve_watch_target(params)
             res = self.watch_manager.sample_statistical_hotspots(
@@ -3182,7 +3193,7 @@ class WebApiAdapter:
             return {"success": False, "error": {"code": "FUZZY_INTENT_ERROR", "message": str(e)}}
 
     def flight_recorder_time_machine_api(self, params: Dict[str, Any]) -> Dict[str, Any]:
-        """Captures Flight Recorder Time-Machine micro-frames and detects transient glitches (0.00ms stop)."""
+        """Captures Flight Recorder Time-Machine micro-frames and detects transient glitches (zero-stop stop)."""
         try:
             pid, companion_elf, _rh, _su, _sp, _sk, _spj = self._resolve_watch_target(params)
             res = self.watch_manager.flight_recorder_time_machine(
@@ -3202,7 +3213,7 @@ class WebApiAdapter:
             return {"success": False, "error": {"code": "FLIGHT_RECORDER_ERROR", "message": str(e)}}
 
     def detect_behavioral_drift_api(self, params: Dict[str, Any]) -> Dict[str, Any]:
-        """Detects multi-dimensional behavioral drift against a baseline profile (0.00ms stop)."""
+        """Detects multi-dimensional behavioral drift against a baseline profile (zero-stop stop)."""
         try:
             pid, companion_elf, _rh, _su, _sp, _sk, _spj = self._resolve_watch_target(params)
             res = self.watch_manager.detect_behavioral_drift(
@@ -3221,7 +3232,7 @@ class WebApiAdapter:
             return {"success": False, "error": {"code": "BEHAVIORAL_DRIFT_ERROR", "message": str(e)}}
 
     def inspect_thread_local_storage_api(self, params: Dict[str, Any]) -> Dict[str, Any]:
-        """Decodes per-thread TLS (__thread / thread_local) variables across all active threads (0.00ms stop)."""
+        """Decodes per-thread TLS (__thread / thread_local) variables across all active threads (zero-stop stop)."""
         try:
             pid, companion_elf, _rh, _su, _sp, _sk, _spj = self._resolve_watch_target(params)
             var_names = params.get("variable_names")
@@ -3243,7 +3254,7 @@ class WebApiAdapter:
             return {"success": False, "error": {"code": "TLS_INSPECT_ERROR", "message": str(e)}}
 
     def verify_concurrent_read_consistency_api(self, params: Dict[str, Any]) -> Dict[str, Any]:
-        """Verifies concurrent read consistency using optimistic Seqlock double-reads (0.00ms stop)."""
+        """Verifies concurrent read consistency using optimistic Seqlock double-reads (zero-stop stop)."""
         try:
             pid, companion_elf, _rh, _su, _sp, _sk, _spj = self._resolve_watch_target(params)
             exprs = params.get("expressions")
@@ -3266,7 +3277,7 @@ class WebApiAdapter:
             return {"success": False, "error": {"code": "VERIFY_CONSISTENCY_ERROR", "message": str(e)}}
 
     def inspect_dpdk_lcores_and_rings_api(self, params: Dict[str, Any]) -> Dict[str, Any]:
-        """Inspects DPDK isolated-core dedicated lcores, PMD poll loops, lockless rings, and spinlocks (0.00ms stop)."""
+        """Inspects DPDK isolated-core dedicated lcores, PMD poll loops, lockless rings, and spinlocks (zero-stop stop)."""
         try:
             pid, companion_elf, _rh, _su, _sp, _sk, _spj = self._resolve_watch_target(params)
             r_exprs = params.get("ring_expressions")
@@ -3720,11 +3731,7 @@ class WebApiAdapter:
 
     def start_investigation(self, params: Dict[str, Any]) -> Dict[str, Any]:
         goal = params.get("goal") or "General state investigation"
-        auth_target = params.get("authorize_target")
-        if auth_target is None and params.get("pid"):
-            auth_target = True
-        else:
-            auth_target = bool(auth_target)
+        auth_target = bool(params.get("authorize_target", False))
 
         res = self.runtime.start_investigation(
             goal=goal,
@@ -3764,7 +3771,7 @@ class WebApiAdapter:
             observation_window=obs_window,
             debug_image=params.get("debug_image"),
             constraints=params.get("constraints"),
-            authorize_target=True,
+            authorize_target=bool(params.get("authorize_target", False)),
         )
         if res.success:
             return {"success": True, "data": _to_json_serializable(res.data)}
@@ -4189,12 +4196,104 @@ class DynamicStateRequestHandler(http.server.BaseHTTPRequestHandler):
 
     server: "DynamicStateWebServer"
 
+    def _is_allowed_host(self) -> bool:
+        host_hdr = (self.headers.get("Host") or "").strip()
+        if not host_hdr:
+            return True
+        if host_hdr.startswith("["):
+            host_only = host_hdr.split("]")[0] + "]"
+        else:
+            host_only = host_hdr.split(":")[0].lower()
+        bound_host = str(self.server.server_address[0]).lower()
+        allowed_hosts = {"127.0.0.1", "localhost", "[::1]", "::1", "0.0.0.0", bound_host}
+        return host_only in allowed_hosts
+
+    def _get_validated_origin(self) -> Tuple[bool, Optional[str]]:
+        origin_hdr = (self.headers.get("Origin") or "").strip()
+        if not origin_hdr:
+            return True, None
+        if origin_hdr.lower() == "null":
+            return False, None
+        try:
+            parsed = urllib.parse.urlparse(origin_hdr)
+        except Exception:
+            return False, None
+        if parsed.scheme not in ("http", "https") or not parsed.hostname:
+            return False, None
+        bound_host = str(self.server.server_address[0]).lower()
+        allowed_hosts = {"127.0.0.1", "localhost", "::1", bound_host}
+        if parsed.hostname.lower() not in allowed_hosts:
+            return False, None
+        return True, origin_hdr
+
+    def _extract_session_token(self, query: Optional[Dict[str, List[str]]] = None) -> Optional[str]:
+        hdr_tok = self.headers.get("X-Session-Token") or self.headers.get("X-API-Token")
+        if hdr_tok:
+            return hdr_tok.strip()
+        auth_hdr = self.headers.get("Authorization") or ""
+        if auth_hdr.lower().startswith("bearer "):
+            return auth_hdr[7:].strip()
+        cookie_hdr = self.headers.get("Cookie") or ""
+        for part in cookie_hdr.split(";"):
+            part = part.strip()
+            if part.startswith("dynamicstate_session="):
+                return part[len("dynamicstate_session="):].strip()
+        if query:
+            q_tok = query.get("token") or query.get("session_token")
+            if q_tok and q_tok[0]:
+                return q_tok[0].strip()
+        return None
+
+    def _verify_api_request(self, method: str, query: Optional[Dict[str, List[str]]] = None) -> bool:
+        if not self._is_allowed_host():
+            self._send_json(
+                {"success": False, "error": {"code": "FORBIDDEN_HOST", "message": "Invalid or untrusted Host header"}},
+                status=403,
+            )
+            return False
+        origin_ok, _ = self._get_validated_origin()
+        if not origin_ok:
+            self._send_json(
+                {"success": False, "error": {"code": "FORBIDDEN_ORIGIN", "message": "Cross-origin API requests are forbidden"}},
+                status=403,
+            )
+            return False
+        expected_tok = getattr(self.server, "session_token", None)
+        provided_tok = self._extract_session_token(query)
+        if not expected_tok or not provided_tok or not hmac.compare_digest(str(provided_tok), str(expected_tok)):
+            self._send_json(
+                {"success": False, "error": {"code": "UNAUTHORIZED", "message": "Valid session token is required for API access"}},
+                status=401,
+            )
+            return False
+        if method == "POST":
+            ctype_raw = self.headers.get("Content-Type") or ""
+            ctype = ctype_raw.split(";")[0].strip().lower()
+            if ctype != "application/json":
+                self._send_json(
+                    {"success": False, "error": {"code": "UNSUPPORTED_MEDIA_TYPE", "message": "POST requests require Content-Type: application/json"}},
+                    status=415,
+                )
+                return False
+        return True
+
     def do_OPTIONS(self) -> None:
-        """Handle CORS pre-flight requests safely."""
+        """Handle CORS pre-flight requests safely without wildcard origins."""
+        if not self._is_allowed_host():
+            self.send_response(403)
+            self.end_headers()
+            return
+        origin_ok, allowed_origin = self._get_validated_origin()
+        if not origin_ok:
+            self.send_response(403)
+            self.end_headers()
+            return
         self.send_response(200)
-        self.send_header("Access-Control-Allow-Origin", "*")
+        if allowed_origin:
+            self.send_header("Access-Control-Allow-Origin", allowed_origin)
+            self.send_header("Vary", "Origin")
         self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type, X-Session-Token, X-API-Token, Authorization")
         self.end_headers()
 
     def do_HEAD(self) -> None:
@@ -4208,6 +4307,8 @@ class DynamicStateRequestHandler(http.server.BaseHTTPRequestHandler):
 
         # 1. API routes
         if path.startswith("/api"):
+            if not self._verify_api_request("GET", query):
+                return
             self._handle_api_get(path, query)
             return
 
@@ -4217,10 +4318,14 @@ class DynamicStateRequestHandler(http.server.BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         parsed = urllib.parse.urlparse(self.path)
         path = parsed.path.rstrip("/")
+        query = urllib.parse.parse_qs(parsed.query)
 
         if not path.startswith("/api"):
             self._send_json({"success": False, "error": {"code": "NOT_FOUND", "message": f"Route not found: {path}"}},
                             status=404)
+            return
+
+        if not self._verify_api_request("POST", query):
             return
 
         # Read JSON body safely with content-length check
@@ -4999,17 +5104,49 @@ class DynamicStateRequestHandler(http.server.BaseHTTPRequestHandler):
     # Static File Server
     # -------------------------------------------------------------------------
 
+    def _inject_session_token_into_html(self, html_bytes: bytes) -> bytes:
+        tok = getattr(self.server, "session_token", "")
+        if not tok:
+            return html_bytes
+        script_snippet = (
+            f"<script>(function(){{"
+            f"var t={json.dumps(tok)};"
+            f"window.__DYNAMICSTATE_SESSION_TOKEN__=t;"
+            f"if(typeof window.fetch==='function'&&!window.__dsFetchWrapped){{"
+            f"window.__dsFetchWrapped=true;"
+            f"var orig=window.fetch.bind(window);"
+            f"window.fetch=function(u,o){{"
+            f"o=Object.assign({{}},o||{{}});"
+            f"var h=new Headers(o.headers||{{}});"
+            f"if(!h.has('X-Session-Token'))h.set('X-Session-Token',t);"
+            f"if(((o.method||'GET').toUpperCase()==='POST')&&!h.has('Content-Type'))h.set('Content-Type','application/json');"
+            f"o.headers=h;"
+            f"return orig(u,o);"
+            f"}};"
+            f"}}"
+            f"}})();</script>"
+        ).encode("utf-8")
+        if b"</head>" in html_bytes:
+            return html_bytes.replace(b"</head>", script_snippet + b"\n</head>", 1)
+        return script_snippet + html_bytes
+
     def _serve_static(self, path: str) -> None:
+        if not self._is_allowed_host():
+            self.send_error(403, "Forbidden Host")
+            return
+        tok = getattr(self.server, "session_token", "")
         if path in ("/workspace", "/workspace/"):
             ws_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "workspace_static")
             ws_index = os.path.join(ws_dir, "index.html")
             if os.path.isfile(ws_index):
                 with open(ws_index, "rb") as f:
-                    content = f.read()
+                    content = self._inject_session_token_into_html(f.read())
                 self.send_response(200)
                 self.send_header("Content-Type", "text/html; charset=utf-8")
                 self.send_header("Content-Length", str(len(content)))
                 self.send_header("Cache-Control", "no-cache")
+                if tok:
+                    self.send_header("Set-Cookie", f"dynamicstate_session={tok}; Path=/; HttpOnly; SameSite=Strict")
                 self.end_headers()
                 self.wfile.write(content)
                 return
@@ -5048,11 +5185,16 @@ class DynamicStateRequestHandler(http.server.BaseHTTPRequestHandler):
         try:
             with open(full_path, "rb") as f:
                 content = f.read()
+            is_html = mime_type.startswith("text/html") or full_path.endswith(".html")
+            if is_html:
+                content = self._inject_session_token_into_html(content)
 
             self.send_response(200)
             self.send_header("Content-Type", mime_type)
             self.send_header("Content-Length", str(len(content)))
             self.send_header("Cache-Control", "no-cache")
+            if is_html and tok:
+                self.send_header("Set-Cookie", f"dynamicstate_session={tok}; Path=/; HttpOnly; SameSite=Strict")
             self.end_headers()
             self.wfile.write(content)
         except (BrokenPipeError, ConnectionResetError):
@@ -5066,10 +5208,13 @@ class DynamicStateRequestHandler(http.server.BaseHTTPRequestHandler):
     def _send_json(self, data: Any, status: int = 200) -> None:
         try:
             encoded = json.dumps(data, indent=2, ensure_ascii=False, default=str).encode("utf-8")
+            origin_ok, allowed_origin = self._get_validated_origin()
             self.send_response(status)
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self.send_header("Content-Length", str(len(encoded)))
-            self.send_header("Access-Control-Allow-Origin", "*")
+            if origin_ok and allowed_origin:
+                self.send_header("Access-Control-Allow-Origin", allowed_origin)
+                self.send_header("Vary", "Origin")
             self.end_headers()
             self.wfile.write(encoded)
         except (BrokenPipeError, ConnectionResetError):
@@ -5085,20 +5230,38 @@ class DynamicStateWebServer(http.server.ThreadingHTTPServer):
     """HTTP Server for dynamicState Web UI."""
     daemon_threads = True
 
-    def __init__(self, server_address: Tuple[str, int], runtime: AgentRuntime, static_dir: str):
+    def __init__(
+        self,
+        server_address: Tuple[str, int],
+        runtime: AgentRuntime,
+        static_dir: str,
+        session_token: Optional[str] = None,
+    ):
         super().__init__(server_address, DynamicStateRequestHandler)
         self.runtime = runtime
         self.adapter = WebApiAdapter(runtime)
         self.static_dir = os.path.abspath(static_dir)
+        self.session_token: str = (
+            session_token
+            or os.environ.get("DYNAMICSTATE_SESSION_TOKEN")
+            or secrets.token_hex(32)
+        )
+        self.api_token: str = self.session_token
+        self.auth_token: str = self.session_token
 
 
-def run_server(runtime: AgentRuntime, host: str = "127.0.0.1", port: int = 8000,
-               static_dir: Optional[str] = None) -> DynamicStateWebServer:
+def run_server(
+    runtime: AgentRuntime,
+    host: str = "127.0.0.1",
+    port: int = 8000,
+    static_dir: Optional[str] = None,
+    session_token: Optional[str] = None,
+) -> DynamicStateWebServer:
     """Instantiate and configure the HTTP server."""
     if static_dir is None:
         static_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
 
-    server = DynamicStateWebServer((host, port), runtime, static_dir)
+    server = DynamicStateWebServer((host, port), runtime, static_dir, session_token=session_token)
     return server
 
 

@@ -634,9 +634,17 @@
     return _basePath ? `${_basePath}${endpoint}` : endpoint;
   }
 
+  function getSessionHeaders(extra = {}) {
+    const hdrs = Object.assign({}, extra);
+    if (typeof window !== 'undefined' && window.__DYNAMICSTATE_SESSION_TOKEN__) {
+      hdrs['X-Session-Token'] = window.__DYNAMICSTATE_SESSION_TOKEN__;
+    }
+    return hdrs;
+  }
+
   async function apiGet(endpoint) {
     try {
-      const res = await fetch(getApiUrl(endpoint));
+      const res = await fetch(getApiUrl(endpoint), { headers: getSessionHeaders() });
       return await res.json();
     } catch (err) {
       console.error(`API GET ${endpoint} error:`, err);
@@ -648,7 +656,7 @@
     try {
       const fetchOpts = {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: getSessionHeaders({ 'Content-Type': 'application/json' }),
         body: JSON.stringify(body),
       };
       if (options && options.signal) {

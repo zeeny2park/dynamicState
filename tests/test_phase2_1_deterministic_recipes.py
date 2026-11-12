@@ -248,7 +248,9 @@ class TestPhase21DeterministicRecipes(unittest.TestCase):
             "thread_locks": {
                 101: {"holding": ["mutex_A"], "waiting_for": "mutex_B"},
                 102: {"holding": ["mutex_B"], "waiting_for": "mutex_A"},
-            }
+            },
+            "cycle_persistent": True,
+            "observation_count": 2,
         })
         self.assertEqual(pos.status, RECIPE_STATUS_SUPPORTED)
         self.assertGreaterEqual(pos.confidence, 0.95)
