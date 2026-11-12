@@ -1,0 +1,1221 @@
+{
+  "schema_version": 1,
+  "environment": {
+    "commit": "0d04514d0a07b6d36b940baba36f18204dfede84",
+    "dirty": false,
+    "arch": "aarch64",
+    "kernel": "7.0.0-1013-oracle",
+    "glibc": "2.39",
+    "python": "3.12.3",
+    "compiler": "gcc (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0",
+    "date_utc": "2026-11-12T21:55:57Z"
+  },
+  "symptom_mode": "ground_truth",
+  "category_to_kind": {
+    "memory_leak": [
+      "MEMORY_LEAK"
+    ],
+    "heap_overflow": [
+      "MEMORY_CORRUPTION"
+    ],
+    "use_after_free": [
+      "USE_AFTER_FREE"
+    ],
+    "deadlock": [
+      "DEADLOCK_INDICATORS"
+    ],
+    "busy_wait": [
+      "PROCESS_INSTABILITY",
+      "RESOURCE_EXHAUSTION"
+    ],
+    "long_stall": [
+      "PROCESS_INSTABILITY"
+    ]
+  },
+  "line_tolerance": 3,
+  "totals": {
+    "overall": {
+      "defect_targets": 11,
+      "detected": 11,
+      "name_full": 8,
+      "name_partial": 2,
+      "location_match": 4,
+      "false_clears": 0,
+      "healthy_targets": 8,
+      "cleared": 7,
+      "not_cleared": 1,
+      "false_positives": 0,
+      "errors": 0,
+      "non_zero_stop": 0,
+      "detection_rate": 1.0,
+      "cause_name_match_rate": 0.7273
+    },
+    "unscored": {
+      "note": "informational; excluded from every total and rate in this report",
+      "targets": [
+        {
+          "id": "stall_pipe",
+          "kind": "long_stall",
+          "scored_reason": "Not scored (owner decision): from outside a thread blocked forever and an idle worker look identical, so the tool deliberately answers 'long wait observed, cannot determine whether expected' instead of a fault. Must never be required to produce a fault; any verdict is reported informationally.",
+          "verdict": "HEALTHY",
+          "detected": false,
+          "name_match": "none",
+          "location_match": false,
+          "false_clear": true,
+          "finding_categories": [],
+          "subjects": [],
+          "error": null
+        },
+        {
+          "id": "stall_sleep",
+          "kind": "long_stall",
+          "scored_reason": "Not scored (owner decision): from outside a thread blocked forever and an idle worker look identical, so the tool deliberately answers 'long wait observed, cannot determine whether expected' instead of a fault. Must never be required to produce a fault; any verdict is reported informationally.",
+          "verdict": "HEALTHY",
+          "detected": false,
+          "name_match": "none",
+          "location_match": false,
+          "false_clear": true,
+          "finding_categories": [],
+          "subjects": [],
+          "error": null
+        }
+      ]
+    },
+    "per_kind": {
+      "memory_leak": {
+        "defect_targets": 3,
+        "detected": 3,
+        "name_full": 2,
+        "name_partial": 0,
+        "location_match": 0,
+        "false_clears": 0,
+        "healthy_targets": 0,
+        "cleared": 0,
+        "not_cleared": 0,
+        "false_positives": 0,
+        "errors": 0,
+        "non_zero_stop": 0
+      },
+      "heap_overflow": {
+        "defect_targets": 2,
+        "detected": 2,
+        "name_full": 2,
+        "name_partial": 0,
+        "location_match": 0,
+        "false_clears": 0,
+        "healthy_targets": 0,
+        "cleared": 0,
+        "not_cleared": 0,
+        "false_positives": 0,
+        "errors": 0,
+        "non_zero_stop": 0
+      },
+      "use_after_free": {
+        "defect_targets": 2,
+        "detected": 2,
+        "name_full": 2,
+        "name_partial": 0,
+        "location_match": 0,
+        "false_clears": 0,
+        "healthy_targets": 0,
+        "cleared": 0,
+        "not_cleared": 0,
+        "false_positives": 0,
+        "errors": 0,
+        "non_zero_stop": 0
+      },
+      "deadlock": {
+        "defect_targets": 2,
+        "detected": 2,
+        "name_full": 2,
+        "name_partial": 0,
+        "location_match": 2,
+        "false_clears": 0,
+        "healthy_targets": 0,
+        "cleared": 0,
+        "not_cleared": 0,
+        "false_positives": 0,
+        "errors": 0,
+        "non_zero_stop": 0
+      },
+      "busy_wait": {
+        "defect_targets": 2,
+        "detected": 2,
+        "name_full": 0,
+        "name_partial": 2,
+        "location_match": 2,
+        "false_clears": 0,
+        "healthy_targets": 0,
+        "cleared": 0,
+        "not_cleared": 0,
+        "false_positives": 0,
+        "errors": 0,
+        "non_zero_stop": 0
+      }
+    },
+    "per_origin": {
+      "project_fixture": {
+        "defect_targets": 2,
+        "detected": 2,
+        "name_full": 1,
+        "name_partial": 0,
+        "location_match": 1,
+        "false_clears": 0,
+        "healthy_targets": 2,
+        "cleared": 2,
+        "not_cleared": 0,
+        "false_positives": 0,
+        "errors": 0,
+        "non_zero_stop": 0
+      },
+      "external_style": {
+        "defect_targets": 3,
+        "detected": 3,
+        "name_full": 3,
+        "name_partial": 0,
+        "location_match": 0,
+        "false_clears": 0,
+        "healthy_targets": 0,
+        "cleared": 0,
+        "not_cleared": 0,
+        "false_positives": 0,
+        "errors": 0,
+        "non_zero_stop": 0
+      },
+      "new": {
+        "defect_targets": 6,
+        "detected": 6,
+        "name_full": 4,
+        "name_partial": 2,
+        "location_match": 3,
+        "false_clears": 0,
+        "healthy_targets": 6,
+        "cleared": 5,
+        "not_cleared": 1,
+        "false_positives": 0,
+        "errors": 0,
+        "non_zero_stop": 0
+      }
+    },
+    "per_naming": {
+      "neutral": {
+        "defect_targets": 8,
+        "detected": 8,
+        "name_full": 6,
+        "name_partial": 2,
+        "location_match": 3,
+        "false_clears": 0,
+        "healthy_targets": 6,
+        "cleared": 5,
+        "not_cleared": 1,
+        "false_positives": 0,
+        "errors": 0,
+        "non_zero_stop": 0
+      },
+      "project": {
+        "defect_targets": 3,
+        "detected": 3,
+        "name_full": 2,
+        "name_partial": 0,
+        "location_match": 1,
+        "false_clears": 0,
+        "healthy_targets": 2,
+        "cleared": 2,
+        "not_cleared": 0,
+        "false_positives": 0,
+        "errors": 0,
+        "non_zero_stop": 0
+      }
+    }
+  },
+  "total_wall_s": 72.9,
+  "rows": [
+    {
+      "id": "deadlock_circular",
+      "kind": "deadlock",
+      "origin": "project_fixture",
+      "naming": "project",
+      "scored": true,
+      "verdict": "CONFIRMED_FAULT",
+      "finding_categories": [
+        "DEADLOCK_INDICATORS"
+      ],
+      "finding_status": [
+        "CONFIRMED_ROOT_CAUSE"
+      ],
+      "subjects": [
+        "3174470",
+        "deadlock_circul",
+        "g_mutex_b",
+        "3174471",
+        "g_mutex_a",
+        "__GI___lll_lock_wait",
+        "pthread_mutex_lock",
+        "worker_1",
+        "proc_thread_circular_deadlock.c:28",
+        "start_thread",
+        "thread_start",
+        "worker_2",
+        "proc_thread_circular_deadlock.c:38"
+      ],
+      "not_covered_kinds": [
+        "check_inconclusive",
+        "recipes_not_planned"
+      ],
+      "capture_mode": "ZERO_STOP_LIVE_RUNTIME",
+      "measured_stop_ms": 0.0,
+      "non_zero_stop": false,
+      "detected": true,
+      "false_clear": false,
+      "names_by_class": {
+        "variables": {
+          "expected": [],
+          "found": []
+        },
+        "locks": {
+          "expected": [
+            "g_mutex_a",
+            "g_mutex_b"
+          ],
+          "found": [
+            "g_mutex_a",
+            "g_mutex_b"
+          ]
+        },
+        "threads": {
+          "expected": [],
+          "found": []
+        },
+        "functions": {
+          "expected": [
+            "worker_1",
+            "worker_2"
+          ],
+          "found": [
+            "worker_1",
+            "worker_2"
+          ]
+        }
+      },
+      "name_match": "full",
+      "location_match": true,
+      "diagnose_s": 5.26,
+      "wall_s": 6.32,
+      "symptom": "the service stopped responding"
+    },
+    {
+      "id": "deadlock_pipeline",
+      "kind": "deadlock",
+      "origin": "new",
+      "naming": "neutral",
+      "scored": true,
+      "verdict": "CONFIRMED_FAULT",
+      "finding_categories": [
+        "DEADLOCK_INDICATORS"
+      ],
+      "finding_status": [
+        "CONFIRMED_ROOT_CAUSE"
+      ],
+      "subjects": [
+        "3174542",
+        "ingest",
+        "m_out",
+        "3174543",
+        "flush",
+        "m_in",
+        "__GI___lll_lock_wait",
+        "pthread_mutex_lock",
+        "ingest",
+        "deadlock_pipeline.c:15",
+        "start_thread",
+        "thread_start",
+        "flush",
+        "deadlock_pipeline.c:27"
+      ],
+      "not_covered_kinds": [
+        "check_inconclusive",
+        "recipes_not_planned"
+      ],
+      "capture_mode": "ZERO_STOP_LIVE_RUNTIME",
+      "measured_stop_ms": 0.0,
+      "non_zero_stop": false,
+      "detected": true,
+      "false_clear": false,
+      "names_by_class": {
+        "variables": {
+          "expected": [],
+          "found": []
+        },
+        "locks": {
+          "expected": [
+            "m_in",
+            "m_out"
+          ],
+          "found": [
+            "m_in",
+            "m_out"
+          ]
+        },
+        "threads": {
+          "expected": [
+            "ingest",
+            "flush"
+          ],
+          "found": [
+            "ingest",
+            "flush"
+          ]
+        },
+        "functions": {
+          "expected": [
+            "ingest",
+            "flush"
+          ],
+          "found": [
+            "ingest",
+            "flush"
+          ]
+        }
+      },
+      "name_match": "full",
+      "location_match": true,
+      "diagnose_s": 5.07,
+      "wall_s": 5.62,
+      "symptom": "the service stopped responding"
+    },
+    {
+      "id": "leak_lru_cache",
+      "kind": "memory_leak",
+      "origin": "external_style",
+      "naming": "neutral",
+      "scored": true,
+      "verdict": "CONFIRMED_FAULT",
+      "finding_categories": [
+        "MEMORY_LEAK"
+      ],
+      "finding_status": [
+        "CONFIRMED_ROOT_CAUSE"
+      ],
+      "subjects": [
+        "filler",
+        "3174613"
+      ],
+      "not_covered_kinds": [
+        "check_inconclusive",
+        "check_not_applicable",
+        "long_wait_not_judged",
+        "recipes_not_planned"
+      ],
+      "capture_mode": "ZERO_STOP_LIVE_RUNTIME",
+      "measured_stop_ms": 0.0,
+      "non_zero_stop": false,
+      "detected": true,
+      "false_clear": false,
+      "names_by_class": {
+        "variables": {
+          "expected": [],
+          "found": []
+        },
+        "locks": {
+          "expected": [],
+          "found": []
+        },
+        "threads": {
+          "expected": [
+            "filler"
+          ],
+          "found": [
+            "filler"
+          ]
+        },
+        "functions": {
+          "expected": [
+            "lru_evict"
+          ],
+          "found": []
+        }
+      },
+      "name_match": "full",
+      "location_match": false,
+      "diagnose_s": 3.45,
+      "wall_s": 4.58,
+      "symptom": "memory usage of this process keeps growing"
+    },
+    {
+      "id": "leak_registry",
+      "kind": "memory_leak",
+      "origin": "new",
+      "naming": "neutral",
+      "scored": true,
+      "verdict": "PROBABLE_FAULT",
+      "finding_categories": [
+        "MEMORY_LEAK"
+      ],
+      "finding_status": [
+        "PROBABLE_CAUSE"
+      ],
+      "subjects": [
+        "reg_head",
+        "reg_head(->next)*",
+        "intake",
+        "3174677"
+      ],
+      "not_covered_kinds": [
+        "check_inconclusive",
+        "long_wait_not_judged",
+        "recipes_not_planned"
+      ],
+      "capture_mode": "ZERO_STOP_LIVE_RUNTIME",
+      "measured_stop_ms": 0.0,
+      "non_zero_stop": false,
+      "detected": true,
+      "false_clear": false,
+      "names_by_class": {
+        "variables": {
+          "expected": [
+            "reg_head"
+          ],
+          "found": [
+            "reg_head"
+          ]
+        },
+        "locks": {
+          "expected": [],
+          "found": []
+        },
+        "threads": {
+          "expected": [
+            "intake"
+          ],
+          "found": [
+            "intake"
+          ]
+        },
+        "functions": {
+          "expected": [
+            "intake"
+          ],
+          "found": [
+            "intake"
+          ]
+        }
+      },
+      "name_match": "full",
+      "location_match": false,
+      "diagnose_s": 3.57,
+      "wall_s": 4.75,
+      "symptom": "memory usage of this process keeps growing"
+    },
+    {
+      "id": "leak_scenario_b",
+      "kind": "memory_leak",
+      "origin": "project_fixture",
+      "naming": "project",
+      "scored": true,
+      "verdict": "PROBABLE_FAULT",
+      "finding_categories": [
+        "MEMORY_LEAK"
+      ],
+      "finding_status": [
+        "PROBABLE_CAUSE"
+      ],
+      "subjects": [],
+      "not_covered_kinds": [
+        "check_inconclusive",
+        "check_not_applicable",
+        "recipes_not_planned",
+        "unattributed_finding"
+      ],
+      "capture_mode": "ZERO_STOP_LIVE_RUNTIME",
+      "measured_stop_ms": 0.0,
+      "non_zero_stop": false,
+      "detected": true,
+      "false_clear": false,
+      "names_by_class": {
+        "variables": {
+          "expected": [],
+          "found": []
+        },
+        "locks": {
+          "expected": [],
+          "found": []
+        },
+        "threads": {
+          "expected": [],
+          "found": []
+        },
+        "functions": {
+          "expected": [
+            "leak_worker_thread"
+          ],
+          "found": []
+        }
+      },
+      "name_match": "none",
+      "location_match": false,
+      "diagnose_s": 3.37,
+      "wall_s": 4.94,
+      "symptom": "memory usage of this process keeps growing"
+    },
+    {
+      "id": "ok_busy_server",
+      "kind": "none",
+      "origin": "new",
+      "naming": "neutral",
+      "scored": true,
+      "verdict": "HEALTHY",
+      "finding_categories": [],
+      "finding_status": [],
+      "subjects": [],
+      "not_covered_kinds": [
+        "check_inconclusive",
+        "check_not_applicable",
+        "long_wait_not_judged",
+        "recipes_not_planned"
+      ],
+      "capture_mode": "ZERO_STOP_LIVE_RUNTIME",
+      "measured_stop_ms": 0.0,
+      "non_zero_stop": false,
+      "false_positive": false,
+      "cleared": true,
+      "not_cleared": false,
+      "diagnose_s": 2.62,
+      "wall_s": 2.78,
+      "symptom": "this process uses a lot of CPU, is something wrong?"
+    },
+    {
+      "id": "ok_contention",
+      "kind": "none",
+      "origin": "new",
+      "naming": "neutral",
+      "scored": true,
+      "verdict": "HEALTHY",
+      "finding_categories": [],
+      "finding_status": [],
+      "subjects": [],
+      "not_covered_kinds": [
+        "check_inconclusive",
+        "check_not_applicable",
+        "long_wait_not_judged",
+        "recipes_not_planned"
+      ],
+      "capture_mode": "ZERO_STOP_LIVE_RUNTIME",
+      "measured_stop_ms": 0.0,
+      "non_zero_stop": false,
+      "false_positive": false,
+      "cleared": true,
+      "not_cleared": false,
+      "diagnose_s": 3.04,
+      "wall_s": 3.11,
+      "symptom": "the process feels slow, check for lock problems"
+    },
+    {
+      "id": "ok_idle_server",
+      "kind": "none",
+      "origin": "new",
+      "naming": "neutral",
+      "scored": true,
+      "verdict": "HEALTHY",
+      "finding_categories": [],
+      "finding_status": [],
+      "subjects": [],
+      "not_covered_kinds": [
+        "check_inconclusive",
+        "long_wait_not_judged",
+        "recipes_not_planned"
+      ],
+      "capture_mode": "ZERO_STOP_LIVE_RUNTIME",
+      "measured_stop_ms": 0.0,
+      "non_zero_stop": false,
+      "false_positive": false,
+      "cleared": true,
+      "not_cleared": false,
+      "diagnose_s": 2.25,
+      "wall_s": 2.6,
+      "symptom": "general health check"
+    },
+    {
+      "id": "ok_normal_cv",
+      "kind": "none",
+      "origin": "project_fixture",
+      "naming": "project",
+      "scored": true,
+      "verdict": "HEALTHY",
+      "finding_categories": [],
+      "finding_status": [],
+      "subjects": [],
+      "not_covered_kinds": [
+        "check_inconclusive",
+        "check_not_applicable",
+        "recipes_not_planned"
+      ],
+      "capture_mode": "ZERO_STOP_LIVE_RUNTIME",
+      "measured_stop_ms": 0.0,
+      "non_zero_stop": false,
+      "false_positive": false,
+      "cleared": true,
+      "not_cleared": false,
+      "diagnose_s": 2.43,
+      "wall_s": 3.49,
+      "symptom": "the process seems stuck, please check"
+    },
+    {
+      "id": "ok_null_globals",
+      "kind": "none",
+      "origin": "new",
+      "naming": "neutral",
+      "scored": true,
+      "verdict": "HEALTHY",
+      "finding_categories": [],
+      "finding_status": [],
+      "subjects": [],
+      "not_covered_kinds": [
+        "check_inconclusive",
+        "long_wait_not_judged",
+        "recipes_not_planned"
+      ],
+      "capture_mode": "ZERO_STOP_LIVE_RUNTIME",
+      "measured_stop_ms": 0.0,
+      "non_zero_stop": false,
+      "false_positive": false,
+      "cleared": true,
+      "not_cleared": false,
+      "diagnose_s": 2.24,
+      "wall_s": 2.54,
+      "symptom": "general health check"
+    },
+    {
+      "id": "ok_sawtooth",
+      "kind": "none",
+      "origin": "new",
+      "naming": "neutral",
+      "scored": true,
+      "verdict": "INCONCLUSIVE",
+      "finding_categories": [],
+      "finding_status": [],
+      "subjects": [],
+      "not_covered_kinds": [
+        "check_inconclusive",
+        "integrity_not_checked",
+        "leak_owner_limited",
+        "long_wait_not_judged",
+        "recipes_not_planned"
+      ],
+      "capture_mode": "ZERO_STOP_LIVE_RUNTIME",
+      "measured_stop_ms": 0.0,
+      "non_zero_stop": false,
+      "false_positive": false,
+      "cleared": false,
+      "not_cleared": true,
+      "diagnose_s": 2.33,
+      "wall_s": 3.45,
+      "symptom": "memory usage looks high, is it leaking?"
+    },
+    {
+      "id": "ok_scenario_a",
+      "kind": "none",
+      "origin": "project_fixture",
+      "naming": "project",
+      "scored": true,
+      "verdict": "HEALTHY",
+      "finding_categories": [],
+      "finding_status": [],
+      "subjects": [],
+      "not_covered_kinds": [
+        "check_inconclusive",
+        "recipes_not_planned"
+      ],
+      "capture_mode": "ZERO_STOP_LIVE_RUNTIME",
+      "measured_stop_ms": 0.0,
+      "non_zero_stop": false,
+      "false_positive": false,
+      "cleared": true,
+      "not_cleared": false,
+      "diagnose_s": 2.39,
+      "wall_s": 3.45,
+      "symptom": "general health check"
+    },
+    {
+      "id": "ok_worker_pool",
+      "kind": "none",
+      "origin": "new",
+      "naming": "neutral",
+      "scored": true,
+      "verdict": "HEALTHY",
+      "finding_categories": [],
+      "finding_status": [],
+      "subjects": [],
+      "not_covered_kinds": [
+        "long_wait_not_judged",
+        "recipes_not_planned"
+      ],
+      "capture_mode": "ZERO_STOP_LIVE_RUNTIME",
+      "measured_stop_ms": 0.0,
+      "non_zero_stop": false,
+      "false_positive": false,
+      "cleared": true,
+      "not_cleared": false,
+      "diagnose_s": 2.55,
+      "wall_s": 2.61,
+      "symptom": "are the worker threads deadlocked?"
+    },
+    {
+      "id": "overflow_ring",
+      "kind": "heap_overflow",
+      "origin": "external_style",
+      "naming": "neutral",
+      "scored": true,
+      "verdict": "CONFIRMED_FAULT",
+      "finding_categories": [
+        "MEMORY_CORRUPTION"
+      ],
+      "finding_status": [
+        "CONFIRMED_ROOT_CAUSE"
+      ],
+      "subjects": [
+        "rb",
+        "rb.buf",
+        "aux"
+      ],
+      "not_covered_kinds": [
+        "check_inconclusive",
+        "long_wait_not_judged",
+        "recipes_not_planned"
+      ],
+      "capture_mode": "ZERO_STOP_LIVE_RUNTIME",
+      "measured_stop_ms": 0.0,
+      "non_zero_stop": false,
+      "detected": true,
+      "false_clear": false,
+      "names_by_class": {
+        "variables": {
+          "expected": [
+            "rb"
+          ],
+          "found": [
+            "rb"
+          ]
+        },
+        "locks": {
+          "expected": [],
+          "found": []
+        },
+        "threads": {
+          "expected": [],
+          "found": []
+        },
+        "functions": {
+          "expected": [
+            "rb_put"
+          ],
+          "found": []
+        }
+      },
+      "name_match": "full",
+      "location_match": false,
+      "diagnose_s": 2.11,
+      "wall_s": 2.16,
+      "symptom": "this program shows occasional strange data and I suspect memory corruption"
+    },
+    {
+      "id": "overflow_tbl",
+      "kind": "heap_overflow",
+      "origin": "new",
+      "naming": "neutral",
+      "scored": true,
+      "verdict": "CONFIRMED_FAULT",
+      "finding_categories": [
+        "MEMORY_CORRUPTION"
+      ],
+      "finding_status": [
+        "CONFIRMED_ROOT_CAUSE"
+      ],
+      "subjects": [
+        "tbl",
+        "tbl[3]"
+      ],
+      "not_covered_kinds": [
+        "check_inconclusive",
+        "long_wait_not_judged",
+        "recipes_not_planned"
+      ],
+      "capture_mode": "ZERO_STOP_LIVE_RUNTIME",
+      "measured_stop_ms": 0.0,
+      "non_zero_stop": false,
+      "detected": true,
+      "false_clear": false,
+      "names_by_class": {
+        "variables": {
+          "expected": [
+            "tbl"
+          ],
+          "found": [
+            "tbl"
+          ]
+        },
+        "locks": {
+          "expected": [],
+          "found": []
+        },
+        "threads": {
+          "expected": [],
+          "found": []
+        },
+        "functions": {
+          "expected": [
+            "tbl_put"
+          ],
+          "found": []
+        }
+      },
+      "name_match": "full",
+      "location_match": false,
+      "diagnose_s": 2.3,
+      "wall_s": 2.35,
+      "symptom": "this program shows occasional strange data and I suspect memory corruption"
+    },
+    {
+      "id": "spin_flag",
+      "kind": "busy_wait",
+      "origin": "new",
+      "naming": "neutral",
+      "scored": true,
+      "verdict": "PROBABLE_FAULT",
+      "finding_categories": [
+        "PROCESS_INSTABILITY"
+      ],
+      "finding_status": [
+        "PROBABLE_CAUSE"
+      ],
+      "subjects": [
+        "3175249",
+        "poller",
+        "poll_loop",
+        "spin_flag.c:11"
+      ],
+      "not_covered_kinds": [
+        "check_inconclusive",
+        "check_not_applicable",
+        "recipes_not_planned"
+      ],
+      "capture_mode": "ZERO_STOP_LIVE_RUNTIME",
+      "measured_stop_ms": 0.0,
+      "non_zero_stop": false,
+      "detected": true,
+      "false_clear": false,
+      "names_by_class": {
+        "variables": {
+          "expected": [
+            "go"
+          ],
+          "found": []
+        },
+        "locks": {
+          "expected": [],
+          "found": []
+        },
+        "threads": {
+          "expected": [
+            "poller"
+          ],
+          "found": [
+            "poller"
+          ]
+        },
+        "functions": {
+          "expected": [
+            "poll_loop"
+          ],
+          "found": [
+            "poll_loop"
+          ]
+        }
+      },
+      "name_match": "partial",
+      "location_match": true,
+      "diagnose_s": 3.09,
+      "wall_s": 3.64,
+      "symptom": "this process uses a full CPU core while doing nothing useful"
+    },
+    {
+      "id": "spin_yield",
+      "kind": "busy_wait",
+      "origin": "new",
+      "naming": "neutral",
+      "scored": true,
+      "verdict": "PROBABLE_FAULT",
+      "finding_categories": [
+        "PROCESS_INSTABILITY"
+      ],
+      "finding_status": [
+        "PROBABLE_CAUSE"
+      ],
+      "subjects": [
+        "3175350",
+        "waiter",
+        "await_event",
+        "spin_yield.c:9"
+      ],
+      "not_covered_kinds": [
+        "check_inconclusive",
+        "check_not_applicable",
+        "recipes_not_planned"
+      ],
+      "capture_mode": "ZERO_STOP_LIVE_RUNTIME",
+      "measured_stop_ms": 0.0,
+      "non_zero_stop": false,
+      "detected": true,
+      "false_clear": false,
+      "names_by_class": {
+        "variables": {
+          "expected": [
+            "ev"
+          ],
+          "found": []
+        },
+        "locks": {
+          "expected": [],
+          "found": []
+        },
+        "threads": {
+          "expected": [
+            "waiter"
+          ],
+          "found": [
+            "waiter"
+          ]
+        },
+        "functions": {
+          "expected": [
+            "await_event"
+          ],
+          "found": [
+            "await_event"
+          ]
+        }
+      },
+      "name_match": "partial",
+      "location_match": true,
+      "diagnose_s": 3.08,
+      "wall_s": 3.63,
+      "symptom": "this process uses a full CPU core while doing nothing useful"
+    },
+    {
+      "id": "stall_pipe",
+      "kind": "long_stall",
+      "origin": "new",
+      "naming": "neutral",
+      "scored": false,
+      "scored_reason": "Not scored (owner decision): from outside a thread blocked forever and an idle worker look identical, so the tool deliberately answers 'long wait observed, cannot determine whether expected' instead of a fault. Must never be required to produce a fault; any verdict is reported informationally.",
+      "verdict": "HEALTHY",
+      "finding_categories": [],
+      "finding_status": [],
+      "subjects": [],
+      "not_covered_kinds": [
+        "check_inconclusive",
+        "check_not_applicable",
+        "long_wait_not_judged",
+        "recipes_not_planned"
+      ],
+      "capture_mode": "ZERO_STOP_LIVE_RUNTIME",
+      "measured_stop_ms": 0.0,
+      "non_zero_stop": false,
+      "detected": false,
+      "false_clear": true,
+      "names_by_class": {
+        "variables": {
+          "expected": [],
+          "found": []
+        },
+        "locks": {
+          "expected": [],
+          "found": []
+        },
+        "threads": {
+          "expected": [
+            "worker"
+          ],
+          "found": []
+        },
+        "functions": {
+          "expected": [
+            "fetch_next"
+          ],
+          "found": []
+        }
+      },
+      "name_match": "none",
+      "location_match": false,
+      "diagnose_s": 2.46,
+      "wall_s": 3.01,
+      "symptom": "requests are not being processed anymore"
+    },
+    {
+      "id": "stall_sleep",
+      "kind": "long_stall",
+      "origin": "new",
+      "naming": "neutral",
+      "scored": false,
+      "scored_reason": "Not scored (owner decision): from outside a thread blocked forever and an idle worker look identical, so the tool deliberately answers 'long wait observed, cannot determine whether expected' instead of a fault. Must never be required to produce a fault; any verdict is reported informationally.",
+      "verdict": "HEALTHY",
+      "finding_categories": [],
+      "finding_status": [],
+      "subjects": [],
+      "not_covered_kinds": [
+        "check_inconclusive",
+        "check_not_applicable",
+        "long_wait_not_judged",
+        "recipes_not_planned"
+      ],
+      "capture_mode": "ZERO_STOP_LIVE_RUNTIME",
+      "measured_stop_ms": 0.0,
+      "non_zero_stop": false,
+      "detected": false,
+      "false_clear": true,
+      "names_by_class": {
+        "variables": {
+          "expected": [],
+          "found": []
+        },
+        "locks": {
+          "expected": [],
+          "found": []
+        },
+        "threads": {
+          "expected": [
+            "syncer"
+          ],
+          "found": []
+        },
+        "functions": {
+          "expected": [
+            "flush_remote"
+          ],
+          "found": []
+        }
+      },
+      "name_match": "none",
+      "location_match": false,
+      "diagnose_s": 2.45,
+      "wall_s": 3.0,
+      "symptom": "requests are not being processed anymore"
+    },
+    {
+      "id": "uaf_jobq",
+      "kind": "use_after_free",
+      "origin": "external_style",
+      "naming": "neutral",
+      "scored": true,
+      "verdict": "PROBABLE_FAULT",
+      "finding_categories": [
+        "USE_AFTER_FREE"
+      ],
+      "finding_status": [
+        "PROBABLE_CAUSE"
+      ],
+      "subjects": [
+        "0xbf3a0ce232d0",
+        "cur"
+      ],
+      "not_covered_kinds": [
+        "check_inconclusive",
+        "check_not_applicable",
+        "long_wait_not_judged",
+        "recipes_not_planned"
+      ],
+      "capture_mode": "ZERO_STOP_LIVE_RUNTIME",
+      "measured_stop_ms": 0.0,
+      "non_zero_stop": false,
+      "detected": true,
+      "false_clear": false,
+      "names_by_class": {
+        "variables": {
+          "expected": [
+            "cur"
+          ],
+          "found": [
+            "cur"
+          ]
+        },
+        "locks": {
+          "expected": [],
+          "found": []
+        },
+        "threads": {
+          "expected": [],
+          "found": []
+        },
+        "functions": {
+          "expected": [
+            "job_finish"
+          ],
+          "found": []
+        }
+      },
+      "name_match": "full",
+      "location_match": false,
+      "diagnose_s": 2.4,
+      "wall_s": 2.45,
+      "symptom": "this program crashes sometimes and data looks wrong"
+    },
+    {
+      "id": "uaf_sessions",
+      "kind": "use_after_free",
+      "origin": "new",
+      "naming": "project",
+      "scored": true,
+      "verdict": "PROBABLE_FAULT",
+      "finding_categories": [
+        "USE_AFTER_FREE"
+      ],
+      "finding_status": [
+        "PROBABLE_CAUSE"
+      ],
+      "subjects": [
+        "0xc0040e1092d0",
+        "g_sessions",
+        "g_sessions[1]"
+      ],
+      "not_covered_kinds": [
+        "check_inconclusive",
+        "check_not_applicable",
+        "long_wait_not_judged",
+        "recipes_not_planned"
+      ],
+      "capture_mode": "ZERO_STOP_LIVE_RUNTIME",
+      "measured_stop_ms": 0.0,
+      "non_zero_stop": false,
+      "detected": true,
+      "false_clear": false,
+      "names_by_class": {
+        "variables": {
+          "expected": [
+            "g_sessions"
+          ],
+          "found": [
+            "g_sessions"
+          ]
+        },
+        "locks": {
+          "expected": [],
+          "found": []
+        },
+        "threads": {
+          "expected": [],
+          "found": []
+        },
+        "functions": {
+          "expected": [
+            "sess_close"
+          ],
+          "found": []
+        }
+      },
+      "name_match": "full",
+      "location_match": false,
+      "diagnose_s": 2.38,
+      "wall_s": 2.43,
+      "symptom": "this program crashes sometimes and data looks wrong"
+    }
+  ]
+}
