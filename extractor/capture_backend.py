@@ -2157,7 +2157,11 @@ class CaptureSafetyPolicy:
       to satisfy a timer.
     - max_capture_bytes: Hard upper bound on bytes to attempt reading across all regions.
     - max_capture_ranges: Hard upper bound on the number of distinct memory regions to process.
-    - timeout_ms: Maximum duration for overall capture operation.
+    - timeout_ms: Maximum duration for the overall capture operation (IMP-020).  Checked between region reads
+      in the read loop: once exceeded (measured from capture start; the first region is always attempted so a
+      slow start cannot yield an empty capture) the remaining regions are recorded as failed with error
+      CAPTURE_TIMEOUT, a `CAPTURE_TIMEOUT` diagnostic is added and completeness is demoted to PARTIAL.  A single
+      read already in flight is a synchronous syscall and is not preempted.  `timeout_ms <= 0` disables the bound.
     - fail_open: Guarantees that target processes suspended by the capture engine are resumed via finally:.
     """
     max_stop_time_ms: float = 50.0
@@ -2174,6 +2178,15 @@ class CaptureSafetyPolicy:
     simulate_mapping_race: bool = False  # Inject mapping race condition for deterministic testing
     allow_stop: bool = False  # Explicit approval required for stopping capture modes
     authorize_stop: bool = False
+
+
+def _capture_deadline_ns(t_start_ns: int, policy: Any) -> Optional[int]:
+    """Monotonic deadline for CaptureSafetyPolicy.timeout_ms (None = unbounded)."""
+    try:
+        ms = float(getattr(policy, "timeout_ms", 0) or 0)
+    except (TypeError, ValueError):
+        return None
+    return t_start_ns + int(ms * 1_000_000) if ms > 0 else None
 
 
 class _struct_iovec(ctypes.Structure):
@@ -3651,8 +3664,20 @@ class ProcessVmCaptureBackend(RuntimeCaptureBackend):
             # 4. Read memory into pre-allocated buffers
             is_same_mem, ident_status_mem = handle.record_checkpoint("PRE_MEMORY_READ")
             mem_reader = getattr(policy, "mem_reader", None)
+            capture_deadline_ns = _capture_deadline_ns(t_overall_start_ns, policy)
+            capture_timed_out = False
             for item in read_plans:
                 idx, reg, reg_start, reg_size, chunk_size, tail_omitted, buf, l_iov, r_iov = item
+                if capture_deadline_ns is not None and read_results and time.monotonic_ns() >= capture_deadline_ns:
+                    if not capture_timed_out:
+                        capture_timed_out = True
+                        diagnostics.append({
+                            "code": "CAPTURE_TIMEOUT",
+                            "message": f"Capture exceeded timeout_ms={policy.timeout_ms}; remaining regions were not read. Snapshot completeness demoted to PARTIAL.",
+                            "level": "WARNING"
+                        })
+                    read_results.append((item, -1, errno.ETIME, None))
+                    continue
                 if not is_same_mem:
                     nread = -1
                     err = errno.ESRCH
@@ -4907,12 +4932,31 @@ class ProcfsCaptureBackend(RuntimeCaptureBackend):
             is_same_mem, ident_status_mem = handle.record_checkpoint("PRE_MEMORY_READ")
             mem_file = f"/proc/{pid}/mem"
             mem_reader = getattr(policy, "mem_reader", None)
+            capture_deadline_ns = _capture_deadline_ns(t_overall_start_ns, policy)
+            timeout_state = {"hit": False}
+
+            def _procfs_timed_out() -> bool:
+                # first region is always attempted (progress guarantee)
+                if capture_deadline_ns is None or not read_results or time.monotonic_ns() < capture_deadline_ns:
+                    return False
+                if not timeout_state["hit"]:
+                    timeout_state["hit"] = True
+                    diagnostics.append({
+                        "code": "CAPTURE_TIMEOUT",
+                        "message": f"Capture exceeded timeout_ms={policy.timeout_ms}; remaining regions were not read. Snapshot completeness demoted to PARTIAL.",
+                        "level": "WARNING"
+                    })
+                return True
+
             if not is_same_mem:
                 for item in read_plans:
                     read_results.append((item, b"", f"IDENTITY_{ident_status_mem}"))
             elif mem_reader:
                 for item in read_plans:
                     idx, reg, reg_start, reg_size, chunk_size, tail_omitted = item
+                    if _procfs_timed_out():
+                        read_results.append((item, b"", "CAPTURE_TIMEOUT"))
+                        continue
                     try:
                         read_data = mem_reader(pid, reg_start, chunk_size)
                         if read_data is not None:
@@ -4925,6 +4969,9 @@ class ProcfsCaptureBackend(RuntimeCaptureBackend):
                 # Prefer pinned /proc/<pid>/mem descriptor
                 for item in read_plans:
                     idx, reg, reg_start, reg_size, chunk_size, tail_omitted = item
+                    if _procfs_timed_out():
+                        read_results.append((item, b"", "CAPTURE_TIMEOUT"))
+                        continue
                     try:
                         read_data = handle.read_mem(reg_start, chunk_size)
                         if read_data is not None:
@@ -4938,6 +4985,9 @@ class ProcfsCaptureBackend(RuntimeCaptureBackend):
                     with open(mem_file, "rb", buffering=0) as f_mem:
                         for item in read_plans:
                             idx, reg, reg_start, reg_size, chunk_size, tail_omitted = item
+                            if _procfs_timed_out():
+                                read_results.append((item, b"", "CAPTURE_TIMEOUT"))
+                                continue
                             try:
                                 f_mem.seek(reg_start)
                                 chunk = f_mem.read(chunk_size)

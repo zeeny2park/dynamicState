@@ -307,6 +307,66 @@ def thread_info_from_raw(raw: Dict[str, Any], pid: int, maps: List[Dict[str, Any
 
 
 
+def parse_load_snapshot_shell(out: str) -> Optional[Dict[str, Any]]:
+    """Parses the output of ``load_snapshot_shell_script`` (IMP-020); None when it is unusable."""
+    if "@@END" not in out:
+        return None
+    sect: Dict[str, List[str]] = {}
+    cur: Optional[str] = None
+    vol = invol = run_ns = wait_ns = slices = 0
+    have_ctx = have_sched = False
+    for line in out.splitlines():
+        if line.startswith("@@"):
+            tag = line[2:].strip()
+            if tag == "END":
+                break
+            cur = tag
+            if tag != "T":
+                sect[tag] = []
+            continue
+        if cur == "T":
+            if line.startswith("voluntary_ctxt_switches:"):
+                try:
+                    vol += int(line.split(":", 1)[1]); have_ctx = True
+                except ValueError:
+                    pass
+            elif line.startswith("nonvoluntary_ctxt_switches:"):
+                try:
+                    invol += int(line.split(":", 1)[1])
+                except ValueError:
+                    pass
+            else:
+                f = line.split()
+                if len(f) >= 3 and all(x.isdigit() for x in f[:3]):
+                    run_ns += int(f[0]); wait_ns += int(f[1]); slices += int(f[2]); have_sched = True
+        elif cur is not None:
+            sect[cur].append(line)
+    stat = "\n".join(sect.get("STAT", [])).strip()
+    if not stat:
+        return None
+    return {
+        "stat": stat,
+        "vol": vol if have_ctx else None,
+        "invol": invol if have_ctx else None,
+        "sched": {"run_ns": run_ns, "wait_ns": wait_ns, "slices": slices} if have_sched else None,
+        "loadavg": "\n".join(sect.get("LOADAVG", [])).strip() or None,
+        "cpu_line": "\n".join(sect.get("CPU", [])).strip() or None,
+        "clk_tck": None,
+        "collector": None,
+    }
+
+
+def load_snapshot_shell_script(pid: int) -> str:
+    """ONE POSIX-sh command (BusyBox applets only) printing the files a load snapshot needs."""
+    p = int(pid)
+    return (
+        f"echo @@STAT; cat /proc/{p}/stat 2>/dev/null; "
+        f"for t in /proc/{p}/task/*; do [ -d \"$t\" ] || continue; echo @@T; "
+        "grep ctxt_switches \"$t/status\" 2>/dev/null; cat \"$t/schedstat\" 2>/dev/null; done; "
+        "echo @@LOADAVG; cat /proc/loadavg 2>/dev/null; echo @@CPU; head -n 1 /proc/stat 2>/dev/null; echo @@END"
+    )
+
+
 class TargetIdentityChangedError(RuntimeError):
     """Raised when a pinned target PID is reused or executes a different binary."""
 
@@ -1135,6 +1195,20 @@ class TargetExecutionAdapter(ABC):
         voluntary/nonvoluntary_ctxt_switches, io_syscalls, syscall) or None when the threads cannot be enumerated."""
         return None
 
+    def read_load_snapshot(self, pid: int) -> Optional[Dict[str, Any]]:
+        """IMP-020: raw load figures of the TARGET host, taken in as few exchanges as the transport allows.
+
+        Returns ``{"stat": <raw /proc/PID/stat>, "vol", "invol" (context switches summed over threads, or None),
+        "sched": {"run_ns","wait_ns","slices"} | None, "loadavg": str | None, "cpu_line": <first /proc/stat line> | None,
+        "clk_tck": int | None, "collector": {"cpu_user_us","cpu_sys_us","max_rss_kb",...} | None, "transport": str}``
+        or None when the adapter cannot provide it.  ``collector`` is the collector process's own getrusage
+        (remote targets only)."""
+        return None
+
+    def read_collector_stats(self) -> Optional[Dict[str, Any]]:
+        """IMP-020: the collector process's own CPU/RSS (``getrusage``), or None (local adapters / no collector)."""
+        return None
+
     @abstractmethod
     def read_memory(self, pid: int, address: int, size: int) -> Tuple[Optional[bytes], str, Optional[str]]:
         """Reads raw bytes from target memory without suspending the process.
@@ -1383,6 +1457,54 @@ class LocalTargetAdapter(TargetExecutionAdapter):
     def read_thread_samples(self, pid: int, counters: Optional[Dict[str, int]] = None) -> Optional[List[Dict[str, Any]]]:
         from .thread_sampler import read_local_thread_samples
         return read_local_thread_samples(pid, counters if counters is not None else {})
+
+    def read_load_snapshot(self, pid: int) -> Optional[Dict[str, Any]]:
+        if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
+            return None
+        def rd(path: str) -> Optional[str]:
+            try:
+                with open(path, "r", encoding="utf-8", errors="replace") as fh:
+                    return fh.read()
+            except OSError:
+                return None
+        stat = rd(f"/proc/{pid}/stat")
+        if not stat:
+            return None
+        vol = invol = run_ns = wait_ns = slices = 0
+        have_ctx = have_sched = False
+        try:
+            tids = [t for t in os.listdir(f"/proc/{pid}/task") if t.isdigit()]
+        except OSError:
+            tids = []
+        for tid in tids:
+            st = rd(f"/proc/{pid}/task/{tid}/status")
+            if st:
+                for line in st.splitlines():
+                    if line.startswith("voluntary_ctxt_switches:"):
+                        vol += int(line.split(":", 1)[1] or 0); have_ctx = True
+                    elif line.startswith("nonvoluntary_ctxt_switches:"):
+                        invol += int(line.split(":", 1)[1] or 0)
+            ss = rd(f"/proc/{pid}/task/{tid}/schedstat")
+            if ss:
+                f = ss.split()
+                if len(f) >= 3 and all(x.isdigit() for x in f[:3]):
+                    run_ns += int(f[0]); wait_ns += int(f[1]); slices += int(f[2]); have_sched = True
+        cpu_text = rd("/proc/stat") or ""
+        try:
+            clk = os.sysconf("SC_CLK_TCK")
+        except (ValueError, OSError):
+            clk = 100
+        return {
+            "stat": stat.strip(),
+            "vol": vol if have_ctx else None,
+            "invol": invol if have_ctx else None,
+            "sched": {"run_ns": run_ns, "wait_ns": wait_ns, "slices": slices} if have_sched else None,
+            "loadavg": (rd("/proc/loadavg") or "").strip() or None,
+            "cpu_line": cpu_text.splitlines()[0] if cpu_text else None,
+            "clk_tck": int(clk),
+            "collector": None,
+            "transport": "local",
+        }
 
     def get_threads(self, pid: int) -> List[Dict[str, Any]]:
         import struct as _struct
@@ -2282,6 +2404,55 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
             return None
         self.last_threads_transport = transport
         return sorted((thread_sample_from_raw(r) for r in raw), key=lambda r: r["tid"])
+
+    # ---- IMP-020: load snapshot + collector self-cost ------------------------------------------
+    def _daemon_json(self, line: str) -> Optional[Dict[str, Any]]:
+        """One daemon exchange expecting a JSON object reply; None = use another transport."""
+        def run(ch: _DaemonChannel) -> Optional[Dict[str, Any]]:
+            reply = ch.exchange(line, max(self.timeout_sec, 1.0))
+            try:
+                payload = json.loads(reply)
+            except ValueError:
+                raise DaemonChannelError(f"garbage reply: {reply[:80]!r}")
+            if not isinstance(payload, dict):
+                raise DaemonChannelError("non-object reply")
+            return payload
+        return self._with_daemon(run)
+
+    def read_collector_stats(self) -> Optional[Dict[str, Any]]:
+        if not self.collector_path or getattr(self, "_stats_unsupported_for", None) == self.collector_path:
+            return None
+        payload = self._daemon_json("STATS")
+        if payload is None:
+            return None
+        if not payload.get("success"):
+            if payload.get("error") == "UNKNOWN_COMMAND":
+                self._stats_unsupported_for = self.collector_path
+            return None
+        coll = payload.get("collector")
+        return coll if isinstance(coll, dict) else None
+
+    def read_load_snapshot(self, pid: int) -> Optional[Dict[str, Any]]:
+        if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
+            return None
+        if self.collector_path and getattr(self, "_impact_unsupported_for", None) != self.collector_path:
+            payload = self._daemon_json(f"IMPACT {int(pid)}")
+            if payload is not None:
+                if payload.get("success") and payload.get("stat"):
+                    out = {k: payload.get(k) for k in ("stat", "vol", "invol", "sched", "loadavg", "cpu_line", "clk_tck", "collector")}
+                    out["transport"] = "daemon"
+                    return out
+                if payload.get("error") == "UNKNOWN_COMMAND":
+                    self._impact_unsupported_for = self.collector_path   # old collector: never ask again
+                elif payload.get("error") == "TARGET_TERMINATED":
+                    return None
+        rc, out_text, _ = self.run_ssh(f"sh -c {shlex.quote(load_snapshot_shell_script(pid))}")
+        if rc != 0 and not out_text:
+            return None
+        parsed = parse_load_snapshot_shell(out_text)
+        if parsed is not None:
+            parsed["transport"] = "shell"
+        return parsed
 
     def get_threads(self, pid: int) -> List[Dict[str, Any]]:
         raw, transport = self._threads_raw(pid)

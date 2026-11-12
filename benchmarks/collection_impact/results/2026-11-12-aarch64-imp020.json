@@ -1,0 +1,314 @@
+{
+  "schema_version": 1,
+  "benchmark": "collection_impact_throughput",
+  "environment": {
+    "os": "Linux",
+    "platform": "Linux-7.0.0-1013-oracle-aarch64-with-glibc2.39",
+    "kernel_release": "7.0.0-1013-oracle",
+    "architecture": "aarch64",
+    "cpu_model": "aarch64",
+    "cpu_count": 4,
+    "compiler": "g++ (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0",
+    "compile_flags": [
+      "-fPIE",
+      "-pie",
+      "-g",
+      "-O0",
+      "-fno-inline",
+      "-fno-omit-frame-pointer",
+      "-Wl,--build-id=sha1",
+      "-lpthread"
+    ],
+    "python_version": "3.12.3",
+    "timestamp_utc": "2026-11-12T10:30:09.127113+00:00",
+    "git_commit": "ff42ce75055fc303a320f2d65afaf4eb0a9eeca0",
+    "git_branch": "worktree-agent-a36aea77ffc8d0fb2",
+    "git_dirty": true
+  },
+  "parameters": {
+    "seconds_per_window": 3.0,
+    "repetitions": 5,
+    "sample_interval_ms": 100.0
+  },
+  "method": "target-printed iteration counter; ABAB idle/loaded windows; diagnosis load = one thread sample + 1 MiB heap walk (4 KiB reads) per cycle",
+  "scenarios": [
+    {
+      "scenario": "local_unpinned",
+      "pinned_to_cpu": null,
+      "repetitions": [
+        {
+          "idle_iter_per_s": 299875384,
+          "loaded_iter_per_s": 342293310,
+          "throughput_delta_pct": -14.15,
+          "diagnosis": {
+            "cycles": 28,
+            "reads": 7168,
+            "bytes_read": 29360128
+          },
+          "target_cpu_ms_during_window": 3120.0,
+          "attributable_cpu_ms": 142.019,
+          "attributable_basis": "diagnosing_process_cpu",
+          "collector_max_rss_kb": null,
+          "target_ctx_switches": 405,
+          "target_runqueue_wait_ms": 79.596
+        },
+        {
+          "idle_iter_per_s": 323548861,
+          "loaded_iter_per_s": 332951092,
+          "throughput_delta_pct": -2.91,
+          "diagnosis": {
+            "cycles": 29,
+            "reads": 7424,
+            "bytes_read": 30408704
+          },
+          "target_cpu_ms_during_window": 3190.0,
+          "attributable_cpu_ms": 136.528,
+          "attributable_basis": "diagnosing_process_cpu",
+          "collector_max_rss_kb": null,
+          "target_ctx_switches": 415,
+          "target_runqueue_wait_ms": 28.103
+        },
+        {
+          "idle_iter_per_s": 344427185,
+          "loaded_iter_per_s": 308819040,
+          "throughput_delta_pct": 10.34,
+          "diagnosis": {
+            "cycles": 28,
+            "reads": 7168,
+            "bytes_read": 29360128
+          },
+          "target_cpu_ms_during_window": 2790.0,
+          "attributable_cpu_ms": 136.636,
+          "attributable_basis": "diagnosing_process_cpu",
+          "collector_max_rss_kb": null,
+          "target_ctx_switches": 545,
+          "target_runqueue_wait_ms": 399.481
+        },
+        {
+          "idle_iter_per_s": 342445132,
+          "loaded_iter_per_s": 256298543,
+          "throughput_delta_pct": 25.16,
+          "diagnosis": {
+            "cycles": 27,
+            "reads": 6912,
+            "bytes_read": 28311552
+          },
+          "target_cpu_ms_during_window": 2300.0,
+          "attributable_cpu_ms": 137.769,
+          "attributable_basis": "diagnosing_process_cpu",
+          "collector_max_rss_kb": null,
+          "target_ctx_switches": 1102,
+          "target_runqueue_wait_ms": 864.827
+        },
+        {
+          "idle_iter_per_s": 262479510,
+          "loaded_iter_per_s": 263418592,
+          "throughput_delta_pct": -0.36,
+          "diagnosis": {
+            "cycles": 27,
+            "reads": 6912,
+            "bytes_read": 28311552
+          },
+          "target_cpu_ms_during_window": 2400.0,
+          "attributable_cpu_ms": 141.033,
+          "attributable_basis": "diagnosing_process_cpu",
+          "collector_max_rss_kb": null,
+          "target_ctx_switches": 1225,
+          "target_runqueue_wait_ms": 830.889
+        }
+      ],
+      "median_idle_iter_per_s": 323548861,
+      "median_loaded_iter_per_s": 308819040,
+      "median_throughput_delta_pct": -0.36,
+      "min_delta_pct": -14.15,
+      "max_delta_pct": 25.16,
+      "idle_cv_pct": 9.72
+    },
+    {
+      "scenario": "local_same_core",
+      "pinned_to_cpu": 0,
+      "repetitions": [
+        {
+          "idle_iter_per_s": 222990560,
+          "loaded_iter_per_s": 191479645,
+          "throughput_delta_pct": 14.13,
+          "diagnosis": {
+            "cycles": 25,
+            "reads": 6400,
+            "bytes_read": 26214400
+          },
+          "target_cpu_ms_during_window": 1700.0,
+          "attributable_cpu_ms": 137.044,
+          "attributable_basis": "diagnosing_process_cpu",
+          "collector_max_rss_kb": null,
+          "target_ctx_switches": 5088,
+          "target_runqueue_wait_ms": 1457.185
+        },
+        {
+          "idle_iter_per_s": 139828007,
+          "loaded_iter_per_s": 184012832,
+          "throughput_delta_pct": -31.6,
+          "diagnosis": {
+            "cycles": 25,
+            "reads": 6400,
+            "bytes_read": 26214400
+          },
+          "target_cpu_ms_during_window": 1750.0,
+          "attributable_cpu_ms": 126.011,
+          "attributable_basis": "diagnosing_process_cpu",
+          "collector_max_rss_kb": null,
+          "target_ctx_switches": 5694,
+          "target_runqueue_wait_ms": 1478.167
+        },
+        {
+          "idle_iter_per_s": 158779264,
+          "loaded_iter_per_s": 194686469,
+          "throughput_delta_pct": -22.61,
+          "diagnosis": {
+            "cycles": 26,
+            "reads": 6656,
+            "bytes_read": 27262976
+          },
+          "target_cpu_ms_during_window": 1640.0,
+          "attributable_cpu_ms": 124.778,
+          "attributable_basis": "diagnosing_process_cpu",
+          "collector_max_rss_kb": null,
+          "target_ctx_switches": 771,
+          "target_runqueue_wait_ms": 1745.987
+        },
+        {
+          "idle_iter_per_s": 192003603,
+          "loaded_iter_per_s": 136824187,
+          "throughput_delta_pct": 28.74,
+          "diagnosis": {
+            "cycles": 26,
+            "reads": 6656,
+            "bytes_read": 27262976
+          },
+          "target_cpu_ms_during_window": 1250.0,
+          "attributable_cpu_ms": 125.394,
+          "attributable_basis": "diagnosing_process_cpu",
+          "collector_max_rss_kb": null,
+          "target_ctx_switches": 673,
+          "target_runqueue_wait_ms": 1926.549
+        },
+        {
+          "idle_iter_per_s": 152464097,
+          "loaded_iter_per_s": 111964832,
+          "throughput_delta_pct": 26.56,
+          "diagnosis": {
+            "cycles": 19,
+            "reads": 4864,
+            "bytes_read": 19922944
+          },
+          "target_cpu_ms_during_window": 1000.0,
+          "attributable_cpu_ms": 93.402,
+          "attributable_basis": "diagnosing_process_cpu",
+          "collector_max_rss_kb": null,
+          "target_ctx_switches": 560,
+          "target_runqueue_wait_ms": 2250.305
+        }
+      ],
+      "median_idle_iter_per_s": 158779264,
+      "median_loaded_iter_per_s": 184012832,
+      "median_throughput_delta_pct": 14.13,
+      "min_delta_pct": -31.6,
+      "max_delta_pct": 28.74,
+      "idle_cv_pct": 17.48
+    },
+    {
+      "scenario": "remote_same_core",
+      "pinned_to_cpu": 0,
+      "repetitions": [
+        {
+          "idle_iter_per_s": 200323199,
+          "loaded_iter_per_s": 198147221,
+          "throughput_delta_pct": 1.09,
+          "diagnosis": {
+            "cycles": 10,
+            "reads": 2560,
+            "bytes_read": 10485760
+          },
+          "target_cpu_ms_during_window": 1780.0,
+          "attributable_cpu_ms": 770.795,
+          "attributable_basis": "collector_process_rusage",
+          "collector_max_rss_kb": 27960,
+          "target_ctx_switches": 814,
+          "target_runqueue_wait_ms": 1474.17
+        },
+        {
+          "idle_iter_per_s": 214856609,
+          "loaded_iter_per_s": 212784949,
+          "throughput_delta_pct": 0.96,
+          "diagnosis": {
+            "cycles": 9,
+            "reads": 2304,
+            "bytes_read": 9437184
+          },
+          "target_cpu_ms_during_window": 1830.0,
+          "attributable_cpu_ms": 690.447,
+          "attributable_basis": "collector_process_rusage",
+          "collector_max_rss_kb": 27960,
+          "target_ctx_switches": 1461,
+          "target_runqueue_wait_ms": 1453.188
+        },
+        {
+          "idle_iter_per_s": 297986338,
+          "loaded_iter_per_s": 217327964,
+          "throughput_delta_pct": 27.07,
+          "diagnosis": {
+            "cycles": 11,
+            "reads": 2816,
+            "bytes_read": 11534336
+          },
+          "target_cpu_ms_during_window": 2100.0,
+          "attributable_cpu_ms": 843.459,
+          "attributable_basis": "collector_process_rusage",
+          "collector_max_rss_kb": 27960,
+          "target_ctx_switches": 655,
+          "target_runqueue_wait_ms": 1280.584
+        },
+        {
+          "idle_iter_per_s": 350759767,
+          "loaded_iter_per_s": 223834347,
+          "throughput_delta_pct": 36.19,
+          "diagnosis": {
+            "cycles": 11,
+            "reads": 2816,
+            "bytes_read": 11534336
+          },
+          "target_cpu_ms_during_window": 2130.0,
+          "attributable_cpu_ms": 834.622,
+          "attributable_basis": "collector_process_rusage",
+          "collector_max_rss_kb": 27960,
+          "target_ctx_switches": 711,
+          "target_runqueue_wait_ms": 1196.562
+        },
+        {
+          "idle_iter_per_s": 238443694,
+          "loaded_iter_per_s": 119801113,
+          "throughput_delta_pct": 49.76,
+          "diagnosis": {
+            "cycles": 7,
+            "reads": 1792,
+            "bytes_read": 7340032
+          },
+          "target_cpu_ms_during_window": 1190.0,
+          "attributable_cpu_ms": 537.618,
+          "attributable_basis": "collector_process_rusage",
+          "collector_max_rss_kb": 27960,
+          "target_ctx_switches": 695,
+          "target_runqueue_wait_ms": 2060.188
+        }
+      ],
+      "median_idle_iter_per_s": 238443694,
+      "median_loaded_iter_per_s": 212784949,
+      "median_throughput_delta_pct": 27.07,
+      "min_delta_pct": 0.96,
+      "max_delta_pct": 49.76,
+      "idle_cv_pct": 21.54
+    }
+  ],
+  "total_wall_s": 98.6,
+  "mode": "STANDARD"
+}

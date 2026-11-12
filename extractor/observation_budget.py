@@ -8,6 +8,8 @@ Tracks and enforces multi-dimensional observation constraints:
 - min_poll_interval_ms (minimum polling interval)
 - max_bytes_per_observation (per-observation byte ceiling)
 - max_target_stop_ms (optional target stop duration ceiling)
+- max_target_cpu_ms (optional ceiling on the target-side CPU the observation itself consumes: the collector's
+  CPU time on remote targets, host-side read cost locally; IMP-020)
 - Per-profile ceilings (InspectionProfile.budget_ceiling)
 - Conservative unknown-cost handling (never treats unknown byte cost as zero,
   and never silently fabricates measured byte counts)
@@ -22,7 +24,7 @@ Strictly separates distinct observation metrics:
 from dataclasses import asdict, dataclass, field
 import threading
 import time
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 
 DEFAULT_CONSERVATIVE_UNKNOWN_BYTES = 65536  # 64 KB conservative fallback when cost is unknown
@@ -39,6 +41,7 @@ class ObservationBudgetLimits:
     max_samples: int = 64
     max_bytes_per_observation: int = 4194304  # 4 MB per single observation
     max_target_stop_ms: Optional[float] = None
+    max_target_cpu_ms: Optional[float] = None
     conservative_unknown_bytes: int = DEFAULT_CONSERVATIVE_UNKNOWN_BYTES
     reject_unknown_byte_cost: bool = False
     # Backward-compatible aliases accepted in constructor
@@ -72,6 +75,9 @@ class ObservationBudgetLimits:
             max_target_stop_ms=(
                 float(d["max_target_stop_ms"]) if d.get("max_target_stop_ms") is not None else None
             ),
+            max_target_cpu_ms=(
+                float(d["max_target_cpu_ms"]) if d.get("max_target_cpu_ms") is not None else None
+            ),
             conservative_unknown_bytes=int(
                 d.get("conservative_unknown_bytes", DEFAULT_CONSERVATIVE_UNKNOWN_BYTES)
             ),
@@ -83,6 +89,7 @@ class ObservationBudgetLimits:
 class ObservationMetrics:
     """Disaggregated runtime observation metrics without fabricated measurements."""
     target_stop_duration_ms: float = 0.0
+    target_cpu_ms: float = 0.0
     observation_latency_us: float = 0.0
     bytes_read: int = 0
     measured_bytes_read: int = 0
@@ -119,6 +126,41 @@ class ObservationBudgetTracker:
         self._start_time_ns: int = time.monotonic_ns()
         self._last_sample_ns: int = 0
         self._history: List[Dict[str, Any]] = []
+        self._target_cpu_probe: Optional[Callable[[], Optional[float]]] = None
+        self._target_cpu_poll_interval_ms: float = 100.0
+        self._last_cpu_poll_ns: int = 0
+
+    def attach_target_cpu_probe(
+        self, probe: Optional[Callable[[], Optional[float]]], poll_interval_ms: float = 100.0,
+    ) -> None:
+        """Registers a callable returning the CUMULATIVE target-side CPU (ms) this observation has consumed
+        (collector CPU on remote targets, host-side read cost locally; ``CollectionImpactMeter.attributable_cpu_ms``).
+        ``check_budget`` polls it (rate limited) so ``max_target_cpu_ms`` stops collection without every caller
+        having to report CPU.  A probe returning None (unmeasurable) never exhausts the budget."""
+        with self._lock:
+            self._target_cpu_probe = probe
+            self._target_cpu_poll_interval_ms = max(0.0, float(poll_interval_ms))
+            self._last_cpu_poll_ns = 0
+
+    def record_target_cpu(self, cpu_ms: float) -> None:
+        """Records the cumulative target-side CPU (ms); the value never decreases."""
+        with self._lock:
+            self.metrics.target_cpu_ms = round(max(self.metrics.target_cpu_ms, max(0.0, float(cpu_ms))), 3)
+            self.check_budget()
+
+    def _poll_target_cpu(self) -> None:
+        if self._target_cpu_probe is None or self.limits.max_target_cpu_ms is None:
+            return
+        now = time.monotonic_ns()
+        if self._last_cpu_poll_ns and (now - self._last_cpu_poll_ns) / 1_000_000.0 < self._target_cpu_poll_interval_ms:
+            return
+        self._last_cpu_poll_ns = now
+        try:
+            val = self._target_cpu_probe()
+        except Exception:  # noqa: BLE001 - a failing probe must not break observation
+            return
+        if val is not None:
+            self.metrics.target_cpu_ms = round(max(self.metrics.target_cpu_ms, max(0.0, float(val))), 3)
 
     def start(self) -> None:
         """Reset or restart wall clock tracking."""
@@ -650,6 +692,17 @@ class ObservationBudgetTracker:
                 )
                 return False, self.metrics.exhaustion_reason
 
+            if self.limits.max_target_cpu_ms is not None:
+                self._poll_target_cpu()
+                if self.metrics.target_cpu_ms > self.limits.max_target_cpu_ms:
+                    self.metrics.is_budget_exhausted = True
+                    self.metrics.exhausted_dimension = "TARGET_CPU"
+                    self.metrics.exhaustion_reason = (
+                        f"EXCEEDED_TARGET_CPU: observation consumed {self.metrics.target_cpu_ms:.2f}ms of target-side CPU "
+                        f"> max {self.limits.max_target_cpu_ms:.2f}ms"
+                    )
+                    return False, self.metrics.exhaustion_reason
+
             return True, None
 
     def check_profile_ceiling(
@@ -698,6 +751,10 @@ class ObservationBudgetTracker:
                     ),
                     "samples_pct": round(
                         (self.metrics.samples_collected / max(1, self.limits.max_samples)) * 100.0, 1
+                    ),
+                    "target_cpu_pct": (
+                        round((self.metrics.target_cpu_ms / max(1e-9, self.limits.max_target_cpu_ms)) * 100.0, 1)
+                        if self.limits.max_target_cpu_ms is not None else None
                     ),
                 },
             }

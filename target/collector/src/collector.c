@@ -15,6 +15,7 @@
 #include <sys/types.h>
 #include <sys/utsname.h>
 #include <sys/uio.h>
+#include <sys/resource.h>
 #include <dirent.h>
 
 #define MAX_LINE 2048
@@ -1694,6 +1695,121 @@ int collector_read_threads(pid_t pid, long after_tid, void *out_file) {
     return 0;
 }
 
+/* ---- IMP-020: collector self-cost and one-exchange target load snapshot ---------------------- */
+
+/* Reads a whole (small) procfs file into buf; returns bytes read (0 on failure). */
+static size_t slurp_small(const char *path, char *buf, size_t cap) {
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) { buf[0] = '\0'; return 0; }
+    size_t n = 0;
+    ssize_t r;
+    while (n + 1 < cap && (r = read(fd, buf + n, cap - 1 - n)) > 0) n += (size_t)r;
+    close(fd);
+    buf[n] = '\0';
+    return n;
+}
+
+/* Value of the "key:" line that starts a line of a status-like text (0 when absent). */
+static unsigned long long status_field_u64(const char *text, const char *key) {
+    size_t klen = strlen(key);
+    const char *q = text;
+    while (q && *q) {
+        if (strncmp(q, key, klen) == 0) return strtoull(q + klen, NULL, 10);
+        q = strchr(q, '\n');
+        if (q) q++;
+    }
+    return 0;
+}
+
+/* The collector's own resource use: getrusage(RUSAGE_SELF).  CPU in microseconds, peak RSS in KiB
+ * (the Linux ru_maxrss unit). */
+static void print_self_rusage(FILE *out) {
+    struct rusage ru;
+    if (getrusage(RUSAGE_SELF, &ru) != 0) {
+        fprintf(out, "\"collector\":null");
+        return;
+    }
+    fprintf(out,
+            "\"collector\":{\"pid\":%ld,\"cpu_user_us\":%lld,\"cpu_sys_us\":%lld,\"max_rss_kb\":%lld,"
+            "\"minflt\":%lld,\"majflt\":%lld,\"nvcsw\":%lld,\"nivcsw\":%lld}",
+            (long)getpid(),
+            (long long)ru.ru_utime.tv_sec * 1000000LL + (long long)ru.ru_utime.tv_usec,
+            (long long)ru.ru_stime.tv_sec * 1000000LL + (long long)ru.ru_stime.tv_usec,
+            (long long)ru.ru_maxrss, (long long)ru.ru_minflt, (long long)ru.ru_majflt,
+            (long long)ru.ru_nvcsw, (long long)ru.ru_nivcsw);
+}
+
+int collector_report_stats(void *out_file) {
+    FILE *out = out_file ? (FILE *)out_file : stdout;
+    fprintf(out, "{\"success\":true,");
+    print_self_rusage(out);
+    fprintf(out, "}\n");
+    fflush(out);
+    return 0;
+}
+
+/* IMPACT <pid>: everything the host needs to bracket a collection window, in ONE reply line:
+ * the target's /proc/PID/stat (raw), context switches and schedstat summed over all its threads,
+ * /proc/loadavg, the aggregate "cpu" line of /proc/stat, and the collector's own rusage. */
+int collector_report_impact(pid_t pid, void *out_file) {
+    FILE *out = out_file ? (FILE *)out_file : stdout;
+    char path[96], raw[4096], esc[8192];
+
+    snprintf(path, sizeof(path), "/proc/%ld/stat", (long)pid);
+    if (slurp_small(path, raw, sizeof(raw)) == 0) {
+        fprintf(out, "{\"success\":false,\"error\":\"TARGET_TERMINATED\"}\n");
+        fflush(out);
+        return -1;
+    }
+    escape_json_string(raw, esc, sizeof(esc));
+    fprintf(out, "{\"success\":true,\"pid\":%ld,\"clk_tck\":%ld,\"stat\":\"%s\"", (long)pid, sysconf(_SC_CLK_TCK), esc);
+
+    unsigned long long vol = 0, invol = 0, run_ns = 0, wait_ns = 0, slices = 0;
+    int have_sched = 0, threads = 0;
+    snprintf(path, sizeof(path), "/proc/%ld/task", (long)pid);
+    DIR *d = opendir(path);
+    if (d) {
+        struct dirent *de;
+        while ((de = readdir(d)) != NULL) {
+            char sub[320];
+            if (de->d_name[0] < '0' || de->d_name[0] > '9') continue;
+            threads++;
+            snprintf(sub, sizeof(sub), "/proc/%ld/task/%s/status", (long)pid, de->d_name);
+            if (slurp_small(sub, raw, sizeof(raw)) > 0) {
+                vol += status_field_u64(raw, "voluntary_ctxt_switches:");
+                invol += status_field_u64(raw, "nonvoluntary_ctxt_switches:");
+            }
+            snprintf(sub, sizeof(sub), "/proc/%ld/task/%s/schedstat", (long)pid, de->d_name);
+            if (slurp_small(sub, raw, sizeof(raw)) > 0) {
+                unsigned long long a = 0, b = 0, c = 0;
+                if (sscanf(raw, "%llu %llu %llu", &a, &b, &c) == 3) {
+                    run_ns += a; wait_ns += b; slices += c; have_sched = 1;
+                }
+            }
+        }
+        closedir(d);
+    }
+    fprintf(out, ",\"threads\":%d,\"vol\":%llu,\"invol\":%llu", threads, vol, invol);
+    if (have_sched) {
+        fprintf(out, ",\"sched\":{\"run_ns\":%llu,\"wait_ns\":%llu,\"slices\":%llu}", run_ns, wait_ns, slices);
+    }
+    if (slurp_small("/proc/loadavg", raw, sizeof(raw)) > 0) {
+        escape_json_string(raw, esc, sizeof(esc));
+        fprintf(out, ",\"loadavg\":\"%s\"", esc);
+    }
+    if (slurp_small("/proc/stat", raw, sizeof(raw)) > 0) {
+        char *nl = strchr(raw, '\n');
+        if (nl) *nl = '\0';
+        escape_json_string(raw, esc, sizeof(esc));
+        fprintf(out, ",\"cpu_line\":\"%s\"", esc);
+    }
+    fprintf(out, ",");
+    print_self_rusage(out);
+    fprintf(out, "}\n");
+    fflush(out);
+    return 0;
+}
+
 int collector_daemon_loop(int backend, void *in_file, void *out_file) {
     FILE *in = in_file ? (FILE *)in_file : stdin;
     FILE *out = out_file ? (FILE *)out_file : stdout;
@@ -1712,6 +1828,24 @@ int collector_daemon_loop(int backend, void *in_file, void *out_file) {
             fprintf(out, "{\"success\":true,\"status\":\"BYE\"}\n");
             fflush(out);
             break;
+        }
+        if (strncmp(p, "STATS", 5) == 0) {
+            collector_report_stats(out);
+            continue;
+        }
+        if (strncmp(p, "IMPACT ", 7) == 0) {
+            char *rest = p + 7;
+            while (*rest == ' ') rest++;
+            char *endp = NULL;
+            errno = 0;
+            long p_val = strtol(rest, &endp, 10);
+            if (errno != 0 || endp == rest || *endp != '\0' || p_val <= 0 || p_val > 4194304L) {
+                fprintf(out, "{\"success\":false,\"error\":\"INVALID_PID\"}\n");
+                fflush(out);
+                continue;
+            }
+            collector_report_impact((pid_t)p_val, out);
+            continue;
         }
         if (strncmp(p, "PING", 4) == 0) {
             fprintf(out, "{\"success\":true,\"status\":\"PONG\"}\n");
