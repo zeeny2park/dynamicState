@@ -108,7 +108,7 @@ __attribute__((constructor)) static void _enable_sibling_cli_ptracer() {
         from extractor.debug_image import inspect_elf
         target_arch = (inspect_elf(self.stripped_bin).architecture or "x86_64").lower()
 
-        def mock_deploy_runner(cmd_args, timeout):
+        def mock_deploy_runner(cmd_args, timeout, input_bytes=None):  # IMP-016: binary now arrives via stdin
             cmd = cmd_args[-1]
             if "echo READY || echo MISSING" in cmd:
                 return 0, "MISSING\n", ""

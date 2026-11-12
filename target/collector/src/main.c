@@ -253,13 +253,24 @@ static void print_usage(const char *prog) {
         "  -I, --key-id <ID>       Key ID for attestation (default: default)\n"
         "  -S, --session-id <ID>   Investigation session ID\n"
         "      --test-crypto       Run cryptographic self-test against FIPS/RFC vectors\n"
+        "      --version           Print collector version and exit\n"
         "  -h, --help              Show this help message\n\n"
         "Example:\n"
         "  %s -o /tmp/snapshot_1234 1234\n",
         prog, prog);
 }
 
+#ifndef COLLECTOR_VERSION
+#define COLLECTOR_VERSION "dev"
+#endif
+/* Greppable marker so the host can read the version from a binary it cannot execute. */
+static const char collector_version_marker[] = "DS_COLLECTOR_VERSION=" COLLECTOR_VERSION;
+
 int main(int argc, char *argv[]) {
+    if (argc == 2 && (strcmp(argv[1], "--version") == 0 || strcmp(argv[1], "version") == 0)) {
+        printf("dynamicstate-collector %s\n", collector_version_marker + sizeof("DS_COLLECTOR_VERSION=") - 1);
+        return 0;
+    }
     collector_config_t cfg;
     collector_init_config(&cfg);
 
