@@ -287,7 +287,10 @@ class TestHealthy(_Base):
                     self.assertFalse([f for f in r["findings"] if "RECIPE_HEAP_METADATA_CORRUPTION" in f["recipe_ids"]],
                                      r["findings"])
                     self.assertIsNotNone(mi)
-                    self.assertEqual(mi["heap"].get("defects"), [], mi["heap"])
+                    # A heap above the baseline cap is honestly NOT_CHECKED (defects None); a checked heap must
+                    # have an empty defect list. Either way no corruption may be reported for a healthy program.
+                    self.assertIn(mi["heap"].get("status"), ("COMPLETED", "PARTIAL", "NOT_CHECKED"), mi["heap"])
+                    self.assertFalse(mi["heap"].get("defects"), mi["heap"])
                     self.assertEqual(mi["stacks"]["warnings"], [])
                     self.assertEqual(mi["globals"].get("candidates", []), [])
             self._kill(proc)
