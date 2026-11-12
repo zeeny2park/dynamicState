@@ -33,12 +33,20 @@ from .dwarf_indexer import DwarfIndex, DwarfIndexer, DwarfVariable
 from .cpp_decoder import CppContainerDecoder
 from .allocator_inspector import detect_allocator, classify_pointer_integrity, PointerClassification, AllocatorType
 from .target_adapter import TargetExecutionAdapter, LocalTargetAdapter, RemoteSshTargetAdapter
+from .cfi_unwinder import (
+    UNWIND_SCAN as CFI_UNWIND_SCAN,
+    decode_call_before,
+    make_unwinder_for_process,
+    parse_proc_syscall,
+)
 from .target_abi import (
     FEATURE_ALLOCATOR_CHUNKS,
+    FEATURE_CFI_UNWIND,
     FEATURE_FRAME_LAYOUT,
     FEATURE_MUTEX_OWNER,
     FEATURE_SYSCALL_NAMES,
     FEATURE_TCB_SCAN,
+    SUPPORT_NOT_SUPPORTED_ON_TARGET,
     SUPPORT_SUPPORTED,
     TargetABI,
     abi_support_summary,
@@ -5330,6 +5338,79 @@ class WatchSessionManager:
             ),
         }
 
+    # ------------------------------------------------------------------------------------------
+    # IMP-011: CFI unwinding helpers shared by the call-stack and frame-locals inspectors
+    # ------------------------------------------------------------------------------------------
+    @staticmethod
+    def _imp011_prepare_unwinder(
+        target_adapter: TargetExecutionAdapter, pid: int, target_abi: TargetABI,
+        map_data: Dict[str, Any], endian: str,
+    ) -> Tuple[Optional[Any], Any, Optional[str]]:
+        """(unwinder or None, FEATURE_CFI_UNWIND decision, reason when no unwinder)."""
+        support = check_support(target_abi, FEATURE_CFI_UNWIND)
+        if not support.supported:
+            return None, support, support.message
+        if target_adapter.is_remote():
+            # /proc/PID/task/TID/syscall (SP/PC) is only read locally; remote thread registers are IMP-011 part 3.
+            return None, support, "remote target: no per-thread SP/PC available, CFI unwinding not attempted"
+
+        def _read(addr: int, size: int) -> Tuple[Optional[bytes], str, Optional[str]]:
+            return target_adapter.read_memory(pid, addr, size)
+
+        try:
+            uw = make_unwinder_for_process(
+                target_abi.architecture, map_data.get("mappings") or [], _read, endian=endian, pid=pid,
+            )
+        except Exception as exc:  # noqa: BLE001
+            return None, support, f"CFI unwinder unavailable: {type(exc).__name__}: {exc}"
+        return uw, support, None if uw is not None else "CFI unwinder unavailable for this architecture"
+
+    @staticmethod
+    def _imp011_read_syscall(pid: int, tid: int) -> Dict[str, Any]:
+        try:
+            with open(f"/proc/{pid}/task/{tid}/syscall", "r", encoding="utf-8") as sf:
+                return parse_proc_syscall(sf.read())
+        except Exception:  # noqa: BLE001
+            return {"state": "unavailable"}
+
+    @staticmethod
+    def _imp011_unwind_thread(
+        unwinder: Optional[Any], sc_info: Dict[str, Any], window: Optional[Tuple[int, int]], max_frames: int,
+    ) -> Optional[Dict[str, Any]]:
+        """Blocked thread: CFI from the kernel-reported SP/PC.  Running thread: labelled two-read sample."""
+        if unwinder is None:
+            return None
+        try:
+            if sc_info.get("sp") and sc_info.get("pc"):
+                return unwinder.unwind_blocked(int(sc_info["sp"]), int(sc_info["pc"]), max_frames=max_frames)
+            if sc_info.get("state") == "running" and window and window[1] > window[0]:
+                return unwinder.sample_running(int(window[0]), int(window[1]), max_frames=max_frames)
+        except Exception:  # noqa: BLE001 - unwinding must never break the inspection
+            return None
+        return None
+
+    @staticmethod
+    def _imp011_thread_summary(res: Optional[Dict[str, Any]], sc_info: Dict[str, Any], reason: Optional[str]) -> Dict[str, Any]:
+        """Thread-level fields describing how the call stack was obtained (added, never renamed)."""
+        if res is None:
+            state = sc_info.get("state")
+            return {
+                "unwind_status": "SCAN_ESTIMATED",
+                "unwind_stop_reason": reason or (
+                    "thread running on a CPU and no stack sample could be anchored" if state == "running"
+                    else "no kernel-reported SP/PC for this thread"
+                ),
+                "unwind_cost": None,
+                "unwind_notes": [],
+            }
+        return {
+            "unwind_status": res["status"],
+            "unwind_stop_reason": res["stop_reason"],
+            "unwind_cost": res["cost"],
+            "unwind_notes": list(res.get("notes") or [])[:8],
+            "running_sample_stable": res.get("sample_stable"),
+        }
+
     def inspect_thread_callstacks_and_locks(
         self,
         pid: int,
@@ -5347,7 +5428,12 @@ class WatchSessionManager:
         """Zero-stop replacement for `gdb thread apply all bt` + mutex deadlock analyzer.
         1. Decodes `pthread_mutex_t` (`__lock`, `__owner` TID) and custom lock structs to identify which thread holds each mutex.
         2. Reads `/proc/<pid>/task/<tid>/syscall` to detect threads blocked on `futex(uaddr, ...)` and matches `uaddr` to mutex addresses.
-        3. Scans each thread's stack frame for return addresses inside executable text segments and symbolizes them via DWARF subprograms & ELF symtab.
+        3. IMP-011: unwinds each blocked thread with CFI (.eh_frame/.debug_frame of every mapped module) from the
+           kernel-reported SP/PC; frames carry `unwind` ("registers" | "cfi" | "frame_pointer" | "scan_estimated" |
+           "cfi_after_scan" | "running_sample_estimated") and `estimated`.  Running threads get a labelled two-read
+           stack sample.  The legacy return-address scan is used only where neither is possible (remote targets,
+           unsupported architectures) and its frames are marked estimated.  Frames are symbolized via DWARF
+           subprograms, ELF symbols (incl. /usr/lib/debug/.build-id) or `module+offset`.
         4. Detects circular wait deadlock cycles across threads and mutexes.
         """
         target_adapter = self._resolve_adapter(
@@ -5418,6 +5504,68 @@ class WatchSessionManager:
                         **resolved,
                     }
             return None
+
+        # IMP-011: CFI unwinder (x86_64 / aarch64, local targets); None -> labelled scan fallback below.
+        unwinder, cfi_support, unwinder_reason = self._imp011_prepare_unwinder(
+            target_adapter, pid, target_abi, map_data, endian
+        )
+        debug_module_paths: Set[str] = set()
+        try:
+            debug_module_paths.add(os.path.realpath(f"/proc/{pid}/exe"))
+        except Exception:
+            pass
+        for mod_info in map_data.get("loaded_debug_modules", []):
+            if mod_info.get("debug_image"):
+                debug_module_paths.add(os.path.realpath(mod_info["debug_image"]))
+
+        def _cfi_callstack_frames(res: Dict[str, Any]) -> List[Dict[str, Any]]:
+            out_frames: List[Dict[str, Any]] = []
+            for fr in res.get("frames", []):
+                lookup = int(fr["lookup_pc"])
+                desc = unwinder.describe_pc(int(fr["pc"]), lookup)
+                sym = None
+                mpath = desc.get("module_path")
+                if mpath and os.path.realpath(mpath) in debug_module_paths:
+                    sym = _symbolize_runtime_pc(lookup)
+                if sym is None:
+                    lt = desc.get("link_pc")
+                    if desc.get("elf_symbol"):
+                        start = int(desc.get("elf_symbol_start") or lookup)
+                        off = lookup - start
+                        fname = desc["elf_symbol"]
+                        sym = {"function_name": fname, "linkage_name": fname, "low_pc": f"0x{start:x}",
+                               "low_pc_int": start, "offset_in_func": off,
+                               "symbol_plus_offset": f"{fname}+0x{off:x}" if off else fname,
+                               "decl_file": None, "decl_line": None, "source_location": None,
+                               "resolution_source": "ELF_SYMBOL"}
+                    else:
+                        fname = f"{desc.get('module') or '??'}+0x{(lt if lt is not None else lookup):x}"
+                        sym = {"function_name": fname, "linkage_name": None, "offset_in_func": None,
+                               "symbol_plus_offset": fname, "decl_file": None, "decl_line": None,
+                               "source_location": None, "resolution_source": "UNRESOLVED"}
+                    sym["module"] = desc.get("module")
+                slot = fr.get("stack_slot")
+                sp_v = fr.get("sp")
+                entry: Dict[str, Any] = {
+                    "frame_index": len(out_frames),
+                    "stack_address": f"0x{(sp_v if sp_v is not None else (slot or 0)):x}" if (sp_v or slot) else None,
+                    **sym,
+                    "runtime_pc": f"0x{int(fr['pc']):x}",
+                    "unwind": fr["unwind"],
+                    "estimated": bool(fr["estimated"]),
+                    "cfa": f"0x{int(fr['cfa']):x}" if fr.get("cfa") is not None else None,
+                    "module_path": mpath,
+                }
+                if fr.get("unwound_via"):
+                    entry["unwound_via"] = fr["unwound_via"]
+                if fr.get("pc_is_function_entry"):
+                    entry["pc_is_function_entry"] = True
+                if fr.get("pac_stripped"):
+                    entry["pac_stripped"] = True
+                if fr.get("fp_inferred"):
+                    entry["fp_inferred"] = True
+                out_frames.append(entry)
+            return out_frames
 
         all_threads = target_adapter.get_threads(pid)
         threads_by_tid: Dict[int, Dict[str, Any]] = {int(t["tid"]): t for t in all_threads}
@@ -5540,22 +5688,18 @@ class WatchSessionManager:
             syscall_arg0: Optional[int] = None
             waiting_on_lock: Optional[Dict[str, Any]] = None
 
+            sc_info: Dict[str, Any] = {"state": "unavailable"}
             if not target_adapter.is_remote():
-                try:
-                    with open(f"/proc/{pid}/task/{t_tid}/syscall", "r", encoding="utf-8") as sf:
-                        sc_raw = sf.read().strip()
-                    if sc_raw and not sc_raw.startswith("running"):
-                        sc_parts = sc_raw.split()
-                        syscall_nr = int(sc_parts[0])
-                        # IMP-015: number -> name via the table of the TARGET architecture; None when unsupported/undetected
-                        syscall_name = abi_syscall_name(target_abi, syscall_nr)
-                        if len(sc_parts) >= 2:
-                            syscall_arg0 = int(sc_parts[1], 16)
-                        if len(sc_parts) >= 9:
-                            sp_int = int(sc_parts[7], 16)
-                            pc_int = int(sc_parts[8], 16)
-                except Exception:
-                    pass
+                sc_info = self._imp011_read_syscall(pid, t_tid)
+                if sc_info.get("state") == "blocked":
+                    syscall_nr = int(sc_info["nr"])
+                    # IMP-015: number -> name via the table of the TARGET architecture; None when unsupported/undetected
+                    syscall_name = abi_syscall_name(target_abi, syscall_nr)
+                    if sc_info.get("args"):
+                        syscall_arg0 = int(sc_info["args"][0])
+                if sc_info.get("sp") and sc_info.get("pc"):
+                    sp_int = int(sc_info["sp"])
+                    pc_int = int(sc_info["pc"])
 
             # Check if syscall_arg0 points into any known mutex (pthread_mutex_t is 40 bytes)
             if syscall_arg0 is not None and syscall_arg0 > 0:
@@ -5580,14 +5724,18 @@ class WatchSessionManager:
                             })
                         break
 
-            # Unwind callstack frames by scanning stack above sp_int for executable return addresses
+            # IMP-011: CFI unwinding from the kernel-reported SP/PC (blocked thread).  Running threads get a
+            # labelled two-read sample below, once the stack region is known.  Only where neither is
+            # possible does the legacy return-address scan run, and its frames are marked estimated.
             frames: List[Dict[str, Any]] = []
             seen_funcs: Set[str] = set()
+            cfi_res = self._imp011_unwind_thread(unwinder, sc_info, None, max_frames)
 
-            if pc_int > 0:
+            if pc_int > 0 and cfi_res is None:
                 top_sym = _symbolize_runtime_pc(pc_int)
                 if top_sym:
-                    frames.append({"frame_index": 0, "stack_address": f"0x{sp_int:x}" if sp_int else None, **top_sym})
+                    frames.append({"frame_index": 0, "stack_address": f"0x{sp_int:x}" if sp_int else None, **top_sym,
+                                   "unwind": "registers", "estimated": False})
                     seen_funcs.add(top_sym["function_name"])
 
             s_start = int(s_info.get("start_int") or 0)
@@ -5627,16 +5775,26 @@ class WatchSessionManager:
                 scan_from = sp_int if (sp_int > 0 and s_start <= sp_int < stack_ceiling) else max(s_start, stack_ceiling - 32768)
                 scan_from = scan_from & ~(ptr_size - 1)
                 scan_len = min(32768, max(0, stack_ceiling - scan_from))
-                if scan_len >= ptr_size:
+                if cfi_res is None and sc_info.get("state") == "running":
+                    cfi_res = self._imp011_unwind_thread(
+                        unwinder, sc_info, (scan_from, scan_from + scan_len), max_frames
+                    )
+                    if cfi_res is not None and not cfi_res.get("frames"):
+                        cfi_res = None
+                if cfi_res is not None:
+                    frames = _cfi_callstack_frames(cfi_res)
+                # The raw stack read is still needed by the scan fallback and by the mutex-pointer fallback below.
+                need_raw = cfi_res is None or (waiting_on_lock is None and bool(locks_by_addr) and t_state in ("S", "D"))
+                if scan_len >= ptr_size and need_raw:
                     try:
                         raw_stack, sst, s_err = target_adapter.read_memory(pid, scan_from, scan_len)
                     except Exception as s_exc:
                         raw_stack, sst, s_err = None, "READ_ERROR", f"{type(s_exc).__name__}: {s_exc}"
-                    if sst != "OBSERVED" or not raw_stack:
+                    if (sst != "OBSERVED" or not raw_stack) and cfi_res is None:
                         stack_read_errors.append(f"Failed to read stack for TID {t_tid}: {s_err or sst}")
                     if sst == "OBSERVED" and raw_stack:
                         num_words = len(raw_stack) // ptr_size
-                        for w_i in range(num_words):
+                        for w_i in range(num_words if cfi_res is None else 0):
                             if len(frames) >= max_frames:
                                 break
                             cand_pc = struct.unpack_from(ptr_fmt, raw_stack, w_i * ptr_size)[0]
@@ -5651,12 +5809,15 @@ class WatchSessionManager:
                             if sym and sym["function_name"] not in ("_start", "__libc_start_main_impl", "clone", "clone3", "start_thread"):
                                 slot_addr = scan_from + w_i * ptr_size
                                 # If this is the innermost return address on a running user-space thread (pc_int == 0),
-                                # inspect the 5-byte CALL rel32 instruction at (cand_pc - 5) to recover a pure leaf poll-mode function!
-                                if not frames and pc_int == 0 and (t_state == "R" or t.get("is_running_user_space")) and frame_support.supported:
-                                    call_bytes, cb_st, _ = target_adapter.read_memory(pid, cand_pc - 5, 5)
-                                    if cb_st == "OBSERVED" and call_bytes and len(call_bytes) == 5 and call_bytes[0] == 0xe8:
-                                        rel32 = struct.unpack("<i" if endian == "little" else ">i", call_bytes[1:5])[0]
-                                        callee_pc = (cand_pc + rel32) & 0xffffffffffffffff
+                                # decode the call instruction before it (x86_64 CALL rel32 / aarch64 BL, per target
+                                # architecture - IMP-011) to recover a pure leaf poll-mode function.
+                                call_len = {"x86_64": 5, "aarch64": 4}.get(target_abi.architecture or "")
+                                if not frames and pc_int == 0 and (t_state == "R" or t.get("is_running_user_space")) and call_len:
+                                    call_bytes, cb_st, _ = target_adapter.read_memory(pid, cand_pc - call_len, call_len)
+                                    c_kind, callee_pc = (None, None)
+                                    if cb_st == "OBSERVED" and call_bytes and len(call_bytes) == call_len:
+                                        c_kind, callee_pc = decode_call_before(target_abi.architecture or "", call_bytes, cand_pc, endian)
+                                    if c_kind == "direct" and callee_pc:
                                         callee_sym = _symbolize_runtime_pc(callee_pc)
                                         if callee_sym and callee_sym.get("resolution_source") == "DWARF_SUBPROGRAM":
                                             if callee_sym and callee_sym["function_name"] != sym["function_name"]:
@@ -5665,12 +5826,16 @@ class WatchSessionManager:
                                                     "stack_address": f"0x{slot_addr - ptr_size:x}",
                                                     "unwound_via": "LEAF_CALL_TARGET_RECOVERY",
                                                     **callee_sym,
+                                                    "unwind": CFI_UNWIND_SCAN,
+                                                    "estimated": True,
                                                 })
                                 if not frames or frames[-1]["function_name"] != sym["function_name"]:
                                     frames.append({
                                         "frame_index": len(frames),
                                         "stack_address": f"0x{slot_addr:x}",
                                         **sym,
+                                        "unwind": CFI_UNWIND_SCAN,
+                                        "estimated": True,
                                     })
 
                         # Fallback when /proc/<pid>/task/<tid>/syscall is unavailable:
@@ -5727,6 +5892,12 @@ class WatchSessionManager:
                 "waiting_on_lock": waiting_on_lock,
                 "frames_count": len(frames),
                 "callstack": frames,
+                # IMP-011 (added fields): how the stack was obtained and what it cost
+                **self._imp011_thread_summary(cfi_res, sc_info, unwinder_reason),
+                "top_user_frame_index": next((i for i, f in enumerate(frames)
+                                             if f.get("resolution_source") == "DWARF_SUBPROGRAM"), None),
+                "syscall_sp": f"0x{sc_info['sp']:x}" if sc_info.get("sp") else None,
+                "syscall_pc": f"0x{sc_info['pc']:x}" if sc_info.get("pc") else None,
             })
 
         # ---------------------------------------------------------------------
@@ -5785,8 +5956,10 @@ class WatchSessionManager:
             "limitations": limitations,
             "target_abi": target_abi.to_dict(),
             "abi_support": abi_support_summary(
-                target_abi, [FEATURE_MUTEX_OWNER, FEATURE_SYSCALL_NAMES, FEATURE_FRAME_LAYOUT]
+                target_abi, [FEATURE_MUTEX_OWNER, FEATURE_SYSCALL_NAMES, FEATURE_FRAME_LAYOUT, FEATURE_CFI_UNWIND]
             ),
+            "cfi_unwind_status": cfi_support.status,
+            "cfi_unwind_status_reason": unwinder_reason or cfi_support.message,
             "lock_owner_status": owner_support.status,
             "lock_owner_status_reason": owner_support.message,
             "threads_inspected": len(thread_reports),
@@ -6569,9 +6742,120 @@ class WatchSessionManager:
                         best_span = span
             return best
 
+        # IMP-011: CFA of every frame from the CFI unwinder; DW_OP_fbreg evaluated against DW_AT_frame_base.
+        unwinder, cfi_support, unwinder_reason = self._imp011_prepare_unwinder(
+            target_adapter, pid, target_abi, map_data, endian
+        )
+        try:
+            main_exe_real = os.path.realpath(f"/proc/{pid}/exe")
+        except Exception:
+            main_exe_real = None
+        sp_dw = {"x86_64": 7, "aarch64": 31}.get(target_abi.architecture or "")
+
+        def _frame_reg(fr: Dict[str, Any], regno: int) -> Optional[int]:
+            if sp_dw is not None and regno == sp_dw:
+                return fr.get("sp")
+            return (fr.get("regs") or {}).get(regno)
+
+        def _eval_frame_base(subp: Any, fr: Dict[str, Any]) -> Tuple[Optional[int], str]:
+            fb = (subp.frame_base or "").strip()
+            cfa = fr.get("cfa")
+            if not fb or "DW_OP_call_frame_cfa" in fb:
+                return cfa, "DW_OP_call_frame_cfa"
+            m_b = re.search(r"DW_OP_breg(\d+)[^:]*:\s*(-?\d+)", fb)
+            if m_b:
+                rv = _frame_reg(fr, int(m_b.group(1)))
+                return (rv + int(m_b.group(2)) if rv is not None else None), fb
+            m_r = re.search(r"DW_OP_reg(\d+)", fb)
+            if m_r:
+                return _frame_reg(fr, int(m_r.group(1))), fb
+            return None, fb
+
+        def _decode_cfi_frame_vars(subp: Any, fr: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], Optional[int], str]:
+            params: List[Dict[str, Any]] = []
+            locs: List[Dict[str, Any]] = []
+            fbase, fb_kind = _eval_frame_base(subp, fr)
+            for v in subp.variables:
+                if not v.name:
+                    continue
+                loc_str = v.location_expr or ""
+                var_rt_addr = 0
+                m_fb = re.search(r"DW_OP_fbreg:\s*(-?\d+)", loc_str)
+                m_breg = re.search(r"DW_OP_breg(\d+)\s*(?:\([^)]+\))?:\s*(-?\d+)", loc_str)
+                m_addr = re.search(r"DW_OP_addr:\s*([0-9a-fA-F]+)", loc_str)
+                if m_fb and fbase is not None:
+                    var_rt_addr = fbase + int(m_fb.group(1))
+                elif m_breg:
+                    rv = _frame_reg(fr, int(m_breg.group(1)))
+                    if rv is not None:
+                        var_rt_addr = rv + int(m_breg.group(2))
+                elif m_addr:
+                    lt_a = int(m_addr.group(1), 16)
+                    var_rt_addr = (load_bias + lt_a) if is_dyn else lt_a
+                if var_rt_addr <= 0:
+                    continue
+                v_val, v_st, _, _ = self._decode_typed_memory(
+                    adapter=target_adapter, pid=pid, idx=idx, addr=var_rt_addr,
+                    type_offset=v.type_offset, depth=0, max_struct_depth=2,
+                )
+                if v_st != "OBSERVED":
+                    continue
+                v_entry = {
+                    "name": v.name,
+                    "type_name": idx.get_type_name(v.type_offset),
+                    "runtime_address": f"0x{var_rt_addr:x}",
+                    "location_expr": loc_str,
+                    "value": v_val,
+                }
+                (params if v.is_parameter else locs).append(v_entry)
+            return params, locs, fbase, fb_kind
+
+        def _cfi_frames_out(res: Dict[str, Any]) -> List[Dict[str, Any]]:
+            out_frames: List[Dict[str, Any]] = []
+            for fr in res.get("frames", []):
+                if len(out_frames) >= max_frames:
+                    break
+                lookup = int(fr["lookup_pc"])
+                desc = unwinder.describe_pc(int(fr["pc"]), lookup)
+                mpath = desc.get("module_path")
+                if main_exe_real and mpath and os.path.realpath(mpath) != main_exe_real:
+                    continue  # DWARF of the companion ELF describes the main executable only
+                subp = _find_dwarf_subprogram(lookup)
+                if subp is None or subp.name in ("_start",):
+                    continue
+                if fr.get("cfa") is None:
+                    params, locs, fbase, fb_kind = [], [], None, "CFA_UNKNOWN"
+                    v_status = "CFA_UNKNOWN"
+                else:
+                    params, locs, fbase, fb_kind = _decode_cfi_frame_vars(subp, fr)
+                    v_status = SUPPORT_SUPPORTED if fbase is not None else "FRAME_BASE_UNKNOWN"
+                fp_reg = {"x86_64": 6, "aarch64": 29}.get(target_abi.architecture or "")
+                fp_val = (fr.get("regs") or {}).get(fp_reg) if fp_reg is not None else None
+                out_frames.append({
+                    "frame_index": len(out_frames),
+                    "function_name": subp.name,
+                    "source_location": f"{subp.decl_file}:{subp.decl_line}" if subp.decl_file else None,
+                    "runtime_pc": f"0x{int(fr['pc']):x}",
+                    "cfa_address": f"0x{int(fr['cfa']):x}" if fr.get("cfa") is not None else None,
+                    "fp_address": f"0x{fp_val:x}" if fp_val else None,
+                    "parameters": params,
+                    "locals": locs,
+                    "variables_status": v_status,
+                    "frame_base": fb_kind,
+                    "frame_base_address": f"0x{fbase:x}" if fbase is not None else None,
+                    "unwind": fr["unwind"],
+                    "estimated": bool(fr["estimated"]),
+                    "stack_frame_index": fr.get("index"),
+                    **({"unwound_via": fr["unwound_via"]} if fr.get("unwound_via") else {}),
+                })
+            return out_frames
+
         all_threads = target_adapter.get_threads(pid)
         target_threads = [t for t in all_threads if tid is None or int(t["tid"]) == int(tid)]
         thread_results: List[Dict[str, Any]] = []
+        # Legacy (no CFI) CFA guesses are only meaningful for the x86_64 frame layout.
+        legacy_layout_ok = frame_support.supported and target_abi.architecture == "x86_64"
+        legacy_status = frame_support.status if (legacy_layout_ok or not frame_support.supported) else SUPPORT_NOT_SUPPORTED_ON_TARGET
 
         for t in target_threads:
             t_tid = int(t["tid"])
@@ -6609,13 +6893,25 @@ class WatchSessionManager:
                             break
 
             frames_out: List[Dict[str, Any]] = []
+            sc_info: Dict[str, Any] = {"state": "unavailable"}
+            if not target_adapter.is_remote():
+                sc_info = self._imp011_read_syscall(pid, t_tid)
+            cfi_res = self._imp011_unwind_thread(unwinder, sc_info, None, 64)
             if s_start > 0 and s_end > s_start:
                 tcb_int = int(s_info.get("tcb_address_int") or 0)
                 stack_ceiling = (tcb_int - 64) if (s_start < tcb_int <= s_end) else s_end
                 scan_from = sp_int if (sp_int > 0 and s_start <= sp_int < stack_ceiling) else max(s_start, stack_ceiling - 32768)
                 scan_from = scan_from & ~(ptr_size - 1)
                 scan_len = min(32768, max(0, stack_ceiling - scan_from))
-                raw_stack, sst, _ = target_adapter.read_memory(pid, scan_from, scan_len)
+                if cfi_res is None and sc_info.get("state") == "running":
+                    cfi_res = self._imp011_unwind_thread(unwinder, sc_info, (scan_from, scan_from + scan_len), 64)
+                    if cfi_res is not None and not cfi_res.get("frames"):
+                        cfi_res = None
+                if cfi_res is not None:
+                    frames_out = _cfi_frames_out(cfi_res)
+                    raw_stack, sst = None, "SKIPPED_CFI"
+                else:
+                    raw_stack, sst, _ = target_adapter.read_memory(pid, scan_from, scan_len)
 
                 if sst == "OBSERVED" and raw_stack:
                     num_words = len(raw_stack) // ptr_size
@@ -6632,7 +6928,7 @@ class WatchSessionManager:
                         subp = _find_dwarf_subprogram(cand_pc - 1)
                         if subp is not None and subp.name not in ("_start", "__libc_start_main_impl", "clone", "clone3", "start_thread"):
                             slot_addr = scan_from + w_i * ptr_size
-                            if not raw_hits and (t.get("state") == "R" or t.get("is_running_user_space")) and frame_support.supported:
+                            if not raw_hits and (t.get("state") == "R" or t.get("is_running_user_space")) and legacy_layout_ok:
                                 call_bytes, cb_st, _ = target_adapter.read_memory(pid, cand_pc - 5, 5)
                                 if cb_st == "OBSERVED" and call_bytes and len(call_bytes) == 5 and call_bytes[0] == 0xe8:
                                     rel32 = struct.unpack("<i" if endian == "little" else ">i", call_bytes[1:5])[0]
@@ -6645,9 +6941,9 @@ class WatchSessionManager:
 
                     # Second pass: for each frame hit, determine its CFA / FP and decode its parameters & local variables
                     for h_idx, (w_i, slot_addr, cand_pc, subp) in enumerate(raw_hits[:max_frames]):
-                        if not frame_support.supported:
-                            # IMP-015: CFA / frame-pointer-chain variable addressing is the x86_64 convention.
-                            # Function identity (return-address scan + DWARF) is kept; no parameter/local values.
+                        if not legacy_layout_ok:
+                            # IMP-015/IMP-011: without CFI the CFA/frame-pointer guesses below are the x86_64
+                            # convention only. Function identity (return-address scan + DWARF) is kept; no values.
                             frames_out.append({
                                 "frame_index": h_idx,
                                 "function_name": subp.name,
@@ -6657,7 +6953,9 @@ class WatchSessionManager:
                                 "fp_address": None,
                                 "parameters": [],
                                 "locals": [],
-                                "variables_status": frame_support.status,
+                                "variables_status": legacy_status,
+                                "unwind": CFI_UNWIND_SCAN,
+                                "estimated": True,
                             })
                             continue
                         # Determine CFA for `subp`:
@@ -6747,6 +7045,8 @@ class WatchSessionManager:
                             "fp_address": f"0x{fp_addr:x}" if fp_addr else None,
                             "parameters": decoded_params,
                             "locals": decoded_locals,
+                            "unwind": CFI_UNWIND_SCAN,
+                            "estimated": True,
                         })
 
             thread_results.append({
@@ -6755,7 +7055,9 @@ class WatchSessionManager:
                 "state": t.get("state", "S"),
                 "frames_count": len(frames_out),
                 "frames": frames_out,
-                "frame_decode_status": frame_support.status,
+                "frame_decode_status": frame_support.status if (cfi_res is not None or legacy_layout_ok) else legacy_status,
+                # IMP-011 (added fields)
+                **self._imp011_thread_summary(cfi_res, sc_info, unwinder_reason),
             })
 
         latency_us = round((time.monotonic_ns() - t_start_ns) / 1000.0, 2)
@@ -6768,6 +7070,8 @@ class WatchSessionManager:
             "target_abi": target_abi.to_dict(),
             "frame_decode_status": frame_support.status,
             "frame_decode_status_reason": frame_support.message,
+            "cfi_unwind_status": cfi_support.status,
+            "cfi_unwind_status_reason": unwinder_reason or cfi_support.message,
             "threads_count": len(thread_results),
             "threads": thread_results,
             "llm_next_step_hint": (
@@ -6868,7 +7172,9 @@ class WatchSessionManager:
         for lk in callstack_res.get("locks", []):
             if lk.get("is_locked") and lk.get("owner_tid"):
                 owner_th = next((t for t in callstack_res.get("threads", []) if t["tid"] == lk["owner_tid"]), None)
-                top_loc = (owner_th["callstack"][0].get("source_location") if (owner_th and owner_th.get("callstack")) else None)
+                # IMP-011: CFI stacks start with the (source-less) libc wait frames: take the first frame with a source line
+                top_loc = next((f.get("source_location") for f in ((owner_th or {}).get("callstack") or [])
+                                if f.get("source_location")), None)
                 if top_loc and top_loc not in source_targets:
                     source_targets.append(top_loc)
                 findings.append({
@@ -7550,7 +7856,8 @@ class WatchSessionManager:
                     "state": t.get("state"),
                     "syscall": t.get("syscall"),
                     "top_function": top_frame.get("function_name") if top_frame else None,
-                    "source_location": top_frame.get("source_location") if top_frame else None,
+                    "source_location": next((f.get("source_location") for f in (t.get("callstack") or [])
+                                             if f.get("source_location")), None),
                 },
             )
             _add_edge(proc_node_id, t_node_id, "HAS_THREAD")

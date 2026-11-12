@@ -255,10 +255,16 @@ class TestElfParsingAndSupportTable(unittest.TestCase):
             self.assertEqual(check_support(glibc_x86, f).status, SUPPORT_SUPPORTED, f)
         self.assertEqual(check_support(glibc_a64, FEATURE_MUTEX_OWNER).status, SUPPORT_SUPPORTED)
         self.assertEqual(check_support(glibc_a64, FEATURE_SYSCALL_NAMES).status, SUPPORT_SUPPORTED)
-        for f in (FEATURE_TCB_SCAN, FEATURE_FRAME_LAYOUT):
+        # IMP-011: frame decoding is CFI-based now and genuinely supported on aarch64 (any libc)
+        self.assertEqual(check_support(glibc_a64, FEATURE_FRAME_LAYOUT).status, SUPPORT_SUPPORTED)
+        self.assertEqual(check_support(musl_a64, FEATURE_FRAME_LAYOUT).status, SUPPORT_SUPPORTED)
+        for f in (FEATURE_TCB_SCAN,):
             d = check_support(glibc_a64, f)
             self.assertEqual(d.status, SUPPORT_NOT_SUPPORTED_ON_TARGET)
             self.assertIn("not supported on this target (aarch64/glibc", d.message)
+        d = check_support(self._abi("arm", LIBC_GLIBC, 32), FEATURE_FRAME_LAYOUT)
+        self.assertEqual(d.status, SUPPORT_NOT_SUPPORTED_ON_TARGET)
+        self.assertIn("not supported on this target (arm/glibc", d.message)
         d = check_support(musl_a64, FEATURE_MUTEX_OWNER)
         self.assertEqual(d.status, SUPPORT_NOT_SUPPORTED_ON_TARGET)
         self.assertIn("(aarch64/musl", d.message)
@@ -625,27 +631,38 @@ class TestRealProcessGating(unittest.TestCase):
         return proc
 
     def test_tls_and_frame_decoders_report_status_instead_of_garbage(self):
-        """REAL: on non-x86_64 hosts the x86-only decoders return the explicit unsupported status and no
-        values; on x86_64 they stay supported."""
+        """REAL: on non-x86_64 hosts the x86-only TLS decoder returns the explicit unsupported status and no
+        values; on x86_64 it stays supported.  Frame decoding is CFI-based since IMP-011: supported on
+        x86_64 and aarch64; on a target outside the table (arm, synthetic ABI over the real process) it
+        returns the explicit unsupported status and no values."""
         proc = self._tls_proc()
         expected = SUPPORT_SUPPORTED if _IS_X86_64 else SUPPORT_NOT_SUPPORTED_ON_TARGET
         tls = self.mgr.inspect_thread_local_storage(pid=proc.pid, companion_elf_path=self.tls_bin)
         self.assertEqual(tls["tcb_scan_status"], expected)
         frames = self.mgr.inspect_thread_locals_and_frame_vars(pid=proc.pid, companion_elf_path=self.tls_bin)
-        self.assertEqual(frames["frame_decode_status"], expected)
+        expected_frames = SUPPORT_SUPPORTED if _NATIVE_MACHINE in ("x86_64", "aarch64") else SUPPORT_NOT_SUPPORTED_ON_TARGET
+        self.assertEqual(frames["frame_decode_status"], expected_frames)
         if not _IS_X86_64:
             self.assertEqual(tls["tcb_resolved_count"], 0)
             self.assertIn("not supported on this target", tls["tcb_scan_status_reason"])
             for t in tls["threads"]:
                 self.assertIsNone(t["tcb_address"])
                 self.assertEqual(t["tls_variables"], [])
-            # frames may still be identified (return-address scan + DWARF) but carry no decoded values
-            for t in frames["threads"]:
-                for fr in t["frames"]:
-                    self.assertEqual((fr["parameters"], fr["locals"]), ([], []))
-                    self.assertIsNone(fr["cfa_address"])
-                    self.assertEqual(fr["variables_status"], SUPPORT_NOT_SUPPORTED_ON_TARGET)
-            self.assertIn("not supported on this target", frames["frame_decode_status_reason"])
+        # a target the support table does not cover: frames may still be identified (return-address
+        # scan + DWARF) but carry no decoded values, and the status says why
+        arm_exe = make_elf(40, 32, True, "/lib/ld-linux-armhf.so.3")
+        arm_frames = self.mgr.inspect_thread_locals_and_frame_vars(
+            pid=proc.pid, companion_elf_path=self.tls_bin,
+            adapter=OverridingLocalAdapter(exe_bytes=arm_exe, maps="/lib/libc.so.6"),
+        )
+        self.assertEqual(arm_frames["frame_decode_status"], SUPPORT_NOT_SUPPORTED_ON_TARGET)
+        self.assertIn("not supported on this target", arm_frames["frame_decode_status_reason"])
+        self.assertEqual(arm_frames["cfi_unwind_status"], SUPPORT_NOT_SUPPORTED_ON_TARGET)
+        for t in arm_frames["threads"]:
+            for fr in t["frames"]:
+                self.assertEqual((fr["parameters"], fr["locals"]), ([], []))
+                self.assertIsNone(fr["cfa_address"])
+                self.assertEqual(fr["variables_status"], SUPPORT_NOT_SUPPORTED_ON_TARGET)
         # local adapter's own TCB fallback is gated too: no thread gets a TCB address on non-x86
         if not _IS_X86_64:
             for t in LocalTargetAdapter().get_threads(proc.pid):
