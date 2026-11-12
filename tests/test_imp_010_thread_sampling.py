@@ -206,6 +206,34 @@ class TestSpinAndLongWait(_RealProcessBase):
                         self.assertEqual(r.raw_details["runaway_threads"], [])
 
 
+class TestHealthyIdlePoolRegression(_RealProcessBase):
+    """A pool of workers idle on a condition variable (plus an uncontended mutex) is not a fault.
+
+    Regression: long-wait observations of unknown expectedness were passed as ``supporting_facts`` of an
+    INSUFFICIENT_EVIDENCE result; the engine turns every supporting fact into SUPPORTED evidence, so diagnose()
+    reported a CONFIRMED deadlock finding with no subjects.
+    """
+    NAME = "proc_idle_pool_uncontended_mutex"
+
+    def test_idle_condvar_pool_yields_no_fault_finding_through_the_engine(self):
+        from extractor.expert_diagnostic_engine import diagnose
+        proc = self._spawn(self.NAME)
+        for symptom in ("are the worker threads deadlocked?", "the process is unresponsive and one thread seems stalled"):
+            with self.subTest(symptom=symptom):
+                res = diagnose(proc.pid, self._binary(self.NAME), symptom, corpus_dir=tempfile.mkdtemp(dir=self.tmp_dir))
+                self.assertNotIn(res.verdict, ("CONFIRMED_FAULT", "PROBABLE_FAULT"), res.confidence_basis)
+                self.assertEqual(res.findings, [])
+                for f in res.findings:
+                    self.assertTrue(f["subjects"])
+                self.assertNotIn("FAIL", [c["status"] for c in res.checks_run])
+
+    def test_long_wait_observation_is_not_evidence(self):
+        proc = self._spawn(self.NAME)
+        res, session = self._run_recipe(RECIPE_LONG_RUNNING_BLOCKED_THREADS, proc, self.NAME)
+        self.assertEqual([e for e in session.collected_evidence if e.get("status") == "SUPPORTED"], [],
+                         "an observation of unknown expectedness must not become SUPPORTED evidence")
+
+
 class TestMemberMutexDeadlock(_RealProcessBase):
     NAME = "proc_thread_member_mutex_deadlock"
 

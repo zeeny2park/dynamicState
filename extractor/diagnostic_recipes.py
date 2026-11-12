@@ -2127,9 +2127,10 @@ def _evaluate_specific_recipe(recipe: DiagnosticRecipe, data: Dict[str, Any]) ->
                 confidence=0.40,
                 confidence_basis="Long wait observed, cannot determine whether expected: "
                                  + "; ".join(f"'{t.get('name')}' in {t.get('syscall')}" for t in lw[:5]),
-                supporting_facts=list(data.get("long_wait_findings") or []),
+                # NOT supporting_facts: the engine turns every supporting fact into SUPPORTED evidence, and an
+                # observation whose expectedness is unknown must not corroborate a fault.
                 missing_evidence=["application_work_queue_state"],
-                limitations=recipe.limitations,
+                limitations=list(recipe.limitations) + list(data.get("long_wait_findings") or []),
                 details={"long_wait_threads": [t.get("name") for t in lw], "expectation": "UNKNOWN"},
             )
         elif "blocked_threads" in data and not blocked:

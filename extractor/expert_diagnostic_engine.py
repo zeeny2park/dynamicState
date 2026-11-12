@@ -3695,7 +3695,10 @@ class ExpertDiagnosticEngine:
 DIAGNOSE_SCHEMA_VERSION = "1"
 DIAGNOSE_DEFAULT_SYMPTOM = "general health check"
 
-_SUBJECT_SKIP_KEYS = {"threads", "callstacks_info", "locks", "observation_window"}
+_SUBJECT_SKIP_KEYS = {"threads", "callstacks_info", "locks", "observation_window", "thread_summary",
+                      "thread_sampling", "long_wait_threads"}
+# IMP-010: thread findings of the time-series sampler (rows are dicts of {tid, name, function, ...})
+_SUBJECT_THREAD_ROW_KEYS = ("runaway_threads", "zombie_threads", "d_state_threads", "stalled_lock_waits")
 _SUBJECT_KEY_KIND = {
     "lock_name": "lock",
     "tid": "thread", "waiter_tid": "thread", "owner_tid": "thread", "held_by_tid": "thread",
@@ -3738,6 +3741,16 @@ def _collect_subjects(obj: Any, out: List[Tuple[str, str]], depth: int = 0) -> N
     if isinstance(obj, dict):
         for k, v in obj.items():
             if k in _SUBJECT_SKIP_KEYS:
+                continue
+            if k in _SUBJECT_THREAD_ROW_KEYS and isinstance(v, list):
+                for row in v:
+                    if not isinstance(row, dict):
+                        continue
+                    for rk, kind_ in (("tid", "thread"), ("name", "thread_name"), ("function", "function"),
+                                      ("top_source_location", "source_location"), ("lock", "lock")):
+                        rv = row.get(rk)
+                        if isinstance(rv, (str, int)) and not isinstance(rv, bool) and str(rv) != "":
+                            out.append((kind_, str(rv)))
                 continue
             kind = _SUBJECT_KEY_KIND.get(k)
             if kind and isinstance(v, (str, int)) and not isinstance(v, bool) and str(v) != "":
@@ -3927,6 +3940,16 @@ def diagnose(
                 "recipe_ids": rules,
                 "evidence_ids": list(rec.get("supporting_evidence_ids") or []),
             })
+
+        # A confirmed finding must name its subject (lock / thread / variable / function); one that names nothing
+        # is an unattributed observation and is downgraded.
+        for f in res.findings:
+            if f["status"] == "CONFIRMED_ROOT_CAUSE" and not f["subjects"]:
+                f["status"] = "PROBABLE_CAUSE"
+                nc.append({"kind": "unattributed_finding", "item": str(f["category"]),
+                           "reason": "the finding named no lock, thread, variable or function, so it was not confirmed"})
+        if res.verdict == "CONFIRMED_FAULT" and not any(f["status"] == "CONFIRMED_ROOT_CAUSE" for f in res.findings):
+            res.verdict = "PROBABLE_FAULT" if res.findings else "INCONCLUSIVE"
 
         for c in session.checks:
             if c.status in (CheckStatus.PASS, CheckStatus.FAIL):
