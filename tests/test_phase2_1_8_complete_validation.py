@@ -28,6 +28,7 @@ import time
 import unittest
 from unittest.mock import patch
 
+from tests.fixture_builds import ensure_built
 from extractor.capture_backend import (
     LiveCaptureReceipt,
     get_trusted_capture_authority_token,
@@ -184,16 +185,14 @@ class TestPhase218CompleteValidation(unittest.TestCase):
         cls.fixture_src = os.path.abspath("tests/fixtures/real_runtime/phase2_1_8_runtime_targets.cpp")
         cls.debug_bin = "/tmp/phase2_1_8_targets_debug"
         cls.stripped_bin = "/tmp/phase2_1_8_targets_stripped"
-        if not os.path.exists(cls.debug_bin):
-            subprocess.run(
-                ["g++", "-g", "-O0", "-pthread", "-Wl,--build-id=sha1", cls.fixture_src, "-o", cls.debug_bin],
-                check=True,
-            )
-        if not os.path.exists(cls.stripped_bin):
-            subprocess.run(
-                ["g++", "-s", "-O1", "-pthread", "-Wl,--build-id=sha1", cls.fixture_src, "-o", cls.stripped_bin],
-                check=True,
-            )
+        ensure_built(
+            cls.debug_bin,
+            lambda t: ["g++", "-g", "-O0", "-pthread", "-Wl,--build-id=sha1", cls.fixture_src, "-o", t],
+        )
+        ensure_built(
+            cls.stripped_bin,
+            lambda t: ["g++", "-s", "-O1", "-pthread", "-Wl,--build-id=sha1", cls.fixture_src, "-o", t],
+        )
         cls.registry = DiagnosticRecipeRegistry()
 
     def setUp(self):

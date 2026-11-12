@@ -93,3 +93,12 @@ def ensure_real_runtime_app_debug(dest: str = REAL_RUNTIME_DEBUG_ELF) -> str:
             _publish(dest, lambda t: ["g++", *_REAL_RUNTIME_FLAGS, _REAL_RUNTIME_SRC, "-o", t,
                                       "-lpthread"])
     return dest
+
+
+def ensure_built(dest: str, argv_for_tmp, deps=(), rebuild_if_older: bool = False) -> str:
+    """Generic atomic build: run ``argv_for_tmp(tmp_path)`` into a unique temp file and publish it at
+    ``dest`` under a lock, only if ``dest`` is missing (or older than ``deps`` when requested)."""
+    with _Lock(dest):
+        if _is_stale(dest, list(deps), rebuild_if_older):
+            _publish(dest, argv_for_tmp)
+    return dest

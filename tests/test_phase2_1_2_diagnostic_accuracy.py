@@ -18,6 +18,7 @@ import time
 import unittest
 from typing import Any, Dict, List, Optional, Tuple
 
+from tests.fixture_builds import ensure_built
 from extractor.diagnostic_recipes import (
     CATEGORY_ABNORMAL_VARIABLE_CHANGES,
     CATEGORY_DEADLOCK_INDICATORS,
@@ -143,12 +144,17 @@ class TestPhase212DiagnosticAccuracy(unittest.TestCase):
         cls.debug_elf = "/tmp/product_general_debug.elf"
         cls.stripped_elf = "/tmp/product_general_stripped.elf"
         cpp_src = "tests/fixtures/real_runtime/product_general_scenarios.cpp"
-        cmd = (
-            f"g++ -g -O0 -fno-inline -fno-omit-frame-pointer {cpp_src} "
-            f"-o {cls.debug_elf} -lpthread && "
-            f"strip -s -o {cls.stripped_elf} {cls.debug_elf}"
+        # Atomic publish (never recompile in place over a binary that a previous run may still execute).
+        ensure_built(
+            cls.debug_elf,
+            lambda t: ["g++", "-g", "-O0", "-fno-inline", "-fno-omit-frame-pointer", cpp_src, "-o", t, "-lpthread"],
+            deps=[cpp_src], rebuild_if_older=True,
         )
-        subprocess.run(cmd, shell=True, check=True)
+        ensure_built(
+            cls.stripped_elf,
+            lambda t: ["strip", "-s", "-o", t, cls.debug_elf],
+            deps=[cls.debug_elf], rebuild_if_older=True,
+        )
 
     def setUp(self):
         self.engine = ExpertDiagnosticEngine(corpus_dir="/tmp/phase2_1_2_corpus")
