@@ -101,8 +101,21 @@ dynamic-state connect --pid 1234 --debug-image ./app.debug --remote-host 192.0.2
 
 The collector matching the target's `uname -m` is streamed over SSH (falls back to a writable directory if `/tmp` is
 noexec). The target's ABI (architecture, libc, allocator) is detected and unsupported features are refused explicitly.
-Current limit: the one-call `diagnose` examines **local** PIDs only; for a remote target use `connect` and the individual
-tools (`runtime_target_connect`, `runtime_inspect_thread_callstack_and_locks`, ...), which accept `remote_host`/`ssh_*`.
+The one-call `diagnose` also works against a remote target (analysis on the host, collector on the board; the matching
+**unstripped** ELF on the host is required because the board's own executable is usually stripped):
+
+<!-- check: skip (needs a remote target; checked with --help) -->
+```bash
+dynamic-state diagnose --pid 1234 --debug-image ./app.debug --host 192.0.2.10 --user root --port 22 --identity ~/.ssh/id_ed25519 --auto-deploy-collector
+```
+
+The same fields exist on the MCP tool `runtime_diagnose_process` (`remote_host`, `ssh_user`, `ssh_port`, `ssh_key`,
+`ssh_proxy_jump`, `auto_deploy_collector`) and on `POST /api/diagnose`; key files only, no passwords. An unreachable
+host is `INCONCLUSIVE` with `target_unreachable`; a missing debug image is `INCONCLUSIVE` with `missing_debug_image`.
+The default wall-clock budget of a remote diagnosis is 120 s (local 5 s; `--time-limit` overrides). Remote gaps are listed in `not_covered` (`remote_limitation`): thread-local storage / TCB discovery, stacks of threads that
+were running at collection time, and symbols of libraries that could not be fetched. Heap walks (leak owner, heap
+integrity) run remotely through the collector's zero-stop reads in 64 KiB slices; they are capped by the observation
+budget, so a large heap over a slow link is reported as not checked rather than walked partially.
 
 ## Safety defaults
 
@@ -137,7 +150,7 @@ Then open `http://127.0.0.1:8765/workspace`.
   - Healthy processes are not yet cleared: they come back `INCONCLUSIVE`, never `HEALTHY` and never a false fault.
     Treat `INCONCLUSIVE` as "could not tell".
   - The result depends on the symptom wording ("the service stopped responding" is `INCONCLUSIVE` on a real deadlock; the default general check finds it).
-- Remote one-call diagnosis is not available yet (see above).
+- Remote one-call diagnosis has the gaps listed above (`remote_limitation` in `not_covered`).
 
 ## Tests and CI
 

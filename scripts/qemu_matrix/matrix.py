@@ -118,6 +118,7 @@ def run_entry(name: str, out_dir: str, entry_timeout_s: float = 1500.0, host_ref
         out.append(checks.guarded("C4a_deadlock_diagnosis", "deadlock", _dl))
         out.append(checks.guarded("C4b_glibc_only_gating", "gating", lambda: checks.c4b_gating(ctx)))
         out.append(checks.guarded("C4c_futex_syscall_names", "syscall", lambda: checks.c4c_syscall_names(ctx)))
+        out.append(checks.guarded("C4d_diagnose_entry_point", "diagnose", lambda: checks.c4d_diagnose_entry_point(ctx)))
         if "run" in holder:
             out.append(checks.guarded("C5_collection_cost", "cost", lambda: checks.c5_cost(ctx, holder["run"])))
         else:
@@ -162,6 +163,7 @@ _CHECK_NAMES = {
     "C4a_deadlock_diagnosis": "Deadlock diagnosis vs. host result",
     "C4b_glibc_only_gating": "Remote heap walk (glibc allocator)",
     "C4c_futex_syscall_names": "futex waiters carry the right syscall name",
+    "C4d_diagnose_entry_point": "diagnose() over SSH on the guest's deadlock fixture vs. host result",
     "C5_collection_cost": "Collection cost (wall time, remote commands)",
     "C6_process_discovery_and_identity": "Process discovery / identity / maps via BusyBox shell tools",
 }

@@ -141,7 +141,7 @@ from .runtime_evidence_provider import (
     RuntimeEvidenceProvider,
     RuntimeEvidenceRecord,
 )
-from .target_adapter import LocalTargetAdapter, TargetExecutionAdapter
+from .target_adapter import LocalTargetAdapter, RemoteSshTargetAdapter, TargetExecutionAdapter
 from .watch_session import read_process_memory_slice
 from .diagnostic_methodology import (
     CheckStatus,
@@ -1179,6 +1179,15 @@ class DiagnosticConclusion:
     diagnostic_limitations: List[str]
     completed_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
     overall_verdict: Optional[str] = None
+
+
+class ReportNotProducibleError(ValueError):
+    """IMP-006: a report was requested for a session that only planned and never executed a check."""
+    error_code = "NO_EXECUTED_CHECKS"
+
+
+# States in which a session without any executed check still has a truthful report: it says why nothing ran.
+_REPORTABLE_WITHOUT_CHECKS = {STATE_BLOCKED, STATE_FAILED, STATE_BUDGET_EXHAUSTED, STATE_INCONCLUSIVE}
 
 
 class AdaptiveInvestigationSession:
@@ -3021,8 +3030,25 @@ class AdaptiveInvestigationSession:
             "recommendation": f"Select {matched[0]['hypothesis_id']} ({matched[0]['problem_statement']})" if matched else "No hypotheses to compare",
         }
 
+    def report_blocked_reason(self) -> Optional[str]:
+        """Why no report may be produced for this session (planned-only), or None."""
+        if not self.executed_check_count() and self.state not in _REPORTABLE_WITHOUT_CHECKS:
+            return (f"investigation {self.investigation_id} is in state {self.state} and no check has been executed; "
+                    "a planned-only investigation produces no report (run the investigation first)")
+        return None
+
+    def executed_check_count(self) -> int:
+        return sum(1 for c in self.checks if c.status not in (CheckStatus.NOT_EXECUTED, CheckStatus.SKIPPED))
+
     def build_diagnostic_report(self) -> DiagnosticReport:
-        """Assembles unified, master DiagnosticReport adhering to Phase 2.1.8 schema (Part E1 & E2)."""
+        """Assembles unified, master DiagnosticReport adhering to Phase 2.1.8 schema (Part E1 & E2).
+
+        IMP-006 guard: a session that only planned (no check ever executed) and did not end in a state that
+        explains why nothing ran (BLOCKED / FAILED / BUDGET_EXHAUSTED / INCONCLUSIVE) yields no report:
+        raises :class:`ReportNotProducibleError` (``export_report`` turns it into an explicit marker)."""
+        why = self.report_blocked_reason()
+        if why:
+            raise ReportNotProducibleError(why)
         if not self.conclusion:
             self._finalize_conclusion("EXPORT_REQUESTED", "Diagnostic report requested prior to terminal state.")
 
@@ -3346,9 +3372,20 @@ class AdaptiveInvestigationSession:
         )
 
     def export_report(self, format: str = "json") -> Union[Dict[str, Any], str]:
-        """Exports master diagnostic report as JSON, Markdown, or HTML."""
-        report = self.build_diagnostic_report()
+        """Exports master diagnostic report as JSON, Markdown, or HTML.
+
+        A planned-only session returns an explicit marker instead of a report: a dict with
+        ``report_available: False`` / ``error_code`` / ``overall_result: INCONCLUSIVE`` for JSON, the same
+        sentence as text for the other formats."""
         fmt = format.lower()
+        try:
+            report = self.build_diagnostic_report()
+        except ReportNotProducibleError as exc:
+            if fmt in ("html", "markdown", "md", "json_str"):
+                return f"NO REPORT: {exc}"
+            return {"report_available": False, "error_code": exc.error_code, "error": str(exc),
+                    "overall_result": "INCONCLUSIVE", "investigation_id": self.investigation_id,
+                    "state": self.state}
         if fmt == "html":
             return report.to_html()
         elif fmt == "markdown" or fmt == "md":
@@ -3891,12 +3928,88 @@ def _diagnose_check_row(c: Any) -> Dict[str, Any]:
     }
 
 
+@dataclass
+class TargetSpec:
+    """Where the target process runs.  The field names are those of ``connect`` / the MCP and web remote
+    parameters (``remote_host``, ``ssh_user``, ``ssh_port``, ``ssh_key``, ``ssh_proxy_jump``,
+    ``auto_deploy_collector``); ``host`` / ``user`` / ``port`` / ``identity`` are accepted as aliases.
+    ``command_runner`` / ``stream_opener`` are injection seams (tests run the "remote" side locally) and are
+    never part of the serialised description.  Credentials (key material, key path) never appear in a result."""
+    remote_host: Optional[str] = None
+    ssh_user: Optional[str] = None
+    ssh_port: int = 22
+    ssh_key: Optional[str] = None
+    ssh_proxy_jump: Optional[str] = None
+    auto_deploy_collector: bool = False
+    collector_path: Optional[str] = None
+    timeout_s: Optional[float] = None
+    command_runner: Any = None
+    stream_opener: Any = None
+
+    @classmethod
+    def from_value(cls, value: Any) -> "TargetSpec":
+        if isinstance(value, cls):
+            return value
+        if not isinstance(value, dict):
+            raise ValueError("target must be a TargetSpec or a dict of connection parameters")
+        aliases = {"host": "remote_host", "user": "ssh_user", "port": "ssh_port", "identity": "ssh_key",
+                   "ssh_key_file": "ssh_key", "key_file": "ssh_key", "proxy_jump": "ssh_proxy_jump"}
+        kw: Dict[str, Any] = {}
+        for k, v in value.items():
+            k = aliases.get(k, k)
+            if k not in cls.__dataclass_fields__:
+                raise ValueError(f"unknown target parameter '{k}'")
+            kw[k] = v
+        spec = cls(**kw)
+        for f in ("remote_host", "ssh_user", "ssh_key", "ssh_proxy_jump", "collector_path"):
+            v = getattr(spec, f)
+            setattr(spec, f, v.strip() if isinstance(v, str) and v.strip() else None)
+        try:
+            spec.ssh_port = int(spec.ssh_port if spec.ssh_port is not None else 22)
+        except (TypeError, ValueError):
+            raise ValueError("ssh_port must be an integer")
+        if not (1 <= spec.ssh_port <= 65535):
+            raise ValueError("ssh_port must be in 1..65535")
+        spec.auto_deploy_collector = bool(spec.auto_deploy_collector)
+        return spec
+
+    def build_adapter(self) -> TargetExecutionAdapter:
+        if not self.remote_host:
+            raise ValueError("target.remote_host is required for a remote target")
+        kw: Dict[str, Any] = {}
+        if self.command_runner is not None:
+            kw["command_runner"] = self.command_runner
+        if self.stream_opener is not None:
+            kw["stream_opener"] = self.stream_opener
+        if self.timeout_s:
+            kw["timeout_sec"] = float(self.timeout_s)
+        return RemoteSshTargetAdapter(
+            host=self.remote_host, user=self.ssh_user, port=self.ssh_port, key_file=self.ssh_key,
+            proxy_jump=self.ssh_proxy_jump, collector_path=self.collector_path, **kw)
+
+    def describe(self) -> Dict[str, Any]:
+        """Transport info for the result: host / user / port / jump host; never a key or a key path."""
+        return {"transport": "ssh", "host": self.remote_host, "user": self.ssh_user, "port": self.ssh_port,
+                "proxy_jump": self.ssh_proxy_jump, "auto_deploy_collector": self.auto_deploy_collector}
+
+
+def _new_diagnose_result(pid: Any, debug_image: Optional[str]) -> DiagnoseResult:
+    res = DiagnoseResult()
+    res.collection_impact = {
+        "capture_mode": "NOT_RUN", "measured_stop_ms": 0.0, "zero_stop": True, "bytes_read": 0,
+        "wall_clock_ms": 0.0, "samples_collected": 0, "budget_exhausted": False,
+    }
+    res.target = {"pid": pid, "process_name": None, "abi": None, "debug_image": debug_image}
+    return res
+
+
 def diagnose(
     pid: int,
     debug_image: Optional[str] = None,
     symptom: Optional[str] = None,
     *,
     adapter: Optional[TargetExecutionAdapter] = None,
+    target: Optional[Any] = None,
     corpus_dir: Optional[str] = None,
     time_limit_s: Optional[float] = None,
     max_steps: int = 30,
@@ -3905,24 +4018,149 @@ def diagnose(
 ) -> DiagnoseResult:
     """Diagnose live process ``pid`` end to end in one call and return a :class:`DiagnoseResult`.
 
-    debug_image: ELF with DWARF; default is the target's own executable (/proc/PID/exe).  A path that
-        does not exist yields an INCONCLUSIVE result.
+    debug_image: ELF with DWARF on THIS host.  Local target: default is the target's own executable
+        (/proc/PID/exe).  Remote target: REQUIRED (the matching unstripped ELF); without it the result is
+        INCONCLUSIVE with ``missing_debug_image`` in ``not_covered`` (the target's own /proc/PID/exe is
+        normally stripped and is not fetched).  A path that does not exist yields an INCONCLUSIVE result.
     symptom: natural-language symptom; default "general health check" (the planner then runs its broad
-        recipe set).  adapter: target adapter (default local).  time_limit_s: wall-clock observation
-        budget.  max_steps: state-machine step cap.
+        recipe set).  adapter: ready target adapter (default local).  time_limit_s: wall-clock observation
+        budget (default: 5 s local, 120 s for a remote target, where every read is an SSH round trip).  max_steps: state-machine step cap.
+    target: remote target as a :class:`TargetSpec` or dict (``remote_host``, ``ssh_user``, ``ssh_port``,
+        ``ssh_key``, ``ssh_proxy_jump``, ``auto_deploy_collector``, ``collector_path``); builds an SSH
+        adapter that is closed again when the call ends.  An unreachable host or failed SSH is INCONCLUSIVE
+        with ``target_unreachable`` in ``not_covered``.  ``result.target`` carries host/transport, never
+        credentials.
 
     Target-side problems never raise: they produce verdict INCONCLUSIVE with the cause in
     ``not_covered``.  A result is only produced after the session executed to a terminal state; a
     session that only planned yields INCONCLUSIVE and no report.
     """
     t0 = time.monotonic()
-    res = DiagnoseResult()
-    res.collection_impact = {
-        "capture_mode": "NOT_RUN", "measured_stop_ms": 0.0, "zero_stop": True, "bytes_read": 0,
-        "wall_clock_ms": 0.0, "samples_collected": 0, "budget_exhausted": False,
-    }
-    res.target = {"pid": pid, "process_name": None, "abi": None, "debug_image": debug_image}
+    spec: Optional[TargetSpec] = None
+    own_adapter: Optional[TargetExecutionAdapter] = None
+    pre_nc: List[Dict[str, Any]] = []
+    extra_target: Dict[str, Any] = {}
+
+    def _early(kind: str, item: str, reason: str, summary: str) -> DiagnoseResult:
+        r = _new_diagnose_result(pid, debug_image)
+        r.target.update(extra_target)
+        r.not_covered.extend(pre_nc)
+        r.not_covered.append({"kind": kind, "item": item, "reason": reason})
+        r.summary = summary
+        r.duration_s = round(time.monotonic() - t0, 3)
+        return r
+
+    try:
+        if target is not None:
+            try:
+                spec = TargetSpec.from_value(target)
+                extra_target.update(spec.describe())
+                if adapter is None:
+                    adapter = own_adapter = spec.build_adapter()
+            except ValueError as exc:
+                return _early("invalid_target", "target", str(exc),
+                              f"The remote target description is invalid: {exc}. No conclusion was reached.")
+        remote = False
+        try:
+            remote = bool(adapter is not None and adapter.is_remote())
+        except Exception:  # noqa: BLE001
+            remote = adapter is not None and not isinstance(adapter, LocalTargetAdapter)
+        if remote:
+            if not extra_target:
+                try:
+                    extra_target.update({"transport": "ssh", "host": adapter.target_host()})
+                except Exception:  # noqa: BLE001
+                    extra_target.update({"transport": "remote"})
+            # Reachability first: an SSH/transport failure is "target_unreachable", not "no such process".
+            run_ssh = getattr(adapter, "run_ssh", None)
+            if callable(run_ssh):
+                try:
+                    rc, _out, err = run_ssh("true")
+                except Exception as exc:  # noqa: BLE001
+                    rc, err = -1, f"{type(exc).__name__}: {exc}"
+                if rc != 0:
+                    why = (err or "").strip().splitlines()[-1:] or [f"ssh exited with {rc}"]
+                    return _early("target_unreachable", str(extra_target.get("host") or "remote target"),
+                                  f"cannot reach the target over SSH: {why[0]}",
+                                  "The remote target could not be reached over SSH, so the process was not diagnosed. "
+                                  "No conclusion was reached.")
+            if spec is not None and spec.auto_deploy_collector and hasattr(adapter, "ensure_remote_collector"):
+                try:
+                    info = adapter.ensure_remote_collector()
+                except Exception as exc:  # noqa: BLE001
+                    info = {"deployed": False, "status": "ERROR", "reason": f"{type(exc).__name__}: {exc}"}
+                if isinstance(info, dict):
+                    extra_target["collector"] = {k: info.get(k) for k in ("status", "collector_path", "collector_version")}
+                if not (isinstance(info, dict) and info.get("collector_path")):
+                    pre_nc.append({"kind": "collector_not_deployed", "item": "target collector",
+                                   "reason": "the native collector could not be deployed ("
+                                             f"{info.get('reason') if isinstance(info, dict) else info}); "
+                                             "reads fall back to the slower batched POSIX shell path"})
+            elif getattr(adapter, "collector_path", None):
+                extra_target["collector"] = {"status": "CONFIGURED", "collector_path": adapter.collector_path}
+            if debug_image is None or not str(debug_image).strip():
+                return _early("missing_debug_image", "debug_image",
+                              "a remote target needs the debug image on this host: provide the matching unstripped "
+                              "ELF (with DWARF) of the target program; the target's own /proc/PID/exe is normally "
+                              "stripped and is not used as a default",
+                              "No debug image was given for the remote target, so it was not diagnosed. Provide the "
+                              "matching unstripped ELF. No conclusion was reached.")
+        return _diagnose_run(pid, debug_image, symptom, adapter=adapter, corpus_dir=corpus_dir,
+                             time_limit_s=time_limit_s, max_steps=max_steps, include_report=include_report,
+                             engine=engine, extra_target=extra_target, pre_nc=pre_nc, t0=t0, remote=remote)
+    finally:
+        if own_adapter is not None:
+            try:
+                own_adapter.close()
+            except Exception:  # noqa: BLE001
+                pass
+
+
+REMOTE_DEFAULT_TIME_LIMIT_S = 120.0  # default wall-clock budget of a remote diagnosis (local: ObservationBudgetLimits default)
+
+
+def _remote_target_gaps(adapter: Any, already: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """What a REMOTE diagnosis cannot examine (never guessed; always listed in ``not_covered``)."""
+    gaps = [
+        {"kind": "remote_limitation", "item": "thread_local_storage",
+         "reason": "remote TLS/TCB discovery is not implemented: thread-local variables and the per-thread "
+                   "struct pthread (tcb_address) are not read on a remote target"},
+        {"kind": "remote_limitation", "item": "running_thread_stacks",
+         "reason": "a thread that is running in user space at collection time exposes no stack pointer in "
+                   "/proc/PID/task/TID/syscall, and nothing is stopped to obtain one: such threads have no "
+                   "stack unwound (blocked threads do)"},
+        {"kind": "remote_limitation", "item": "library_symbolisation",
+         "reason": "shared-library frames are symbolised from images fetched from the target "
+                   "over the link (size-capped at 32 MiB, cached per session); a library that cannot be fetched or has "
+                   "no symbol table stays unsymbolised and the stack beyond it is labelled estimated"},
+    ]
+    if not getattr(adapter, "collector_path", None) and not any(n.get("kind") == "collector_not_deployed" for n in already):
+        gaps.append({"kind": "remote_limitation", "item": "target_collector",
+                     "reason": "no native collector is configured on the target: memory and thread reads use the "
+                               "slower batched POSIX shell path (pass auto_deploy_collector / collector_path)"})
+    return gaps
+
+
+def _diagnose_run(
+    pid: int,
+    debug_image: Optional[str],
+    symptom: Optional[str],
+    *,
+    adapter: Optional[TargetExecutionAdapter],
+    corpus_dir: Optional[str],
+    time_limit_s: Optional[float],
+    max_steps: int,
+    include_report: bool,
+    engine: Optional["ExpertDiagnosticEngine"],
+    extra_target: Dict[str, Any],
+    pre_nc: List[Dict[str, Any]],
+    t0: float,
+    remote: bool,
+) -> DiagnoseResult:
+    res = _new_diagnose_result(pid, debug_image)
+    res.target.update(extra_target)
     nc = res.not_covered
+    nc.extend(pre_nc)
 
     def _finish(summary: str) -> DiagnoseResult:
         res.summary = summary
@@ -3941,7 +4179,7 @@ def diagnose(
         if debug_image is None and isinstance(adapter, LocalTargetAdapter):
             debug_image = f"/proc/{pid}/exe"
         res.target["debug_image"] = debug_image
-        if isinstance(adapter, LocalTargetAdapter) and (not debug_image or not os.path.exists(debug_image)):
+        if (isinstance(adapter, LocalTargetAdapter) or remote) and (not debug_image or not os.path.exists(debug_image)):
             nc.append({"kind": "missing_debug_image", "item": str(debug_image),
                        "reason": "debug image does not exist; symbol-level diagnosis is impossible"})
             return _finish("The debug image was not found, so the process was not diagnosed. No conclusion was reached.")
@@ -3956,8 +4194,15 @@ def diagnose(
         except Exception as exc:  # noqa: BLE001
             nc.append({"kind": "abi_detection_failed", "item": "target ABI", "reason": f"{type(exc).__name__}: {exc}"})
 
+        if remote:
+            nc.extend(_remote_target_gaps(adapter, pre_nc))
+
         engine = engine or ExpertDiagnosticEngine(corpus_dir=corpus_dir)
         limits = ObservationBudgetLimits(max_wall_clock_ms=float(time_limit_s) * 1000.0) if time_limit_s else None
+        if limits is None and remote:
+            # every sample costs SSH round trips (about 0.5 s each on the slow QEMU guest): the local 5 s default
+            # exhausts before the baseline checks ran.  An explicit time_limit_s is always honoured.
+            limits = ObservationBudgetLimits(max_wall_clock_ms=REMOTE_DEFAULT_TIME_LIMIT_S * 1000.0)
         # IMP-020: bracket the whole collection with the target-load meter (never raises; unmeasured -> None).
         from .collection_impact import CollectionImpactMeter, impact_summary_for_report
         meter = CollectionImpactMeter(adapter, pid).start()

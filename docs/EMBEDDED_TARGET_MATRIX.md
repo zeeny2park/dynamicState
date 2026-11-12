@@ -65,24 +65,28 @@ known buffer; C1b noexec primary location falls back; C2a daemon channel (30 rea
 target, 0 after close); C2b no-collector fallback with BusyBox `dd`/`tail`/`head` on unaligned and page-crossing
 ranges (singly and batched) and an unmapped address; C3 ABI detection and the support table; C4a deadlock diagnosis of
 `proc_thread_circular_deadlock.c` (`-g -pthread`, debug ELF on the host, vs. the same fixture diagnosed natively on the
-host); C4b remote heap walk; C4c futex syscall name; C5 cost; C6 process discovery / identity / maps.
+host); C4b remote heap walk; C4c futex syscall name; C4d the one-call `diagnose(target=...)` entry point (IMP-006) against
+the guest's deadlock fixture over SSH, compared with `diagnose()` on the same fixture natively on the host (verdict,
+categories, lock names; collector deploy decision, ABI/glibc identification and the recorded remote gaps are exercised
+on the way); C5 cost; C6 process discovery / identity / maps.
 
 ## Result of the committed run (`docs/test_baseline/qemu_matrix/`, host aarch64 4 cores, no KVM, QEMU 8.2.2)
 
 | check | aarch64-glibc |
 |---|---|
-| C1 collector deploy + slice read | PASS (aarch64, 857 472 B, collector v1.1.0) |
+| C1 collector deploy + slice read | PASS (aarch64, 857 848 B, collector v1.2.0) |
 | C1b noexec fallback location | PASS |
 | C2a daemon channel | PASS |
 | C2b no-collector BusyBox fallback | PASS |
 | C3 ABI detection | PASS aarch64/64/little/glibc |
 | C4a deadlock | PASS: SUPPORTED, locks g_mutex_a/g_mutex_b = host |
-| C4b remote heap walk | BLOCKED (see open items) |
+| C4b remote heap walk | PASS: OK, 3 chunks in 1 arena (was BLOCKED: glibc version not identified remotely) |
 | C4c futex syscall name | PASS (threads reported as futex, blocked, with sp/pc) |
+| C4d `diagnose()` over SSH vs. host | PASS: CONFIRMED_FAULT, DEADLOCK_INDICATORS, locks g_mutex_a/g_mutex_b = host; 190.6 s, 709 ssh commands, 488 KB read, zero-stop |
 | C5 cost | PASS |
 | C6 discovery / identity / maps | PASS |
 | overall | PASS |
-| entry wall time | 133 s |
+| entry wall time | 330 s |
 
 Cost on the constrained TCG guest (absolute times are pessimistic; the ratios matter):
 
@@ -90,13 +94,25 @@ Cost on the constrained TCG guest (absolute times are pessimistic; the ratios ma
 |---|---|---|---|---|---|
 | aarch64-glibc | 19.9 s / 70 ssh cmds | 0.55 s / 1 | 25.3 s / 100 | 28.6 s / 100 | 21.5 s / 81 |
 
-A matrix run takes about 2.5 minutes after the image is cached (boot to SSH about 9 s).
+A matrix run takes about 5.5 minutes after the image is cached (boot to SSH about 9 s); C4d alone is about 3 minutes
+because a remote diagnosis issues a few hundred SSH commands at about 0.25 s each on the TCG guest.
 
 ## Open items and findings
 
-* **BLOCKED (open product gap)** remote heap walk on aarch64+glibc (C4b): `HeapWalker` answers
-  `INCONCLUSIVE_ABI_UNDETECTED` because it cannot identify the glibc version of a remote target (the version probe is
-  local-only).  Honest answer, but the supported combination cannot be exercised remotely until this is fixed.
+* **Fixed** - remote heap walk (C4b, was BLOCKED): the glibc version was read from the mapped libc through the
+  collector as designed, but the collector returns at most 64 KiB per slice and the host asked for whole segments
+  (up to 4 MiB): every large read came back `PARTIAL` and the walker concluded "version not identified".  The adapter now
+  splits large slices into 64 KiB pieces and reassembles them (`COLLECTOR_MAX_SLICE`), which also fixes every other large
+  remote read (heap regions).  The banner is now read backwards in 128 KiB chunks and cached per session.
+* **Fixed** - the remote deadlock result was INCONCLUSIVE for struct-member mutexes: the lock-candidate widening
+  (`variable.member`, futex addresses) skipped remote targets; it now takes the per-thread syscalls from the collector's
+  thread sample.
+* **Finding** - a remote diagnosis is chatty: about 700 SSH commands for one deadlock diagnosis on the guest (most are
+  not the daemon channel: maps, identity, thread info).  The default remote budget is therefore 120 s (local 5 s) and the
+  baseline heap-integrity walk gets a 10x wall cap remotely (byte caps unchanged).  `ControlMaster` reuse for the
+  one-call path is not enabled and not measured here; real boards on a LAN are expected to be faster than TCG.
+* Remote gaps that stay (reported in `not_covered` as `remote_limitation`, never guessed): TLS/TCB discovery, stacks of
+  threads that were running, symbols of libraries that cannot be fetched.
 * **Fixed** - `RemoteSshTargetAdapter.find_processes` could never work: the remote script contained a raw NUL
   (`'\000'`) and a raw newline in `tr` arguments, so every call failed on every target.  Fixed in
   `extractor/target_adapter.py`; regression `tests/test_imp014_find_processes_regression.py`.

@@ -162,6 +162,18 @@ T: Dict[str, Tuple[str, str]] = {
     "k_notexam": ("What was NOT examined (a check that was not run is not evidence of absence):",
                   "확인하지 못한 것 (실행하지 못한 검사는 문제가 없다는 근거가 아닙니다):"),
     "k_none": ("Nothing was reported as unexamined.", "확인하지 못했다고 보고된 항목은 없습니다."),
+    "nc_target_unreachable": ("The remote target could not be reached over SSH ({items}), so nothing was examined.",
+                              "원격 대상에 SSH로 접속하지 못해({items}) 아무것도 확인하지 못했습니다."),
+    "nc_invalid_target": ("The remote target description is invalid: {items}.", "원격 대상 설명이 올바르지 않습니다: {items}."),
+    "nc_missing_debug_image_remote": ("No debug image was given for the remote target ({items}); provide the matching "
+                                      "unstripped ELF with DWARF symbols on this machine.",
+                                      "원격 대상에 대한 디버그 이미지가 지정되지 않았습니다({items}). 이 컴퓨터에 있는 같은 버전의 "
+                                      "심볼 포함(strip 되지 않은) ELF를 제공하세요."),
+    "nc_remote_limitation": ("Remote-target limits (not guessed): {items}.", "원격 대상의 제약 (추측하지 않음): {items}."),
+    "nc_collector_not_deployed": ("The native collector is not running on the target, so reads use the slower shell path.",
+                                  "대상에서 네이티브 수집기를 쓸 수 없어 더 느린 셸 경로로 읽었습니다."),
+    "r_unreach": ("the remote target cannot be reached over SSH: {raw}", "원격 대상에 SSH로 접속할 수 없습니다: {raw}"),
+    "r_noimg_remote": ("no debug image was given for the remote target", "원격 대상에 대한 디버그 이미지가 지정되지 않았습니다"),
     "nc_target_unreadable": ("The target process could not be read: {items}.", "대상 프로세스를 읽을 수 없었습니다: {items}."),
     "nc_pid_gone": ("the process does not exist", "프로세스가 존재하지 않습니다"),
     "nc_missing_debug_image": ("The debug image was not found ({items}), so nothing was resolved to variable names.",
@@ -649,17 +661,22 @@ def _finding_next(ctx: _Ctx, f: Dict[str, Any], rendered: Dict[str, Any]) -> Lis
 def _incon_reason(ctx: _Ctx, res: Dict[str, Any]) -> str:
     nc = res.get("not_covered") or []
     pid = (res.get("target") or {}).get("pid")
-    prio = ("target_unreadable", "missing_debug_image", "stage_failed", "unexpected_error", "not_executed")
+    prio = ("target_unreachable", "invalid_target", "target_unreadable", "missing_debug_image", "stage_failed",
+            "unexpected_error", "not_executed")
     for kind in prio:
         for n in nc:
             if n.get("kind") != kind:
                 continue
             raw = str(n.get("reason") or "")
+            if kind in ("target_unreachable", "invalid_target"):
+                return ctx.t("r_unreach", raw=_c(raw))
             if kind == "target_unreadable":
                 if "does not exist" in raw or "invalid PID" in raw:
                     return ctx.t("r_nopid", pid=pid)
                 return ctx.t("r_unread", raw=_c(raw))
             if kind == "missing_debug_image":
+                if (res.get("target") or {}).get("transport") == "ssh":
+                    return ctx.t("r_noimg_remote")
                 return ctx.t("r_noimg", item=_c(n.get("item")))
             if kind in ("stage_failed", "unexpected_error"):
                 return ctx.t("r_stage", item=_c(n.get("item")), raw=_c(raw))
@@ -842,7 +859,12 @@ def _section4(ctx: _Ctx, res: Dict[str, Any]) -> List[str]:
             gone = any("does not exist" in r or "invalid PID" in r for r in raws)
             line = ctx.t("nc_target_unreadable", items=ctx.t("nc_pid_gone") if gone else _join([_c(r) for r in raws]))
         elif kind == "missing_debug_image":
-            line = ctx.t("nc_missing_debug_image", items=_join(names))
+            line = ctx.t("nc_missing_debug_image_remote" if (res.get("target") or {}).get("transport") == "ssh"
+                         else "nc_missing_debug_image", items=_join(names))
+        elif kind in ("target_unreachable", "invalid_target"):
+            line = ctx.t(f"nc_{kind}", items=_join([_c(r) for r in raws] or names))
+        elif kind == "remote_limitation":
+            line = ctx.t("nc_remote_limitation", items="; ".join(_c(r) for r in raws) or _join(names))
         elif kind == "unsupported_on_target":
             line = ctx.t("nc_unsupported_on_target", abi=_abi_text(res), items=_join(names))
         elif kind.startswith("check_"):
@@ -973,7 +995,8 @@ def render_human_report(result: Dict[str, Any], report: Optional[Dict[str, Any]]
 
 def diagnose_with_summary(pid: int, debug_image: Optional[str] = None, symptom: Optional[str] = None,
                           time_limit_s: Optional[float] = None, engine: Any = None, lang: str = "en",
-                          corpus_dir: Optional[str] = None) -> Tuple[Dict[str, Any], str]:
+                          corpus_dir: Optional[str] = None, target: Any = None,
+                          adapter: Any = None) -> Tuple[Dict[str, Any], str]:
     """Run ``diagnose`` once and return ``(result_dict_without_inline_report, human_summary_markdown)``.
 
     The inline full report is requested only to give the summary its names and numbers; it is dropped from the
@@ -981,6 +1004,10 @@ def diagnose_with_summary(pid: int, debug_image: Optional[str] = None, symptom: 
     """
     from .expert_diagnostic_engine import diagnose
     kw: Dict[str, Any] = {"engine": engine} if engine is not None else {"corpus_dir": corpus_dir}
+    if target is not None:
+        kw["target"] = target
+    if adapter is not None:
+        kw["adapter"] = adapter
     res = diagnose(pid, debug_image=debug_image, symptom=symptom, time_limit_s=time_limit_s,
                    include_report=True, **kw)
     d = res.to_dict()

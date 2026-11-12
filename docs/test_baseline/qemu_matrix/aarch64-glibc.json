@@ -2,8 +2,8 @@
  "schema": "dynamicstate.qemu_matrix.v1",
  "entry": "aarch64-glibc",
  "title": "aarch64 + glibc (Debian trixie userland, BusyBox applets)",
- "started_utc": "2026-11-12T09:06:59Z",
- "duration_s": 133.2,
+ "started_utc": "2026-11-12T11:55:04Z",
+ "duration_s": 330.3,
  "overall": "PASS",
  "infrastructure_error": null,
  "guest": {
@@ -11,7 +11,7 @@
    "Linux 6.12.107+deb13-arm64 aarch64",
    "BusyBox v1.37.0 (Debian 1:1.37.0-6+b9) multi-call binary."
   ],
-  "boot_to_ssh_s": 9.2,
+  "boot_to_ssh_s": 9.3,
   "vcpus": 1,
   "mem_mb": 128,
   "cpu_model": "cortex-a72",
@@ -47,16 +47,16 @@
    "-monitor",
    "none",
    "-serial",
-   "file:/home/ubuntu/.cache/dynamicstate-qemu/dsqemu_aarch64-glibc_jud1jww5/console.log",
+   "file:/home/ubuntu/.cache/dynamicstate-qemu/dsqemu_aarch64-glibc_ftgiksix/console.log",
    "-no-reboot",
    "-kernel",
    "/home/ubuntu/.cache/dynamicstate-qemu/aarch64-glibc/vmlinuz",
    "-initrd",
-   "/home/ubuntu/.cache/dynamicstate-qemu/dsqemu_aarch64-glibc_jud1jww5/initrd.cpio.gz",
+   "/home/ubuntu/.cache/dynamicstate-qemu/dsqemu_aarch64-glibc_ftgiksix/initrd.cpio.gz",
    "-append",
    "console=ttyAMA0 panic=-1 quiet loglevel=3",
    "-netdev",
-   "user,id=n0,hostfwd=tcp:127.0.0.1:57077-:22",
+   "user,id=n0,hostfwd=tcp:127.0.0.1:34241-:22",
    "-device",
    "virtio-net-pci,netdev=n0,romfile="
   ]
@@ -66,19 +66,19 @@
    "id": "C1_collector_deploy_and_slice",
    "name": "Collector deploys (arch, static, version) + slice read returns expected bytes",
    "status": "PASS",
-   "summary": "DEPLOYED_BINARY aarch64 collector v1.1.0, 857472 bytes; slice of 48 bytes at 0xaaaad7460010 matches",
+   "summary": "DEPLOYED_BINARY aarch64 collector v1.2.0, 857848 bytes; slice of 48 bytes at 0xaaaaca570010 matches",
    "details": {
     "deploy": {
      "deployed": true,
      "status": "DEPLOYED_BINARY",
      "collector_path": "/tmp/dynamicstate-collector",
-     "bytes_transferred": 857472,
+     "bytes_transferred": 857848,
      "architecture": "aarch64",
-     "collector_version": "1.1.0",
-     "local_binary": "/home/ubuntu/workspace/ut/.claude/worktrees/agent-ae0c3c27f75e5ef0a/target/collector/dist/aarch64/dynamicstate-collector",
+     "collector_version": "1.2.0",
+     "local_binary": "/home/ubuntu/workspace/ut/.claude/worktrees/agent-ab09a9b07a1b30c85/target/collector/dist/aarch64/dynamicstate-collector",
      "transfer": "ssh_stdin"
     },
-    "deploy_reason": "Successfully deployed dynamicstate-collector (857472 bytes) to /tmp/dynamicstate-collector",
+    "deploy_reason": "Successfully deployed dynamicstate-collector (857848 bytes) to /tmp/dynamicstate-collector",
     "guest_uname_m": "aarch64",
     "local_binary": "target/collector/dist/aarch64/dynamicstate-collector",
     "local_binary_elf": {
@@ -87,10 +87,10 @@
      "endianness": "little",
      "interpreter": null
     },
-    "remote_version_output": "dynamicstate-collector 1.1.0",
-    "expected_version": "1.1.0",
+    "remote_version_output": "dynamicstate-collector 1.2.0",
+    "expected_version": "1.2.0",
     "slice_read": {
-     "address": "0xaaaad7460010",
+     "address": "0xaaaaca570010",
      "size": 48,
      "status": "OBSERVED",
      "error": null,
@@ -105,7 +105,7 @@
     "remote_commands": 14
    },
    "remote_commands": 14,
-   "duration_s": 4.32
+   "duration_s": 4.27
   },
   {
    "id": "C1b_noexec_fallback_location",
@@ -118,17 +118,17 @@
      "deployed": true,
      "status": "DEPLOYED_BINARY",
      "collector_path": "/tmp/dsmx_fallback/dynamicstate-collector",
-     "bytes_transferred": 857472,
+     "bytes_transferred": 857848,
      "architecture": "aarch64",
-     "collector_version": "1.1.0",
-     "local_binary": "/home/ubuntu/workspace/ut/.claude/worktrees/agent-ae0c3c27f75e5ef0a/target/collector/dist/aarch64/dynamicstate-collector",
+     "collector_version": "1.2.0",
+     "local_binary": "/home/ubuntu/workspace/ut/.claude/worktrees/agent-ab09a9b07a1b30c85/target/collector/dist/aarch64/dynamicstate-collector",
      "transfer": "ssh_stdin"
     },
-    "reason": "Successfully deployed dynamicstate-collector (857472 bytes) to /tmp/dsmx_fallback/dynamicstate-collector",
+    "reason": "Successfully deployed dynamicstate-collector (857848 bytes) to /tmp/dsmx_fallback/dynamicstate-collector",
     "read_via_fallback_copy": "OBSERVED"
    },
    "remote_commands": 6,
-   "duration_s": 2.55
+   "duration_s": 2.53
   },
   {
    "id": "C2a_daemon_channel",
@@ -138,7 +138,7 @@
    "details": {
     "reads": 30,
     "bad_reads": [],
-    "wall_s": 0.36,
+    "wall_s": 0.34,
     "daemon_stats": {
      "opens": 1,
      "requests": 30,
@@ -154,7 +154,7 @@
     }
    },
    "remote_commands": 1,
-   "duration_s": 2.49
+   "duration_s": 2.48
   },
   {
    "id": "C2b_no_collector_fallback",
@@ -234,7 +234,7 @@
     }
    },
    "remote_commands": 10,
-   "duration_s": 3.6
+   "duration_s": 3.59
   },
   {
    "id": "C3_abi_detection",
@@ -310,28 +310,28 @@
      "recipe_status": "SUPPORTED",
      "lock_owner_status": "SUPPORTED",
      "collections": 1,
-     "wall_s": 19.87,
-     "ssh_commands": 70
+     "wall_s": 21.08,
+     "ssh_commands": 76
     },
     "limitations": []
    },
-   "duration_s": 19.87,
-   "remote_commands": 70
+   "duration_s": 21.08,
+   "remote_commands": 76
   },
   {
    "id": "C4b_glibc_only_gating",
    "name": "Remote heap walk (glibc allocator)",
-   "status": "BLOCKED",
-   "summary": "heap walking is declared supported here but HeapWalker cannot identify the glibc version of a REMOTE target (version probe is local-only / banner read from target memory failed) and answers INCONCLUSIVE - honest, but the remote heap walk cannot run: inconclusive: glibc version of the target could not be identified (the ptmalloc layout depends on it)",
+   "status": "PASS",
+   "summary": "heap walk OK: 3 chunks in 1 arena(s)",
    "details": {
-    "heap_walk_status": "INCONCLUSIVE_ABI_UNDETECTED",
-    "heap_walk_message": "inconclusive: glibc version of the target could not be identified (the ptmalloc layout depends on it)",
-    "chunks": 0,
-    "arenas": 0,
-    "wall_s": 0.76,
-    "ssh_commands": 2
+    "heap_walk_status": "OK",
+    "heap_walk_message": "",
+    "chunks": 3,
+    "arenas": 1,
+    "wall_s": 2.58,
+    "ssh_commands": 6
    },
-   "duration_s": 0.8
+   "duration_s": 2.6
   },
   {
    "id": "C4c_futex_syscall_names",
@@ -380,77 +380,190 @@
       "state": "blocked",
       "nr": 98,
       "args": [
-       187650903507024,
+       187650805596240,
        128,
        2,
        0,
        0,
        0
       ],
-      "sp": 281473423763584,
-      "pc": 281473424306032
+      "sp": 281473733814400,
+      "pc": 281473734356848
      },
      "850": {
       "state": "blocked",
       "nr": 98,
       "args": [
-       187650903506976,
+       187650805596192,
        128,
        2,
        0,
        0,
        0
       ],
-      "sp": 281473415309440,
-      "pc": 281473424306032
+      "sp": 281473725360256,
+      "pc": 281473734356848
      }
     }
    },
-   "duration_s": 0.84
+   "duration_s": 0.83
+  },
+  {
+   "id": "C4d_diagnose_entry_point",
+   "name": "diagnose() over SSH on the guest's deadlock fixture vs. host result",
+   "status": "PASS",
+   "summary": "diagnose() over SSH: verdict CONFIRMED_FAULT, ['DEADLOCK_INDICATORS'], locks ['g_mutex_a', 'g_mutex_b'] = host; 8 item(s) recorded in not_covered",
+   "details": {
+    "remote": {
+     "verdict": "CONFIRMED_FAULT",
+     "categories": [
+      "DEADLOCK_INDICATORS"
+     ],
+     "locks": [
+      "g_mutex_a",
+      "g_mutex_b"
+     ]
+    },
+    "host": {
+     "available": true,
+     "verdict": "CONFIRMED_FAULT",
+     "categories": [
+      "DEADLOCK_INDICATORS"
+     ],
+     "locks": [
+      "g_mutex_a",
+      "g_mutex_b"
+     ],
+     "host_arch": "aarch64"
+    },
+    "wall_s": 190.6,
+    "ssh_commands": 709,
+    "target": {
+     "pid": 847,
+     "process_name": "deadlock",
+     "abi": {
+      "status": "DETECTED",
+      "architecture": "aarch64",
+      "word_size": 64,
+      "endianness": "little",
+      "libc": "glibc",
+      "libc_version": null,
+      "interpreter": "/lib/ld-linux-aarch64.so.1",
+      "libc_path": "/usr/lib/aarch64-linux-gnu/libc.so.6",
+      "evidence": [
+       "ELF header: aarch64, 64-bit, little-endian",
+       "PT_INTERP /lib/ld-linux-aarch64.so.1",
+       "mapped /usr/lib/aarch64-linux-gnu/libc.so.6",
+       "mapped /usr/lib/aarch64-linux-gnu/ld-linux-aarch64.so.1"
+      ],
+      "error": null
+     },
+     "debug_image": "/home/ubuntu/.cache/dynamicstate-qemu/aarch64-glibc/targets/deadlock.debug",
+     "transport": "ssh",
+     "host": "127.0.0.1",
+     "user": "root",
+     "port": 34241,
+     "proxy_jump": null,
+     "auto_deploy_collector": true,
+     "collector": {
+      "status": "ALREADY_PRESENT",
+      "collector_path": "/tmp/dynamicstate-collector",
+      "collector_version": "1.2.0"
+     }
+    },
+    "bytes_read": 488358,
+    "zero_stop": true,
+    "capture_mode": "ZERO_STOP_LIVE_RUNTIME",
+    "not_covered": [
+     {
+      "kind": "unsupported_on_target",
+      "item": "tcb_scan",
+      "reason": "NOT_SUPPORTED_ON_TARGET: tcb_scan: not supported on this target (aarch64/glibc, 64-bit little-endian)"
+     },
+     {
+      "kind": "remote_limitation",
+      "item": "thread_local_storage",
+      "reason": "remote TLS/TCB discovery is not implemented: thread-local variables and the per-thread struct pthread (tcb_address) are not read on a remote target"
+     },
+     {
+      "kind": "remote_limitation",
+      "item": "running_thread_stacks",
+      "reason": "a thread that is running in user space at collection time exposes no stack pointer in /proc/PID/task/TID/syscall, and nothing is stopped to obtain one: such threads have no stack unwound (blocked threads do)"
+     },
+     {
+      "kind": "remote_limitation",
+      "item": "library_symbolisation",
+      "reason": "shared-library frames are symbolised from images fetched from the target over the link (size-capped at 32 MiB, cached per session); a library that cannot be fetched or has no symbol table stays unsymbolised and the stack beyond it is labelled estimated"
+     },
+     {
+      "kind": "check_inconclusive",
+      "item": "RECIPE_INVALID_MEMORY_ACCESS",
+      "reason": "Check executed"
+     },
+     {
+      "kind": "check_inconclusive",
+      "item": "RECIPE_ALLOCATION_FREE_IMBALANCE",
+      "reason": "Check executed"
+     },
+     {
+      "kind": "check_inconclusive",
+      "item": "RECIPE_THREAD_STATE_ANOMALIES",
+      "reason": "Check executed"
+     },
+     {
+      "kind": "recipes_not_planned",
+      "item": "RECIPE_DOUBLE_FREE,RECIPE_INVALID_FREE,RECIPE_USE_AFTER_FREE,RECIPE_SUSPICIOUS_A",
+      "reason": "not selected by the planner for this symptom classification"
+     }
+    ],
+    "summary": "Verdict CONFIRMED_FAULT: found DEADLOCK_INDICATORS. 2 of 8 executed checks passed; 8 item(s) could not be examined (see not_covered)."
+   },
+   "duration_s": 190.57,
+   "remote_commands": 709
   },
   {
    "id": "C5_collection_cost",
    "name": "Collection cost (wall time, remote commands)",
    "status": "PASS",
-   "summary": "deadlock 19.87s/70 cmds; 100 reads: daemon channel 0.55s/1 cmds, one collector process per call 25.26s/100 cmds, no collector 28.59s/100 cmds",
+   "summary": "deadlock 21.08s/76 cmds; 100 reads: daemon channel 0.54s/1 cmds, one collector process per call 24.99s/100 cmds, no collector 28.5s/100 cmds",
    "details": {
     "read_modes": [
      {
       "mode": "daemon channel (collector)",
       "reads": 100,
-      "wall_s": 0.55,
+      "wall_s": 0.54,
       "ssh_commands": 1,
-      "per_read_ms": 5.5,
+      "per_read_ms": 5.4,
       "wrong_reads": 0
      },
      {
       "mode": "one collector process per call",
       "reads": 100,
-      "wall_s": 25.26,
+      "wall_s": 24.99,
       "ssh_commands": 100,
-      "per_read_ms": 252.6,
+      "per_read_ms": 249.9,
       "wrong_reads": 0
      },
      {
       "mode": "no collector (busybox dd block pipeline)",
       "reads": 100,
-      "wall_s": 28.59,
+      "wall_s": 28.5,
       "ssh_commands": 100,
-      "per_read_ms": 285.9,
+      "per_read_ms": 285.0,
       "wrong_reads": 0
      },
      {
       "mode": "daemon channel + pinned identity",
       "reads": 20,
-      "wall_s": 21.51,
+      "wall_s": 21.6,
       "ssh_commands": 81,
-      "per_read_ms": 1075.5,
+      "per_read_ms": 1080.2,
       "wrong_reads": 0
      }
     ],
     "deadlock_diagnosis": {
-     "wall_s": 19.87,
-     "ssh_commands": 70,
+     "wall_s": 21.08,
+     "ssh_commands": 76,
      "collections": 1
     },
     "guest": {
@@ -459,13 +572,13 @@
      "accel": "tcg (software emulation; absolute times are pessimistic)"
     }
    },
-   "duration_s": 95.78
+   "duration_s": 96.71
   },
   {
    "id": "C6_process_discovery_and_identity",
    "name": "Process discovery / identity / maps via BusyBox shell tools",
    "status": "PASS",
-   "summary": "found pid 166, build-id ceec7ebce9b4, 17 maps entries, rw region located",
+   "summary": "found pid 166, build-id c13227c551f6, 17 maps entries, rw region located",
    "details": {
     "find_processes": [
      {
@@ -477,8 +590,8 @@
     "identity": {
      "architecture": "aarch64",
      "elf_type": "ET_DYN",
-     "build_id": "ceec7ebce9b4aead01772466a7db550f1748ab69",
-     "start_time": "937",
+     "build_id": "c13227c551f650bd41dc56458e0fdae24aa5b3c6",
+     "start_time": "941",
      "executable": "/tmp/memtarget"
     },
     "maps": {
@@ -495,7 +608,7 @@
     ]
    },
    "remote_commands": 8,
-   "duration_s": 6.51
+   "duration_s": 6.53
   }
  ],
  "teardown": {

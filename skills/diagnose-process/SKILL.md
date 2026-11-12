@@ -23,13 +23,16 @@ report the result honestly.
 3. Optional symptom in the user's words (for example "the process hangs"). Pass it as `symptom` only if the user
    gave one; do not invent one. Wording changes which checks run: a phrase such as "the service stopped
    responding" can yield INCONCLUSIVE on a real deadlock where the default general health check finds it.
-4. Remote (embedded) target: ask for host, ssh user, port and key if needed. `runtime_diagnose_process` and
-   `dynamic-state diagnose` examine local PIDs only; for a remote target connect with `runtime_target_connect`
-   (remote_host, ssh_user, ...) and use the narrower tools below. Say that the one-call diagnosis is not
-   available remotely.
+4. Remote (embedded) target: if the process runs on a board / another host, ask: "Which host (name or IP), ssh user,
+   port and key file should I use?" and never invent them. Then pass `remote_host`, `ssh_user`, `ssh_port`,
+   `ssh_key` (a key FILE path on this machine; never a password or key contents) and, if the user agrees to copy the
+   small collector to the board, `auto_deploy_collector=true` to the same `runtime_diagnose_process` call (CLI:
+   `--host --user --port --identity [--auto-deploy-collector]`). The PID is the PID on the target. For a remote target
+   the debug ELF is REQUIRED (the board's own executable is usually stripped): ask for the unstripped build of the
+   running program on this machine. It is the host that analyses; nothing is stopped on the board.
 
 ## Workflow
-1. Call `runtime_diagnose_process(pid, debug_image, symptom, language)` once; set `language` to `ko` when the user writes Korean, otherwise `en`. CLI equivalent: `dynamic-state diagnose -p PID [-d ELF] [--symptom TEXT] [--lang ko|en] --json`.
+1. Call `runtime_diagnose_process(pid, debug_image, symptom, language[, remote_host, ssh_user, ssh_port, ssh_key, auto_deploy_collector])` once; set `language` to `ko` when the user writes Korean, otherwise `en`. CLI equivalent: `dynamic-state diagnose -p PID [-d ELF] [--symptom TEXT] [--lang ko|en] --json`.
 2. Read `human_summary` first (a ready-made plain-language report in the requested language), then `verdict`, `findings`, `not_covered`, `collection_impact` (see next section).
 3. Follow up according to the verdict (see Follow-up). Do not re-run `diagnose` hoping for a different answer.
 4. Relay `human_summary` to the user as written (do not re-summarize away its names, source locations, what was not examined or the measured impact), then add only what a follow-up tool contributed. If you must explain in your own words, use the user's language.
@@ -57,7 +60,9 @@ report the result honestly.
   - a suspect variable: `runtime_eval_memory_path` with the names from `subjects`.
 - INCONCLUSIVE: read `not_covered` and act on the cause.
   - target_unreadable: ask the user to fix permissions (same user, or ptrace allowed) or confirm the PID.
-  - missing_debug_image / no DWARF: ask for the debug ELF of the running build.
+  - missing_debug_image / no DWARF: ask for the debug ELF of the running build (remote: the matching unstripped ELF on this machine).
+  - target_unreachable: SSH to the host failed (the reason is in `not_covered`); ask the user to check host, user, port, key and that the board is up. Do not retry with other credentials you were not given.
+  - remote_limitation: things a remote diagnosis cannot examine (thread-local storage, stacks of threads that were running, symbols of libraries that could not be fetched). State them as not examined.
   - unsupported_on_target: say the feature is not supported there; do not substitute a guess.
   - no findings: if you passed a symptom, re-run `diagnose` once without `symptom` (general health check); then offer the narrower tools above for the user's symptom.
 - HEALTHY: say "no problem was found in the checks that ran", then list `not_covered`. It does not prove the process is fine.
@@ -81,4 +86,4 @@ report the result honestly.
 ## Limits (state them when relevant)
 - Linux, same-user (or ptrace-permitted) processes; x86_64 and aarch64 hosts.
 - Heap tools support glibc ptmalloc only.
-- `diagnose` is local; remote targets use the collector plus the individual tools.
+- `diagnose` also runs against a remote target over SSH (ARM64 / x86-64 glibc board, host-side analysis); every heap byte then crosses the link, so heap checks are capped and slower, and the remote gaps listed in `not_covered` apply. Key authentication only (no passwords).

@@ -107,6 +107,7 @@ def run_board(args: argparse.Namespace) -> int:
         if "run" in holder:
             out.append(checks.guarded("C4b_glibc_only_gating", "gating", lambda: checks.c4b_gating(ctx)))
             out.append(checks.guarded("C4c_futex_syscall_names", "syscall", lambda: checks.c4c_syscall_names(ctx)))
+            out.append(checks.guarded("C4d_diagnose_entry_point", "diagnose", lambda: checks.c4d_diagnose_entry_point(ctx)))
             out.append(checks.guarded("C5_collection_cost", "cost", lambda: checks.c5_cost(ctx, holder["run"])))
     except SystemExit:
         raise

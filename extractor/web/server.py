@@ -3730,6 +3730,7 @@ class WebApiAdapter:
             return {"success": False, "error": {"code": "COMPARE_ERROR", "message": str(e)}}
 
     DIAGNOSE_MAX_TIME_LIMIT_S = 60.0
+    DIAGNOSE_REMOTE_MAX_TIME_LIMIT_S = 300.0   # remote: every read is an SSH round trip
 
     def diagnose_api(self, params: Dict[str, Any]) -> Dict[str, Any]:
         """POST /api/diagnose: the one-call entry point (IMP-006). Calls the same diagnose() as MCP and CLI.
@@ -3756,15 +3757,39 @@ class WebApiAdapter:
                     raise ValueError
             except (TypeError, ValueError):
                 return {"success": False, "error": {"code": "INVALID_PARAM", "message": "time_limit_s must be a positive number"}}
-            time_limit_s = min(time_limit_s, self.DIAGNOSE_MAX_TIME_LIMIT_S)
+            time_limit_s = min(time_limit_s, self.DIAGNOSE_REMOTE_MAX_TIME_LIMIT_S if params.get("remote_host") not in (None, "")
+                               else self.DIAGNOSE_MAX_TIME_LIMIT_S)
         language = params.get("language") or "en"
         if language not in ("en", "ko"):
             return {"success": False, "error": {"code": "INVALID_PARAM", "message": "language must be 'en' or 'ko'"}}
+        # Remote target: the same fields (and the same rules) as validate_target / deploy_remote_collector: an SSH key
+        # is a PATH on this host; passwords / key material are never accepted.
+        for secret in ("ssh_password", "password", "ssh_key_data", "ssh_private_key"):
+            if secret in params:
+                return {"success": False, "error": {"code": "INVALID_PARAM",
+                                                    "message": f"'{secret}' is not accepted: use an SSH key file path (ssh_key)"}}
+        remote_target = None
+        remote_host = params.get("remote_host")
+        if remote_host not in (None, ""):
+            for f in ("remote_host", "ssh_user", "ssh_key", "ssh_proxy_jump", "collector_path"):
+                if params.get(f) is not None and not isinstance(params.get(f), str):
+                    return {"success": False, "error": {"code": "INVALID_PARAM", "message": f"{f} must be a string"}}
+            raw_port = params.get("ssh_port")
+            if raw_port is not None and (isinstance(raw_port, bool) or not str(raw_port).strip().isdigit()
+                                         or not 1 <= int(str(raw_port).strip()) <= 65535):
+                return {"success": False, "error": {"code": "INVALID_PARAM", "message": "ssh_port must be an integer 1..65535"}}
+            remote_target = {
+                "remote_host": remote_host, "ssh_user": params.get("ssh_user") or None,
+                "ssh_port": int(str(raw_port).strip()) if raw_port is not None else 22,
+                "ssh_key": params.get("ssh_key") or None, "ssh_proxy_jump": params.get("ssh_proxy_jump") or None,
+                "auto_deploy_collector": params.get("auto_deploy_collector") is True,
+                "collector_path": params.get("collector_path") or None,
+            }
         try:
             from extractor.human_report import diagnose_with_summary
             result, summary = diagnose_with_summary(
                 pid, debug_image=debug_image, symptom=symptom, time_limit_s=time_limit_s,
-                engine=self.runtime.expert_diagnostic_engine, lang=language,
+                engine=self.runtime.expert_diagnostic_engine, lang=language, target=remote_target,
             )
             return {"success": True, "result": _to_json_serializable({**result, "human_summary": summary})}
         except Exception as e:
@@ -3889,6 +3914,9 @@ class WebApiAdapter:
             exp_sess = exp_eng.get_session(investigation_id)
             if exp_sess:
                 fmt = (format_type or "json").lower()
+                why = exp_sess.report_blocked_reason()
+                if why:
+                    return {"success": False, "error": {"code": "NO_EXECUTED_CHECKS", "message": why}}
                 if fmt in ("markdown", "md", "html"):
                     rendered = exp_sess.export_report(format=fmt)
                     json_rep = exp_sess.export_report(format="json")
@@ -4048,6 +4076,9 @@ class WebApiAdapter:
         sess = self.runtime.expert_diagnostic_engine.get_session(investigation_id)
         if not sess:
             return {"success": False, "error": {"code": "NOT_FOUND", "message": f"Investigation '{investigation_id}' not found"}}
+        why = sess.report_blocked_reason()
+        if why:
+            return {"success": False, "error": {"code": "NO_EXECUTED_CHECKS", "message": why}}
         report = sess.export_report(format=format)
         return {"success": True, "investigation_id": investigation_id, "format": format, "report": report}
 
