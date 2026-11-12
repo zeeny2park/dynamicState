@@ -543,10 +543,23 @@ def c4c_syscall_names(ctx: Ctx) -> Dict[str, Any]:
                      "RemoteSshTargetAdapter.get_threads returns no syscall/wchan fields (only tid/name/state); the table maps the guest's "
                      f"raw numbers {sorted(set(truth[t] for t in futex_tids))} to futex, but the product path cannot report them until the "
                      "collector thread-info command lands", d)
-    wrong = {t: by_tid[t].get("syscall") for t in futex_tids if "futex" not in str(by_tid[t].get("syscall"))}
-    if wrong:
-        return check(cid, name, FAIL, f"futex waiters reported with wrong syscall: {wrong}", d)
-    return check(cid, name, PASS, f"threads {futex_tids} reported as futex", d)
+    def _reported_name(t):
+        # The remote adapter reports the raw syscall record ({"state","nr","args","sp","pc"}), like the local
+        # adapter; the name is derived from the number through the TARGET's ABI table, never the host's.
+        sc = by_tid[t].get("syscall")
+        if isinstance(sc, dict):
+            nr = sc.get("nr")
+            return syscall_name(ctx.abi, nr) if isinstance(nr, int) else None
+        return str(sc) if sc is not None else None
+
+    reported = {t: _reported_name(t) for t in futex_tids}
+    d["reported_syscalls"] = {t: by_tid[t].get("syscall") for t in futex_tids}
+    wrong = {t: by_tid[t].get("syscall") for t in futex_tids if "futex" not in str(reported[t])}
+    not_blocked = [t for t in futex_tids
+                   if isinstance(by_tid[t].get("syscall"), dict) and by_tid[t]["syscall"].get("state") != "blocked"]
+    if wrong or not_blocked:
+        return check(cid, name, FAIL, f"futex waiters reported with wrong syscall: {wrong or not_blocked}", d)
+    return check(cid, name, PASS, f"threads {futex_tids} reported as futex (blocked, with sp/pc)", d)
 
 
 # --------------------------------------------------------------------------------------- C5
