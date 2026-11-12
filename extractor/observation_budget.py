@@ -42,7 +42,10 @@ class ObservationBudgetLimits:
     min_poll_interval_ms: float = 10.0
     max_consecutive_read_failures: int = 3
     max_total_read_failures: int = 10
-    max_samples: int = 64
+    # Sample cap: the always-run baseline samples every thread several times (thread window, memory trend, fd probe,
+    # free-chunk re-reads), so a multi-thread target used ~65 samples and tripped the old cap of 64; wall-clock and
+    # byte caps remain the cost bound.
+    max_samples: int = 256
     max_bytes_per_observation: int = 4194304  # 4 MB per single observation
     max_target_stop_ms: Optional[float] = None
     max_target_cpu_ms: Optional[float] = None
@@ -74,7 +77,7 @@ class ObservationBudgetLimits:
                 d.get("max_consecutive_read_failures", d.get("max_consecutive_failures", 3))
             ),
             max_total_read_failures=int(d.get("max_total_read_failures", 10)),
-            max_samples=int(d.get("max_samples", 64)),
+            max_samples=int(d.get("max_samples", 256)),
             max_bytes_per_observation=int(d.get("max_bytes_per_observation", 4194304)),
             max_target_stop_ms=(
                 float(d["max_target_stop_ms"]) if d.get("max_target_stop_ms") is not None else None
