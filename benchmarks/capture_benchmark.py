@@ -423,7 +423,7 @@ def run_backend_benchmarks(
 def validate_budget_enforcement(pid: int) -> Dict[str, Any]:
     """Prove that stop budget policy triggers cleanly when exceeded."""
     backend = ProcessVmCaptureBackend()
-    plan = CapturePlan(mode=CaptureMode.TARGETED.value, memory_ranges=[(0x1000, 0x2000)])
+    plan = CapturePlan(mode=CaptureMode.TARGETED.value, memory_ranges=[(0x1000, 0x2000)], allow_stop=True)
 
     # Inject a slow reader that triggers the budget
     def slow_reader(p: int, a: int, s: int) -> bytes:
@@ -851,7 +851,9 @@ def run_benchmark(
 
         # 3. Launch live C++ process and measure backends
         with RunningFixture(fixture_bin) as pid:
-            plan = CapturePlan(mode=CaptureMode.TARGETED.value)
+            # The benchmark measures stop latency, so it needs an explicitly approved stopped capture.
+            plan = CapturePlan(mode=CaptureMode.TARGETED.value, allow_stop=True)
+            print("Capture mode: STOPPED (TARGETED, explicit allow_stop approval) - stop latencies are measured")
             policy = CaptureSafetyPolicy(max_stop_time_ms=50.0)
 
             # Benchmark 1: ProcessVmCaptureBackend

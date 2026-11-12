@@ -24,6 +24,7 @@ from .capture_backend import (
     RuntimeCaptureBackend,
     get_default_capture_backend,
 )
+from .capture_plan import CaptureMode, CapturePlan
 from .debug_image import BinaryIdentity, inspect_elf
 from .evidence_ledger import (
     ControlledExecutionResult,
@@ -418,6 +419,9 @@ class ProductionPilotHarness:
 
         try:
             backend = get_default_capture_backend()
+            # The pilot's causal verification needs atomic snapshots: request an explicitly approved
+            # STOPPED capture (zero-stop is the production default and cannot prove atomicity).
+            stopped_plan = CapturePlan(mode=CaptureMode.FULL.value, allow_stop=True)
 
             if simulate_competing_thread:
                 target_proc.stdin.write("ENABLE_COMPETING\n")
@@ -430,6 +434,7 @@ class ProductionPilotHarness:
             snap1_dir = os.path.join(self.workspace_dir, "snap1_initial")
             snap1 = backend.capture(
                 pid=pid,
+                plan=stopped_plan,
                 policy=CaptureSafetyPolicy(max_stop_time_ms=50.0),
                 snapshot_id="snap1_initial"
             )
@@ -441,6 +446,7 @@ class ProductionPilotHarness:
                 b_dir = os.path.join(self.workspace_dir, f"snap_bench_{i}")
                 snap_b = backend.capture(
                     pid=pid,
+                    plan=stopped_plan,
                     policy=CaptureSafetyPolicy(max_stop_time_ms=50.0),
                     snapshot_id=f"snap_bench_{i}"
                 )
@@ -458,6 +464,7 @@ class ProductionPilotHarness:
             snap2_dir = os.path.join(self.workspace_dir, "snap2_mutated")
             snap2 = backend.capture(
                 pid=pid,
+                plan=stopped_plan,
                 policy=CaptureSafetyPolicy(max_stop_time_ms=50.0),
                 snapshot_id="snap2_mutated"
             )
@@ -603,6 +610,7 @@ class ProductionPilotHarness:
                     "active_writer_function": target_candidate_name,
                 },
                 hypothesis_id=hypo.hypothesis_id,
+                evidence_id="ev_treatment_pilot",
             )
 
             # Record treatment observation into evidence ledger

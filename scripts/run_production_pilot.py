@@ -121,6 +121,7 @@ def main():
     print(f"Candidate Writers:       {inv['candidate_functions']}")
     print(f"Causal Attribution:      {inv['final_candidate']} ({inv['final_tier']})")
     print(f"Investigation Status:    {inv['final_status']}")
+    print("Capture Mode:            STOPPED (FULL, explicit allow_stop approval; atomic snapshots)")
     print(f"Throughput (mean):       {lat.get('throughput_mb_s', 0.0)} MB/s ({lat.get('bytes_read_mean', 0):,} bytes/capture)")
     print(f"Stop Latency (p50):      {lat.get('stop_latency_us', {}).get('p50', 0.0)} us (max: {lat.get('stop_latency_us', {}).get('max', 0.0)} us)")
     print(f"Read Latency (p50):      {lat.get('memory_read_us', {}).get('p50', 0.0)} us (max: {lat.get('memory_read_us', {}).get('max', 0.0)} us)")
