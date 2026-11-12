@@ -92,6 +92,8 @@ int collector_read_region(pid_t pid, int mem_fd, int backend, uint64_t start, si
 int collector_run(const collector_config_t *cfg, collector_stats_t *stats_out);
 int collector_read_slices(pid_t pid, int backend, const char *slices_spec, void *out_file);
 int collector_read_threads(pid_t pid, long after_tid, void *out_file);
+int collector_report_stats(void *out_file);
+int collector_report_impact(pid_t pid, void *out_file);
 int collector_daemon_loop(int backend, void *in_file, void *out_file);
 
 #ifdef __cplusplus

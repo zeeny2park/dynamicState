@@ -33,6 +33,7 @@ from .dwarf_indexer import DwarfIndex, DwarfIndexer, DwarfVariable
 from .cpp_decoder import CppContainerDecoder
 from .allocator_inspector import detect_allocator, classify_pointer_integrity, PointerClassification, AllocatorType
 from .target_adapter import TargetExecutionAdapter, LocalTargetAdapter, RemoteSshTargetAdapter
+from .collection_impact import CollectionImpactMeter, impact_summary_for_report, impact_summary_lines
 from .cfi_unwinder import (
     UNWIND_SCAN as CFI_UNWIND_SCAN,
     decode_call_before,
@@ -12114,6 +12115,15 @@ class WatchSessionManager:
         if eff_pid and not remote_host and adapter is None and eff_pid != os.getpid() and not os.path.exists(f"/proc/{eff_pid}"):
             limitations.append(f"Target process PID {eff_pid} does not exist or has exited (ESRCH).")
 
+        # IMP-020: bracket the whole collection with a target load snapshot (local, or via the given adapter)
+        impact_meter: Optional[CollectionImpactMeter] = None
+        impact_record = None
+        if not limitations and eff_pid and (adapter is not None or not remote_host):
+            try:
+                impact_meter = CollectionImpactMeter(adapter or LocalTargetAdapter(), eff_pid).start()
+            except Exception:  # noqa: BLE001 - measuring must never break the report
+                impact_meter = None
+
         if not limitations:
             try:
                 triage = self.auto_triage_incident(
@@ -12155,6 +12165,16 @@ class WatchSessionManager:
             triage = {"overall_status": "INCONCLUSIVE", "health_score": None, "findings": [], "limitations": list(limitations)}
             cs_locks = {"threads": [], "status": "INCONCLUSIVE", "limitations": list(limitations)}
 
+        if impact_meter is not None:
+            try:
+                impact_record = impact_meter.finish(
+                    measured_stop_ms=round(
+                        float(triage.get("stop_duration_ms", 0.0) or 0.0) + float(cs_locks.get("stop_duration_ms", 0.0) or 0.0), 3
+                    )
+                )
+            except Exception:  # noqa: BLE001
+                impact_record = None
+
         hyp_res: Optional[Dict[str, Any]] = None
         if hypothesis or assertions:
             try:
@@ -12185,6 +12205,10 @@ class WatchSessionManager:
             3,
         )
         collection_mode = str(triage.get("collection_mode") or ("STOPPED" if measured_stop_ms > 0.0 else "ZERO_STOP"))
+        collection_impact = impact_summary_for_report(
+            impact_record, capture_mode=collection_mode, measured_stop_ms=measured_stop_ms,
+            bytes_read=impact_record.bytes_read if impact_record is not None else None,
+        )
 
         remediation_checklist: List[str] = []
         for f_item in findings:
@@ -12215,6 +12239,7 @@ class WatchSessionManager:
             f"- **Build ID**: `{ctx_info.get('build_id') or 'N/A'}`",
             f"- **Collection Mode**: `{collection_mode}`",
             f"- **Process Stop Duration**: `{measured_stop_ms:.2f}ms` (Measured)",
+            *impact_summary_lines(collection_impact),
             status_line,
             f"- **Generated At**: `{now_iso}`",
             "",
@@ -12379,6 +12404,8 @@ class WatchSessionManager:
             "collection_mode": collection_mode,
             "stop_duration_ms": measured_stop_ms,
             "target_stop_duration_ms": measured_stop_ms,
+            "collection_impact": collection_impact,
+            "collection_impact_record": impact_record.to_dict() if impact_record is not None else None,
             "report_latency_us": latency_us,
             "observation_latency_us": latency_us,
             "title": title,

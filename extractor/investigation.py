@@ -310,6 +310,38 @@ class InvestigationSession:
         self.budget_tracker: ObservationBudgetTracker = ObservationBudgetTracker(
             ObservationBudgetLimits.from_dict(self.budgets)
         )
+        self.impact_meter: Optional[Any] = None
+        self.collection_impact: Optional[Dict[str, Any]] = None
+
+    def begin_collection_impact(self, adapter: Any, pid: int) -> None:
+        """IMP-020: starts bracketing this investigation's collection (target load snapshot + collector self-cost)
+        and lets ``budgets["max_target_cpu_ms"]`` stop collection through the budget tracker.  Never raises."""
+        try:
+            from .collection_impact import CollectionImpactMeter
+            self.impact_meter = CollectionImpactMeter(adapter, pid).start()
+            self.budget_tracker.attach_target_cpu_probe(self.impact_meter.attributable_cpu_ms)
+        except Exception:  # noqa: BLE001 - measuring must never break an investigation
+            self.impact_meter = None
+
+    def end_collection_impact(self) -> Optional[Dict[str, Any]]:
+        """Closes the window; returns (and stores) the report fields for the "collection impact" block."""
+        if self.impact_meter is None:
+            return self.collection_impact
+        try:
+            from .collection_impact import impact_summary_for_report
+            m = self.budget_tracker.metrics
+            rec = self.impact_meter.finish(bytes_read=int(m.bytes_read), measured_stop_ms=float(m.target_stop_duration_ms))
+            if rec.diagnosis_attributable.get("attributable_cpu_ms") is not None:
+                self.budget_tracker.record_target_cpu(rec.diagnosis_attributable["attributable_cpu_ms"])
+            self.collection_impact = impact_summary_for_report(
+                rec, measured_stop_ms=float(m.target_stop_duration_ms), bytes_read=int(m.bytes_read),
+                budget_exhausted=bool(m.is_budget_exhausted), exhaustion_reason=m.exhaustion_reason,
+            )
+        except Exception:  # noqa: BLE001
+            pass
+        finally:
+            self.impact_meter = None
+        return self.collection_impact
 
     @property
     def session_secret(self) -> str:
@@ -483,6 +515,7 @@ class InvestigationSession:
             "state_transitions": self.state_machine.transitions,
             "executed_observation_keys": sorted(self.executed_observation_keys),
             "budget_usage": self.budget_tracker.to_dict(),
+            "collection_impact": self.collection_impact,
         })
 
     @classmethod

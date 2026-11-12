@@ -135,6 +135,21 @@ For high-frequency remote watch sessions and deep pointer-chain traversal withou
   no collector is orphaned on the target. The host starts it as `exec <collector> --daemon` and falls back to
   per-call `--read-slices` when the daemon cannot be established (old collector, exec denied).
 
+### Collection impact (`STATS`, `IMPACT`; collector >= 1.2.0, IMP-020)
+
+Daemon commands that let the host measure what a diagnosis costs the target (one reply line each):
+
+- `STATS` -> `{"success":true,"collector":{"pid","cpu_user_us","cpu_sys_us","max_rss_kb","minflt","majflt","nvcsw","nivcsw"}}`:
+  `getrusage(RUSAGE_SELF)` of the collector process itself.  CPU is cumulative since the daemon started, so the
+  host reports deltas; `max_rss_kb` is the peak resident set (KiB).
+- `IMPACT <pid>` -> one exchange carrying the target's raw `/proc/PID/stat` (`stat`), `vol`/`invol` context
+  switches and `sched` (`run_ns`, `wait_ns`, `slices` from `schedstat`, omitted without `CONFIG_SCHED_INFO`)
+  summed over all threads, `threads`, `loadavg`, the aggregate `cpu_line` of `/proc/stat`, and the same
+  `collector` object.  `{"success":false,"error":"TARGET_TERMINATED"}` when the process is gone.
+
+Older collectors answer `UNKNOWN_COMMAND`; the host then falls back to one batched `sh` command (no collector
+CPU/memory figures in that case, and the report says so).
+
 ### Thread information (`THREADS`, `--threads`; collector >= 1.1.0, IMP-011)
 
 One reply carries every thread of a process, so a thread sample costs one exchange regardless of the thread count:
