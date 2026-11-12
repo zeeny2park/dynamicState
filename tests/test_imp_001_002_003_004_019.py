@@ -1,7 +1,7 @@
 """Verification suite for roadmap items IMP-001, IMP-002, IMP-003, IMP-004 and IMP-019.
 
 Each test drives the production code path and checks specific result fields (not whole-document
-substring greps). Acceptance criteria: `20261112-1016-full/IMPROVEMENT_ROADMAP.md`.
+substring greps). Acceptance criteria: `docs/history/2026-11-12-diagnosis/IMPROVEMENT_ROADMAP.md`.
 
 - IMP-001: collection failure never becomes HEALTHY / 100 / NO_ISSUE_DETECTED / "healthy" wording.
 - IMP-002: default capture never stops the target (polled from a separate process), stop modes need
