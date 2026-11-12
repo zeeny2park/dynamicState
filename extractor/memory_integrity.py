@@ -90,8 +90,10 @@ def _full_reason(classification: Any, target_recipe: Optional[str]) -> Optional[
 
 
 def run_integrity(adapter: Any, pid: int, companion_elf: Optional[str], cfg: IntegrityConfig, budget: Any = None,
-                  full_reason: Optional[str] = None, shared: Any = None) -> Dict[str, Any]:
-    """One integrity investigation; returns plain data (see module docstring)."""
+                  full_reason: Optional[str] = None, shared: Any = None,
+                  keep: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """One integrity investigation; returns plain data (see module docstring).  ``keep`` (a dict) receives the
+    walk objects (walk, walker, analyzer, t_walk) for the use-after-free check that re-uses this walk."""
     from .heap_walker import BudgetedReader, HeapWalker, remote_cost_note
     from .heap_integrity import HeapIntegrityChecker, undersized_allocations
     from .observation_budget import ObservationBudgetLimits, ObservationBudgetTracker
@@ -159,6 +161,7 @@ def run_integrity(adapter: Any, pid: int, companion_elf: Optional[str], cfg: Int
             walker = HeapWalker(adapter, pid, budget=hb, reader=reader, use_libc_debug_info=False)
             walk = walker.walk()
             heap["walk_source"] = "own integrity walk"
+        t_walk = time.monotonic()
         heap["walk_status"] = walk.status
         heap["walk_message"] = walk.message
         if walk.status in _WALK_UNSUPPORTED:
@@ -181,6 +184,9 @@ def run_integrity(adapter: Any, pid: int, companion_elf: Optional[str], cfg: Int
                 if info.get("reachability_error"):
                     rec["limitations"].append("owner names incomplete: %s" % info["reachability_error"])
             defects = chk.attribute(analyzer)
+            # free-list damage in a free chunk a typed pointer still refers to: use after free, not an overflow
+            from .uaf_detection import classify_integrity_defects
+            classify_integrity_defects(defects)
             heap["defects"] = defects
             heap["inconsistent_reads_not_evidence"] = chk.transient[:16]
             heap["checked"] = dict(chk.checked, chunks=len(walk.chunks),
@@ -190,6 +196,8 @@ def run_integrity(adapter: Any, pid: int, companion_elf: Optional[str], cfg: Int
             heap["status"] = "COMPLETED" if walk.status == "OK" or walk.damaged_regions or defects else "PARTIAL"
             if walk.status != "OK" and not defects:
                 heap["note"] = walk.message
+            if keep is not None:
+                keep.update(walk=walk, walker=walker, analyzer=analyzer, t_walk=t_walk)
         heap["cost"] = {"bytes_read": int(reader.bytes_read),
                         "walk_wall_ms": (walk.stats or {}).get("wall_ms")}
         rec["cost"]["bytes_read"] += heap["cost"]["bytes_read"]
@@ -235,11 +243,10 @@ def _state(provider: Any) -> Dict[Any, Any]:
     return st
 
 
-def attach_integrity_observation(provider: Any, recipe: Any, pid: int, companion_elf: Optional[str],
-                                 classification: Any, session_id: Optional[str], observation_data: Dict[str, Any],
-                                 records: List[Any]) -> None:
-    from .runtime_evidence_provider import RuntimeEvidenceRecord, COLLECTION_STATUS_SUCCESS, \
-        COLLECTION_STATUS_PARTIAL, PROVENANCE_LIVE_RUNTIME_CAPTURE
+def ensure_integrity(provider: Any, pid: int, companion_elf: Optional[str], classification: Any,
+                     session_id: Optional[str]):
+    """The session's integrity record (run once per session and pid) -> (record, walk objects, fresh).  The walk
+    objects (walk, walker, analyzer, t_walk) are kept for the use-after-free check, which re-uses the walk."""
     cfg: IntegrityConfig = getattr(provider, "integrity_config", None) or IntegrityConfig()
     mo = getattr(provider, "memory_observation", None)
     key = (session_id or "default", int(pid))
@@ -249,9 +256,20 @@ def attach_integrity_observation(provider: Any, recipe: Any, pid: int, companion
     if fresh:
         reason = _full_reason(classification, getattr(mo, "target_recipe", None))
         shared = (getattr(provider, "_imp008_state", None) or {}).get("analyses", {}).get(key)
+        objs: Dict[str, Any] = {}
         rec = run_integrity(provider.adapter, pid, companion_elf, cfg, getattr(provider, "budget_tracker", None),
-                            full_reason=reason, shared=shared)
+                            full_reason=reason, shared=shared, keep=objs)
         st[key] = rec
+        st[("walk_objects",) + key] = objs
+    return rec, st.get(("walk_objects",) + key) or {}, fresh
+
+
+def attach_integrity_observation(provider: Any, recipe: Any, pid: int, companion_elf: Optional[str],
+                                 classification: Any, session_id: Optional[str], observation_data: Dict[str, Any],
+                                 records: List[Any]) -> None:
+    from .runtime_evidence_provider import RuntimeEvidenceRecord, COLLECTION_STATUS_SUCCESS, \
+        COLLECTION_STATUS_PARTIAL, PROVENANCE_LIVE_RUNTIME_CAPTURE
+    rec, _objs, fresh = ensure_integrity(provider, pid, companion_elf, classification, session_id)
     observation_data["memory_integrity"] = rec
     if fresh:
         if rec["cost"].get("bytes_read"):

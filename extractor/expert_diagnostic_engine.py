@@ -3835,6 +3835,8 @@ _SUBJECT_KEY_KIND = {
     # thread whose arena holds the blocks (evidence-based, see leak_attribution.arena_threads)
     "variable_path": "variable",
     "allocating_thread_name": "thread_name", "allocating_thread_tid": "thread",
+    # use-after-free (recipe_plugins/use_after_free): the freed chunk a dangling pointer refers to / was written
+    "freed_chunk": "heap_chunk",
 }
 
 

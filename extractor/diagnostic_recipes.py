@@ -1244,6 +1244,10 @@ def _evaluate_integrity_investigation(recipe: "DiagnosticRecipe", data: Dict[str
     rid = recipe.recipe_id
     heap = mi.get("heap") or {}
     defects = list(heap.get("defects") or [])
+    # free-list damage inside a FREE chunk that a typed pointer still refers to was written through that dangling
+    # pointer: it is reported as USE_AFTER_FREE (here and by the use-after-free recipe), not as an overflow
+    uaf_defects = [d for d in defects if d.get("use_after_free")]
+    defects = [d for d in defects if not d.get("use_after_free")]
     undersized = list(heap.get("undersized_allocations") or [])
     glob = list((mi.get("globals") or {}).get("candidates") or [])
     stack_w = list((mi.get("stacks") or {}).get("warnings") or [])
@@ -1277,6 +1281,17 @@ def _evaluate_integrity_investigation(recipe: "DiagnosticRecipe", data: Dict[str
             recommended_action="Bound the writes into the named buffer (size of the copy / string length) and "
                                "rebuild with AddressSanitizer to find the write site.",
             details=d)
+    if uaf_defects:
+        uf = [d["description"] for d in uaf_defects]
+        return RecipeEvaluationResult(
+            recipe_id=rid, status=RECIPE_STATUS_SUPPORTED, confidence=0.9, confidence_basis=uf[0],
+            supporting_facts=uf + stack_facts, limitations=lims,
+            recommended_action="Clear the named pointer when its block is freed (or stop using it after free); "
+                               "rebuild with AddressSanitizer to find the write site.",
+            details=dict(base, finding_category=CATEGORY_USE_AFTER_FREE, corruption_confirmed=False,
+                         finding_summary="; ".join(uf[:4]), certainty_cap="PROBABLE",
+                         certainty_cap_reason="free-list damage seen by the integrity walk; the use-after-free check "
+                                              "decides whether it is confirmed"))
     if stack_w:
         guard = [w for w in stack_w if w.get("kind") == "SP_IN_GUARD"]
         return RecipeEvaluationResult(
