@@ -1349,6 +1349,13 @@ class RuntimeEvidenceProvider:
                 all_records.append(rec)
 
                 observation_data["callstacks_info"] = callstacks_info
+                _lo_status = callstacks_info.get("lock_owner_status")
+                if _lo_status and _lo_status != "SUPPORTED":
+                    # Owner words could not be decoded on this target: an empty wait-for graph is "not
+                    # interpretable", never "no deadlock" (consumed by the lock-dependent recipes).
+                    observation_data["lock_owner_status"] = _lo_status
+                    observation_data["lock_owner_status_reason"] = callstacks_info.get("lock_owner_status_reason") or ""
+                    observation_data["lock_owner_unsupported"] = True
                 observation_data["deadlock_detected"] = callstacks_info.get("deadlock_detected", False)
                 dl_cycles = callstacks_info.get("deadlock_cycles", [])
                 dl_first = callstacks_info.get("deadlock_cycle") or (dl_cycles[0] if dl_cycles else [])
@@ -1462,7 +1469,7 @@ class RuntimeEvidenceProvider:
                         observation_data["blocked_threads"] = blocked
                         observation_data["deadlock_cycle"] = []
                         observation_data["deadlock_detected"] = False
-                        if not incomplete_graph:
+                        if not incomplete_graph and not observation_data.get("lock_owner_unsupported"):
                             observation_data["contradicting_facts"] = ["Threads are blocked on mutex, but complete lock graph contains zero circular wait cycles."]
                             observation_data["negative_evidence_found"] = True
             except Exception as e:

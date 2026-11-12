@@ -25,6 +25,7 @@ from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Union
 import uuid
 
 from .diagnostic_recipes import (
+    _LOCK_OWNER_DEPENDENT_RECIPES,
     BASELINE_RECIPE_IDS,
     CATEGORY_ABNORMAL_VARIABLE_CHANGES,
     CATEGORY_DATA_RACE_INDICATORS,
@@ -4062,8 +4063,24 @@ def diagnose(
                 kind = "unsupported_on_target" if "not supported on this target" in why else (
                     "integrity_not_checked" if "not checked" in why else "integrity_limited")
                 nc.append({"kind": kind, "item": "memory_integrity", "reason": str(why)})
+        # DEF-ARM-1: a lock check that could not run because mutex owners cannot be decoded on this target
+        lock_nc_seen = set()
+        lock_unsupported_checks = set()
+        for c in session.checks:
+            ob = c.actual_observations if isinstance(c.actual_observations, dict) else {}
+            if ob.get("lock_owner_unsupported") and c.recipe_id in _LOCK_OWNER_DEPENDENT_RECIPES:
+                lock_unsupported_checks.add(c.check_id)
+                why = ("not supported on this target: lock-owner decoding (%s) %s" % (
+                    ob.get("lock_owner_status"), ob.get("lock_owner_status_reason") or "")).strip()
+                if why not in lock_nc_seen:
+                    lock_nc_seen.add(why)
+                    nc.append({"kind": "unsupported_on_target", "item": "lock_owner_decoding", "reason": why})
         for c in session.checks:
             if c.status in (CheckStatus.PASS, CheckStatus.FAIL):
+                continue
+            if c.check_id in lock_unsupported_checks:
+                nc.append({"kind": "unsupported_on_target", "item": c.recipe_id,
+                           "reason": "not checked: lock-owner decoding is not supported on this target"})
                 continue
             why = "; ".join(list(c.limitations or []) + list(c.missing_evidence or [])) or (c.error_details or "") \
                 or (c.technical_interpretation or "")

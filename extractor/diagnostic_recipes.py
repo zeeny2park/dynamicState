@@ -1252,7 +1252,38 @@ def _evaluate_specific_recipe(recipe: DiagnosticRecipe, data: Dict[str, Any]) ->
     if rid in ("RECIPE_INVALID_MEMORY_ACCESS", "RECIPE_HEAP_METADATA_CORRUPTION"):
         # IMP-009: the name/poison-value heuristic can no longer confirm corruption on its own
         return _cap_name_hint(_evaluate_specific_recipe_rules(recipe, data), data)
-    return _evaluate_specific_recipe_rules(recipe, data)
+    res = _evaluate_specific_recipe_rules(recipe, data)
+    if rid in _LOCK_OWNER_DEPENDENT_RECIPES and data.get("lock_owner_unsupported") \
+            and not res.details.get("long_wait_threads") \
+            and (res.status != RECIPE_STATUS_SUPPORTED or rid == "RECIPE_LONG_RUNNING_BLOCKED_THREADS"):
+        # a stall without decodable owners cannot be attributed to a lock/deadlock: report it as not evaluable
+        out = _lock_owner_not_evaluable(recipe, data)
+        if res.status == RECIPE_STATUS_SUPPORTED:
+            out.confidence_basis += " Observed (not attributable): " + str(res.confidence_basis)
+        return out
+    return res
+
+
+# Recipes whose "nothing found" verdict is only meaningful when mutex owners could be decoded.
+_LOCK_OWNER_DEPENDENT_RECIPES = frozenset({
+    "RECIPE_POTENTIAL_DEADLOCK_PATTERNS", "RECIPE_SUSPICIOUS_LOCK_OWNERSHIP",
+    "RECIPE_LONG_RUNNING_BLOCKED_THREADS"})
+
+
+def _lock_owner_not_evaluable(recipe: "DiagnosticRecipe", data: Dict[str, Any]) -> RecipeEvaluationResult:
+    status = data.get("lock_owner_status") or "NOT_SUPPORTED_ON_TARGET"
+    reason = data.get("lock_owner_status_reason") or ""
+    why = f"lock-owner decoding is not supported on this target ({status}){': ' + reason if reason else ''}"
+    return RecipeEvaluationResult(
+        recipe_id=recipe.recipe_id,
+        status=RECIPE_STATUS_INSUFFICIENT_EVIDENCE,
+        confidence=0.0,
+        confidence_basis=f"Not checked: {why}. An empty wait-for graph here is not evidence of absence.",
+        missing_evidence=["lock_owner_decoding"],
+        limitations=list(recipe.limitations) + [f"not supported on this target: {why}"],
+        details={"reason": f"not supported on this target: {why}", "lock_owner_status": status,
+                 "lock_owner_unsupported": True},
+    )
 
 
 def _evaluate_specific_recipe_rules(recipe: DiagnosticRecipe, data: Dict[str, Any]) -> RecipeEvaluationResult:
