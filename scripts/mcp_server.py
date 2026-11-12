@@ -17,12 +17,25 @@ if PROJECT_ROOT not in sys.path:
 
 try:
     from mcp.server.mcpserver import MCPServer
-except ImportError:
+except ImportError as _mcp_import_error:
+    # Fail loudly: a server that silently does nothing looks like a hung agent connection.
+    # The standalone entry point exits non-zero; importing this module without `mcp` (tests, tooling)
+    # keeps a minimal stand-in that registers tools but cannot serve.
+    MCP_INSTALL_HINT = (
+        "dynamicState MCP server: the 'mcp' package (>=2.0) is not installed or is too old "
+        f"({_mcp_import_error}).\n"
+        "Install it with:  python3 -m pip install 'mcp>=2.0.0,<3'   (or install this project: python3 -m pip install .)"
+    )
+    if __name__ == "__main__":
+        print(MCP_INSTALL_HINT, file=sys.stderr)
+        sys.exit(2)
+
     class MCPServer:  # type: ignore[no-redef]
-        def __init__(self, name: str, version: str = "1.0.0", description: str = ""):
+        def __init__(self, name: str, version: str = "1.0.0", description: str = "", instructions: str = ""):
             self.name = name
             self.version = version
             self.description = description
+            self.instructions = instructions
             self.tools = {}
 
         def tool(self, name: Optional[str] = None):
@@ -33,18 +46,35 @@ except ImportError:
             return decorator
 
         def run(self, transport: str = "stdio"):
-            pass
+            print(MCP_INSTALL_HINT, file=sys.stderr)
+            sys.exit(2)
 from extractor.agent_runtime import AgentRuntime
 from extractor.diagnostic_recipes import DiagnosticRecipeRegistry
 from extractor.observation_budget import ObservationBudgetLimits, ObservationBudgetTracker
 
+from extractor.agent_skill import skill_body, workflow_steps
+
+# The workflow text is the agent skill (skills/diagnose-process/SKILL.md); instructions and
+# runtime_get_playbook are generated from it so they cannot drift.
 server = MCPServer(
     name="dynamicstate",
     version="1.0.0",
-    description="dynamicState runtime state exploration and live memory capture engine"
+    description="dynamicState runtime state exploration and live memory capture engine",
+    instructions=skill_body(),
 )
 
-runtime = AgentRuntime(corpus_dir=os.path.join(PROJECT_ROOT, "corpus"))
+
+def _default_corpus_dir() -> str:
+    """Source checkout: <repo>/corpus. Installed package: never write into site-packages."""
+    env = os.environ.get("DYNAMICSTATE_CORPUS_DIR")
+    if env:
+        return env
+    if os.path.isdir(os.path.join(PROJECT_ROOT, "scripts")) and os.path.isdir(os.path.join(PROJECT_ROOT, "extractor")):
+        return os.path.join(PROJECT_ROOT, "corpus")
+    return os.path.join(os.path.expanduser("~"), ".dynamicstate", "corpus")
+
+
+runtime = AgentRuntime(corpus_dir=_default_corpus_dir())
 
 
 import functools
@@ -1762,7 +1792,7 @@ def runtime_get_xray_blueprint(
 def runtime_scan_memory_pool(
     pid: Optional[int] = None,
     companion_elf: Optional[str] = None,
-    base_expression: str = "*gpMem",
+    base_expression: str = "",
     count: Optional[int] = None,
     status_field: Optional[str] = None,
     include_fields: Optional[List[str]] = None,
@@ -1776,6 +1806,8 @@ def runtime_scan_memory_pool(
     in a single zero-stop batch read and return slot-by-slot allocation status ('IN_USE' vs 'FREE'),
     utilization summary, allocation_bitmap, and a visual ascii_map_chart.
     """
+    if not str(base_expression or "").strip():
+        return _format_watch_result({"success": False, "error": "base_expression is required: name the pool/array to scan (take it from the symbols of the target, not from an example)", "error_code": "MissingArgument"})
     try:
         if pid is None or companion_elf is None or runtime.watch_session_manager.get_active_target_context().get('pid') == pid:
             _ctx = _resolve_mcp_target(pid=pid, companion_elf=companion_elf, remote_host=remote_host, ssh_user=ssh_user, ssh_port=ssh_port, ssh_key=ssh_key, ssh_proxy_jump=ssh_proxy_jump)
@@ -1886,7 +1918,7 @@ def runtime_traverse_linked_structure(
     pid: Optional[int] = None,
     companion_elf: Optional[str] = None,
     head_expression: str = "",
-    next_field: str = "next",
+    next_field: str = "",
     max_depth: int = 64,
     include_fields: Optional[List[str]] = None,
     remote_host: Optional[str] = None,
@@ -1898,6 +1930,8 @@ def runtime_traverse_linked_structure(
     """Traverse a non-contiguous linked list, queue, or tree pointer chain (`node->next`) in a single
     zero-stop MCP call. Automatically detects pointer cycles (infinite loops) and corrupted/unmapped links.
     """
+    if not str(head_expression or "").strip() or not str(next_field or "").strip():
+        return _format_watch_result({"success": False, "error": "head_expression and next_field are required: name the list head and the link field of the target's node type", "error_code": "MissingArgument"})
     try:
         if pid is None or companion_elf is None or runtime.watch_session_manager.get_active_target_context().get('pid') == pid:
             _ctx = _resolve_mcp_target(pid=pid, companion_elf=companion_elf, remote_host=remote_host, ssh_user=ssh_user, ssh_port=ssh_port, ssh_key=ssh_key, ssh_proxy_jump=ssh_proxy_jump)
@@ -2802,7 +2836,7 @@ def runtime_ask(
 
 @server.tool()
 def runtime_smart_compact_query(
-    query_or_expression: str = "*gpMem",
+    query_or_expression: str = "",
     mode: str = "auto",
     max_tokens: int = 800,
     drop_zero_or_free: bool = True,
@@ -2821,6 +2855,8 @@ def runtime_smart_compact_query(
     of `IN_USE` / anomalous / non-zero items first, and supports cursor pagination (`cursor_offset`, `page_size`)
     with `token_reduction_pct` telemetry so massive pools or structs never overflow the LLM context window.
     """
+    if not str(query_or_expression or "").strip():
+        return _format_watch_result({"success": False, "error": "query_or_expression is required: name the expression or pool to compact (take it from the symbols of the target)", "error_code": "MissingArgument"})
     try:
         res = runtime.watch_session_manager.smart_compact_query(
             query_or_expression=query_or_expression,
@@ -3030,29 +3066,20 @@ def runtime_export_incident_report(
 
 @server.tool()
 def runtime_get_playbook() -> str:
-    """Returns the structured decision playbook for when and how to use dynamicState MCP tools
-    on live local or remote embedded Linux processes.
+    """Returns the diagnosis playbook (the same text as the server instructions and the diagnose-process
+    agent skill): when to diagnose, required inputs, how to read the result, follow-up per verdict, hard rules.
     """
     return _format_watch_result({
         "success": True,
-        "recommended_workflow": [
-            "1. Connect & Blueprint: Call `runtime_target_connect` or `runtime_get_xray_blueprint` to verify Build ID and discover categorized Memory Pools, Worker Contexts, and State Machines.",
-            "2. Choose Diagnostic Scenario:",
-            "   - Scenario A (Silent Hang / Stuck State): Call `runtime_run_diagnostic_recipe(recipe='instant_xray', ...)` or `runtime_eval_memory_path(expressions=[...])`.",
-            "   - Scenario B (Memory Pool Allocation Map): Call `runtime_scan_memory_pool(base_expression='*gpMem')` to get the full slot allocation bitmap and map chart in 1 call.",
-            "   - Scenario C (Find Thread Using Buffer Index N): Call `runtime_find_symbol_owners(target_expression='gpMem->buffers[9]')` to scan struct TID fields, worker tables, and thread stacks.",
-            "   - Scenario D (Event Before/After Mutation): Call `runtime_capture_and_diff(expressions=[...], wait_ms=1000)`.",
-            "   - Scenario E (Regression vs Healthy Baseline): Call `runtime_golden_baseline_save` when healthy, then `runtime_golden_baseline_compare` when degraded.",
-            "   - Scenario F (Intermittent Condition Trigger / Watchpoint): Call `runtime_watch_until_condition(condition_expression='gpMem->active_buffers >= 30')`.",
-            "   - Scenario G (Linked List / Tree Pointer Chain & Cycle Detection): Call `runtime_traverse_linked_structure(head_expression='g_task_list', next_field='next')`.",
-            "   - Scenario H (Deadlock / Mutex Owner & Zero-Stop Callstacks): Call `runtime_inspect_thread_callstack_and_locks`.",
-            "   - Scenario I (Memory Corruption / Dangling Pointer Audit): Call `runtime_audit_memory_integrity`.",
-            "   - Scenario J (Function Pointer / C++ vtable Symbolization): Call `runtime_resolve_code_pointers`.",
-            "   - Scenario K (Shared Memory IPC & Type Overlay Casting): Call `runtime_inspect_shared_memory_ipc`."
-        ],
-        "zero_stop_guarantee": "All recommended tools read memory non-intrusively without suspending the target and never inject code into the target process.",
+        "skill": "diagnose-process",
+        "recommended_workflow": workflow_steps(),
+        "playbook": skill_body(),
     })
 
 
-if __name__ == "__main__":
+def main() -> None:
     server.run(transport="stdio")
+
+
+if __name__ == "__main__":
+    main()
