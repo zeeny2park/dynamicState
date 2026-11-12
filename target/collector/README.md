@@ -138,6 +138,36 @@ For high-frequency remote watch sessions and deep pointer-chain traversal withou
   no collector is orphaned on the target. The host starts it as `exec <collector> --daemon` and falls back to
   per-call `--read-slices` when the daemon cannot be established (old collector, exec denied).
 
+### Thread information (`THREADS`, `--threads`; collector >= 1.1.0, IMP-011)
+
+One reply carries every thread of a process, so a thread sample costs one exchange regardless of the thread count:
+
+```bash
+./dynamicstate-collector -p 1234 --threads [--after-tid 5000]    # one-shot, one JSON line
+THREADS 1234 [after_tid]                                          # daemon command
+```
+
+Reply (one line, `success:true`):
+`{"success":true,"pid":P,"clk_tck":100,"threads":[T,...],"count":N,"more":false,"next_after_tid":0,"truncated":false,"duration_us":..}`
+with one object `T` per thread, ordered by tid:
+
+| field | source | notes |
+|-------|--------|-------|
+| `tid`, `comm`, `state`, `utime`, `stime` | `task/TID/stat` | `comm` is the text between the first `(` and the LAST `)` (names may contain spaces and parentheses); `utime`/`stime` in clock ticks |
+| `startstack`, `kstkesp`, `cpu` (processor last run on), `rt_prio`, `policy` | `stat` | |
+| `vol`, `invol`, `cpus_allowed`, `mems_allowed` | `task/TID/status` | `*_ctxt_switches`, `Cpus_allowed_list`, `Mems_allowed_list` |
+| `syscall` | `task/TID/syscall`, raw line | `"nr a0..a5 sp pc"`, `"-1 sp pc"` or `"running"`; omitted when unreadable |
+| `io` = `{"syscr","syscw"}` | `task/TID/io` | omitted without privileges |
+| `sched` = `{"run_ns","wait_ns","slices"}` | `task/TID/schedstat` | run time, run-queue wait, timeslices; omitted without `CONFIG_SCHED_INFO` |
+
+All 64-bit counters are printed as `unsigned long long`, so 32-bit ARM targets are exact.  A thread that exits
+while the directory is being enumerated is skipped (never an error).  Replies are paged: at most 128 threads per
+reply; `more:true` plus `next_after_tid` tells the caller to repeat the request with that tid as `after_tid`.
+At most 16384 tids are enumerated per request (`truncated:true` beyond that).  Errors use the usual
+`{"success":false,"error":..}` line: `INVALID_PID`, `INVALID_ARGS` (bad `after_tid`), `TARGET_TERMINATED`,
+`PERMISSION_DENIED`.  A collector older than 1.1.0 answers `UNKNOWN_COMMAND` (or rejects `--threads`); the host then
+falls back to ONE batched POSIX-sh command that cats the same `/proc` files of all threads.
+
 ### Multi-architecture static builds (`make dist`)
 ```bash
 make dist   # dist/{arm,aarch64,x86_64}/dynamicstate-collector, static; prints which arches were skipped

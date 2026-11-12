@@ -252,7 +252,8 @@ static void print_usage(const char *prog) {
         "  -D, --key-fd <FD>       Inherited file descriptor containing signing key\n"
         "  -I, --key-id <ID>       Key ID for attestation (default: default)\n"
         "  -S, --session-id <ID>   Investigation session ID\n"
-        "      --test-crypto       Run cryptographic self-test against FIPS/RFC vectors\n"
+        "      --threads           With -p: print per-thread info (one JSON page); --after-tid <TID> continues\n"
+        "      --test-crypto     Run cryptographic self-test against FIPS/RFC vectors\n"
         "      --version           Print collector version and exit\n"
         "  -h, --help              Show this help message\n\n"
         "Example:\n"
@@ -283,6 +284,8 @@ int main(int argc, char *argv[]) {
         {"backend", required_argument, 0, 'B'},
         {"read-slices", required_argument, 0, 's'},
         {"daemon", no_argument, 0, 'd'},
+        {"threads", no_argument, 0, 1002},
+        {"after-tid", required_argument, 0, 1003},
         {"timeout-ms", required_argument, 0, 't'},
         {"json", no_argument, 0, 'j'},
         {"verbose", no_argument, 0, 'v'},
@@ -301,6 +304,8 @@ int main(int argc, char *argv[]) {
     const char *max_region_str = NULL;
     const char *read_slices_spec = NULL;
     int daemon_mode = 0;
+    int threads_mode = 0;
+    long after_tid = 0;
     int opt;
     int option_index = 0;
 
@@ -376,6 +381,19 @@ int main(int argc, char *argv[]) {
             case 'd':
                 daemon_mode = 1;
                 break;
+            case 1002:
+                threads_mode = 1;
+                break;
+            case 1003: {
+                char *aend = NULL;
+                errno = 0;
+                after_tid = strtol(optarg, &aend, 10);
+                if (errno != 0 || aend == optarg || *aend != '\0' || after_tid < 0) {
+                    fprintf(stdout, "{\"success\":false,\"error\":\"INVALID_ARGS\"}\n");
+                    return 1;
+                }
+                break;
+            }
             case 't':
                 timeout_str = optarg;
                 break;
@@ -503,6 +521,10 @@ int main(int argc, char *argv[]) {
             fflush(stdout);
         }
         return 1;
+    }
+
+    if (threads_mode) {
+        return (collector_read_threads(cfg.pid, after_tid, stdout) == 0) ? 0 : 1;
     }
 
     if (read_slices_spec != NULL) {

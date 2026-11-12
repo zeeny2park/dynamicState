@@ -5358,9 +5358,19 @@ class WatchSessionManager:
         support = check_support(target_abi, FEATURE_CFI_UNWIND)
         if not support.supported:
             return None, support, support.message
+        provider = None
         if target_adapter.is_remote():
-            # /proc/PID/task/TID/syscall (SP/PC) is only read locally; remote thread registers are IMP-011 part 3.
-            return None, support, "remote target: no per-thread SP/PC available, CFI unwinding not attempted"
+            # IMP-011 part 3: SP/PC come from the adapter's per-thread "syscall" field; module images are the
+            # companion image (main executable) plus library images fetched from the target (size-capped, cached).
+            if not getattr(target_adapter, "thread_samples_supported", False):
+                return None, support, "remote adapter provides no per-thread SP/PC, CFI unwinding not attempted"
+            from .remote_module_images import RemoteImageResolver, find_main_remote_path
+            main_mod = next((m for m in map_data.get("loaded_debug_modules", []) if m.get("is_main_executable")), None)
+            provider = RemoteImageResolver(
+                target_adapter, pid,
+                find_main_remote_path(map_data.get("mappings") or [], (main_mod or {}).get("module")),
+                (main_mod or {}).get("debug_image"),
+            )
 
         def _read(addr: int, size: int) -> Tuple[Optional[bytes], str, Optional[str]]:
             return target_adapter.read_memory(pid, addr, size)
@@ -5368,7 +5378,10 @@ class WatchSessionManager:
         try:
             uw = make_unwinder_for_process(
                 target_abi.architecture, map_data.get("mappings") or [], _read, endian=endian, pid=pid,
+                image_provider=provider,
             )
+            if uw is not None and provider is not None:
+                uw.remote_image_provider = provider
         except Exception as exc:  # noqa: BLE001
             return None, support, f"CFI unwinder unavailable: {type(exc).__name__}: {exc}"
         return uw, support, None if uw is not None else "CFI unwinder unavailable for this architecture"
@@ -5519,7 +5532,12 @@ class WatchSessionManager:
         )
         debug_module_paths: Set[str] = set()
         try:
-            debug_module_paths.add(os.path.realpath(f"/proc/{pid}/exe"))
+            if target_adapter.is_remote():
+                _rp = getattr(getattr(unwinder, "remote_image_provider", None), "main_remote_path", None)
+                if _rp:
+                    debug_module_paths.update({_rp, os.path.realpath(_rp)})
+            else:
+                debug_module_paths.add(os.path.realpath(f"/proc/{pid}/exe"))
         except Exception:
             pass
         for mod_info in map_data.get("loaded_debug_modules", []):
@@ -5533,7 +5551,7 @@ class WatchSessionManager:
                 desc = unwinder.describe_pc(int(fr["pc"]), lookup)
                 sym = None
                 mpath = desc.get("module_path")
-                if mpath and os.path.realpath(mpath) in debug_module_paths:
+                if mpath and (mpath in debug_module_paths or os.path.realpath(mpath) in debug_module_paths):
                     sym = _symbolize_runtime_pc(lookup)
                 if sym is None:
                     lt = desc.get("link_pc")
@@ -5697,17 +5715,19 @@ class WatchSessionManager:
             waiting_on_lock: Optional[Dict[str, Any]] = None
 
             sc_info: Dict[str, Any] = {"state": "unavailable"}
-            if not target_adapter.is_remote():
+            if target_adapter.is_remote():
+                sc_info = dict(t.get("syscall") or {"state": "unavailable"})   # adapter-provided (IMP-011 part 3)
+            else:
                 sc_info = self._imp011_read_syscall(pid, t_tid)
-                if sc_info.get("state") == "blocked":
-                    syscall_nr = int(sc_info["nr"])
-                    # IMP-015: number -> name via the table of the TARGET architecture; None when unsupported/undetected
-                    syscall_name = abi_syscall_name(target_abi, syscall_nr)
-                    if sc_info.get("args"):
-                        syscall_arg0 = int(sc_info["args"][0])
-                if sc_info.get("sp") and sc_info.get("pc"):
-                    sp_int = int(sc_info["sp"])
-                    pc_int = int(sc_info["pc"])
+            if sc_info.get("state") == "blocked":
+                syscall_nr = int(sc_info["nr"])
+                # IMP-015: number -> name via the table of the TARGET architecture; None when unsupported/undetected
+                syscall_name = abi_syscall_name(target_abi, syscall_nr)
+                if sc_info.get("args"):
+                    syscall_arg0 = int(sc_info["args"][0])
+            if sc_info.get("sp") and sc_info.get("pc"):
+                sp_int = int(sc_info["sp"])
+                pc_int = int(sc_info["pc"])
 
             # Check if syscall_arg0 points into any known mutex (pthread_mutex_t is 40 bytes)
             if syscall_arg0 is not None and syscall_arg0 > 0:
@@ -6902,7 +6922,9 @@ class WatchSessionManager:
 
             frames_out: List[Dict[str, Any]] = []
             sc_info: Dict[str, Any] = {"state": "unavailable"}
-            if not target_adapter.is_remote():
+            if target_adapter.is_remote():
+                sc_info = dict(t.get("syscall") or {"state": "unavailable"})   # adapter-provided (IMP-011 part 3)
+            else:
                 sc_info = self._imp011_read_syscall(pid, t_tid)
             cfi_res = self._imp011_unwind_thread(unwinder, sc_info, None, 64)
             if s_start > 0 and s_end > s_start:
