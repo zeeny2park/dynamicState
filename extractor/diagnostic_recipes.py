@@ -1061,6 +1061,10 @@ def _evaluate_leak_investigation(recipe: "DiagnosticRecipe", data: Dict[str, Any
         return None
     if rid != "RECIPE_PROCESS_MEMORY_GROWTH" and walks == 0:
         return None                                  # follow-ups without walk data: legacy rules
+    if rid == "RECIPE_LONG_LIVED_OBJECT_ACCUMULATION" and verdict in _NO_LEAK_VERDICTS:
+        # no growth in the window says nothing about a container that is ALREADY large: keep the legacy census
+        # rules (container size / object counts) for that question
+        return None
     trend = data.get("memory_trend") or {}
     if verdict in _LEAK_VERDICTS:
         if rid == "RECIPE_LONG_LIVED_OBJECT_ACCUMULATION" and not li.get("growth_owners"):

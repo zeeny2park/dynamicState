@@ -694,8 +694,6 @@ def investigate(adapter: Any, pid: int, companion_elf: Optional[str], cfg: Memor
 
 
 # --------------------------------------------------------------------------------------------- provider glue
-_MEMORY_RECIPES_WITH_WALK_INPUTS = ("RECIPE_PROCESS_MEMORY_GROWTH", "RECIPE_HEAP_GROWTH",
-                                    "RECIPE_LONG_LIVED_OBJECT_ACCUMULATION")
 
 
 def _memory_interest(recipe_id: str, classification: Any, cfg: MemoryObservationConfig) -> Optional[str]:
