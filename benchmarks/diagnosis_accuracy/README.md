@@ -36,6 +36,11 @@ Heap-corruption targets do the bad write once, then idle without calling malloc/
   is not a false positive (false positives are defined for healthy controls only); the verdict is just reported.
   `KIND_CATEGORIES` keeps `long_stall` only to label and describe those rows.
 
+- False clear (defect): a scored defect target whose verdict is `HEALTHY` (the diagnoser told the user "nothing is
+  wrong" about a real defect), the most dangerous miss. Counted as `false_clears` in the overall and per-kind totals,
+  printed on the healthy totals line next to false positives, and flagged per row as `false_clear`. Unscored targets
+  carry the flag but are not counted. There is no threshold or assertion on the real diagnoser; the number is reported.
+
 - Detection (defect): some finding's `category` is in `KIND_CATEGORIES[kind]` (table in `run_benchmark.py`). A fault
   verdict without a matching-category finding is not a detection. `confidence` is never used.
 - Healthy control: any fault-class verdict (CONFIRMED_FAULT, PROBABLE_FAULT, FAULT) or any finding is a false positive.

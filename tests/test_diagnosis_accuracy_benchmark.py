@@ -133,6 +133,23 @@ class TestScorer(unittest.TestCase):
         o = rb.summarize([rb.score_result(g, _clean_result(g)) for g in GT])["overall"]
         self.assertEqual((o["cleared"], o["false_positives"], o["detected"]), (len(HEALTHY), 0, 0))
 
+    def test_always_healthy_diagnoser_false_clears_every_scored_defect(self):
+        rows = [rb.score_result(g, _clean_result(g)) for g in GT]
+        rep = rb.summarize(rows)
+        o = rep["overall"]
+        self.assertEqual(o["false_clears"], len(SCORED_DEFECTS))
+        self.assertEqual(o["detected"], 0)
+        self.assertEqual(sum(s["false_clears"] for s in rep["per_kind"].values()), len(SCORED_DEFECTS))
+        by_id = {r["id"]: r for r in rows}
+        self.assertTrue(all(by_id[g["id"]]["false_clear"] for g in DEFECTS))  # flagged per row, even unscored
+        self.assertEqual(sum(1 for r in rep["unscored"]["targets"] if r["false_clear"]), len(UNSCORED))
+        self.assertFalse(any(r.get("false_clear") for r in rows if r["kind"] == rb.HEALTHY_KIND))
+
+    def test_existing_fakes_have_no_false_clears(self):
+        for fn in (_wrong_result, _everything_result):
+            o = rb.summarize([rb.score_result(g, fn(g)) for g in GT])["overall"]
+            self.assertEqual(o["false_clears"], 0)
+
     def test_inconclusive_on_healthy_is_not_cleared_not_fp(self):
         res = dict(_clean_result(None), verdict="INCONCLUSIVE")
         row = rb.score_result(HEALTHY[0], res)

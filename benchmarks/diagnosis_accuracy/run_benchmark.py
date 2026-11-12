@@ -159,7 +159,7 @@ def score_result(gt: Dict[str, Any], result: Optional[Dict[str, Any]], error: Op
         if gt["kind"] == HEALTHY_KIND:
             row.update(false_positive=False, not_cleared=False, cleared=False)
         else:
-            row.update(detected=False, name_match="none", location_match=False)
+            row.update(detected=False, name_match="none", location_match=False, false_clear=False)
         return row
 
     findings = list(result.get("findings") or [])
@@ -189,6 +189,7 @@ def score_result(gt: Dict[str, Any], result: Optional[Dict[str, Any]], error: Op
     cats = KIND_CATEGORIES[gt["kind"]]
     matching = [f for f in findings if str(f.get("category")) in cats]
     row["detected"] = bool(matching)
+    row["false_clear"] = verdict == "HEALTHY"  # told "nothing is wrong" about a real defect
     subj = {s for f in matching for s in (f.get("subjects") or [])}
     by_class = {}
     for cls in NAME_CLASSES:
@@ -221,6 +222,7 @@ def _stats(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
         "name_full": sum(1 for r in d if r.get("name_match") == "full"),
         "name_partial": sum(1 for r in d if r.get("name_match") == "partial"),
         "location_match": sum(1 for r in d if r.get("location_match")),
+        "false_clears": sum(1 for r in d if r.get("false_clear")),
         "healthy_targets": len(h),
         "cleared": sum(1 for r in h if r.get("cleared")),
         "not_cleared": sum(1 for r in h if r.get("not_cleared")),
@@ -243,7 +245,8 @@ def summarize(all_rows: List[Dict[str, Any]]) -> Dict[str, Any]:
         "unscored": {
             "note": "informational; excluded from every total and rate in this report",
             "targets": [{k: r.get(k) for k in ("id", "kind", "scored_reason", "verdict", "detected", "name_match",
-                                                "location_match", "finding_categories", "subjects", "error")}
+                                                "location_match", "false_clear", "finding_categories", "subjects",
+                                                "error")}
                         for r in unscored],
         },
         "per_kind": {k: _stats([r for r in rows if r["kind"] == k]) for k in DEFECT_KINDS
@@ -420,12 +423,13 @@ def format_table(report: Dict[str, Any]) -> str:
     lines.append(f"scored defects: detected {o['detected']}/{o['defect_targets']}, cause names full {o['name_full']}"
                  f" partial {o['name_partial']}, location {o['location_match']}")
     lines.append(f"healthy: cleared {o['cleared']}, not cleared {o['not_cleared']}, false positives "
-                 f"{o['false_positives']} (of {o['healthy_targets']}); errors {o['errors']}; "
+                 f"{o['false_positives']} (of {o['healthy_targets']}), false clears {o['false_clears']} (of "
+                 f"{o['defect_targets']} defects); errors {o['errors']}; "
                  f"non-zero-stop collections {o['non_zero_stop']}")
     for k, s in t["per_kind"].items():
         if s["defect_targets"]:
             lines.append(f"  {k:15} detected {s['detected']}/{s['defect_targets']}  names {s['name_full']}/"
-                         f"{s['defect_targets']}")
+                         f"{s['defect_targets']}  false clears {s['false_clears']}")
     for k, s in t["per_origin"].items():
         if s["defect_targets"] or s["healthy_targets"]:
             lines.append(f"  origin {k:15} detected {s['detected']}/{s['defect_targets']}  names "

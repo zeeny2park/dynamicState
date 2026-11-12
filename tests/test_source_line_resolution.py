@@ -241,5 +241,74 @@ class TestDepth5CallLines(_Base):
                     _basename_line(d["source_location"])[1] - 1])
 
 
+class SourceLineIsCheckoutIndependentTest(unittest.TestCase):
+    """The same fixture compiled in two differently named / nested directories (relative source path, different
+    cwd and DW_AT_comp_dir, different build-id) resolves to the same exact call line; a transient addr2line
+    failure is retried instead of being memoised as "no line table"."""
+
+    @classmethod
+    def setUpClass(cls):
+        if not (shutil.which("gcc") and shutil.which("addr2line")):
+            raise unittest.SkipTest("gcc/addr2line not available")
+        cls.tmp = tempfile.mkdtemp(prefix="srcline_dirs_")
+        cls.addClassCleanup(shutil.rmtree, cls.tmp, True)
+        cls.addClassCleanup(DwarfIndexer.clear_cache)
+        cls.want = _line_of(DL_SRC, "pthread_mutex_lock(&g_mutex_b);", 1)  # worker_1's blocking call
+
+    def _build(self, *parts):
+        d = os.path.join(self.tmp, *parts)
+        os.makedirs(os.path.join(d, "benchmarks", "t"))
+        shutil.copy(DL_SRC, os.path.join(d, "benchmarks", "t", "fx.c"))
+        out = os.path.join(d, "fx")
+        subprocess.run(["gcc", "-g", "-O0", "-pthread", "-Wl,--build-id=sha1", os.path.join("benchmarks", "t", "fx.c"),
+                        "-o", out], cwd=d, check=True)
+        return out
+
+    def _call_line_of_worker_1(self, binary):
+        idx = DwarfIndexer.get_index(binary)
+        sp = next(x for x in idx.subprograms if x.name == "worker_1" and x.low_pc is not None)
+        hi = sp.high_pc if sp.high_pc and sp.high_pc > sp.low_pc else sp.low_pc + sp.high_pc
+        lines = set()
+        for pc in range(sp.low_pc, hi):
+            r = idx.resolve_source_line(pc)
+            if r:
+                lines.add((r["file"], r["line"]))
+        return idx, sp, lines
+
+    def test_same_fixture_in_two_checkouts_resolves_the_exact_call_line(self):
+        a = self._build("a", ".claude", "worktrees", "agent-x")
+        b = self._build("b")
+        for binary in (a, b):
+            _idx, sp, lines = self._call_line_of_worker_1(binary)
+            self.assertIn(("fx.c", self.want), lines, binary)
+            self.assertNotEqual(sp.decl_line, self.want)
+        cwd = os.getcwd()
+        try:  # a relative image path and an unrelated cwd must not matter either
+            os.chdir(os.path.dirname(b))
+            idx = DwarfIndexer.get_index(os.path.relpath(a))
+            self.assertEqual(idx.resolve_source_line(
+                next(x for x in idx.subprograms if x.name == "worker_1").low_pc + 4)["file"], "fx.c")
+        finally:
+            os.chdir(cwd)
+
+    def test_transient_addr2line_failure_is_not_memoised(self):
+        from unittest import mock
+        binary = self._build("c")
+        idx = DwarfIndexer.get_index(binary)
+        pc = next(x for x in idx.subprograms if x.name == "worker_1").low_pc + 4
+        real = subprocess.run
+        calls = []
+
+        def flaky(*args, **kw):
+            calls.append(1)
+            if len(calls) <= 2:
+                raise subprocess.TimeoutExpired(args[0], 1)
+            return real(*args, **kw)
+
+        with mock.patch("extractor.dwarf_indexer.subprocess.run", side_effect=flaky):
+            self.assertIsNone(idx.resolve_source_line(pc))      # both attempts timed out: unresolved ...
+            self.assertEqual(idx.resolve_source_line(pc)["file"], "fx.c")  # ... but not cached as "no entry"
+
+
 if __name__ == "__main__":
     unittest.main()
