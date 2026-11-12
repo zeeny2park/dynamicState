@@ -40,7 +40,11 @@ run_one() {
 export -f run_one; export LOGS TMO OUT
 
 rm -f "${OUT}"/failed_*.log
-ls tests/test_*.py | xargs -P "${JOBS}" -I{} bash -c 'run_one "$1"' _ {}
+# Files that saturate the CPU on purpose (marked with the token BASELINE_SERIAL) would starve the files
+# running next to them, so they run alone after the parallel batch.
+SERIAL_FILES="$(grep -l "BASELINE_SERIAL" tests/test_*.py || true)"
+ls tests/test_*.py | grep -vxF "${SERIAL_FILES:-__none__}" | xargs -P "${JOBS}" -I{} bash -c 'run_one "$1"' _ {}
+for f in ${SERIAL_FILES}; do run_one "$f"; done
 
 SUMMARY="${OUT}/summary.tsv"
 {

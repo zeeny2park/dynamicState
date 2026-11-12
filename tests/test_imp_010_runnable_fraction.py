@@ -1,5 +1,6 @@
 """IMP-010: spin judgement by runnable fraction (schedstat), robust to machine load."""
 
+# BASELINE_SERIAL: this file starts CPU-burning competitors; scripts/run_test_baseline.sh runs it alone.
 import os
 import subprocess
 import sys
