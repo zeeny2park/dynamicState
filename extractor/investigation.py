@@ -1,4 +1,19 @@
-"""Investigation Engine: High-level evidence-first investigation workflow for dynamicState.
+"""Staged evidence investigation and offline snapshot analysis -- NOT the live diagnosis path.
+
+The one diagnosis entry point for a live process is ``expert_diagnostic_engine.diagnose()`` (CLI ``diagnose`` /
+``investigate -p``, MCP ``runtime_diagnose_process``, web ``POST /api/diagnose``).  ``InvestigationManager``
+here serves:
+
+- offline snapshots: CLI ``investigate --snapshot/--memory-snapshot`` and ``compare`` on captured snapshots
+  (``capture-memory`` / ``analyze-memory`` produce and read them);
+- the step-by-step evidence-browsing contract of the agent runtime / web API (investigation_id, evidence,
+  hypotheses, timeline) -- for a live PID the web endpoint takes its verdict from ``diagnose()`` (IMP-017);
+- temporal investigations over a watch session (delegated to temporal_investigation).
+
+Its report never passes for a live diagnosis: provenance is never caller-supplied, every non-live session is
+reported as ``IMPORTED_UNVERIFIED`` (IMP-005), and its verdict label is mapped into the aggregator vocabulary
+(``to_overall_verdict``) rather than decided here.
+
 
 Orchestrates the investigation pipeline:
 1. Target/process and build identity validation (GNU Build-ID & load bias)
@@ -13,18 +28,14 @@ Orchestrates the investigation pipeline:
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 import hashlib
-import hmac
 import json
 import os
-import re
 import uuid
 from typing import Any, Dict, List, Optional, Set, Tuple, Union
 
 from .debug_artifacts import DebugArtifactProvider
-from .debug_image import BinaryIdentity, inspect_elf
-from .dwarf_indexer import DwarfIndex, DwarfIndexer
+from .debug_image import inspect_elf
 from .evidence_ledger import (
-    EVIDENCE_SCHEMA_VERSION,
     EVIDENCE_TYPE_CAPTURE_QUALITY,
     EVIDENCE_TYPE_COMPARISON,
     EVIDENCE_TYPE_FIELD_OBSERVATION,
@@ -37,7 +48,6 @@ from .evidence_ledger import (
     EvidenceLedger,
     EvidenceRecord,
     NATURE_HYPOTHESIS,
-    NATURE_INFERENCE,
     NATURE_OBSERVATION,
     compute_receipt_signature,
     is_atomic_or_stopped_consistency,
@@ -58,32 +68,17 @@ from .evidence_ledger import (
     CLAIM_TARGET_IDENTITY_VERIFIED,
     CLAIM_STATE_TRANSITION_VERIFIED,
     CLAIM_FUNCTION_ATTRIBUTION_VERIFIED,
-    ALL_TRUST_CLAIMS,
 )
 from .investigation_lifecycle import (
-    STATE_BUDGET_EXHAUSTED,
-    STATE_CANCELED,
-    STATE_COMPLETED,
     STATE_CREATED,
-    STATE_FAILED,
-    STATE_FINALIZATION,
-    STATE_FOLLOW_UP_PLANNING,
-    STATE_HYPOTHESIS_FORMATION,
-    STATE_HYPOTHESIS_UPDATE,
-    STATE_INCONCLUSIVE,
-    STATE_INITIAL_TRIAGE,
-    STATE_OBSERVATION,
-    STATE_TARGET_VALIDATION,
     InvestigationStateMachine,
 )
 from .evidence_adapter import (
     COLLECTION_STATUS_ABSTAIN,
     COLLECTION_STATUS_COLLECTED,
-    RESULT_BUDGET_REJECTED,
     RESULT_DUPLICATE_EVIDENCE,
     RESULT_NEW_EVIDENCE,
     RESULT_OBSERVATION_FAILED,
-    RESULT_OBSERVATION_UNAVAILABLE,
 )
 from .observation_budget import ObservationBudgetLimits, ObservationBudgetTracker
 from .diagnostic_verdict_aggregator import to_overall_verdict
@@ -94,22 +89,17 @@ from .verdict_engine import (
     AssertionEvaluation,
     VerdictEngine,
     ZeroCdnReporter,
-    sanitize_report_output_path,
 )
 from .hypothesis import (
-    CONFIDENCE_HIGH,
     CONFIDENCE_LOW,
-    CONFIDENCE_MEDIUM,
     CONFIDENCE_SPECULATIVE,
     DeterministicHypothesisGenerator,
     EVIDENCE_CLASSIFICATION_FACT,
     EVIDENCE_CLASSIFICATION_INFERENCE,
-    EVIDENCE_CLASSIFICATION_PROPOSED_ACTION,
     EVIDENCE_CLASSIFICATION_UNKNOWN,
     FollowUpObservation,
     FUNCTION_TIER_EVIDENCE_SUPPORTED,
     FUNCTION_TIER_STATIC_CANDIDATE,
-    FUNCTION_TIER_UNKNOWN,
     FUNCTION_TIER_UNVERIFIED,
     FUNCTION_TIER_VALIDATED_CAUSAL,
     HYPOTHESIS_STATUS_CONTRADICTED,
@@ -117,7 +107,6 @@ from .hypothesis import (
     HYPOTHESIS_STATUS_PROPOSED,
     HYPOTHESIS_STATUS_SUPPORTED,
     HYPOTHESIS_STATUS_VALIDATED,
-    HypothesisGenerator,
     HypothesisValidator,
     InvestigationHypothesis,
     OBSERVATION_STATUS_CANCELED,
@@ -125,26 +114,18 @@ from .hypothesis import (
     OBSERVATION_STATUS_FAILED,
     OBSERVATION_STATUS_PROPOSED,
     OBSERVATION_STATUS_VERIFIED,
-    OptionalLLMHypothesisAdapter,
-    PluggableHypothesisEngine,
     sanitize_and_disarm_llm_hypothesis,
     TARGET_KIND_COMPARISON,
     TARGET_KIND_FIELD,
     TARGET_KIND_OBJECT,
-    TARGET_KIND_SNAPSHOT,
     TARGET_KIND_THREAD,
-    VALID_EVIDENCE_CLASSIFICATIONS,
-    VALID_OBSERVATION_STATUSES,
-    ValidationTransitionResult,
 )
-from .modules import ModuleAddressResolver, RuntimeModule, discover_modules
+from .modules import ModuleAddressResolver, RuntimeModule
 from .raw_snapshot import RawRuntimeSnapshot
-from .semantic_state import OfflineSemanticEngine, SemanticState
-from .snapshot import RuntimeSnapshot
-from .snapshot_consistency import ATOMIC, NON_ATOMIC, STOPPED, SnapshotConsistency
+from .semantic_state import OfflineSemanticEngine
+from .snapshot_consistency import NON_ATOMIC, STOPPED
 from .state_corpus import StateCorpus
 from .state_diff import StateDiffEngine
-from .state_lab import compute_semantic_diff
 from .static_analyzer import (
     get_static_provider,
     IDENTITY_DEBUG_ID_UNAVAILABLE,
@@ -152,14 +133,9 @@ from .static_analyzer import (
     IDENTITY_MISMATCH,
     IDENTITY_TARGET_ID_UNAVAILABLE,
     IDENTITY_VERIFIED_MATCH,
-    LINK_KIND_CALL_RELATIONSHIP,
-    LINK_KIND_FIELD_WRITE_CANDIDATE,
     LINK_KIND_FUNCTION_ADDRESS,
     LINK_KIND_GLOBAL_VARIABLE,
-    LINK_KIND_SOURCE_LOCATION,
     LINK_KIND_TYPE_DEFINITION,
-    LINK_KIND_UNRESOLVED,
-    DwarfStaticAnalysisProvider,
     NullStaticAnalysisProvider,
     StaticAnalysisProvider,
     validate_module_identity,
@@ -355,26 +331,6 @@ class InvestigationSession:
     @property
     def state_transitions(self) -> List[Dict[str, Any]]:
         return self.state_machine.transitions
-
-    def transition_lifecycle(
-        self,
-        to_state: str,
-        reason: str,
-        timestamp: Optional[str] = None,
-        metadata: Optional[Dict[str, Any]] = None,
-    ) -> Dict[str, Any]:
-        """Transitions the session lifecycle state machine and records a timeline event."""
-        prev = self.state_machine.state
-        entry = self.state_machine.transition(to_state, reason=reason, timestamp=timestamp, metadata=metadata)
-        self.add_timeline_event(
-            event_type="LIFECYCLE_TRANSITION",
-            title=f"State Transition: {prev} -> {to_state}",
-            summary=reason,
-            status_before=prev,
-            status_after=to_state,
-            details=entry,
-        )
-        return entry
 
     def issue_verification_capability(
         self,
@@ -3686,22 +3642,6 @@ class InvestigationManager:
                 remediation_checklist=[s.description for s in session.next_steps] if session.next_steps else None,
             ),
         })
-
-    def export_html_report(self, investigation_id: str, output_path: str) -> bool:
-        """Exports the Zero-CDN standalone HTML investigation report to a validated disk path."""
-        report = self.generate_report(investigation_id)
-        if not report or "report_html" not in report:
-            return False
-        sanitized_path, err = sanitize_report_output_path(output_path, file_type="HTML report")
-        if err or not sanitized_path:
-            return False
-        try:
-            os.makedirs(os.path.dirname(os.path.abspath(sanitized_path)), exist_ok=True)
-            with open(sanitized_path, "w", encoding="utf-8") as f:
-                f.write(report["report_html"])
-            return True
-        except Exception:
-            return False
 
     def get_investigation_timeline(self, investigation_id: str) -> Dict[str, Any]:
         """Retrieve the auditable, sequential timeline of events for an investigation."""
