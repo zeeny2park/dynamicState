@@ -11,6 +11,7 @@ This test verifies dynamicState running under genuine GNU gdb 9.2 (Ubuntu 20.04)
 
 import json
 import os
+import platform
 import shutil
 import subprocess
 import sys
@@ -115,7 +116,11 @@ int main() {
 }
 """)
         # Compile with -g and build-id
-        comp = subprocess.run(["gcc", "-g", "-O0", "-Wl,--build-id", c_src, "-o", c_bin],
+        # GDB 9.x does not skip the function prologue when it starts with the CET `endbr64` instruction
+        # (emitted by default on x86 Ubuntu toolchains; fixed in GDB 10), so `break worker_loop` stops before
+        # the arguments are stored and `sess` reads as garbage. Build the fixture without CET on x86.
+        cet_flags = ["-fcf-protection=none"] if platform.machine() in ("x86_64", "AMD64", "i686") else []
+        comp = subprocess.run(["gcc", "-g", "-O0", *cet_flags, "-Wl,--build-id", c_src, "-o", c_bin],
                               capture_output=True, text=True)
         self.assertEqual(comp.returncode, 0, f"Compilation failed: {comp.stderr}")
 
