@@ -39,6 +39,7 @@ from extractor.capture_backend import (
     ProcessVmCaptureBackend,
     ProcfsCaptureBackend,
 )
+from extractor.capture_plan import CaptureMode, CapturePlan
 from extractor.debug_image import inspect_elf
 from extractor.evidence_ledger import (
     ATTRIBUTION_BASIS_SINGLE_WRITER,
@@ -131,8 +132,12 @@ def main():
         # Step 3: Capture Initial State
         log("STEP 3", f"Capturing pre-mutation memory snapshot of PID {proc.pid}...")
         t0 = time.monotonic()
+        # Causal verification requires an atomic (stopped) snapshot pair. Zero-stop is the production
+        # default, so this demonstration explicitly approves a stopped FULL capture.
+        stopped_plan = CapturePlan(mode=CaptureMode.FULL.value, allow_stop=True)
+        log("STEP 3", "Using explicitly approved STOPPED capture (mode=FULL, allow_stop=True) for atomic snapshots.")
         backend = ProcessVmCaptureBackend() if ProcessVmCaptureBackend().is_available(proc.pid) else ProcfsCaptureBackend()
-        snap1 = backend.capture(pid=proc.pid)
+        snap1 = backend.capture(pid=proc.pid, plan=stopped_plan)
         snap1.save(snap1_dir)
         t_snap1 = (time.monotonic() - t0) * 1000
         log("STEP 3", f"Initial snapshot saved ({snap1.provenance.get('captured_bytes', 0)} bytes in {t_snap1:.1f}ms)", "OK")
@@ -148,7 +153,7 @@ def main():
         # Step 5: Capture Updated State
         log("STEP 5", f"Capturing post-mutation memory snapshot of PID {proc.pid}...")
         t0 = time.monotonic()
-        snap2 = backend.capture(pid=proc.pid)
+        snap2 = backend.capture(pid=proc.pid, plan=stopped_plan)
         snap2.save(snap2_dir)
         t_snap2 = (time.monotonic() - t0) * 1000
         log("STEP 5", f"Post-mutation snapshot saved ({snap2.provenance.get('captured_bytes', 0)} bytes in {t_snap2:.1f}ms)", "OK")
@@ -261,6 +266,7 @@ def main():
                 "active_writer_function": "active_worker_state_writer",
             },
             hypothesis_id=hypo.hypothesis_id,
+            evidence_id="ev_treatment_e2e",
         )
 
         assert receipt.state_transition_verified, "State transition not verified"
@@ -329,6 +335,7 @@ def main():
         print(f" Debug Companion:     {os.path.basename(debug_bin)} (GNU Build ID: {elf_debug.build_id})")
         print(f" Root Cause Function: {promoted_cand['function_name']} ({promoted_cand['candidate_tier']})")
         print(f" State Transition:    WorkerState.counter: {before_val} -> {after_val}")
+        print(" Capture Mode:        STOPPED (FULL, explicit allow_stop approval; atomic snapshots)")
         print(f" Attribution Basis:   {receipt.attribution_basis}")
         print(f" Evidence IDs:        {hypo.supporting_evidence_ids}")
         print(f" Validation Status:   {eval_trans['to_status']} (Confidence: {eval_trans['confidence']})")

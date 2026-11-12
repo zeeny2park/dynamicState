@@ -60,6 +60,7 @@ from extractor.llm_provider import (
     ProviderUnavailableError,
 )
 from extractor.web.server import run_server
+from tests.fake_cli_tools import fake_cli_environment
 
 
 class TestCLISecurityDefaults(unittest.TestCase):
@@ -69,7 +70,8 @@ class TestCLISecurityDefaults(unittest.TestCase):
         """Verify that GeminiCLIProvider does NOT include --dangerously-skip-permissions by default."""
         cfg = LLMProviderConfig(provider_type="gemini", model="gemini-2.5-pro")
         prov = GeminiCLIProvider(cfg)
-        cmd = prov.build_command("Test prompt", timeout=30.0)
+        with fake_cli_environment(["agy"]):
+            cmd = prov.build_command("Test prompt", timeout=30.0)
 
         # Flag must NOT be present by default
         self.assertNotIn("--dangerously-skip-permissions", cmd)
@@ -85,9 +87,10 @@ class TestCLISecurityDefaults(unittest.TestCase):
             allow_dangerous_permissions=True,
         )
         prov_opt_in = GeminiCLIProvider(cfg_opt_in)
-        cmd_opt_in = prov_opt_in.build_command("Test prompt", timeout=30.0)
-        if any("agy" in arg for arg in cmd_opt_in):
-            self.assertIn("--dangerously-skip-permissions", cmd_opt_in)
+        with fake_cli_environment(["agy"]):
+            cmd_opt_in = prov_opt_in.build_command("Test prompt", timeout=30.0)
+        self.assertTrue(any("agy" in arg for arg in cmd_opt_in))
+        self.assertIn("--dangerously-skip-permissions", cmd_opt_in)
 
         # Environment variable opt-in parsing
         with patch.dict(os.environ, {"DYNAMICSTATE_ALLOW_CLI_PERMISSION_BYPASS": "true"}):

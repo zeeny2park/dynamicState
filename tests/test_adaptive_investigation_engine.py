@@ -21,6 +21,7 @@ import tempfile
 import time
 import unittest
 
+from tests.fixture_builds import ensure_real_runtime_app_debug
 from extractor.adaptive_engine import (
     AdaptiveInvestigationEngine,
     AdaptiveInvestigationPlanner,
@@ -79,13 +80,10 @@ class TestAdaptiveInvestigationEngine(unittest.TestCase):
 
         # Launch real runtime C++ target with pipe
         cls.proc = None
-        cls.target_bin = "/tmp/real_runtime_app_debug.elf"
-        if not os.path.isfile(cls.target_bin) and os.path.isfile("tests/fixtures/real_runtime/main.cpp"):
-            subprocess.run(
-                ["g++", "-fPIE", "-pie", "-g", "-O0", "-fno-inline", "-fno-omit-frame-pointer", "-Wl,--build-id=sha1",
-                 "tests/fixtures/real_runtime/main.cpp", "-o", cls.target_bin, "-lpthread"],
-                check=False,
-            )
+        try:
+            cls.target_bin = ensure_real_runtime_app_debug()
+        except Exception:
+            cls.target_bin = "/tmp/real_runtime_app_debug.elf"
 
         if os.path.isfile(cls.target_bin):
             try:

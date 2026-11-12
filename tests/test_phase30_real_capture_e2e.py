@@ -23,7 +23,7 @@ import time
 import unittest
 from typing import Any, Dict, Tuple
 
-from playwright.sync_api import sync_playwright
+from tests.playwright_support import skip_unless_browser_available, sync_playwright
 
 from extractor.agent_runtime import AgentRuntime
 from extractor.web.server import DynamicStateWebServer
@@ -34,6 +34,7 @@ class TestPhase30RealCaptureE2E(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
+        skip_unless_browser_available()
         cls.work_dir = tempfile.mkdtemp(prefix="dynstate_phase30_")
 
         # 1. Compile real target with DWARF (-g) and GNU build-id

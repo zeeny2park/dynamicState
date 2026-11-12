@@ -26,6 +26,7 @@ import urllib.error
 import urllib.request
 
 from extractor.agent_models import AgentAction
+from tests.fake_cli_tools import fake_cli_environment
 from extractor.agent_runtime import AgentRuntime
 from extractor.conversational_investigation import (
     ConversationalAnalysisService,
@@ -50,6 +51,7 @@ from extractor.llm_provider import (
     LLMProviderManager,
     LLMProviderStatus,
     OpenAICompatibleProvider,
+    ProviderUnavailableError,
 )
 from extractor.snapshot_consistency import STOPPED
 from extractor.web.server import run_server
@@ -319,6 +321,11 @@ class TestConversationalAnalysisServiceEndToEnd(unittest.TestCase):
         self.assertEqual(self.session.chat_history[1]["role"], "assistant")
 
     def test_analyze_investigation_with_mocked_llm_response(self):
+        # The configured default must be a real LLM provider type: with the host-detected default
+        # ("none" when no CLI/endpoint exists) the service legitimately short-circuits to deterministic rules.
+        self.service = ConversationalAnalysisService(
+            provider_manager=LLMProviderManager(config=LLMProviderConfig(provider_type="openai", model="mock-gpt4"))
+        )
         mock_provider = MagicMock(spec=BaseLLMProvider)
         mock_provider.check_health.return_value = LLMProviderStatus(
             configured=True,
@@ -493,17 +500,19 @@ class TestCLILLMProviders(unittest.TestCase):
     """Test suite for local CLI-based LLM adapters (Gemini, Gemini ACP, Cline, and generic CLI)."""
 
     def test_gemini_cli_provider_resolution_and_command_builder(self):
-        cfg = LLMProviderConfig(provider_type="gemini", model="gemini-2.5-pro")
-        prov = GeminiCLIProvider(cfg)
-        bin_path = prov.resolve_binary()
-        self.assertIsNotNone(bin_path, "Gemini or agy binary should resolve")
-        self.assertTrue(os.path.exists(bin_path))
+        # Hermetic: fake executables on a temp PATH/HOME, so the real resolver + builder run on any host.
+        with fake_cli_environment(["agy"]) as home:
+            cfg = LLMProviderConfig(provider_type="gemini", model="gemini-2.5-pro")
+            prov = GeminiCLIProvider(cfg)
+            bin_path = prov.resolve_binary()
+            self.assertIsNotNone(bin_path, "Gemini or agy binary should resolve")
+            self.assertTrue(os.path.exists(bin_path))
+            self.assertEqual(os.path.basename(bin_path), "agy")
 
-        cmd = prov.build_command("Test prompt", timeout=30.0)
-        self.assertEqual(cmd[0], bin_path)
-        self.assertIn("-p", cmd)
-        self.assertIn("Test prompt", cmd)
-        if "agy" in os.path.basename(bin_path).lower():
+            cmd = prov.build_command("Test prompt", timeout=30.0)
+            self.assertEqual(cmd[0], bin_path)
+            self.assertIn("-p", cmd)
+            self.assertIn("Test prompt", cmd)
             self.assertIn("--output-format", cmd)
             self.assertIn("text", cmd)
             self.assertIn("--disable-slash-commands", cmd)
@@ -515,34 +524,83 @@ class TestCLILLMProviders(unittest.TestCase):
             cmd_opt_in = GeminiCLIProvider(cfg_opt_in).build_command("Test prompt", timeout=30.0)
             self.assertIn("--dangerously-skip-permissions", cmd_opt_in)
 
-    def test_gemini_acp_provider_resolution_and_handshake(self):
-        cfg = LLMProviderConfig(provider_type="acp")
-        prov = GeminiACPProvider(cfg)
-        bin_path = prov.resolve_binary()
-        self.assertIsNotNone(bin_path, "agy-acp binary should resolve at ~/.gemini/antigravity/agy-acp/dist/")
-        self.assertTrue(os.path.exists(bin_path))
+        # `gemini` takes precedence over `agy` and uses its own flag set
+        with fake_cli_environment(["gemini", "agy"]):
+            prov = GeminiCLIProvider(LLMProviderConfig(provider_type="gemini", model="gemini-2.5-pro"))
+            bin_path = prov.resolve_binary()
+            self.assertEqual(os.path.basename(bin_path), "gemini")
+            cmd = prov.build_command("Test prompt", timeout=30.0)
+            self.assertEqual(cmd[:3], [bin_path, "-p", "Test prompt"])
+            self.assertIn("-m", cmd)
+            self.assertNotIn("--dangerously-skip-permissions", cmd)
 
-        status = prov.check_health()
-        self.assertTrue(status.configured)
-        self.assertTrue(status.reachable)
-        self.assertTrue(status.is_cli)
-        self.assertIn("acp://", status.base_url)
-        self.assertIsNotNone(status.latency_ms)
+        # ~/.local/bin/agy default location is honoured even when it is not on PATH
+        with fake_cli_environment([]) as home:
+            candidate = os.path.join(home, ".local", "bin", "agy")
+            os.makedirs(os.path.dirname(candidate))
+            with open(candidate, "w") as fh:
+                fh.write("#!/bin/sh\nexit 0\n")
+            os.chmod(candidate, 0o755)
+            prov = GeminiCLIProvider(LLMProviderConfig(provider_type="gemini"))
+            self.assertEqual(prov.resolve_binary(), candidate)
+
+        # Nothing installed: resolution is truthfully None and building raises
+        with fake_cli_environment([]):
+            prov = GeminiCLIProvider(LLMProviderConfig(provider_type="gemini"))
+            self.assertIsNone(prov.resolve_binary())
+            with self.assertRaises(ProviderUnavailableError):
+                prov.build_command("Test prompt", timeout=30.0)
+
+    def test_gemini_acp_provider_resolution_and_handshake(self):
+        with fake_cli_environment([], acp=True) as home:
+            cfg = LLMProviderConfig(provider_type="acp")
+            prov = GeminiACPProvider(cfg)
+            bin_path = prov.resolve_binary()
+            self.assertIsNotNone(bin_path, "agy-acp binary should resolve at ~/.gemini/antigravity/agy-acp/dist/")
+            self.assertTrue(os.path.exists(bin_path))
+            self.assertTrue(bin_path.startswith(home))
+
+            status = prov.check_health()
+            self.assertTrue(status.configured)
+            self.assertTrue(status.reachable)
+            self.assertTrue(status.is_cli)
+            self.assertIn("acp://", status.base_url)
+            self.assertIsNotNone(status.latency_ms)
+
+        with fake_cli_environment([]):
+            prov = GeminiACPProvider(LLMProviderConfig(provider_type="acp"))
+            self.assertIsNone(prov.resolve_binary())
+            self.assertFalse(prov.check_health().reachable)
 
     def test_cline_cli_provider_resolution_and_command_builder(self):
-        cfg = LLMProviderConfig(provider_type="cline")
-        prov = ClineCLIProvider(cfg)
-        bin_path = prov.resolve_binary()
-        self.assertIsNotNone(bin_path, "Cline or paseo binary should resolve")
-        self.assertTrue(os.path.exists(bin_path))
+        # paseo only
+        with fake_cli_environment(["paseo"]):
+            prov = ClineCLIProvider(LLMProviderConfig(provider_type="cline"))
+            bin_path = prov.resolve_binary()
+            self.assertIsNotNone(bin_path, "Cline or paseo binary should resolve")
+            self.assertTrue(os.path.exists(bin_path))
+            self.assertEqual(os.path.basename(bin_path), "paseo")
 
-        cmd = prov.build_command("Inspect state", timeout=25.0)
-        self.assertEqual(cmd[0], bin_path)
-        if "paseo" in os.path.basename(bin_path).lower():
+            cmd = prov.build_command("Inspect state", timeout=25.0)
+            self.assertEqual(cmd[0], bin_path)
             self.assertIn("run", cmd)
             self.assertIn("Inspect state", cmd)
             self.assertIn("--provider", cmd)
             self.assertIn("--json", cmd)
+
+        # cline takes precedence over paseo and uses `-p <prompt>`
+        with fake_cli_environment(["cline", "paseo"]):
+            prov = ClineCLIProvider(LLMProviderConfig(provider_type="cline"))
+            bin_path = prov.resolve_binary()
+            self.assertEqual(os.path.basename(bin_path), "cline")
+            cmd = prov.build_command("Inspect state", timeout=25.0)
+            self.assertEqual(cmd[:3], [bin_path, "-p", "Inspect state"])
+
+        with fake_cli_environment([]):
+            prov = ClineCLIProvider(LLMProviderConfig(provider_type="cline"))
+            self.assertIsNone(prov.resolve_binary())
+            with self.assertRaises(ProviderUnavailableError):
+                prov.build_command("Inspect state", timeout=25.0)
 
     def test_generic_cli_provider_template_substitution_and_secrets(self):
         secret = "sk-super-secret-token-777"
@@ -610,7 +668,7 @@ class TestCLILLMProviders(unittest.TestCase):
         })
 
         prov_mgr = LLMProviderManager.get_instance()
-        with patch.object(GeminiCLIProvider, "chat_completion", return_value=mock_gemini_output):
+        with fake_cli_environment(["gemini"]), patch.object(GeminiCLIProvider, "chat_completion", return_value=mock_gemini_output):
             service = ConversationalAnalysisService(provider_manager=prov_mgr)
             result = service.analyze_investigation(
                 session=session,

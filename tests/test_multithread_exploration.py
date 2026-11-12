@@ -17,6 +17,7 @@ import unittest
 
 from extractor.agent_runtime import AgentRuntime
 from extractor.explorer import StateExplorer
+from extractor.gdb_env import gdb_subprocess_env
 from extractor.runtime_controller import (
     GdbRuntimeController,
     RuntimeCapabilities,
@@ -357,7 +358,8 @@ class MultithreadGdbIntegrationTests(unittest.TestCase):
                 "-ex", "checkpoint",
             ],
             capture_output=True,
-            text=True
+            text=True,
+            env=gdb_subprocess_env(),
         )
         # GDB must fail checkpoint command with error message
         self.assertNotEqual(res.returncode, 0)
@@ -425,7 +427,8 @@ print("MULTITHREAD_BRANCH_INDEPENDENCE_SUCCESS")
         res = subprocess.run(
             ["gdb", "-batch", "-ex", f"python\n{py_script}\n"],
             capture_output=True,
-            text=True
+            text=True,
+            env=gdb_subprocess_env(),
         )
         self.assertEqual(res.returncode, 0, f"GDB test failed:\nSTDOUT:\n{res.stdout}\nSTDERR:\n{res.stderr}")
         self.assertIn("MULTITHREAD_BRANCH_INDEPENDENCE_SUCCESS", res.stdout)
@@ -467,7 +470,8 @@ print("MULTITHREAD_CRASH_ISOLATION_SUCCESS")
         res = subprocess.run(
             ["gdb", "-batch", "-ex", f"python\n{py_script}\n"],
             capture_output=True,
-            text=True
+            text=True,
+            env=gdb_subprocess_env(),
         )
         self.assertEqual(res.returncode, 0, f"GDB crash recovery failed:\nSTDOUT:\n{res.stdout}\nSTDERR:\n{res.stderr}")
         self.assertIn("MULTITHREAD_CRASH_ISOLATION_SUCCESS", res.stdout)
@@ -628,7 +632,8 @@ print("REQUIREMENT_7_PARENT_A_RESTORE_B_RESTORE_PASS")
         res = subprocess.run(
             ["gdb", "-batch", "-ex", f"python\n{py_script}\n"],
             capture_output=True,
-            text=True
+            text=True,
+            env=gdb_subprocess_env(),
         )
         self.assertEqual(res.returncode, 0, f"GDB test failed:\nSTDOUT:\n{res.stdout}\nSTDERR:\n{res.stderr}")
         self.assertIn("REQUIREMENT_7_PARENT_A_RESTORE_B_RESTORE_PASS", res.stdout)
@@ -692,7 +697,8 @@ print("REQUIREMENT_9_TIMEOUT_ISOLATION_PASS")
         res = subprocess.run(
             ["gdb", "-batch", "-ex", f"python\n{py_script}\n"],
             capture_output=True,
-            text=True
+            text=True,
+            env=gdb_subprocess_env(),
         )
         self.assertEqual(res.returncode, 0, f"GDB timeout isolation failed:\nSTDOUT:\n{res.stdout}\nSTDERR:\n{res.stderr}")
         self.assertIn("REQUIREMENT_9_TIMEOUT_ISOLATION_PASS", res.stdout)
@@ -738,7 +744,8 @@ print("REQUIREMENT_10_THREAD_LIFECYCLE_ISOLATION_PASS")
         res = subprocess.run(
             ["gdb", "-batch", "-ex", f"python\n{py_script}\n"],
             capture_output=True,
-            text=True
+            text=True,
+            env=gdb_subprocess_env(),
         )
         self.assertEqual(res.returncode, 0, f"GDB lifecycle isolation failed:\nSTDOUT:\n{res.stdout}\nSTDERR:\n{res.stderr}")
         self.assertIn("REQUIREMENT_10_THREAD_LIFECYCLE_ISOLATION_PASS", res.stdout)
@@ -781,7 +788,8 @@ print("REQUIREMENT_11_TLS_DETERMINISM_PASS")
         res = subprocess.run(
             ["gdb", "-batch", "-ex", f"python\n{py_script}\n"],
             capture_output=True,
-            text=True
+            text=True,
+            env=gdb_subprocess_env(),
         )
         self.assertEqual(res.returncode, 0, f"GDB TLS determinism failed:\nSTDOUT:\n{res.stdout}\nSTDERR:\n{res.stderr}")
         self.assertIn("REQUIREMENT_11_TLS_DETERMINISM_PASS", res.stdout)
@@ -821,7 +829,8 @@ print("REQUIREMENT_12_NONDETERMINISTIC_CLASSIFICATION_PASS")
         res = subprocess.run(
             ["gdb", "-batch", "-ex", f"python\n{py_script}\n"],
             capture_output=True,
-            text=True
+            text=True,
+            env=gdb_subprocess_env(),
         )
         self.assertEqual(res.returncode, 0, f"GDB nondeterministic workload failed:\nSTDOUT:\n{res.stdout}\nSTDERR:\n{res.stderr}")
         self.assertIn("REQUIREMENT_12_NONDETERMINISTIC_CLASSIFICATION_PASS", res.stdout)

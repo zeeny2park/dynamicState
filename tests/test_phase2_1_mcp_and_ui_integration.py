@@ -29,6 +29,7 @@ import subprocess
 import time
 import unittest
 
+from tests.fixture_builds import ensure_expert_diagnostic_fixture
 from extractor.agent_runtime import AgentRuntime
 from extractor.web.server import WebApiAdapter
 import scripts.mcp_server as mcp_srv
@@ -40,7 +41,7 @@ class TestPhase21McpAndUiIntegration(unittest.TestCase):
     def setUp(self):
         self.runtime = AgentRuntime(corpus_dir="/tmp/phase2_1_mcp_corpus")
         self.web_adapter = WebApiAdapter(self.runtime)
-        self.companion_elf = "/tmp/expert_diagnostic_debug.elf"
+        self.companion_elf, _ = ensure_expert_diagnostic_fixture(need_stripped=False)
         self.proc = subprocess.Popen([self.companion_elf, "healthy"], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         time.sleep(0.15)
         self.pid = self.proc.pid

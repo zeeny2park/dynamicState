@@ -28,6 +28,7 @@ import time
 import unittest
 from unittest.mock import MagicMock, patch
 
+from tests.fixture_builds import ensure_expert_diagnostic_fixture
 from extractor.diagnostic_methodology import (
     CheckStatus,
     DiagnosticCheck,
@@ -574,13 +575,7 @@ class TestRealisticCppScenarios(unittest.TestCase):
 
     def test_cpp_memory_leak_investigation_end_to_end(self):
         debug_elf = "/tmp/expert_diagnostic_debug.elf"
-        if not os.path.exists(debug_elf):
-            cmd = (
-                "g++ -g -O0 -fno-inline -fno-omit-frame-pointer "
-                "tests/fixtures/real_runtime/expert_diagnostic_scenarios.cpp "
-                "-o /tmp/expert_diagnostic_debug.elf -lpthread"
-            )
-            subprocess.run(cmd, shell=True, check=True)
+        ensure_expert_diagnostic_fixture(need_stripped=False)
 
         proc = subprocess.Popen([debug_elf, "leak"], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         try:

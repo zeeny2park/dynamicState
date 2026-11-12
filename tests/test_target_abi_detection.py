@@ -220,8 +220,16 @@ class TestSyscallTables(unittest.TestCase):
                 by_num = {}
                 for name, n in nums.items():
                     by_num.setdefault(n, set()).add(name)
+                compared = 0
                 for n, name in SYSCALL_TABLES[arch].items():
+                    if name not in nums and n not in by_num:
+                        # Syscall newer than the installed kernel headers (e.g. futex_waitv=449 vs Ubuntu 22.04's
+                        # 5.15 uapi): the headers define neither the name nor the number, so there is nothing to
+                        # compare against - not an error. Any number the headers DO define must still match.
+                        continue
                     self.assertIn(name, by_num.get(n, set()), f"{arch}: {n} is not {name} in {cc} headers")
+                    compared += 1
+                self.assertGreater(compared, 0, f"{arch}: no table entry could be compared with {cc} headers")
                 checked += 1
                 break
         if not checked:

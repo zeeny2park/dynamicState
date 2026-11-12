@@ -276,7 +276,19 @@ class TestPhase47DpdkIsolatedLcoreAndPmd(unittest.TestCase):
 
         self.assertTrue(lc1["is_single_core_pinned"])
         self.assertEqual(lc1["lcore_id"], 1)
-        self.assertEqual(lc1["pmd_health_status"], "PMD_POLLING_HEALTHY")
+        # The lcore id / TLS progress / ring facts above and below are deterministic. The jitter
+        # classification is environmental: on a shared, non-isolated (non-isolcpus) VM the scheduler
+        # preempts the spinning thread (non-voluntary context switches / CPU migration) inside the
+        # sampling window, which the product correctly reports as PMD_POLLING_WITH_OS_JITTER. So: the
+        # lcore must be classified as polling (never stuck), and the classification must agree with the
+        # jitter evidence the same report carries - HEALTHY iff no jitter evidence, JITTER only with it.
+        self.assertIn(lc1["pmd_health_status"], ("PMD_POLLING_HEALTHY", "PMD_POLLING_WITH_OS_JITTER"))
+        jitter_evidence = lc1["nonvoluntary_ctxt_switches_delta"] > 0 or lc1["cpu_migrated"]
+        self.assertEqual(lc1["isolation_jitter_detected"], jitter_evidence)
+        if jitter_evidence:
+            self.assertEqual(lc1["pmd_health_status"], "PMD_POLLING_WITH_OS_JITTER")
+        else:
+            self.assertEqual(lc1["pmd_health_status"], "PMD_POLLING_HEALTHY")
         self.assertGreater(lc1["progress_delta"], 0)
         self.assertEqual(lc1["top_function"], "pmd_poll_rx_tx_burst")
 

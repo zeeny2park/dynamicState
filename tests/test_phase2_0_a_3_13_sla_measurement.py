@@ -14,6 +14,7 @@ import subprocess
 import time
 import unittest
 
+from tests.fixture_builds import ensure_real_runtime_app_debug
 from extractor.target_adapter import LocalTargetAdapter
 
 
@@ -22,15 +23,7 @@ class TestPhase20A313SlaMeasurement(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.bin_path = "/tmp/real_runtime_app_debug.elf"
-        if not os.path.exists(cls.bin_path):
-            res = subprocess.run([
-                "g++", "-fPIE", "-pie", "-g", "-O0", "-fno-inline", "-fno-omit-frame-pointer",
-                "-Wl,--build-id=sha1", "tests/fixtures/real_runtime/main.cpp",
-                "-o", cls.bin_path, "-lpthread"
-            ], capture_output=True)
-            if res.returncode != 0:
-                raise RuntimeError(f"Failed compiling test fixture: {res.stderr.decode()}")
+        cls.bin_path = ensure_real_runtime_app_debug()
 
     def setUp(self):
         self.proc = subprocess.Popen(

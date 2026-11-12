@@ -13,6 +13,7 @@ import subprocess
 import time
 import unittest
 
+from tests.fixture_builds import ensure_expert_diagnostic_fixture
 from extractor.expert_diagnostic_engine import (
     STATE_ASSESSING,
     STATE_BLOCKED,
@@ -36,14 +37,7 @@ class TestPhase21AdaptiveInvestigationLifecycle(unittest.TestCase):
         # IMP-001: an investigation only reaches COMPLETED when checks really pass, so the full
         # lifecycle runs against the matching healthy fixture process (not the test interpreter
         # paired with an unrelated companion ELF, whose checks are all INCONCLUSIVE).
-        if not os.path.exists("/tmp/expert_diagnostic_debug.elf"):
-            subprocess.run(
-                "g++ -g -O0 -fno-inline -fno-omit-frame-pointer "
-                "tests/fixtures/real_runtime/expert_diagnostic_scenarios.cpp "
-                "-o /tmp/expert_diagnostic_debug.elf -lpthread",
-                shell=True,
-                check=True,
-            )
+        ensure_expert_diagnostic_fixture(need_stripped=False)
         proc = subprocess.Popen(["/tmp/expert_diagnostic_debug.elf", "healthy"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         self.addCleanup(lambda: (proc.kill(), proc.wait(timeout=5)))
         time.sleep(0.2)
