@@ -1230,6 +1230,11 @@ class AdaptiveInvestigationSession:
             corpus_dir=self.corpus_dir,
             budget_tracker=self.budget_tracker,
         )
+        # IMP-010: thread time-series sampling is configurable through the recipe thresholds
+        self.evidence_provider.thread_sampling_overrides = {
+            k: v for k, v in self.recipe_thresholds.items()
+            if k in ("thread_sample_count", "thread_sample_interval_sec", "runaway_cpu_share")
+        }
         self.temporal_memory_samples: List[Dict[str, Any]] = []
         self.observation_window = ObservationWindow(
             target_pid=pid or 0,

@@ -23,6 +23,16 @@ import uuid
 from .target_adapter import LocalTargetAdapter, TargetExecutionAdapter
 from .temporal_observation_window import MemorySample, ObservationWindow, MemoryBehavior
 from .watch_session import WatchSessionManager, read_process_memory_slice
+from .thread_sampler import (
+    LockObservationSeries,
+    ThreadSampler,
+    ThreadSamplingConfig,
+    augment_lock_info,
+    judge as judge_thread_series,
+)
+
+# Recipes whose inputs come from the per-thread time series (IMP-010)
+THREAD_SAMPLING_RECIPES = frozenset({"RECIPE_THREAD_STATE_ANOMALIES", "RECIPE_LONG_RUNNING_BLOCKED_THREADS"})
 
 
 # Provenance constants
@@ -114,6 +124,69 @@ class RuntimeEvidenceProvider:
         self.watch_manager = watch_manager or WatchSessionManager(corpus_dir=corpus_dir or "/tmp/dynamicstate_corpus")
         self.budget_tracker = budget_tracker
         self._historical_samples: Dict[str, Dict[str, Any]] = {}
+        # IMP-010: overrides for ThreadSamplingConfig (thread_sample_count, thread_sample_interval_sec, ...)
+        self.thread_sampling_overrides: Dict[str, Any] = {}
+
+    def _inspect_locks(self, pid: int, companion_elf: Optional[str]) -> Any:
+        """One lock inspection (existing callstack/lock interface) widened with member / futex mutexes (IMP-010)."""
+        info = self.watch_manager.inspect_thread_callstacks_and_locks(
+            pid=pid,
+            companion_elf_path=companion_elf or "",
+            adapter=self.adapter,
+        )
+        return augment_lock_info(
+            info, pid=pid, adapter=self.adapter, companion_elf=companion_elf or "", watch_manager=self.watch_manager,
+        )
+
+    def _collect_thread_series(
+        self,
+        recipe: Any,
+        pid: int,
+        companion_elf: Optional[str],
+        observation_data: Dict[str, Any],
+        all_records: List[RuntimeEvidenceRecord],
+    ) -> None:
+        """IMP-010: N samples per thread -> existing thread-recipe input keys (runaway_threads, zombie_threads,
+        thread_state_anomaly, threads_healthy, blocked_duration_sec, persistent_block) + long_wait_threads."""
+        cfg = ThreadSamplingConfig.from_thresholds({**getattr(recipe, "thresholds_and_conditions", {}), **self.thread_sampling_overrides})
+        try:
+            sampler = ThreadSampler(self.adapter, self.watch_manager, self.budget_tracker)
+            series = sampler.collect(pid, companion_elf or "", cfg, inspect_fn=lambda: self._inspect_locks(pid, companion_elf))
+            derived = judge_thread_series(series)
+        except Exception as exc:  # noqa: BLE001
+            all_records.append(RuntimeEvidenceRecord(
+                evidence_id=f"ev_{uuid.uuid4().hex[:12]}",
+                collection_method="thread_sampler",
+                target_pid=pid,
+                observed_value=None,
+                collection_scope="THREAD_TIME_SERIES",
+                collection_status=COLLECTION_STATUS_FAILED,
+                limitations=[f"Thread time-series sampling failed: {type(exc).__name__}: {exc}"],
+                provenance_class=PROVENANCE_LIVE_RUNTIME_CAPTURE,
+            ))
+            observation_data["thread_sampling"] = {"status": "FAILED", "error": f"{type(exc).__name__}: {exc}"}
+            return
+        meta = derived.get("thread_sampling", {})
+        ok = meta.get("status") == "OK"
+        all_records.append(RuntimeEvidenceRecord(
+            evidence_id=f"ev_{uuid.uuid4().hex[:12]}",
+            collection_method="thread_sampler",
+            target_pid=pid,
+            observed_value={k: derived.get(k) for k in (
+                "thread_sampling", "thread_findings", "thread_count_trend", "thread_count_series") if k in derived},
+            collection_scope="THREAD_TIME_SERIES",
+            collection_status=COLLECTION_STATUS_SUCCESS if ok else COLLECTION_STATUS_FAILED,
+            limitations=([] if ok else [f"Thread time series not usable: {meta.get('status')} {meta.get('stop_reason') or ''}".strip()]),
+            provenance_class=PROVENANCE_LIVE_RUNTIME_CAPTURE,
+            raw_details=derived,
+        ))
+        # Only a usable series may influence rule inputs; an unusable one adds nothing (no "healthy" by default).
+        keep = dict(derived)
+        if not ok:
+            for k in ("threads_healthy", "thread_state_anomaly", "runaway_threads", "zombie_threads",
+                      "blocked_duration_sec", "persistent_block", "long_wait_threads"):
+                keep.pop(k, None)
+        observation_data.update(keep)
 
     def get_target_identity_key(self, pid: int) -> Tuple[Optional[str], Optional[Dict[str, Any]], Optional[str]]:
         """Discovers and verifies mandatory process identity fields.
@@ -1135,7 +1208,7 @@ class RuntimeEvidenceProvider:
         # -------------------------------------------------------------------------
         # 3. Abnormal Runtime State Domain
         # -------------------------------------------------------------------------
-        if domain == "ABNORMAL_STATE" or "STATE" in recipe_id or "VARIABLE" in recipe_id or "BOUNDARY" in recipe_id:
+        if recipe_id not in THREAD_SAMPLING_RECIPES and (domain == "ABNORMAL_STATE" or "STATE" in recipe_id or "VARIABLE" in recipe_id or "BOUNDARY" in recipe_id):
             exprs: List[str] = []
             if classification and hasattr(classification, "extracted_entities"):
                 exprs.extend(classification.extracted_entities.get("variables", []))
@@ -1213,11 +1286,9 @@ class RuntimeEvidenceProvider:
 
             # Inspect thread callstacks and mutex locks using watch_manager
             try:
-                callstacks_info = self.watch_manager.inspect_thread_callstacks_and_locks(
-                    pid=pid,
-                    companion_elf_path=companion_elf or "",
-                    adapter=self.adapter,
-                )
+                callstacks_info = self._inspect_locks(pid, companion_elf)
+                lock_series = LockObservationSeries()   # IMP-010: every successful inspection feeds a WaitForGraph
+                lock_series.add_sample(1, callstacks_info)
                 rec = RuntimeEvidenceRecord(
                     evidence_id=f"ev_{uuid.uuid4().hex[:12]}",
                     collection_method="watch_manager.inspect_thread_callstacks_and_locks",
@@ -1282,11 +1353,7 @@ class RuntimeEvidenceProvider:
                     callstacks_info_2: Any = None
                     second_error: Optional[str] = None
                     try:
-                        callstacks_info_2 = self.watch_manager.inspect_thread_callstacks_and_locks(
-                            pid=pid,
-                            companion_elf_path=companion_elf or "",
-                            adapter=self.adapter,
-                        )
+                        callstacks_info_2 = self._inspect_locks(pid, companion_elf)
                     except Exception as e2:
                         second_error = f"{type(e2).__name__}: {e2}"
                     if second_error is None:
@@ -1314,7 +1381,9 @@ class RuntimeEvidenceProvider:
                             raw_details=callstacks_info_2 if isinstance(callstacks_info_2, dict) else {},
                         ))
                         observation_data["reobservation_error"] = second_error
+                        lock_series.add_failure(2, second_error)
                     else:
+                        lock_series.add_sample(2, callstacks_info_2)
                         rec_2 = RuntimeEvidenceRecord(
                             evidence_id=f"ev_{uuid.uuid4().hex[:12]}",
                             collection_method="watch_manager.inspect_thread_callstacks_and_locks",
@@ -1333,21 +1402,12 @@ class RuntimeEvidenceProvider:
                         observation_data["observation_count"] = 2
                         observation_data["historical_observations"] = 2
 
-                        dl_cycles_2 = callstacks_info_2.get("deadlock_cycles", [])
-                        dl_first_2 = callstacks_info_2.get("deadlock_cycle") or (dl_cycles_2[0] if dl_cycles_2 else [])
-                        second_cycle_edges = {
-                            (
-                                int(c.get("waiter_tid") or c.get("tid") or 0),
-                                str(c.get("lock_address") or c.get("lock_name") or ""),
-                                int(c.get("owner_tid") or 0),
-                            )
-                            for c in dl_first_2 if isinstance(c, dict)
-                        }
-                        same_cycle_persisted = bool(
-                            callstacks_info_2.get("deadlock_detected")
-                            and first_cycle_edges
-                            and first_cycle_edges == second_cycle_edges
-                        )
+                        # Persistence is judged by the wait-for graph's multi-observation semantics over the
+                        # successful samples (IMP-010); a different cycle is a different signature.
+                        persistence = lock_series.persistence(frozenset(first_cycle_edges)) if first_cycle_edges else {
+                            "persistent": False, "epochs": [], "state": "NOT_OBSERVED"}
+                        observation_data["lock_graph_persistence"] = persistence
+                        same_cycle_persisted = bool(first_cycle_edges and persistence["persistent"])
                         observation_data["cycle_persistent"] = same_cycle_persisted
                         observation_data["is_persistent"] = same_cycle_persisted
                         if not same_cycle_persisted and not callstacks_info_2.get("deadlock_detected"):
@@ -1373,6 +1433,9 @@ class RuntimeEvidenceProvider:
                 )
                 all_records.append(rec)
                 observation_data["lock_inspection_error"] = str(e)
+
+            if recipe_id in THREAD_SAMPLING_RECIPES:
+                self._collect_thread_series(recipe, pid, companion_elf, observation_data, all_records)
 
             return observation_data, all_records
 
