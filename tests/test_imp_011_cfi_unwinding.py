@@ -332,16 +332,20 @@ def _compare_with_readelf(testcase, path, max_fdes=None):
                 if reg is None:
                     continue
                 mine = _cell_of(row.rules.get(img_reg), names)
-                if mine != cell and col == "ra" and cell == "u" and loc == pc_begin:
-                    # Observed with binutils 2.38 (ubuntu-22.04): readelf prints the RA column as `u` already on
-                    # the FDE's first row for `advance_loc; DW_CFA_undefined ra` programs (glibc _start/libc
-                    # entry points), where DWARF says the CIE rule (c-8) holds until the advanced location.
-                    # Not loosened blindly: the raw op listing must prove the undefined comes after an
-                    # advance_loc, and our row at that later location must be `u`.
+                if mine != cell and cell == "u":
+                    # binutils 2.38 (ubuntu-22.04) readelf pre-scans each FDE and marks every column that the
+                    # program later hits with DW_CFA_undefined as `u` from the FDE's first row on, although per
+                    # DWARF the CIE rule holds until that instruction's location (seen on glibc 2.35 libc and
+                    # crt entry points; binutils 2.42 prints the per-row truth). Not loosened blindly: the raw
+                    # op listing must contain a DW_CFA_undefined for this very column, and our own table must
+                    # turn `u` for it at a later row of the same FDE.
                     raw = raw_ops_cache.setdefault("ops", _readelf_raw_fde_ops(path)).get(pc_begin, [])
-                    later = [r for r in rows if r[0] > pc_begin]
-                    if (_ra_undefined_deferred_by_advance(raw, img_reg)
-                            and later and _cell_of(img.row_at(later[0][0], fde)[1].rules.get(img_reg), names) == "u"):
+                    has_undef = any(o.startswith("DW_CFA_undefined") and re.search(rf"\br{img_reg}\b", o) for o in raw)
+                    later_u = any(
+                        _cell_of(img.row_at(r[0], fde)[1].rules.get(img_reg), names) == "u"
+                        for r in rows if r[0] > loc
+                    )
+                    if has_undef and later_u:
                         continue
                 testcase.assertEqual(mine, cell, f"{path} FDE 0x{pc_begin:x} loc 0x{loc:x} column {col}")
             checked_rows += 1
