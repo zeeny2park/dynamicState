@@ -112,8 +112,11 @@ class TestInvestigationBackwardCompatibility(unittest.TestCase):
         inv_data = json.loads(inv_proc.stdout)
         self.assertEqual(inv_data["goal"], "CLI verification goal")
         self.assertIn("findings", inv_data)
-        self.assertIn("next_steps", inv_data)
-        self.assertGreater(inv_data["evidence_count"], 0)
+        # 533a0bb renamed the report key next_steps -> recommended_next_steps
+        self.assertIn("recommended_next_steps", inv_data)
+        # 533a0bb dropped the top-level evidence_count from the report; evidence lives in the ledger
+        self.assertGreater(inv_data["evidence_ledger"]["record_count"], 0)
+        self.assertEqual(inv_data["evidence_ledger"]["record_count"], len(inv_data["evidence_ledger"]["records"]))
 
 
         # 2. CLI compare

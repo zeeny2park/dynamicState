@@ -27,6 +27,7 @@ D. Collection Environment:
 import errno
 import json
 import os
+import platform
 import shutil
 import socket
 import struct
@@ -198,6 +199,10 @@ int main(int argc, char** argv) {
 """
 
 
+# ELF architecture name reported by inspect_elf for natively compiled binaries on this host.
+_NATIVE_ELF_ARCH = {"aarch64": "aarch64", "arm64": "aarch64", "x86_64": "x86_64", "amd64": "x86_64"}[platform.machine().lower()]
+
+
 class TestPhase24RealWorldTargets(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -274,7 +279,7 @@ class TestPhase24RealWorldTargets(unittest.TestCase):
         """Verify ELF inspector correctly parses native ARM64, cross-compiled x86_64, and ARM32."""
         # 1. Native ARM64
         ident_arm64 = inspect_elf(self.bin_debug)
-        self.assertEqual(ident_arm64.architecture, "aarch64")
+        self.assertEqual(ident_arm64.architecture, _NATIVE_ELF_ARCH)
         self.assertEqual(ident_arm64.elf_class, "ELF64")
         self.assertEqual(ident_arm64.endianness, "little")
         self.assertTrue(ident_arm64.has_debug_info)
@@ -371,7 +376,7 @@ class TestPhase24RealWorldTargets(unittest.TestCase):
             self.assertTrue(alive, f"Target process {pid} must be alive: {reason}")
             ident = adapter.get_process_identity(pid)
             self.assertEqual(ident["pid"], pid)
-            self.assertEqual(ident["architecture"], "aarch64")
+            self.assertEqual(ident["architecture"], _NATIVE_ELF_ARCH)
             self.assertEqual(ident["elf_type"], "ET_DYN")
 
             # 2. Verify thread enumeration on real running process

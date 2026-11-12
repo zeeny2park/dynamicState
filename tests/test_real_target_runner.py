@@ -73,9 +73,9 @@ class TestRealTargetRunner(unittest.TestCase):
 
     def test_02_ready_handshake_missing_ready(self) -> None:
         """Verifies that target output missing 'READY: PID=' is detected and rejected promptly."""
-        # Process that writes something else and exits
+        # Process that writes something else and stays alive, so the reader never races with process exit
         proc = subprocess.Popen(
-            ["python3", "-u", "-c", "import sys; print('STARTING_UP...', flush=True)"],
+            ["python3", "-u", "-c", "print('STARTING_UP...', flush=True); import time; time.sleep(30)"],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
@@ -89,9 +89,10 @@ class TestRealTargetRunner(unittest.TestCase):
 
     def test_03_ready_handshake_malformed_pid(self) -> None:
         """Verifies that non-integer or mismatched PIDs in the handshake are rejected."""
+        # Children keep running after printing so the handshake reader never races with process exit (timing-deterministic).
         # Non-integer PID
         proc1 = subprocess.Popen(
-            ["python3", "-u", "-c", "print('READY: PID=not_a_number', flush=True)"],
+            ["python3", "-u", "-c", "print('READY: PID=not_a_number', flush=True); import time; time.sleep(30)"],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
@@ -105,7 +106,7 @@ class TestRealTargetRunner(unittest.TestCase):
 
         # Mismatched PID
         proc2 = subprocess.Popen(
-            ["python3", "-u", "-c", "print('READY: PID=9999999', flush=True)"],
+            ["python3", "-u", "-c", "print('READY: PID=9999999', flush=True); import time; time.sleep(30)"],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,

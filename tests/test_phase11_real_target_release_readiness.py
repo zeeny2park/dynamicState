@@ -35,6 +35,7 @@ import subprocess
 import tempfile
 import time
 import unittest
+import unittest.mock
 from typing import Optional
 
 from extractor.capture_backend import (
@@ -927,9 +928,20 @@ class TestPhase11CaptureLifecycleAndPerformance(BasePhase11ProcessTestCase):
         proc = self._start_process(self.stripped_bin)
         try:
             backend = ProcessVmCaptureBackend() if ProcessVmCaptureBackend().is_available(proc.pid) else ProcfsCaptureBackend()
-            # Set SLA threshold lower than actual suspension time (typically 3-6ms) but long enough to confirm stop
-            policy = CaptureSafetyPolicy(max_stop_time_ms=1.0)
-            snap = backend.capture(pid=proc.pid, policy=policy)
+            # The SLA threshold also bounds the stop-confirmation window, so it must stay comfortably above
+            # the time SIGSTOP needs to take effect. Make the overrun deterministic and host-speed independent
+            # (instead of relying on a typical 3-6ms suspension, which fast hosts beat) by holding the target
+            # stopped for 60ms before SIGCONT is delivered, against a 20ms SLA.
+            policy = CaptureSafetyPolicy(max_stop_time_ms=20.0)
+            real_send_signal = ProcessTargetHandle.send_signal
+
+            def _slow_resume(handle_self, sig):
+                if sig == signal.SIGCONT:
+                    time.sleep(0.06)
+                return real_send_signal(handle_self, sig)
+
+            with unittest.mock.patch.object(ProcessTargetHandle, "send_signal", _slow_resume):
+                snap = backend.capture(pid=proc.pid, policy=policy)
 
             # Completeness demoted to PARTIAL due to stop budget exceeded
             self.assertEqual(snap.completeness, "PARTIAL")

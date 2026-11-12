@@ -446,6 +446,9 @@ class TestPhase13RealCppOperationalAcceptance(BasePhase13ProcessTestCase):
                 "control_evidence_id": "ev_control_baseline_s5",
                 "active_writer_function": "active_worker_state_writer",
             },
+            # e182796: capability issuance requires the receipt itself to be bound to the evidence/hypothesis
+            hypothesis_id="hypo_s5",
+            evidence_id="ev_treatment_s5",
         )
 
         self.assertTrue(receipt.state_transition_verified)

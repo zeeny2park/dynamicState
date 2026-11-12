@@ -38,6 +38,7 @@ class TestPhase20A313TransactionContextSecurity(unittest.TestCase):
             "pid": self.pid,
             "process_identity": "test_app_proc",
             "start_time": "12345678",
+            "boot_id": "boot-test-0001",
             "executable": "/usr/bin/test_app",
             "executable_identity": "/usr/bin/test_app",
             "build_id": "sha1:abc123456789def",

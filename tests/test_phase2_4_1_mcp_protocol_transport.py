@@ -22,6 +22,7 @@ Validates:
 import asyncio
 import json
 import os
+import platform
 import shutil
 import subprocess
 import tempfile
@@ -138,7 +139,10 @@ class TestPhase241McpProtocolTransport(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(conn_data.get("pid"), self.pid)
                 self.assertIn("build_id", conn_data)
                 self.assertIn("active_context", conn_data)
-                self.assertEqual(conn_data.get("architecture"), "aarch64")
+                self.assertEqual(
+                    conn_data.get("architecture"),
+                    {"arm64": "aarch64", "amd64": "x86_64"}.get(platform.machine().lower(), platform.machine().lower()),
+                )
 
                 # 2. runtime_symbol_search
                 sym_res = await session.call_tool(

@@ -72,6 +72,14 @@ from extractor.dwarf_indexer import (
 from extractor.ebpf_tracer import FrameMetadata
 
 
+
+def _fbreg_offset(subp, var_name: str) -> int:
+    """DW_OP_fbreg offset of a variable as emitted by the host compiler (stack layout is architecture-dependent)."""
+    m = re.search(r"DW_OP_fbreg:\s*(-?\d+)", subp.get_variable(var_name).location_expr)
+    assert m, f"{var_name} is not a DW_OP_fbreg variable"
+    return int(m.group(1))
+
+
 class TestDwarfEvaluatorCorrectness(unittest.TestCase):
     """Deep verification of DWARF location evaluation, frame-base rules, and GDB parity."""
 
@@ -188,7 +196,8 @@ class TestDwarfEvaluatorCorrectness(unittest.TestCase):
         fp = 0x7fffffffe000
 
         # Memory reader simulating stack contents at op_code address
-        fake_mem = {fp + 16 - 116: struct.pack("<i", 42)}
+        op_off = _fbreg_offset(subp, "op_code")
+        fake_mem = {fp + 16 + op_off: struct.pack("<i", 42)}
         def mem_reader(addr: int, sz: int) -> Optional[bytes]:
             return fake_mem.get(addr)
 
@@ -205,7 +214,7 @@ class TestDwarfEvaluatorCorrectness(unittest.TestCase):
         self.assertEqual(res.status, EVAL_STATUS_OBSERVED)
         self.assertEqual(res.value, 42)
         self.assertEqual(res.value_hex, "0x0000002a")
-        self.assertEqual(res.evaluated_address, fp + 16 - 116)
+        self.assertEqual(res.evaluated_address, fp + 16 + op_off)
 
     def test_03_omitted_frame_pointer_is_truthfully_unavailable(self):
         """Binaries compiled with -fomit-frame-pointer must return UNAVAILABLE, never guess FP+16."""
@@ -437,7 +446,7 @@ class TestDwarfEvaluatorCorrectness(unittest.TestCase):
         post_pc = subp.frame_established_pc or (subp.low_pc + 16)
         fp = 0x7fffffffe000
 
-        fake_mem = {fp + 16 - 116: struct.pack("<i", 99)}
+        fake_mem = {fp + 16 + _fbreg_offset(subp, "op_code"): struct.pack("<i", 99)}
         ctx = DwarfEvaluationContext(
             binary_identity=ident,
             subprogram=subp,
@@ -719,7 +728,7 @@ class TestDwarfEvaluatorCorrectness(unittest.TestCase):
             subp = idx.subprograms_by_name["trace_target_function"][0]
 
             fp = 0x7fffffffe000
-            var_offset = -116
+            var_offset = _fbreg_offset(subp, "op_code")
             mem = {
                 (fp + 16 + var_offset): b"\x2a\x00\x00\x00",
             }

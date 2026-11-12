@@ -114,7 +114,12 @@ class TestEvidenceSchema(unittest.TestCase):
             parent_evidence_ids=["ev_missing_parent"],
             observation="Child with missing parent",
         )
-        ledger.add_record(rec)
+        # add_record() rejects dangling parents (79ed54e)
+        with self.assertRaisesRegex(ValueError, "nonexistent parent record"):
+            ledger.add_record(rec)
+        # trace must still fail safe if admitted state is corrupted afterwards
+        ledger.add_record(EvidenceRecord(evidence_id="ev_child", observation="Child"))
+        ledger.get_record("ev_child").parent_evidence_ids = ["ev_missing_parent"]
         chain = ledger.trace_provenance_chain("ev_child")
         self.assertEqual(len(chain), 2)
         self.assertEqual(chain[0]["evidence_id"], "ev_child")
@@ -124,10 +129,13 @@ class TestEvidenceSchema(unittest.TestCase):
 
     def test_provenance_chain_cycle_detection(self):
         ledger = EvidenceLedger()
-        rec_a = EvidenceRecord(evidence_id="ev_a", parent_evidence_ids=["ev_b"])
+        rec_a = EvidenceRecord(evidence_id="ev_a")
         rec_b = EvidenceRecord(evidence_id="ev_b", parent_evidence_ids=["ev_a"])
         ledger.add_record(rec_a)
         ledger.add_record(rec_b)
+        # A cycle cannot be admitted (parents must pre-exist); corrupt in place instead
+        # and ensure trace_provenance_chain still terminates and reports it.
+        rec_a.parent_evidence_ids = ["ev_b"]
         chain = ledger.trace_provenance_chain("ev_a")
         cycle_entries = [c for c in chain if c.get("status") == "CYCLE_DETECTED"]
         self.assertTrue(len(cycle_entries) > 0)

@@ -452,7 +452,7 @@ class TestHypothesisValidator(unittest.TestCase):
             execution_id="exec_det_1",
             investigation_id=self.ledger.session_id,
             target_function="mutate_state",
-            field_path="",
+            field_path="State.counter",
             before_value=42,
             after_value=100,
             execution_status="REPRODUCED",
@@ -567,6 +567,16 @@ class TestInvestigationManagerHypothesisIntegration(unittest.TestCase):
         )
         inv_id = start_res["investigation_id"]
         session = self.manager.sessions[inv_id]
+
+        # Hypothesis evidence records require their parent evidence to exist in the ledger
+        session.ledger.add_record(EvidenceRecord(
+            evidence_id="ev_start_1",
+            evidence_type=EVIDENCE_TYPE_COMPARISON,
+            nature=NATURE_OBSERVATION,
+            source="test",
+            session_id=inv_id,
+            observation="Counter mutated from 42 to 100",
+        ))
 
         # 2. Add finding to session
         finding = InvestigationFinding(
@@ -750,6 +760,15 @@ class TestAgentRuntimeAndWebAdapterHypothesisEndpoints(unittest.TestCase):
         inv_id = start_res.data["investigation_id"]
 
         session = self.runtime.investigation_manager.sessions[inv_id]
+        # Hypothesis evidence records require their parent evidence to exist in the ledger
+        session.ledger.add_record(EvidenceRecord(
+            evidence_id="ev_1",
+            evidence_type=EVIDENCE_TYPE_COMPARISON,
+            nature=NATURE_OBSERVATION,
+            source="test",
+            session_id=inv_id,
+            observation="Diff 1 -> 2",
+        ))
         # Add finding and run synthesis
         session.findings.append(InvestigationFinding(
             finding_id="fnd_arp",
@@ -761,6 +780,10 @@ class TestAgentRuntimeAndWebAdapterHypothesisEndpoints(unittest.TestCase):
             field_name="val",
             before_value=1,
             after_value=2,
+            function_candidates=[{
+                "function_name": "update_val",
+                "evidence_level": "static",
+            }],
         ))
         self.runtime.investigation_manager._execute_stage_synthesis(session)
         self.assertGreaterEqual(len(session.hypotheses), 1)

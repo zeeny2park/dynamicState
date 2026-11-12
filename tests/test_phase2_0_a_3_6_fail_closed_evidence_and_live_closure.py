@@ -496,7 +496,8 @@ class TestPhase20A36FailClosedEvidenceAndLiveClosure(unittest.TestCase):
             data_reused, status_reused, err_reused = adapter.read_memory(proc.pid, addr, 4)
             self.assertIsNone(data_reused)
             self.assertEqual(status_reused, "PID_REUSED")
-            self.assertIn("PID reuse detected", err_reused)
+            self.assertIn("Target identity changed", err_reused)
+            self.assertIn("start_time", err_reused)
         finally:
             proc.kill()
             proc.wait()

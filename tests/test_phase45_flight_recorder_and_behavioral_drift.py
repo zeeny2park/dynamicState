@@ -1,6 +1,8 @@
 import os
+import signal
 import subprocess
 import tempfile
+import threading
 import time
 import unittest
 
@@ -11,6 +13,7 @@ from extractor.web.server import WebApiAdapter
 
 PHASE45_TARGET_CPP = r"""
 #include <pthread.h>
+#include <signal.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -36,16 +39,29 @@ volatile int32_t g_transient_spike_flag = 0;
 volatile int32_t g_drift_mode = 0;
 volatile int g_keep_running = 1;
 volatile int g_ready = 0;
+volatile sig_atomic_t g_spike_request = 0;
+
+static void on_spike_request(int sig) {
+    (void)sig;
+    g_spike_request = 1;
+}
 
 void* spike_and_drift_worker(void* arg) {
     (void)arg;
     prctl(PR_SET_NAME, "spike_worker", 0, 0, 0);
     g_ready = 1;
     int tick = 0;
+    int spike_ticks_left = 0;
     while (g_keep_running) {
         tick++;
-        // Toggle transient spike every alternate 25ms window so Flight Recorder sees 0 -> 999 -> 0
-        if (tick % 2 == 1) {
+        // One transient spike per SIGUSR1: 0 -> 999 for ~100ms -> 0. The test triggers it while the
+        // Flight Recorder is sampling, so the first and last frames are at baseline by construction.
+        if (g_spike_request) {
+            g_spike_request = 0;
+            spike_ticks_left = 5;
+        }
+        if (spike_ticks_left > 0) {
+            spike_ticks_left--;
             g_transient_spike_flag = 999;
         } else {
             g_transient_spike_flag = 0;
@@ -66,6 +82,7 @@ void* spike_and_drift_worker(void* arg) {
 }
 
 int main() {
+    signal(SIGUSR1, on_spike_request);
     memset(&g_pool_storage, 0, sizeof(g_pool_storage));
     g_pool_storage.total_buffers = 8;
     g_pool_storage.active_buffers = 1;
@@ -120,15 +137,27 @@ class TestPhase45FlightRecorderAndBehavioralDrift(unittest.TestCase):
                 cls.proc.kill()
 
     def test_01_flight_recorder_time_machine(self):
+        # Prime ELF/DWARF caches so the timed run below starts sampling immediately.
+        self.wm.flight_recorder_time_machine(
+            pid=self.pid,
+            companion_elf_path=self.bin_path,
+            frames_count=1,
+            interval_ms=1,
+            watch_expressions=["g_transient_spike_flag", "*gpMem"],
+        )
+        # Trigger exactly one ~100ms spike 150ms into a ~600ms recording window.
+        trigger = threading.Timer(0.15, os.kill, args=(self.pid, signal.SIGUSR1))
+        trigger.start()
+        self.addCleanup(trigger.cancel)
         res = self.wm.flight_recorder_time_machine(
             pid=self.pid,
             companion_elf_path=self.bin_path,
-            frames_count=6,
-            interval_ms=22,
+            frames_count=20,
+            interval_ms=30,
             watch_expressions=["g_transient_spike_flag", "*gpMem"],
         )
         self.assertEqual(res["stop_duration_ms"], 0.0)
-        self.assertEqual(res["frames_recorded"], 6)
+        self.assertEqual(res["frames_recorded"], 20)
         self.assertIn("pre_anomaly_frame", res["time_machine_triad"])
         self.assertIn("peak_anomaly_frame", res["time_machine_triad"])
         self.assertIn("post_anomaly_frame", res["time_machine_triad"])

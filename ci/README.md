@@ -8,7 +8,8 @@ This directory contains the automated CI workflows for dynamicState.
    - Runs on Ubuntu 22.04.
    - Installs system dependencies (`gdb`, `gcc`, `g++`, `make`).
    - Compiles the native C99 target collector (`target/collector`) and real runtime C++ fixtures.
-   - Executes the full test suite (634+ unit and integration tests across all modules, including Phase 10-14 security gates, operational acceptance, and production pilot).
+   - Installs Python test dependencies from `requirements-test.txt` (`mcp`, `PyYAML`).
+   - Executes the full test suite and uploads a per-file result summary (`scripts/run_test_baseline.sh`) as the `test-baseline` artifact. The recorded numbers live in `docs/test_baseline/`; see `docs/TEST_BASELINE.md`.
 
 2. **`ci/workflows/gdb92.yml`**:
    - Runs on Ubuntu 22.04 with Docker.
@@ -69,7 +70,7 @@ python3 -m benchmarks.capture_benchmark --smoke
 # 11. Capture benchmark 20-iteration acceptance run
 python3 -m benchmarks.capture_benchmark --iterations 20 --acceptance --output benchmarks/latest_results.json
 
-# 12. Full test discovery suite (634+ tests)
+# 12. Full test discovery suite
 python3 -m unittest discover -s tests -v
 ```
 

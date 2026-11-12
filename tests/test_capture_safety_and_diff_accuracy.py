@@ -515,29 +515,20 @@ class TestEvidenceLedgerSchemaValidation(unittest.TestCase):
         """Verifies cycle detection handles circular parent references cleanly."""
         ledger = EvidenceLedger()
 
-        # Build a circular chain: A -> B -> C -> A
-        rec_a = EvidenceRecord(
-            evidence_id="EV_A",
-            evidence_type=EVIDENCE_TYPE_OBJECT_STATE,
-            nature=NATURE_OBSERVATION,
-            parent_evidence_ids=["EV_C"],
-        )
-        rec_b = EvidenceRecord(
-            evidence_id="EV_B",
-            evidence_type=EVIDENCE_TYPE_OBJECT_STATE,
-            nature=NATURE_OBSERVATION,
-            parent_evidence_ids=["EV_A"],
-        )
-        rec_c = EvidenceRecord(
-            evidence_id="EV_C",
-            evidence_type=EVIDENCE_TYPE_OBJECT_STATE,
-            nature=NATURE_OBSERVATION,
-            parent_evidence_ids=["EV_B"],
-        )
-
+        # Since 79ed54e add_record() rejects dangling parents, so a cycle can only be
+        # produced by corrupting already-admitted records. Admit A,B,C acyclically
+        # and then corrupt A's parent link in place (tampered / deserialized state).
+        rec_a = EvidenceRecord(evidence_id="EV_A", evidence_type=EVIDENCE_TYPE_OBJECT_STATE, nature=NATURE_OBSERVATION)
+        rec_b = EvidenceRecord(evidence_id="EV_B", evidence_type=EVIDENCE_TYPE_OBJECT_STATE, nature=NATURE_OBSERVATION,
+                               parent_evidence_ids=["EV_A"])
+        rec_c = EvidenceRecord(evidence_id="EV_C", evidence_type=EVIDENCE_TYPE_OBJECT_STATE, nature=NATURE_OBSERVATION,
+                               parent_evidence_ids=["EV_B"])
         ledger.add_record(rec_a)
         ledger.add_record(rec_b)
         ledger.add_record(rec_c)
+
+        # Corrupt in place: A -> C closes the loop A -> C -> B -> A
+        ledger.get_record("EV_A").parent_evidence_ids = ["EV_C"]
 
         # trace_provenance_chain must not enter an infinite loop and detect cycle
         chain_a = ledger.trace_provenance_chain("EV_A")
@@ -623,7 +614,16 @@ class TestEvidenceLedgerSchemaValidation(unittest.TestCase):
             nature=NATURE_OBSERVATION,
             parent_evidence_ids=["EV_MISSING_PARENT"],
         )
-        ledger.add_record(rec)
+        # add_record() now rejects dangling parents (79ed54e) ...
+        with self.assertRaisesRegex(ValueError, "nonexistent parent record"):
+            ledger.add_record(rec)
+        # ... so an unresolved parent can only arise from post-admission corruption.
+        ledger.add_record(EvidenceRecord(
+            evidence_id="EV_CHILD",
+            evidence_type=EVIDENCE_TYPE_OBJECT_STATE,
+            nature=NATURE_OBSERVATION,
+        ))
+        ledger.get_record("EV_CHILD").parent_evidence_ids = ["EV_MISSING_PARENT"]
 
         chain = ledger.trace_provenance_chain("EV_CHILD")
         statuses = [step.get("status") for step in chain]

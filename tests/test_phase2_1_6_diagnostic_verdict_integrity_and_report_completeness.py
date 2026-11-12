@@ -88,8 +88,8 @@ from extractor.expert_diagnostic_engine import (
 from scripts.mcp_server import (
     runtime_inspect_investigation,
     runtime_get_investigation_report,
-    runtime,
 )
+import scripts.mcp_server as _mcp_server
 
 
 class TestPhase216DiagnosticVerdictIntegrity(unittest.TestCase):
@@ -559,7 +559,9 @@ class TestPhase216DiagnosticVerdictIntegrity(unittest.TestCase):
 
     def test_case_r_single_source_report_consistency_json_markdown_html_mcp(self):
         """Case R: JSON, Markdown, HTML, Web, and MCP report data remain semantically equivalent."""
-        session = runtime.expert_diagnostic_engine.start_investigation("Single source test", pid=4444)
+        # Resolve the MCP runtime at call time: other test modules replace scripts.mcp_server.runtime,
+        # and a module-level import would bind a stale instance when the whole suite runs in one process.
+        session = _mcp_server.runtime.expert_diagnostic_engine.start_investigation("Single source test", pid=4444)
         session.step()
 
         # 1. MCP JSON
