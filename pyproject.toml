@@ -1,0 +1,40 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dynamicstate"
+version = "0.1.0"
+description = "Diagnose a live Linux process (leaks, buffer ownership, deadlocks, misbehaving threads) by reading its memory and /proc without stopping it; MCP server, CLI and web UI."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "zeeny2park" }]
+classifiers = [
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+]
+# mcp>=2.0: scripts/mcp_server.py imports mcp.server.mcpserver.MCPServer, which exists from mcp 2.0.0
+# (1.x only has mcp.server.fastmcp).
+dependencies = ["mcp>=2.0.0,<3"]
+
+[project.optional-dependencies]
+test = ["PyYAML>=6.0"]
+
+[project.scripts]
+dynamic-state = "extractor.cli:main"
+dynamic-state-workspace = "extractor.web.workspace:main"
+dynamic-state-mcp = "dynamicstate_mcp.mcp_server:main"
+
+[tool.setuptools]
+packages = ["extractor", "extractor.web", "extractor.web.static", "extractor.web.workspace_static", "dynamicstate_mcp", "dynamicstate_skills"]
+
+[tool.setuptools.package-dir]
+dynamicstate_mcp = "scripts"
+dynamicstate_skills = "skills"
+
+[tool.setuptools.package-data]
+"extractor.web" = ["static/*", "workspace_static/*"]
+dynamicstate_skills = ["*/SKILL.md"]

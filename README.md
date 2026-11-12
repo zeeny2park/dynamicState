@@ -1,264 +1,168 @@
-# DynamicState
+# dynamicState
 
-> **Agent-Native Runtime Engine & Non-Intrusive State Explorer for C/C++ Systems**
+[![Linux](https://img.shields.io/badge/Platform-Linux-blue.svg)](#supported-targets-and-known-limits)
+[![Python](https://img.shields.io/badge/Python-3.10%2B-blue.svg)](#install)
+[![License](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-[![Linux](https://img.shields.io/badge/Platform-Linux%20x86__64-blue.svg)](#prerequisites)
-[![Python](https://img.shields.io/badge/Python-3.9%2B-blue.svg)](#prerequisites)
-[![Architecture](https://img.shields.io/badge/Agent-Native-brightgreen.svg)](#agent-runtime-protocol-and-mcp-server)
-[![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
-[![Safety](https://img.shields.io/badge/Safety-Hardened%20Signals%20%26%20AST%20Audited-success.svg)](#safety-boundaries-and-defensive-hardening)
+dynamicState lets an AI agent (or you) diagnose a **live Linux process** (memory leaks, buffer ownership, deadlocks,
+misbehaving threads) by reading the process's memory and `/proc` **without stopping it**. It resolves what it reads
+against DWARF debug info, so findings name the variable, thread, lock and source line. It runs locally or against an
+embedded target over SSH, and is exposed as an MCP server, a CLI and a web UI.
 
-**DynamicState** is a high-performance, agent-native runtime exploration and live-system debugging platform tailored for Linux C/C++ binaries. It enables both human engineers and autonomous AI coding agents to observe, reconstruct, and navigate live execution state without arbitrary heap corruption or disruptive debugger halts.
-
----
-
-## 🌟 Key Highlights
-
-- **Zero-Stop Non-Intrusive Memory Capture (`LOW_IMPACT` Mode)**  
-  Capture live process memory at wire speed using Linux `process_vm_readv()` without pausing or halting critical production threads.
-- **Offline Semantic Object Graph Reconstruction**  
-  Resolve memory dumps against external unstripped ELF debug images via DWARF symbol resolution, type canonicalization, and pointer chasing—bypassing raw guesswork.
-- **External Debug Image & Build ID Binding**  
-  Seamlessly inspect stripped production binaries using external `nostrip` binaries or `.debug` files validated against GNU Build-ID and `.gnu_debuglink` CRC32 checksums.
-- **Consistent State Exploration & Checkpointing (`CONSISTENT` Mode)**  
-  Perform deterministic state-space branching, typed mutations, and instant rollback using GDB fork checkpoints for root-cause reproduction.
-- **Agent Runtime Protocol (ARP) & MCP Server**  
-  Full Model Context Protocol (MCP) integration with over 45 native tools, equipping LLM coding agents (Gemini, Claude, Antigravity) with structured runtime introspection.
-- **Real-Time Web Workspace UI**  
-  Interactive browser-based live dashboard with reverse-proxy support, subpath awareness, live trace cards, callstack/lock visualizers, and memory integrity monitors.
-- **Industrial Safety & Defensive Hardening**  
-  Ast-verified signal dispatch, PID bounds checking (strict rejection of PID <= 1 and boolean inputs), safe `kill --` delimiters, and `AbortController` timeouts.
-
----
-
-## 🏗️ Architecture & Exploration Pipeline
-
-DynamicState separates observation from live process interference through a clean, multi-layered architecture:
-
-```text
-               Autonomous AI Agent / Web UI / CLI
-                                │
-                                │ Agent Runtime Protocol (JSON-RPC / MCP)
-                                ▼
-                         AgentRuntime
-                                │
-       ┌────────────────────────┴────────────────────────┐
-       ▼ [LOW_IMPACT Mode]                               ▼ [CONSISTENT Mode]
- Non-Intrusive Live Capture                     Deterministic State Explorer
-  (process_vm_readv)                             (GDB Checkpoints & Ptrace)
-       │                                                 │
-       ├── Zero process halt (0.00ms stop)               ├── Controlled breakpoint stop
-       ├── Accurate PT_LOAD load_bias computation        ├── Typed field mutation
-       ├── Build ID & .gnu_debuglink verification        ├── Rollback & branch exploration
-       └── RawMemorySnapshot persistence                 └── Semantic diff & state hash
-               │                                                 │
-               ▼                                                 ▼
-     OfflineMemoryAnalyzer                             RuntimeController
-               │                                                 │
-               └───────────────┬─────────────────────────────────┘
-                               ▼
-                   Semantic Object Graph
-          (DWARF Typed Roots: Globals / Locals / Heap)
-```
-
-### Core Invariant: Semantic Reachability over Brute-Force Scanning
-
-DynamicState is **not** a blind heap scanner. It never traverses `/proc/<pid>/mem` haphazardly. Instead, state exploration is anchored to typed roots:
-
-```text
-Typed Roots (Global / Static / Frame Locals / Thread Stacks)
-    ↓
-DWARF Type Canonicalization & Member Offsets
-    ↓
-Target Object Resolution (Virtual Address, DWARF Tag)
-    ↓
-Pointer Dereference & Boundary Validation
-    ↓
-Recursive Semantic Reachability Traversal
-```
-
-Memory mapping `/proc/<pid>/maps` is strictly consulted to classify storage classes (`global`, `heap`, `stack`, `mmap`), not to invent synthetic addresses.
-
----
-
-## 🚀 Quickstart
-
-### Prerequisites
-
-- **Linux** (x86_64 or aarch64, kernel 4.10+)
-- **Python 3.9+** (with standard libraries; `pyelftools` recommended)
-- **GDB** (optional, required only for `CONSISTENT` checkpointing mode)
-- Sufficient permissions to inspect target processes (`CAP_SYS_PTRACE` or sudo access for tracing)
-
-### Installation
-
-Clone the repository:
+## Quick start: diagnose PID N
 
 ```bash
-git clone https://github.com/zeeny2park/dynamicState.git
-cd dynamicState
+python3 -m pip install .
+gcc -g -O0 -pthread -o /tmp/deadlock_demo benchmarks/diagnosis_accuracy/targets/deadlock_pipeline.c
+/tmp/deadlock_demo > /dev/null &
+PID=$!
+sleep 1
+dynamic-state diagnose -p $PID
 ```
 
----
-
-## 💻 CLI Usage
-
-DynamicState provides dedicated entry points in `./bin/` for both operators and agents:
-
-### 1. Launch the Real-Time Workspace Web Service
-
-Start the integrated web workspace server:
+Output (abridged): `Verdict CONFIRMED_FAULT: found DEADLOCK_INDICATORS. ...` and a report path. Add `--json` for the full
+result, `-d /path/to/debug.elf` when the process binary is stripped, `--symptom "..."` to describe the problem.
 
 ```bash
-./bin/dynamic-state-workspace --host 127.0.0.1 --port 8000
+dynamic-state diagnose -p $PID --json
+kill $PID
 ```
 
-Open `http://localhost:8000/workspace` in your browser. The web UI automatically connects to local or remote targets and provides:
-- Live process selection & connection validation
-- Memory pool visualizer & linked structure traverser
-- Callstack & pthread lock inspection
-- Memory corruption & integrity audits
-- Natural language agent chat assistant
-
-### 2. Capture Zero-Stop Memory (`LOW_IMPACT`)
-
-Capture raw memory of a live running process without stopping it:
-
-```bash
-python3 -m extractor.capture_backend capture-memory --pid 12345 --output-dir /tmp/snapshot_12345
-```
-
-### 3. Offline Semantic Analysis
-
-Analyze a captured snapshot against an unstripped binary:
-
-```bash
-python3 -m extractor.capture_backend analyze-memory \
-  --snapshot-dir /tmp/snapshot_12345 \
-  --debug-image /path/to/unstripped_binary.debug
-```
-
----
-
-## 🤖 Model Context Protocol (MCP) Server
-
-DynamicState includes a production-grade MCP server for autonomous agents:
-
-```bash
-python3 scripts/mcp_server.py
-```
-
-### Agent Configuration (e.g. Claude Desktop, Antigravity, Cursor)
-
-Add the server to your agent's MCP settings:
+From an AI agent, the same thing is one MCP call, `runtime_diagnose_process(pid, debug_image?, symptom?)`.
+Configure your agent (Claude Desktop, Cursor, ...) with:
 
 ```json
 {
   "mcpServers": {
-    "dynamicstate": {
-      "command": "python3",
-      "args": ["/absolute/path/to/dynamicState/scripts/mcp_server.py"],
-      "env": {
-        "PYTHONPATH": "/absolute/path/to/dynamicState"
-      }
-    }
+    "dynamicstate": { "command": "dynamic-state-mcp" }
   }
 }
 ```
 
-### Key MCP Tools
+The server ships its operating instructions (the `diagnose-process` skill, [skills/diagnose-process/SKILL.md](skills/diagnose-process/SKILL.md))
+so an agent asked to "diagnose PID N" calls `runtime_diagnose_process` once and reports what was and was not examined.
+The same text is returned by `runtime_get_playbook`.
 
-| Tool Name | Description |
-| :--- | :--- |
-| `runtime_target_connect` | Discover and bind a target PID to its external companion ELF image. |
-| `runtime_capture_memory` | Non-intrusively capture process memory (`LOW_IMPACT`). |
-| `runtime_eval_memory_path` | Evaluate DWARF-typed expressions (e.g., `*g_service.config.port`). |
-| `runtime_capture_and_diff` | Compare two temporal snapshots to reveal mutated fields and state drift. |
-| `runtime_inspect_thread_callstack_and_locks` | Inspect callstacks across all threads along with active mutex/rwlock owners. |
-| `runtime_audit_memory_integrity` | Detect heap canary corruption, dangling pointers, and boundary overruns. |
-| `runtime_traverse_linked_structure` | Walk linked lists, trees, and STL containers safely up to max depth. |
-| `runtime_run_diagnostic_recipe` | Execute predefined diagnostic suites (Leak Detection, Deadlock Triage, etc.). |
+## Install
 
----
+Requires Python 3.10+, Linux, and the `mcp` Python package (>= 2.0, installed automatically).
 
-## 🧪 Testing & Verification
+<!-- check: skip (the check script creates its own fresh venv) -->
+```bash
+python3 -m venv .venv && . .venv/bin/activate
+python3 -m pip install .
+```
 
-DynamicState enforces rigorous automated testing covering eBPF tracing, signal dispatch, memory integrity, web services, and agent protocol conformance:
+Host tools used by the analysis (install the `binutils` package; `gcc`/`g++` only to build test programs):
 
-### Running Test Suites
+| Tool | Used for | Required |
+| :--- | :--- | :--- |
+| `readelf` (binutils) | DWARF location lists, section checks | yes, for symbol-level diagnosis |
+| `nm`, `objdump`, `addr2line`, `c++filt`, `objcopy`, `strip` (binutils) | symbol / address resolution, debug-image handling | recommended |
+| `ssh`, `scp` (OpenSSH client) | remote (embedded) targets | only for remote |
+| `gdb` | CONSISTENT (stop-and-checkpoint) mode only | optional |
+| `bpftrace` | function tracing (`trace-function`) | optional |
+| cross compilers (`arm-linux-gnueabihf-gcc`, `aarch64-linux-gnu-gcc`) | building the collector for ARM targets | only to build it |
 
-Run the complete test suite:
+Reading another process's memory needs the same user and `kernel.yama.ptrace_scope` permitting it (or `CAP_SYS_PTRACE`).
+Debug info: the target binary must be built with `-g`, or you must pass the unstripped build of the same program as
+`debug_image` (the GNU build-id must match).
+
+## What the diagnosis returns
+
+`diagnose()` (CLI `diagnose`, MCP `runtime_diagnose_process`) returns one JSON object:
+
+- `verdict`: `CONFIRMED_FAULT`, `PROBABLE_FAULT`, `FAULT`, `DEGRADED`, `HEALTHY`, `INCONCLUSIVE` or `ABORTED`, with `confidence` and `summary`.
+- `findings[]`: `category`, `severity`, `subjects` (the concrete lock, thread, function, variable and `file:line` names), evidence ids.
+- `checks_run[]` and `not_covered[]`: what was executed, and what could not be examined and why. An unreadable PID or a
+  missing debug image gives `INCONCLUSIVE` with the cause in `not_covered`; it is never reported as healthy.
+- `collection_impact`: capture mode, measured stop time (0 for the default mode), bytes read, budget use.
+- `report_path`: a JSON report on disk.
+
+Narrower tools for follow-up (MCP): `runtime_heap_owner_lookup` (address to owning variable), `runtime_heap_leak_candidates`
+(in-use chunks no root reaches), `runtime_inspect_thread_callstack_and_locks`, `runtime_eval_memory_path`, and others.
+Call `runtime_get_playbook` for how an agent should use them.
+
+## Embedded and remote targets
+
+The target needs no Python: a small static C collector captures memory on the board and the host does the analysis.
 
 ```bash
-./scripts/run_all_tests.sh
+make -C target/collector dist
 ```
 
-Or execute focused regression and hardening suites directly:
+This builds `target/collector/dist/<arch>/dynamicstate-collector` for each installed cross compiler (arm, aarch64,
+x86_64) and prints which architectures were skipped. Deploy and connect (needs SSH access to the target):
+
+<!-- check: skip (needs a remote target; checked with --help) -->
+```bash
+dynamic-state connect --pid 1234 --debug-image ./app.debug --remote-host 192.0.2.10 --ssh-user root --auto-deploy-collector
+```
+
+The collector matching the target's `uname -m` is streamed over SSH (falls back to a writable directory if `/tmp` is
+noexec). The target's ABI (architecture, libc, allocator) is detected and unsupported features are refused explicitly.
+Current limit: the one-call `diagnose` examines **local** PIDs only; for a remote target use `connect` and the individual
+tools (`runtime_target_connect`, `runtime_inspect_thread_callstack_and_locks`, ...), which accept `remote_host`/`ssh_*`.
+
+## Safety defaults
+
+- **Read-only and zero-stop by default.** Reads use `process_vm_readv` and `/proc`; the process is never paused or written to.
+  `collection_impact.measured_stop_ms` reports the measured stop time.
+- **Needs explicit approval:** any stop-mode capture (`allow_stop`, CONSISTENT/GDB mode) and any state change
+  (checkpoint, restore, transition, explore, replay). The runtime is read-only unless started with `--allow-mutation` (`dynamic-state server`).
+- **Web UI/API:** the REST API requires a per-run session token (injected into the page the server itself serves) and binds to 127.0.0.1 by default.
+- Observation budgets (bytes, wall clock, samples) bound every diagnosis.
+
+Web UI (optional):
+
+<!-- check: skip (blocking server; checked by starting it and fetching /workspace) -->
+```bash
+dynamic-state-workspace --host 127.0.0.1 --port 8765
+```
+
+Then open `http://127.0.0.1:8765/workspace`.
+
+## Supported targets and known limits
+
+- Linux, C/C++ programs with DWARF. Lock-owner decoding, heap walking and call-stack unwinding are implemented for
+  **glibc on 64-bit x86_64 and aarch64 (little-endian)** (`extractor/target_abi.py`). On other ABIs (32-bit ARM, musl, MIPS, ...)
+  `diagnose` lists the affected features in `not_covered` as `unsupported_on_target` and does not guess; raw capture with the
+  collector still works there.
+- Current accuracy is low and measured, not assumed. [benchmarks/diagnosis_accuracy](benchmarks/diagnosis_accuracy/README.md)
+  runs `diagnose` on 13 defective and 8 healthy real processes (committed results in `benchmarks/diagnosis_accuracy/results/`;
+  re-run on this version: 0 of 13 detected with the scenario symptom, 2 of 13 with the general health check).
+  - Works today: **deadlocks** are confirmed with the lock names and thread names (and the lock call's source line, within a few lines).
+  - Not yet: leaks, heap overflow, use-after-free, busy-wait and long stalls are usually `INCONCLUSIVE` from `diagnose`.
+    For leaks and buffer ownership use `runtime_heap_leak_candidates` and `runtime_heap_owner_lookup` directly.
+  - Healthy processes are not yet cleared: they come back `INCONCLUSIVE`, never `HEALTHY` and never a false fault.
+    Treat `INCONCLUSIVE` as "could not tell".
+  - The result depends on the symptom wording ("the service stopped responding" is `INCONCLUSIVE` on a real deadlock; the default general check finds it).
+- Remote one-call diagnosis is not available yet (see above).
+
+## Tests and CI
 
 ```bash
-# Web Service & MCP Comprehensive Defensive Hardening
-python3 -m unittest tests/test_phase52_web_and_mcp_defensive_hardening.py
-
-# eBPF Tracer & Signal / AST Safety Audits
-python3 -m unittest tests/test_ebpf_tracer.py
-
-# Real Workspace Web Service Tests
-python3 -m unittest tests/test_phase51_real_workspace_web_service.py
-
-# Watch Session & Temporal State Tests
-python3 -m unittest tests/test_phase21_watch_session.py
+python3 -m pip install ".[test]"
+python3 -m unittest tests/test_imp_006_diagnose.py
 ```
 
----
-
-## 🛡️ Safety Boundaries and Defensive Hardening
-
-DynamicState is engineered with zero-compromise safety guarantees for production environments:
-
-1. **Strict Signal & PID Isolation**:
-   - Every `kill` command is dispatched with explicit `--` parameter termination to prevent procps negative PID option misparsing (`kill -INT -- -<PGID>`).
-   - Hardened PID guards reject non-integer, negative, or reserved PIDs (`pid <= 1`).
-   - Process group killing is restricted exclusively to confirmed session leaders (`child_pgid == child_pid`).
-
-2. **Web & API Defensiveness**:
-   - All REST endpoints reject malformed JSON and adversarial parameter types gracefully.
-   - Per-card failure isolation in `/api/workspace/chat` ensures one failed query never degrades healthy cards.
-   - Browser client uses `AbortController` timeouts and automatic 3-strike circuit breakers for unresponsive targets.
-
-3. **Memory Safety Contract**:
-   - Zero-stop memory reads via `process_vm_readv` never modify inferior process memory or write to inferior address spaces.
-   - Bounded recursion limits on pointer dereferencing and cyclic container detection prevent infinite loops and runaway allocations.
-
----
-
-## 📂 Project Structure
-
-```text
-dynamicState/
-├── bin/
-│   └── dynamic-state-workspace      # Web service launcher script
-├── extractor/
-│   ├── capture_backend.py          # process_vm_readv memory capture engine
-│   ├── dwarf_indexer.py            # DWARF debugging information parser
-│   ├── ebpf_tracer.py              # bpftrace / eBPF kernel tracing adapter
-│   ├── explorer.py                 # Deterministic state-space explorer
-│   ├── llm_provider.py             # LLM provider integration & CLI wrappers
-│   ├── runtime_controller.py       # GDB checkpoint & restore backend
-│   ├── state_hash.py               # Canonical semantic state hasher
-│   ├── target_adapter.py           # Target process inspection & liveness
-│   ├── watch_session.py            # Persistent temporal watch sessions
-│   └── web/
-│       ├── server.py               # Production REST API & WebSocket server
-│       └── workspace_static/       # Browser UI (HTML5, Tailwind, JS)
-├── scripts/
-│   ├── mcp_server.py               # Model Context Protocol (MCP) server
-│   └── run_all_tests.sh            # Automated end-to-end test runner
-├── tests/                          # 80+ comprehensive test suites
-└── docs/                           # Architectural specs & practical playbooks
+<!-- check: skip (full suite; run by its own CI steps) -->
+```bash
+python3 -m unittest discover tests
 ```
 
----
+The per-file baseline of the full suite is in [docs/TEST_BASELINE.md](docs/TEST_BASELINE.md) (regenerate with
+`scripts/run_test_baseline.sh`). CI ([ci/workflows/test.yml](ci/workflows/test.yml), mirrored in `.github/workflows/`) builds the
+collector and fixtures, runs the suite, records the baseline, runs the diagnosis accuracy benchmark (reports, never gates on the score),
+and installs the package into a fresh venv and runs the commands in this README (`scripts/check_readme_commands.sh`).
 
-## 📄 License
+## Documentation
 
-DynamicState is released under the **Apache License 2.0**. See [LICENSE](LICENSE) for details.
+- [skills/diagnose-process/SKILL.md](skills/diagnose-process/SKILL.md): the agent workflow (single source for the MCP instructions and playbook)
+- [docs/PRACTICAL_PLAYBOOK_KO.md](docs/PRACTICAL_PLAYBOOK_KO.md): practical playbook (Korean)
+- [docs/PROCESS_HEALTH_INVESTIGATION_SKILL.md](docs/PROCESS_HEALTH_INVESTIGATION_SKILL.md), [docs/PROCESS_HEALTH_INVESTIGATION_KNOWLEDGE.md](docs/PROCESS_HEALTH_INVESTIGATION_KNOWLEDGE.md): investigation method and tool semantics
+- [target/collector/README.md](target/collector/README.md): the target-side collector
+
+## License
+
+MIT, see [LICENSE](LICENSE).
