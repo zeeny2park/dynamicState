@@ -116,6 +116,197 @@ def _get_kernel_isolated_cpus() -> List[int]:
     return sorted(set(isolated))
 
 
+def _thread_stack_info(maps: List[Dict[str, Any]], stack_maps: List[Dict[str, Any]], pid: int, tid: int,
+                       sp_int: int, startstack: int) -> Dict[str, Any]:
+    """Stack mapping of one thread (shared by the local and remote adapters)."""
+    stack_info: Dict[str, Any] = {"status": "UNAVAILABLE", "reason": "Thread stack mapping not identifiable in proc maps"}
+    matched_map = None
+    if sp_int > 0:
+        for m in maps:
+            if m["start_int"] <= sp_int < m["end_int"]:
+                matched_map = m
+                break
+    if not matched_map and tid == pid:
+        for m in stack_maps:
+            if m.get("pathname") == "[stack]":
+                matched_map = m
+                break
+    if not matched_map:
+        for m in stack_maps:
+            if m.get("pathname") == f"[stack:{tid}]":
+                matched_map = m
+                break
+    if not matched_map and tid == pid and startstack > 0:
+        for m in maps:
+            if m["start_int"] <= startstack < m["end_int"]:
+                matched_map = m
+                break
+    if matched_map:
+        stack_info = {
+            "status": "AVAILABLE",
+            "start": matched_map["start"],
+            "end": matched_map["end"],
+            "start_int": matched_map["start_int"],
+            "end_int": matched_map["end_int"],
+            "size": matched_map["size"],
+            "permissions": matched_map["permissions"],
+            "sp": f"0x{sp_int:x}" if sp_int > 0 else None,
+            "sp_int": sp_int if sp_int > 0 else None,
+            "tcb_address": None,
+            "tcb_address_int": None,
+        }
+    return stack_info
+
+
+_SCHED_POLICY_NAMES = {
+    0: "SCHED_OTHER", 1: "SCHED_FIFO", 2: "SCHED_RR", 3: "SCHED_BATCH", 5: "SCHED_IDLE", 6: "SCHED_DEADLINE",
+}
+
+
+def parse_sampler_syscall(raw: Optional[str]) -> Optional[Dict[str, Any]]:
+    """Sampler view of a /proc/PID/task/TID/syscall line: {"running": True} | {"running": False, nr, args} | None."""
+    if raw is None:
+        return None
+    raw = raw.strip()
+    if not raw:
+        return None
+    if raw.startswith("running"):
+        return {"running": True}
+    parts = raw.split()
+    try:
+        nr = int(parts[0])
+        args = [int(p, 16) for p in parts[1:7]]
+    except ValueError:
+        return None
+    return {"running": False, "nr": nr, "args": args}
+
+
+def thread_raw_from_proc_text(tid: int, stat: Optional[str], status: Optional[str], syscall: Optional[str],
+                              io: Optional[str], schedstat: Optional[str]) -> Optional[Dict[str, Any]]:
+    """Builds one entry of the collector THREADS wire format from /proc file texts (no-collector fallback)."""
+    if not stat:
+        return None
+    lp, rp = stat.find("("), stat.rfind(")")
+    if lp == -1 or rp == -1 or rp < lp:
+        return None
+    rest = stat[rp + 1:].split()
+    if len(rest) < 13:
+        return None
+    try:
+        raw: Dict[str, Any] = {"tid": int(tid), "comm": stat[lp + 1:rp], "state": rest[0],
+                               "utime": int(rest[11]), "stime": int(rest[12])}
+        if len(rest) >= 27:
+            raw["startstack"], raw["kstkesp"] = int(rest[25]), int(rest[26])
+        if len(rest) >= 37:
+            raw["cpu"] = int(rest[36])
+        if len(rest) >= 39:
+            raw["rt_prio"], raw["policy"] = int(rest[37]), int(rest[38])
+    except ValueError:
+        return None
+    for line in (status or "").splitlines():
+        key, _, val = line.partition(":")
+        val = val.strip()
+        try:
+            if key == "voluntary_ctxt_switches":
+                raw["vol"] = int(val)
+            elif key == "nonvoluntary_ctxt_switches":
+                raw["invol"] = int(val)
+            elif key == "Cpus_allowed_list":
+                raw["cpus_allowed"] = val
+            elif key == "Mems_allowed_list":
+                raw["mems_allowed"] = val
+        except ValueError:
+            pass
+    if syscall and syscall.strip():
+        raw["syscall"] = syscall.strip().splitlines()[0]
+    io_d: Dict[str, int] = {}
+    for line in (io or "").splitlines():
+        key, _, val = line.partition(":")
+        if key in ("syscr", "syscw"):
+            try:
+                io_d[key] = int(val)
+            except ValueError:
+                pass
+    if len(io_d) == 2:
+        raw["io"] = io_d
+    try:
+        sp = (schedstat or "").split()
+        if len(sp) >= 3:
+            raw["sched"] = {"run_ns": int(sp[0]), "wait_ns": int(sp[1]), "slices": int(sp[2])}
+    except ValueError:
+        pass
+    return raw
+
+
+def thread_sample_from_raw(raw: Dict[str, Any]) -> Dict[str, Any]:
+    """Thread-sampler record (same fields/types as thread_sampler.read_thread_fields) from a wire entry."""
+    io = raw.get("io") or {}
+    syscr, syscw = io.get("syscr"), io.get("syscw")
+    rec: Dict[str, Any] = {
+        "tid": int(raw["tid"]),
+        "name": raw.get("comm", ""),
+        "state": raw.get("state", "?"),
+        "utime_ticks": int(raw.get("utime", 0)),
+        "stime_ticks": int(raw.get("stime", 0)),
+        "voluntary_ctxt_switches": raw.get("vol"),
+        "nonvoluntary_ctxt_switches": raw.get("invol"),
+        "io_syscalls": (int(syscr) + int(syscw)) if (syscr is not None and syscw is not None) else None,
+        "syscall": parse_sampler_syscall(raw.get("syscall")),
+    }
+    sched = raw.get("sched")
+    if isinstance(sched, dict):   # remote-only extra: run time / run-queue wait / timeslices (ns, ns, count)
+        rec["schedstat"] = {"run_ns": int(sched.get("run_ns", 0)), "wait_ns": int(sched.get("wait_ns", 0)),
+                            "timeslices": int(sched.get("slices", 0))}
+    return rec
+
+
+def _parse_proc_syscall(text: str) -> Dict[str, Any]:
+    from .cfi_unwinder import parse_proc_syscall
+    return parse_proc_syscall(text)
+
+
+def thread_info_from_raw(raw: Dict[str, Any], pid: int, maps: List[Dict[str, Any]],
+                         stack_maps: List[Dict[str, Any]], kernel_isolated: Optional[set] = None) -> Dict[str, Any]:
+    """get_threads() entry (same field names/types as LocalTargetAdapter.get_threads) from a wire entry."""
+    tid = int(raw["tid"])
+    state = raw.get("state") or "UNKNOWN"
+    cpu_id = raw.get("cpu")
+    cpus_allowed_list = raw.get("cpus_allowed") or ""
+    pinned_cpus = _parse_cpulist(cpus_allowed_list)
+    sc = _parse_proc_syscall(raw["syscall"]) if raw.get("syscall") else {"state": "unavailable"}
+    is_running = (state == "R") or sc.get("state") == "running"
+    sp_int = int(sc.get("sp") or 0) or int(raw.get("kstkesp") or 0)
+    pol = raw.get("policy")
+    sched = raw.get("sched")
+    return {
+        "tid": tid,
+        "name": raw.get("comm") or "unknown",
+        "state": state,
+        "cpu_id": cpu_id,
+        "cpus_allowed_list": cpus_allowed_list,
+        "pinned_cpus": pinned_cpus,
+        "is_single_core_pinned": (len(pinned_cpus) == 1),
+        "is_kernel_isolated_core": bool(cpu_id is not None and cpu_id in (kernel_isolated or ())),
+        "numa_nodes_list": raw.get("mems_allowed") or "",
+        "sched_policy": _SCHED_POLICY_NAMES.get(pol, f"POLICY_{pol}") if pol is not None else "SCHED_OTHER",
+        "rt_priority": int(raw.get("rt_prio") or 0),
+        "utime_ticks": int(raw.get("utime", 0)),
+        "stime_ticks": int(raw.get("stime", 0)),
+        "voluntary_ctxt_switches": int(raw.get("vol") or 0),
+        "nonvoluntary_ctxt_switches": int(raw.get("invol") or 0),
+        "is_running_user_space": is_running,
+        "stack_info": _thread_stack_info(maps, stack_maps, pid, tid, sp_int, int(raw.get("startstack") or 0)),
+        "local_variables": {
+            "status": "UNSUPPORTED",
+            "reason": "Stack frame inspection requires an active debugger backend (GDB/ptrace frame unwind).",
+        },
+        "syscall": sc,
+        "schedstat": ({"run_ns": int(sched.get("run_ns", 0)), "wait_ns": int(sched.get("wait_ns", 0)),
+                       "timeslices": int(sched.get("slices", 0))} if isinstance(sched, dict) else None),
+    }
+
+
+
 class TargetIdentityChangedError(RuntimeError):
     """Raised when a pinned target PID is reused or executes a different binary."""
 
@@ -936,6 +1127,14 @@ class TargetExecutionAdapter(ABC):
         """Discovers active threads from /proc/<pid>/task."""
         pass
 
+    #: True where read_thread_samples() is implemented (the thread sampler then uses it for every sample).
+    thread_samples_supported = False
+
+    def read_thread_samples(self, pid: int, counters: Optional[Dict[str, int]] = None) -> Optional[List[Dict[str, Any]]]:
+        """One thread-sampler sample: per-thread records (tid, name, state, utime_ticks, stime_ticks,
+        voluntary/nonvoluntary_ctxt_switches, io_syscalls, syscall) or None when the threads cannot be enumerated."""
+        return None
+
     @abstractmethod
     def read_memory(self, pid: int, address: int, size: int) -> Tuple[Optional[bytes], str, Optional[str]]:
         """Reads raw bytes from target memory without suspending the process.
@@ -1179,6 +1378,12 @@ class LocalTargetAdapter(TargetExecutionAdapter):
                 pass
         return status
 
+    thread_samples_supported = True
+
+    def read_thread_samples(self, pid: int, counters: Optional[Dict[str, int]] = None) -> Optional[List[Dict[str, Any]]]:
+        from .thread_sampler import read_local_thread_samples
+        return read_local_thread_samples(pid, counters if counters is not None else {})
+
     def get_threads(self, pid: int) -> List[Dict[str, Any]]:
         import struct as _struct
         threads: List[Dict[str, Any]] = []
@@ -1296,12 +1501,14 @@ class LocalTargetAdapter(TargetExecutionAdapter):
                     is_single_core_pinned = (len(pinned_cpus) == 1)
 
                     syscall_sp = 0
+                    syscall_info: Dict[str, Any] = {"state": "unavailable"}
                     is_running_user_space = (state == "R")
                     syscall_file = os.path.join(task_dir, tid_entry, "syscall")
                     if os.path.exists(syscall_file):
                         try:
                             with open(syscall_file, "r", encoding="utf-8", errors="replace") as syf:
                                 sy_raw = syf.read().strip()
+                                syscall_info = _parse_proc_syscall(sy_raw)
                                 if sy_raw.startswith("running"):
                                     is_running_user_space = True
                                 else:
@@ -1313,43 +1520,17 @@ class LocalTargetAdapter(TargetExecutionAdapter):
 
                     sp_int = syscall_sp or kstkesp
 
-                    stack_info: Dict[str, Any] = {"status": "UNAVAILABLE", "reason": "Thread stack mapping not identifiable in proc maps"}
-                    matched_map = None
-                    if sp_int > 0:
-                        for m in maps:
-                            if m["start_int"] <= sp_int < m["end_int"]:
-                                matched_map = m
-                                break
-                    if not matched_map and tid == pid:
-                        for m in stack_maps:
-                            if m.get("pathname") == "[stack]":
-                                matched_map = m
-                                break
-                    if not matched_map:
-                        for m in stack_maps:
-                            if m.get("pathname") == f"[stack:{tid}]":
-                                matched_map = m
-                                break
-                    if not matched_map and tid == pid and startstack > 0:
-                        for m in maps:
-                            if m["start_int"] <= startstack < m["end_int"]:
-                                matched_map = m
-                                break
+                    schedstat_info: Optional[Dict[str, Any]] = None
+                    try:
+                        with open(os.path.join(task_dir, tid_entry, "schedstat"), "r") as ssf:
+                            ss_parts = ssf.read().split()
+                        if len(ss_parts) >= 3:
+                            schedstat_info = {"run_ns": int(ss_parts[0]), "wait_ns": int(ss_parts[1]),
+                                              "timeslices": int(ss_parts[2])}
+                    except (OSError, ValueError):
+                        pass
 
-                    if matched_map:
-                        stack_info = {
-                            "status": "AVAILABLE",
-                            "start": matched_map["start"],
-                            "end": matched_map["end"],
-                            "start_int": matched_map["start_int"],
-                            "end_int": matched_map["end_int"],
-                            "size": matched_map["size"],
-                            "permissions": matched_map["permissions"],
-                            "sp": f"0x{sp_int:x}" if sp_int > 0 else None,
-                            "sp_int": sp_int if sp_int > 0 else None,
-                            "tcb_address": None,
-                            "tcb_address_int": None,
-                        }
+                    stack_info = _thread_stack_info(maps, stack_maps, pid, tid, sp_int, startstack)
 
                     threads.append({
                         "tid": tid,
@@ -1373,6 +1554,8 @@ class LocalTargetAdapter(TargetExecutionAdapter):
                             "status": "UNSUPPORTED",
                             "reason": "Stack frame inspection requires an active debugger backend (GDB/ptrace frame unwind).",
                         },
+                        "syscall": syscall_info,
+                        "schedstat": schedstat_info,
                     })
 
             # Resolve stack_info and TCB address for pure user-space poll-mode threads (e.g. DPDK lcores where sp_int == 0)
@@ -1685,6 +1868,8 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
         self._daemon_path: Optional[str] = None
         self._daemon_unsupported_for: Optional[str] = None  # collector path decided "no daemon"
         self.daemon_stats: Dict[str, int] = {"opens": 0, "requests": 0, "reopens": 0, "fallbacks": 0}
+        self._threads_unsupported_for: Optional[str] = None  # collector path without the THREADS command
+        self.last_threads_transport: Optional[str] = None
 
     def is_remote(self) -> bool:
         return True
@@ -1885,6 +2070,19 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
         except Exception:  # noqa: BLE001
             return None
 
+    def stat_target_file(self, pid: int, path: str) -> Optional[Tuple[int, int]]:
+        """(size, mtime) of a file on the target in one exchange; None where it cannot be determined."""
+        q = shlex.quote(str(path))
+        cmd = f"stat -c '%s %Y' {q} 2>/dev/null"
+        rc, out, _ = self.run_ssh(cmd)
+        parts = out.split()
+        if rc == 0 and len(parts) == 2:
+            try:
+                return int(parts[0]), int(parts[1])
+            except ValueError:
+                pass
+        return None
+
     def get_proc_maps(self, pid: int) -> List[Dict[str, Any]]:
         cmd = f"cat /proc/{int(pid)}/maps 2>/dev/null"
         rc, stdout, _ = self.run_ssh(cmd)
@@ -1960,42 +2158,139 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
                         status[k] = v
         return status
 
-    def get_threads(self, pid: int) -> List[Dict[str, Any]]:
-        # Efficient remote script to list threads without spawning multiple remote processes
-        remote_script = (
-            f"for t in /proc/{int(pid)}/task/*; do "
-            f"[ -d \"$t\" ] || continue; "
-            f"tid=$(basename \"$t\"); "
-            f"comm=$(cat \"$t/comm\" 2>/dev/null || echo unknown); "
-            f"stat=$(sed 's/.*) //' \"$t/stat\" 2>/dev/null | awk '{{print $1}}' || echo UNKNOWN); "
-            f"echo \"$tid $stat $comm\"; "
-            f"done"
+    # ---- IMP-011 part 3: remote thread information -------------------------------------------
+    thread_samples_supported = True
+
+    #: Reply pages are bounded by the collector (128 threads each); this bounds the host loop.
+    THREADS_MAX_PAGES = 128
+
+    @staticmethod
+    def _threads_shell_script(pid: int) -> str:
+        """ONE POSIX-sh command (no bashisms, BusyBox applets only) that dumps the needed /proc files of
+        every thread, delimited by lines starting with ``@@``."""
+        return (
+            f"for t in /proc/{int(pid)}/task/*; do [ -d \"$t\" ] || continue; "
+            "echo \"@@T ${t##*/}\"; "
+            "for f in stat status syscall io schedstat; do echo \"@@F $f\"; cat \"$t/$f\" 2>/dev/null; done; "
+            "done; echo @@END"
         )
-        rc, stdout, _ = self.run_ssh(f"sh -c {shlex.quote(remote_script)}")
+
+    @staticmethod
+    def _parse_threads_shell_output(out: str) -> Optional[List[Dict[str, Any]]]:
+        if "@@END" not in out:
+            return None
         threads: List[Dict[str, Any]] = []
-        if rc != 0 or not stdout:
-            return threads
+        state: Dict[str, Any] = {"tid": None, "files": {}, "cur": None}
 
-        for line in stdout.splitlines():
-            tokens = line.strip().split(maxsplit=2)
-            if len(tokens) >= 2 and tokens[0].isdigit():
-                tid = int(tokens[0])
-                state = tokens[1]
-                comm = tokens[2] if len(tokens) >= 3 else "unknown"
-                threads.append({
-                    "tid": tid,
-                    "name": comm,
-                    "state": state,
-                    "stack_info": {
-                        "status": "UNAVAILABLE",
-                        "reason": "Remote thread stack mapping not inspected over lightweight ssh adapter",
-                    },
-                    "local_variables": {
-                        "status": "UNSUPPORTED",
-                        "reason": "Stack frame inspection requires an active debugger backend.",
-                    },
-                })
+        def flush() -> None:
+            if state["tid"] is None:
+                return
+            f = state["files"]
+            raw = thread_raw_from_proc_text(
+                state["tid"], "\n".join(f.get("stat", [])), "\n".join(f.get("status", [])),
+                "\n".join(f.get("syscall", [])), "\n".join(f.get("io", [])), "\n".join(f.get("schedstat", [])),
+            )
+            if raw is not None:
+                threads.append(raw)
 
+        for line in out.splitlines():
+            if line.startswith("@@T "):
+                flush()
+                try:
+                    state["tid"] = int(line[4:].strip())
+                except ValueError:
+                    state["tid"] = None
+                state["files"], state["cur"] = {}, None
+            elif line.startswith("@@F "):
+                state["cur"] = line[4:].strip()
+                state["files"][state["cur"]] = []
+            elif line.startswith("@@END"):
+                break
+            elif state["cur"] is not None:
+                state["files"][state["cur"]].append(line)
+        flush()
+        return threads
+
+    def _threads_via_daemon(self, pid: int) -> Optional[List[Dict[str, Any]]]:
+        def run(ch: _DaemonChannel) -> Optional[List[Dict[str, Any]]]:
+            collected: List[Dict[str, Any]] = []
+            after = 0
+            for _ in range(self.THREADS_MAX_PAGES):
+                line = f"THREADS {int(pid)}" + (f" {after}" if after else "")
+                reply = ch.exchange(line, max(self.timeout_sec, 1.0))
+                try:
+                    payload = json.loads(reply)
+                except ValueError:
+                    raise DaemonChannelError(f"garbage reply: {reply[:80]!r}")
+                if not isinstance(payload, dict):
+                    raise DaemonChannelError("non-object reply")
+                if not payload.get("success"):
+                    if payload.get("error") == "UNKNOWN_COMMAND":
+                        self._threads_unsupported_for = self.collector_path   # old collector: never ask again
+                    return None
+                collected.extend(t for t in payload.get("threads", []) if isinstance(t, dict) and "tid" in t)
+                after = int(payload.get("next_after_tid") or 0)
+                if not payload.get("more") or after <= 0:
+                    return collected
+            return collected
+        return self._with_daemon(run)
+
+    def _threads_via_collector_oneshot(self, pid: int) -> Optional[List[Dict[str, Any]]]:
+        collected: List[Dict[str, Any]] = []
+        after = 0
+        for _ in range(self.THREADS_MAX_PAGES):
+            cmd = f"{shlex.quote(self.collector_path)} -p {int(pid)} --threads"
+            if after:
+                cmd += f" --after-tid {after}"
+            rc, stdout, _ = self.run_ssh(cmd + " 2>/dev/null")
+            if not stdout.strip():
+                return None
+            try:
+                payload = json.loads(stdout.strip().splitlines()[-1])
+            except ValueError:
+                return None
+            if not isinstance(payload, dict) or not payload.get("success"):
+                return None
+            collected.extend(t for t in payload.get("threads", []) if isinstance(t, dict) and "tid" in t)
+            after = int(payload.get("next_after_tid") or 0)
+            if not payload.get("more") or after <= 0:
+                return collected
+        return collected
+
+    def _threads_raw(self, pid: int) -> Tuple[Optional[List[Dict[str, Any]]], str]:
+        """(wire entries, transport): daemon channel, else per-call collector, else one batched sh command."""
+        if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
+            return None, "invalid_pid"
+        if self.collector_path and self._threads_unsupported_for != self.collector_path:
+            raw = self._threads_via_daemon(pid)
+            if raw is not None:
+                return raw, "daemon"
+            if self._threads_unsupported_for != self.collector_path:
+                raw = self._threads_via_collector_oneshot(pid)
+                if raw is not None:
+                    return raw, "collector"
+        rc, out, _ = self.run_ssh(f"sh -c {shlex.quote(self._threads_shell_script(pid))}")
+        if rc != 0 and not out:
+            return None, "shell"
+        return self._parse_threads_shell_output(out), "shell"
+
+    def read_thread_samples(self, pid: int, counters: Optional[Dict[str, int]] = None) -> Optional[List[Dict[str, Any]]]:
+        raw, transport = self._threads_raw(pid)
+        if counters is not None:
+            counters["remote_thread_requests"] = counters.get("remote_thread_requests", 0) + 1
+        if raw is None:
+            return None
+        self.last_threads_transport = transport
+        return sorted((thread_sample_from_raw(r) for r in raw), key=lambda r: r["tid"])
+
+    def get_threads(self, pid: int) -> List[Dict[str, Any]]:
+        raw, transport = self._threads_raw(pid)
+        if not raw:
+            return []
+        self.last_threads_transport = transport
+        maps = self.get_proc_maps(pid)
+        stack_maps = [m for m in maps if m.get("category") == "stack" or m.get("pathname", "").startswith("[stack")]
+        threads = [thread_info_from_raw(r, pid, maps, stack_maps) for r in raw]
         threads.sort(key=lambda t: t["tid"])
         return threads
 
@@ -2106,17 +2401,15 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
             out.extend(res)
         return out
 
-    def _read_slices_via_daemon(
-        self, pid: int, slices: List[Tuple[int, int]],
-    ) -> Optional[List[Tuple[Optional[bytes], str, Optional[str]]]]:
-        """Reads through the persistent channel; None means "use the per-call path".
+    def _with_daemon(self, fn: Callable[["_DaemonChannel"], Any]) -> Any:
+        """Runs ``fn(channel)`` on the persistent channel; None means "use the per-call path".
 
         Decision logic: if the daemon can never be established (old collector without --daemon,
         exec denied, ...) the decision is remembered per collector path.  If a channel that worked
-        dies (EOF / timeout / garbage) it is closed, reopened once and the read retried; a second
-        failure falls back to per-call execution for this read only.
+        dies (EOF / timeout / garbage) it is closed, reopened once and the request retried; a second
+        failure falls back to per-call execution for this request only.
         """
-        if not self._use_daemon or not self.collector_path or not slices:
+        if not self._use_daemon or not self.collector_path:
             return None
         with self._daemon_lock:
             path = self.collector_path
@@ -2133,7 +2426,7 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
                             self.daemon_stats["reopens"] += 1
                         self._open_daemon_locked()
                     self.daemon_stats["requests"] += 1
-                    return self._daemon_exchange_slices(self._daemon, pid, slices)
+                    return fn(self._daemon)
                 except (DaemonChannelError, OSError, ValueError):
                     self._close_daemon_locked(graceful=False)
                     if self.daemon_stats["opens"] == 0:
@@ -2144,6 +2437,14 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
                         self.daemon_stats["fallbacks"] += 1
                         return None
             return None
+
+    def _read_slices_via_daemon(
+        self, pid: int, slices: List[Tuple[int, int]],
+    ) -> Optional[List[Tuple[Optional[bytes], str, Optional[str]]]]:
+        """Reads through the persistent channel; None means "use the per-call path"."""
+        if not slices:
+            return None
+        return self._with_daemon(lambda ch: self._daemon_exchange_slices(ch, pid, slices))
 
     def _read_slices_via_collector(
         self,

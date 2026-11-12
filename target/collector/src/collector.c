@@ -15,6 +15,7 @@
 #include <sys/types.h>
 #include <sys/utsname.h>
 #include <sys/uio.h>
+#include <dirent.h>
 
 #define MAX_LINE 2048
 
@@ -1491,6 +1492,208 @@ int collector_read_slices(pid_t pid, int backend, const char *slices_spec, void 
     return 0;
 }
 
+/* ---- IMP-011: thread information (THREADS command / --threads) ------------------------------
+ * One reply (one JSON line) per page of at most THREADS_PAGE_SIZE threads, ordered by tid.  64-bit
+ * counters are printed through unsigned long long (>= 64 bit on every C99 target, incl. 32-bit ARM). */
+#define THREADS_PAGE_SIZE 128
+#define THREADS_MAX_ENUM 16384
+#define THREADS_FILE_BUF 8192
+
+static int read_small_file(const char *path, char *buf, size_t cap) {
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) return -1;
+    size_t n = 0;
+    for (;;) {
+        if (n + 1 >= cap) break;
+        ssize_t r = read(fd, buf + n, cap - 1 - n);
+        if (r < 0) {
+            if (errno == EINTR) continue;
+            if (n == 0) { close(fd); return -1; }
+            break;
+        }
+        if (r == 0) break;
+        n += (size_t)r;
+    }
+    close(fd);
+    buf[n] = '\0';
+    return (int)n;
+}
+
+static int cmp_int(const void *a, const void *b) {
+    int x = *(const int *)a, y = *(const int *)b;
+    return (x > y) - (x < y);
+}
+
+/* Value of "key" at the start of a line of /proc status-like text; NULL when absent. */
+static const char *proc_line_value(const char *text, const char *key) {
+    size_t kl = strlen(key);
+    const char *p = text;
+    while (p && *p) {
+        if (strncmp(p, key, kl) == 0) {
+            p += kl;
+            while (*p == ' ' || *p == '\t') p++;
+            return p;
+        }
+        p = strchr(p, '\n');
+        if (p) p++;
+    }
+    return NULL;
+}
+
+static void print_line_value(FILE *out, const char *v) {
+    char raw[128], esc[300];
+    size_t n = 0;
+    while (v && v[n] && v[n] != '\n' && n + 1 < sizeof(raw)) { raw[n] = v[n]; n++; }
+    while (n > 0 && (raw[n - 1] == ' ' || raw[n - 1] == '\t')) n--;
+    raw[n] = '\0';
+    escape_json_string(raw, esc, sizeof(esc));
+    fprintf(out, "\"%s\"", esc);
+}
+
+/* Emits one thread object; returns 0, or -1 (nothing printed) when the thread vanished. */
+static int emit_thread(FILE *out, pid_t pid, int tid, int first) {
+    char path[96];
+    char sbuf[THREADS_FILE_BUF];
+    snprintf(path, sizeof(path), "/proc/%d/task/%d/stat", (int)pid, tid);
+    if (read_small_file(path, sbuf, sizeof(sbuf)) <= 0) return -1;
+    char *lp = strchr(sbuf, '(');
+    char *rp = strrchr(sbuf, ')');           /* LAST ')': comm may contain spaces and parentheses */
+    if (!lp || !rp || rp < lp) return -1;
+    char comm_raw[64], comm_esc[160];
+    size_t cl = (size_t)(rp - lp - 1);
+    if (cl >= sizeof(comm_raw)) cl = sizeof(comm_raw) - 1;
+    memcpy(comm_raw, lp + 1, cl);
+    comm_raw[cl] = '\0';
+    for (size_t i = 0; i < cl; i++) {
+        if ((unsigned char)comm_raw[i] < 0x20 || comm_raw[i] == 0x7f) comm_raw[i] = '?';
+    }
+    escape_json_string(comm_raw, comm_esc, sizeof(comm_esc));
+
+    /* fields after the comm: tok[0]=state ... tok[11]=utime tok[12]=stime tok[25]=startstack
+     * tok[26]=kstkesp tok[36]=processor tok[37]=rt_priority tok[38]=policy */
+    char *tok[40];
+    int nt = 0;
+    char *q = rp + 1;
+    while (*q && nt < 40) {
+        while (*q == ' ' || *q == '\n') q++;
+        if (!*q) break;
+        tok[nt++] = q;
+        while (*q && *q != ' ' && *q != '\n') q++;
+        if (*q) *q++ = '\0';
+    }
+    if (nt < 13) return -1;
+    unsigned long long utime = strtoull(tok[11], NULL, 10);
+    unsigned long long stime = strtoull(tok[12], NULL, 10);
+    char state[2] = { tok[0][0], '\0' };
+
+    fprintf(out, "%s{\"tid\":%d,\"comm\":\"%s\",\"state\":\"%s\",\"utime\":%llu,\"stime\":%llu",
+            first ? "" : ",", tid, comm_esc, state, utime, stime);
+    if (nt >= 27)
+        fprintf(out, ",\"startstack\":%llu,\"kstkesp\":%llu", strtoull(tok[25], NULL, 10), strtoull(tok[26], NULL, 10));
+    if (nt >= 37) fprintf(out, ",\"cpu\":%lld", strtoll(tok[36], NULL, 10));
+    if (nt >= 39)
+        fprintf(out, ",\"rt_prio\":%llu,\"policy\":%llu", strtoull(tok[37], NULL, 10), strtoull(tok[38], NULL, 10));
+
+    snprintf(path, sizeof(path), "/proc/%d/task/%d/status", (int)pid, tid);
+    if (read_small_file(path, sbuf, sizeof(sbuf)) > 0) {
+        const char *v;
+        if ((v = proc_line_value(sbuf, "voluntary_ctxt_switches:")) != NULL)
+            fprintf(out, ",\"vol\":%llu", strtoull(v, NULL, 10));
+        if ((v = proc_line_value(sbuf, "nonvoluntary_ctxt_switches:")) != NULL)
+            fprintf(out, ",\"invol\":%llu", strtoull(v, NULL, 10));
+        if ((v = proc_line_value(sbuf, "Cpus_allowed_list:")) != NULL) {
+            fprintf(out, ",\"cpus_allowed\":");
+            print_line_value(out, v);
+        }
+        if ((v = proc_line_value(sbuf, "Mems_allowed_list:")) != NULL) {
+            fprintf(out, ",\"mems_allowed\":");
+            print_line_value(out, v);
+        }
+    }
+
+    snprintf(path, sizeof(path), "/proc/%d/task/%d/syscall", (int)pid, tid);
+    if (read_small_file(path, sbuf, sizeof(sbuf)) > 0) {
+        char raw[200], esc[420];
+        size_t n = 0;
+        for (const char *c = sbuf; *c && *c != '\n' && n + 1 < sizeof(raw); c++) raw[n++] = *c;
+        raw[n] = '\0';
+        escape_json_string(raw, esc, sizeof(esc));
+        fprintf(out, ",\"syscall\":\"%s\"", esc);
+    }
+
+    snprintf(path, sizeof(path), "/proc/%d/task/%d/io", (int)pid, tid);
+    if (read_small_file(path, sbuf, sizeof(sbuf)) > 0) {    /* unreadable without privileges: omitted */
+        const char *r = proc_line_value(sbuf, "syscr:");
+        const char *w = proc_line_value(sbuf, "syscw:");
+        if (r && w)
+            fprintf(out, ",\"io\":{\"syscr\":%llu,\"syscw\":%llu}", strtoull(r, NULL, 10), strtoull(w, NULL, 10));
+    }
+
+    snprintf(path, sizeof(path), "/proc/%d/task/%d/schedstat", (int)pid, tid);
+    if (read_small_file(path, sbuf, sizeof(sbuf)) > 0) {    /* needs CONFIG_SCHED_INFO: omitted otherwise */
+        unsigned long long run_ns = 0, wait_ns = 0, slices = 0;
+        if (sscanf(sbuf, "%llu %llu %llu", &run_ns, &wait_ns, &slices) == 3)
+            fprintf(out, ",\"sched\":{\"run_ns\":%llu,\"wait_ns\":%llu,\"slices\":%llu}", run_ns, wait_ns, slices);
+    }
+    fputc('}', out);
+    return 0;
+}
+
+/* THREADS <pid> [after_tid]: one page (threads with tid > after_tid, at most THREADS_PAGE_SIZE). */
+int collector_read_threads(pid_t pid, long after_tid, void *out_file) {
+    FILE *out = out_file ? (FILE *)out_file : stdout;
+    if (pid <= 0) {
+        fprintf(out, "{\"success\":false,\"error\":\"INVALID_ARGS\",\"pid\":%d}\n", (int)pid);
+        fflush(out);
+        return -1;
+    }
+    int64_t t_start = get_time_ns();
+    char dpath[64];
+    snprintf(dpath, sizeof(dpath), "/proc/%d/task", (int)pid);
+    DIR *d = opendir(dpath);
+    if (!d) {
+        const char *e = (errno == EPERM || errno == EACCES) ? "PERMISSION_DENIED" : "TARGET_TERMINATED";
+        fprintf(out, "{\"success\":false,\"error\":\"%s\",\"pid\":%d}\n", e, (int)pid);
+        fflush(out);
+        return -1;
+    }
+    int *tids = (int *)malloc(sizeof(int) * THREADS_MAX_ENUM);
+    if (!tids) {
+        closedir(d);
+        fprintf(out, "{\"success\":false,\"error\":\"OUT_OF_MEMORY\",\"pid\":%d}\n", (int)pid);
+        fflush(out);
+        return -1;
+    }
+    int ntids = 0, truncated = 0;
+    struct dirent *de;
+    while ((de = readdir(d)) != NULL) {
+        char *endp = NULL;
+        long v = strtol(de->d_name, &endp, 10);
+        if (endp == de->d_name || *endp != '\0' || v <= 0 || v > 2147483647L) continue;
+        if (ntids >= THREADS_MAX_ENUM) { truncated = 1; break; }
+        tids[ntids++] = (int)v;
+    }
+    closedir(d);
+    qsort(tids, (size_t)ntids, sizeof(int), cmp_int);
+
+    fprintf(out, "{\"success\":true,\"pid\":%d,\"clk_tck\":%ld,\"threads\":[", (int)pid, (long)sysconf(_SC_CLK_TCK));
+    int emitted = 0, more = 0;
+    long last_tid = after_tid;
+    for (int i = 0; i < ntids; i++) {
+        if ((long)tids[i] <= after_tid) continue;
+        if (emitted >= THREADS_PAGE_SIZE) { more = 1; break; }
+        last_tid = tids[i];                     /* a vanished thread is skipped, never fatal */
+        if (emit_thread(out, pid, tids[i], emitted == 0) == 0) emitted++;
+    }
+    free(tids);
+    int64_t t_end = get_time_ns();
+    fprintf(out, "],\"count\":%d,\"more\":%s,\"next_after_tid\":%ld,\"truncated\":%s,\"duration_us\":%.2f}\n",
+            emitted, more ? "true" : "false", more ? last_tid : 0L, truncated ? "true" : "false",
+            (double)(t_end - t_start) / 1000.0);
+    fflush(out);
+    return 0;
+}
+
 int collector_daemon_loop(int backend, void *in_file, void *out_file) {
     FILE *in = in_file ? (FILE *)in_file : stdin;
     FILE *out = out_file ? (FILE *)out_file : stdout;
@@ -1537,6 +1740,35 @@ int collector_daemon_loop(int backend, void *in_file, void *out_file) {
             char *spec = space + 1;
             while (*spec == ' ') spec++;
             collector_read_slices(pid, backend, spec, out);
+            continue;
+        }
+        if (strncmp(p, "THREADS ", 8) == 0) {
+            char *rest = p + 8;
+            while (*rest == ' ') rest++;
+            char *space = strchr(rest, ' ');
+            long after_tid = 0;
+            if (space) {
+                *space = '\0';
+                char *astr = space + 1;
+                char *aend = NULL;
+                while (*astr == ' ') astr++;
+                errno = 0;
+                after_tid = strtol(astr, &aend, 10);
+                if (errno != 0 || aend == astr || *aend != '\0' || after_tid < 0) {
+                    fprintf(out, "{\"success\":false,\"error\":\"INVALID_ARGS\"}\n");
+                    fflush(out);
+                    continue;
+                }
+            }
+            char *endp = NULL;
+            errno = 0;
+            long p_val = strtol(rest, &endp, 10);
+            if (errno != 0 || endp == rest || *endp != '\0' || p_val <= 0 || p_val > 4194304L) {
+                fprintf(out, "{\"success\":false,\"error\":\"INVALID_PID\"}\n");
+                fflush(out);
+                continue;
+            }
+            collector_read_threads((pid_t)p_val, after_tid, out);
             continue;
         }
         fprintf(out, "{\"success\":false,\"error\":\"UNKNOWN_COMMAND\"}\n");

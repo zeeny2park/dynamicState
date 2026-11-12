@@ -1013,6 +1013,7 @@ class CfiUnwinder:
         self._read = read_memory
         self._mappings = [m for m in mappings if m.get("end_int", 0) > m.get("start_int", 0)]
         self._file_resolver = file_resolver
+        self.strict_images = False
         self._extra_images = dict(extra_images or {})
         self.max_stack_bytes = max_stack_bytes
         self.scan_window = scan_window
@@ -1052,9 +1053,11 @@ class CfiUnwinder:
         img: Optional[ElfImage] = None
         if path.startswith("/"):
             local = self._extra_images.get(path) or path
-            if self._file_resolver is not None:
+            if self.strict_images:   # remote target: a host file of the same path is a different file
+                local = (self._file_resolver(path) if self._file_resolver is not None else None) or ""
+            elif self._file_resolver is not None:
                 local = self._file_resolver(path) or local
-            img = load_elf_image(local)
+            img = load_elf_image(local) if local else None
             if img is not None and img.arch != self.arch.name:
                 img = None
         bias = 0
@@ -1879,12 +1882,18 @@ class CfiUnwinder:
 def make_unwinder_for_process(arch: Optional[str], mappings: Sequence[Dict[str, Any]],
                               read_memory: Callable[[int, int], Tuple[Optional[bytes], str, Optional[str]]],
                               endian: str = "little", pid: Optional[int] = None,
-                              extra_images: Optional[Dict[str, str]] = None) -> Optional[CfiUnwinder]:
-    """Factory used by the thread inspectors; None when the architecture is not implemented."""
+                              extra_images: Optional[Dict[str, str]] = None,
+                              image_provider: Optional[Callable[[str], Optional[str]]] = None) -> Optional[CfiUnwinder]:
+    """Factory used by the thread inspectors; None when the architecture is not implemented.
+
+    ``image_provider(target_path) -> local file | None`` supplies module images that are not on this host
+    (remote targets, IMP-011); when set it is the only source -- an unobtainable image stays unobtainable."""
     if not arch_supported(arch):
         return None
 
     def resolver(path: str) -> Optional[str]:
+        if image_provider is not None:
+            return image_provider(path)
         if os.path.isfile(path):
             return path
         if pid is not None:
@@ -1893,8 +1902,10 @@ def make_unwinder_for_process(arch: Optional[str], mappings: Sequence[Dict[str, 
                 return alt
         return None
 
-    return CfiUnwinder(arch or "", mappings, read_memory, endian=endian, file_resolver=resolver,
-                       extra_images=extra_images)
+    uw = CfiUnwinder(arch or "", mappings, read_memory, endian=endian, file_resolver=resolver,
+                     extra_images=extra_images)
+    uw.strict_images = image_provider is not None
+    return uw
 
 
 def parse_proc_syscall(text: str) -> Dict[str, Any]:

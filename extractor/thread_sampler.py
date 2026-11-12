@@ -600,6 +600,21 @@ def read_thread_fields(pid: int, tid: int, counters: Dict[str, int]) -> Optional
     return rec
 
 
+def read_local_thread_samples(pid: int, counters: Dict[str, int]) -> Optional[List[Dict[str, Any]]]:
+    """One local sample (LocalTargetAdapter.read_thread_samples): None when /proc/PID/task is unreadable."""
+    try:
+        tids = sorted(int(x) for x in os.listdir(f"/proc/{pid}/task") if x.isdigit())
+    except OSError:
+        return None
+    counters["proc_reads"] = counters.get("proc_reads", 0) + 1
+    out: List[Dict[str, Any]] = []
+    for tid in tids:
+        rec = read_thread_fields(pid, tid, counters)   # a thread may vanish mid-read: skipped
+        if rec is not None:
+            out.append(rec)
+    return out
+
+
 def _top_frame(thread_report: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     cs = thread_report.get("callstack") or []
     if not cs:
@@ -651,6 +666,14 @@ class ThreadSampler:
             return None
         return None
 
+    def _target_alive(self, pid: int, remote: bool) -> bool:
+        if not remote:
+            return os.path.exists(f"/proc/{pid}")
+        try:
+            return bool(self.adapter.check_liveness(pid)[0])
+        except Exception:  # noqa: BLE001
+            return True
+
     def collect(
         self,
         pid: int,
@@ -665,9 +688,10 @@ class ThreadSampler:
             remote = bool(self.adapter.is_remote())
         except Exception:  # noqa: BLE001
             remote = True
-        if remote:
-            series.stop_reason = ("remote target: per-thread CPU time / context switches / syscalls are not "
-                                  "available through the remote adapter (roadmap IMP-011/021)")
+        supported = bool(getattr(type(self.adapter), "thread_samples_supported", False))
+        if remote and not supported:
+            series.stop_reason = ("remote target: this adapter does not provide per-thread CPU time / context "
+                                  "switches / syscalls (read_thread_samples)")
             return series
         interval = cfg.interval_sec
         n_max = cfg.samples
@@ -685,21 +709,18 @@ class ThreadSampler:
                     break
                 time.sleep(interval)
             t_now = time.monotonic()
-            tids: List[int] = []
-            try:
-                tids = sorted(int(x) for x in os.listdir(f"/proc/{pid}/task") if x.isdigit())
-                series.counters["proc_reads"] = series.counters.get("proc_reads", 0) + 1
-            except OSError as exc:
-                series.failures.append({"index": i, "stage": "enumerate", "error": str(exc)})
-                if not os.path.exists(f"/proc/{pid}"):
+            recs: Optional[List[Dict[str, Any]]]
+            if supported:
+                recs = self.adapter.read_thread_samples(pid, series.counters)
+            else:
+                recs = read_local_thread_samples(pid, series.counters)
+            if recs is None:
+                series.failures.append({"index": i, "stage": "enumerate", "error": "thread enumeration failed"})
+                if not self._target_alive(pid, remote):
                     series.stop_reason = "target process exited"
                     break
                 continue
-            threads: Dict[int, Dict[str, Any]] = {}
-            for tid in tids:
-                rec = read_thread_fields(pid, tid, series.counters)   # a thread may vanish mid-read: skipped
-                if rec is not None:
-                    threads[tid] = rec
+            threads: Dict[int, Dict[str, Any]] = {int(r["tid"]): r for r in recs}
             info = None
             if inspect_fn is not None:
                 try:
