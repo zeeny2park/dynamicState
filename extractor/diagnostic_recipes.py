@@ -1020,8 +1020,124 @@ class DiagnosticRecipeRegistry:
         return _evaluate_specific_recipe(recipe, observation_data)
 
 
+# -----------------------------------------------------------------------------
+# IMP-008: rules over the multi-observation heap-walk investigation (extractor.leak_attribution)
+# -----------------------------------------------------------------------------
+_LEAK_VERDICTS = ("LEAK_UNREACHABLE", "UNBOUNDED_GROWTH_OWNED")
+_NO_LEAK_VERDICTS = ("NO_GROWTH", "IN_USE_SHRANK", "NO_GROWTH_TREND")
+
+
+def _leak_details(li: Dict[str, Any], extra: Dict[str, Any]) -> Dict[str, Any]:
+    owned_only = li.get("verdict") == "UNBOUNDED_GROWTH_OWNED"
+    d = {
+        "finding_category": CATEGORY_MEMORY_LEAK,
+        "leak_verdict": li.get("verdict"),
+        "leak_confirmed": li.get("verdict") == "LEAK_UNREACHABLE",
+        "finding_summary": li.get("summary"),
+        "rate_kb_per_sec": li.get("rate_kb_per_s"),
+        "limitations": list(li.get("limitations") or []),
+    }
+    if owned_only:
+        roots = ", ".join(dict.fromkeys(str(o.get("variable")) for o in li.get("growth_owners") or []))
+        d["certainty_cap"] = "PROBABLE"
+        d["certainty_cap_reason"] = (
+            "the growing blocks are still referenced from %s: unbounded growth under that owner over the "
+            "observation window; whether it is a leak or intended accumulation cannot be decided from memory" % roots)
+    d.update(extra)
+    return d
+
+
+def _evaluate_leak_investigation(recipe: "DiagnosticRecipe", data: Dict[str, Any]) -> Optional[RecipeEvaluationResult]:
+    """Evaluation of the memory recipes from the IMP-008 investigation; None = use the legacy rules."""
+    li = data.get("leak_investigation")
+    if not isinstance(li, dict) or not li.get("verdict"):
+        return None
+    rid = recipe.recipe_id
+    verdict = li["verdict"]
+    walks = int(li.get("walks") or 0)
+    lims = list(li.get("limitations") or [])
+    facts = list(li.get("facts") or [])
+    if verdict == "LEAK_OWNER_UNSUPPORTED":
+        return None
+    if rid != "RECIPE_PROCESS_MEMORY_GROWTH" and walks == 0:
+        return None                                  # follow-ups without walk data: legacy rules
+    if rid == "RECIPE_LONG_LIVED_OBJECT_ACCUMULATION" and verdict in _NO_LEAK_VERDICTS:
+        # no growth in the window says nothing about a container that is ALREADY large: keep the legacy census
+        # rules (container size / object counts) for that question
+        return None
+    trend = data.get("memory_trend") or {}
+    if verdict in _LEAK_VERDICTS:
+        if rid == "RECIPE_LONG_LIVED_OBJECT_ACCUMULATION" and not li.get("growth_owners"):
+            return RecipeEvaluationResult(
+                recipe_id=rid, status=RECIPE_STATUS_NOT_APPLICABLE, confidence=0.9,
+                confidence_basis="The growing blocks are unreachable: no container retains them.",
+                not_applicable_reason="growing blocks have no reachable owner (no retaining container)",
+                details={"object_accumulation_confirmed": False, "limitations": lims},
+            )
+        if rid == "RECIPE_LONG_LIVED_OBJECT_ACCUMULATION":
+            own = [f for f in facts if f.startswith("unbounded growth under")]
+            o = li["growth_owners"][0]
+            return RecipeEvaluationResult(
+                recipe_id=rid, status=RECIPE_STATUS_SUPPORTED, confidence=0.85,
+                confidence_basis="; ".join(own) or str(li.get("summary")),
+                supporting_facts=own or [str(li.get("summary"))],
+                recommended_action="Inspect the eviction / capacity policy of the growing owner.",
+                details=_leak_details(li, {"object_accumulation_confirmed": True, "container_symbol": o.get("variable"),
+                                           "retained_count": o.get("blocks_delta"), "is_unbounded": True}),
+            )
+        if rid == "RECIPE_HEAP_GROWTH":
+            fact = ("in-use heap grew +%d KB (+%d blocks) across %d heap walks over %.2f s, without a drop"
+                    % (int(li.get("in_use_growth_bytes") or 0) // 1024, int(li.get("in_use_growth_blocks") or 0),
+                       walks, float(li.get("window_s") or 0.0)))
+            return RecipeEvaluationResult(
+                recipe_id=rid, status=RECIPE_STATUS_SUPPORTED, confidence=0.9, confidence_basis=fact,
+                supporting_facts=[fact],
+                recommended_action="See the leak attribution (owner path / unreachable size classes).",
+                details=_leak_details(li, {"heap_growth_confirmed": True,
+                                           "heap_growth_bytes": li.get("in_use_growth_bytes"),
+                                           "live_leak_confirmed": verdict == "LEAK_UNREACHABLE"}),
+            )
+        return RecipeEvaluationResult(
+            recipe_id=rid, status=RECIPE_STATUS_SUPPORTED,
+            confidence=0.95 if verdict == "LEAK_UNREACHABLE" else 0.85,
+            confidence_basis=str(li.get("summary")),
+            supporting_facts=facts or [str(li.get("summary"))],
+            limitations=lims,
+            recommended_action=("Find where the unreachable blocks lose their last reference." if verdict ==
+                                "LEAK_UNREACHABLE" else "Check whether the growing owner has an upper bound."),
+            details=_leak_details(li, {"growth_confirmed": True,
+                                       "classification": "CONFIRMED_LEAK" if verdict == "LEAK_UNREACHABLE"
+                                       else "OBJECT_ACCUMULATION"}),
+        )
+    rss_grew = bool(trend.get("indicates_growth"))
+    if verdict in _NO_LEAK_VERDICTS and not (verdict == "NO_GROWTH" and rss_grew):
+        txt = str(li.get("summary") or verdict)
+        return RecipeEvaluationResult(
+            recipe_id=rid, status=RECIPE_STATUS_CONTRADICTED, confidence=0.9, confidence_basis=txt,
+            contradicting_facts=[txt],
+            recommended_action="Refute unmanaged memory growth in the observation window.",
+            details={"growth_confirmed": False, "leak_verdict": verdict, "limitations": lims,
+                     "transient_warmup": verdict == "IN_USE_SHRANK"},
+        )
+    if verdict == "NO_GROWTH" and rss_grew:
+        lims = lims + ["growth observed, not established as a leak: RSS %+d KB but in-use heap %+d KB over the "
+                       "walks (fragmentation, file / anonymous mappings outside malloc, or allocator caching)"
+                       % (int(trend.get("rss_growth_kb") or 0), int(li.get("in_use_growth_bytes") or 0) // 1024)]
+    return RecipeEvaluationResult(
+        recipe_id=rid, status=RECIPE_STATUS_INSUFFICIENT_EVIDENCE, confidence=0.3,
+        confidence_basis="; ".join(lims) or str(li.get("summary") or verdict),
+        missing_evidence=["heap_growth_attributed_to_unreachable_blocks_or_an_owner"],
+        limitations=lims,
+        details={"growth_confirmed": False, "leak_verdict": verdict, "limitations": lims},
+    )
+
+
 def _evaluate_specific_recipe(recipe: DiagnosticRecipe, data: Dict[str, Any]) -> RecipeEvaluationResult:
     rid = recipe.recipe_id
+    if rid in ("RECIPE_PROCESS_MEMORY_GROWTH", "RECIPE_HEAP_GROWTH", "RECIPE_LONG_LIVED_OBJECT_ACCUMULATION"):
+        _li_res = _evaluate_leak_investigation(recipe, data)
+        if _li_res is not None:
+            return _li_res
 
     # 1. RECIPE_INVALID_MEMORY_ACCESS
     if rid == "RECIPE_INVALID_MEMORY_ACCESS":

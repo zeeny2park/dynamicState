@@ -128,6 +128,9 @@ class RuntimeEvidenceProvider:
         self.thread_sampling_overrides: Dict[str, Any] = {}
         # When a dict, a usable thread series is shared by all thread recipes of the run (None = never share)
         self.thread_series_cache: Optional[Dict[Any, Any]] = None
+        # IMP-008: multi-observation memory investigation (leak_attribution.MemoryObservationConfig); None = legacy
+        # single-sample behaviour of the memory branch (direct provider users / epoch-driven callers).
+        self.memory_observation: Optional[Any] = None
 
     def _inspect_locks(self, pid: int, companion_elf: Optional[str]) -> Any:
         """One lock inspection (existing callstack/lock interface) widened with member / futex mutexes (IMP-010)."""
@@ -158,7 +161,12 @@ class RuntimeEvidenceProvider:
                 derived = self.thread_series_cache[cache_key]
             else:
                 sampler = ThreadSampler(self.adapter, self.watch_manager, self.budget_tracker)
-                series = sampler.collect(pid, companion_elf or "", cfg, inspect_fn=lambda: self._inspect_locks(pid, companion_elf))
+                inspect = lambda: self._inspect_locks(pid, companion_elf)  # noqa: E731
+                if self.memory_observation is not None:
+                    # IMP-008: one /proc memory sample per thread sample - the memory trend shares this window
+                    from .leak_attribution import cosampling_inspect
+                    inspect = cosampling_inspect(self, pid, inspect)
+                series = sampler.collect(pid, companion_elf or "", cfg, inspect_fn=inspect)
                 derived = judge_thread_series(series)
                 if self.thread_series_cache is not None and derived.get("thread_sampling", {}).get("status") == "OK":
                     self.thread_series_cache[cache_key] = derived
@@ -1211,6 +1219,13 @@ class RuntimeEvidenceProvider:
             })
             if len(heap_valid_series) >= 2:
                 observation_data["heap_growth_bytes"] = (heap_valid_series[-1] - heap_valid_series[0]) * 1024
+
+            if self.memory_observation is not None:
+                # IMP-008: >= 3 spaced observations in this run; heap walks + growth attribution when the trend or
+                # the run asks for them (shared by the memory recipes of the session).
+                from .leak_attribution import attach_memory_observation
+                attach_memory_observation(self, recipe, pid, companion_elf, classification, session_id,
+                                          observation_data, all_records, target_key=target_key)
 
             return observation_data, all_records
 

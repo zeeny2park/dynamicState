@@ -1245,6 +1245,11 @@ class AdaptiveInvestigationSession:
         }
         # One thread sample series per run, shared by the thread recipes (the baseline runs two of them)
         self.evidence_provider.thread_series_cache = {}
+        # IMP-008: memory is observed >= 3 times per run at the session's interval / window (cheap /proc samples
+        # share the thread-sampling window; heap walks only when the trend or the run asks about memory).
+        from .leak_attribution import MemoryObservationConfig
+        self.evidence_provider.memory_observation = MemoryObservationConfig.from_session(
+            self.observation_interval, self.observation_duration, self.recipe_thresholds, target_recipe=self.target_recipe)
         self.temporal_memory_samples: List[Dict[str, Any]] = []
         self.observation_window = ObservationWindow(
             target_pid=pid or 0,
@@ -2172,7 +2177,11 @@ class AdaptiveInvestigationSession:
                         s.status = "SKIPPED"
                 # IMP-004: dynamically scheduled growth follow-ups must still execute; otherwise keep the
                 # original early stop.  Baseline checks that have not run yet also keep the loop going.
+                # (IMP-008: also the follow-ups scheduled by an EARLIER growth step - a supported first follow-up
+                # must not cut off the second one.)
                 if (not any(s.status == "PENDING" for s in dynamic_followups)
+                        and not any(s.status == "PENDING" and str(s.rationale or "").startswith("Dynamic follow-up")
+                                    for s in remaining_steps)
                         and not any(s.status == "PENDING" and s.recipe_id in BASELINE_RECIPE_IDS
                                     for s in remaining_steps)):
                     self.state = STATE_ANALYZING
@@ -2294,9 +2303,13 @@ class AdaptiveInvestigationSession:
                 hyp_status = "INCONCLUSIVE"
                 conf_basis = "Insufficient evidence collected to evaluate hypothesis criteria."
 
+            # IMP-008: a rule may name what it observed (e.g. the growing owner path and rate) for the finding text
+            summaries = list(dict.fromkeys(str(e.get("details", {}).get("finding_summary")) for e in supp_ev
+                                           if e.get("details", {}).get("finding_summary")))
             hyp = ExpertHypothesis(
                 hypothesis_id=f"HYP_{hyp_counter:02d}",
-                problem_statement=f"Runtime anomaly in {cat}: observed {len(supp_ev)} corroborating indicators.",
+                problem_statement=f"Runtime anomaly in {cat}: observed {len(supp_ev)} corroborating indicators."
+                                  + ("".join(" " + x for x in summaries[:2])),
                 category=cat,
                 domain=ev_list[0].get("domain", DOMAIN_ABNORMAL_RUNTIME_STATE),
                 status=hyp_status,
@@ -2560,7 +2573,19 @@ class AdaptiveInvestigationSession:
             has_primary_supp = bool(hyp.supporting_evidence and any(e.get("status") == "SUPPORTED" for e in hyp.supporting_evidence))
             has_unrefuted_contra = bool(hyp.contradicting_evidence and any(e.get("status") == "CONTRADICTED" for e in hyp.contradicting_evidence))
 
-            if has_fail and has_primary_supp and not has_pass:
+            # IMP-008: a rule can cap what its observation proves (e.g. unbounded growth of a still-referenced
+            # container: the growth is measured, but leak vs intended accumulation is not decidable from memory)
+            capped = [e for e in hyp.supporting_evidence if e.get("details", {}).get("certainty_cap") == "PROBABLE"]
+            uncapped = [e for e in hyp.supporting_evidence if e.get("status") == "SUPPORTED"
+                        and e.get("details", {}).get("certainty_cap") != "PROBABLE"
+                        and e.get("details", {}).get("leak_confirmed")]
+            if has_fail and has_primary_supp and not has_pass and capped and not uncapped:
+                hyp.status = "LIKELY"
+                hyp.confidence = min(max(hyp.confidence, 0.70), 0.85)
+                hyp.confidence_basis = ("Observed fault criteria met, but the evidence caps the conclusion at probable: "
+                                        + "; ".join(dict.fromkeys(str(e["details"].get("certainty_cap_reason", ""))
+                                                                  for e in capped)))
+            elif has_fail and has_primary_supp and not has_pass:
                 hyp.status = "CONFIRMED"
                 hyp.confidence = max(hyp.confidence, 0.92)
                 hyp.confidence_basis = f"Executable criteria verified fault: {'; '.join(r['rationale'] for r in results if r['result'] == 'FAIL')}"
@@ -3717,7 +3742,9 @@ DIAGNOSE_SCHEMA_VERSION = "1"
 DIAGNOSE_DEFAULT_SYMPTOM = "general health check"
 
 _SUBJECT_SKIP_KEYS = {"threads", "callstacks_info", "locks", "observation_window", "thread_summary",
-                      "thread_sampling", "long_wait_threads"}
+                      "thread_sampling", "long_wait_threads",
+                      # IMP-008: per-walk totals and growth NOT attributed to an owner carry no subject names
+                      "heap_walks", "held_growth", "memory_trend"}
 # IMP-010: thread findings of the time-series sampler (rows are dicts of {tid, name, function, ...})
 _SUBJECT_THREAD_ROW_KEYS = ("runaway_threads", "zombie_threads", "d_state_threads", "stalled_lock_waits")
 _SUBJECT_KEY_KIND = {
@@ -3729,6 +3756,10 @@ _SUBJECT_KEY_KIND = {
     "source_location": "source_location",
     "variable": "variable", "variable_name": "variable", "symbol": "variable",
     "expression": "variable", "source_variable": "variable",
+    # IMP-008 leak attribution: the owning variable / its normalised growth path; for unreachable growth the
+    # thread whose arena holds the blocks (evidence-based, see leak_attribution.arena_threads)
+    "variable_path": "variable",
+    "allocating_thread_name": "thread_name", "allocating_thread_tid": "thread",
 }
 
 
@@ -3980,6 +4011,18 @@ def diagnose(
         if res.verdict == "CONFIRMED_FAULT" and not any(f["status"] == "CONFIRMED_ROOT_CAUSE" for f in res.findings):
             res.verdict = "PROBABLE_FAULT" if res.findings else "INCONCLUSIVE"
 
+        # IMP-008: the leak-owner part (heap walks) could not be done / completed on this target
+        leak_nc_seen = set()
+        for c in session.checks:
+            li = (c.actual_observations or {}).get("leak_investigation") if isinstance(c.actual_observations, dict) else None
+            if isinstance(li, dict) and li.get("status") in ("UNSUPPORTED", "LIMITED"):
+                why = "; ".join(str(x) for x in (li.get("limitations") or [])) or str(li.get("status"))
+                if why not in leak_nc_seen:
+                    leak_nc_seen.add(why)
+                    nc.append({"kind": "unsupported_on_target" if li["status"] == "UNSUPPORTED" else "leak_owner_limited",
+                               "item": "leak_owner_attribution",
+                               "reason": ("not supported on this target: " if li["status"] == "UNSUPPORTED" else "")
+                               + why})
         for c in session.checks:
             if c.status in (CheckStatus.PASS, CheckStatus.FAIL):
                 continue

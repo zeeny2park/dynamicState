@@ -472,8 +472,15 @@ class ObservationWindow:
         if is_rss_monotonic and rss_delta > 512:
             # P0: RSS growth alone establishes SUSTAINED_RSS_GROWTH, NOT confirmed memory leak!
             # Only if live allocations or allocator heap or container growth is ALSO observed does it become a leak!
+            # IMP-008: allocator series measured at >= 3 points must not drop (a sawtooth whose ends happen to be
+            # higher is released memory, not a leak)
+            alloc_monotonic = (len(alloc_heap_series) < 3
+                               or all(b >= a for a, b in zip(alloc_heap_series, alloc_heap_series[1:])))
+            live_monotonic = (len(live_alloc_series) < 3
+                              or all(b >= a for a, b in zip(live_alloc_series, live_alloc_series[1:])))
             has_internal_heap_leak_evidence = (
-                live_alloc_delta > 50 or allocator_heap_delta > 256 or bool(retaining_containers)
+                (live_alloc_delta > 50 and live_monotonic) or (allocator_heap_delta > 256 and alloc_monotonic)
+                or bool(retaining_containers)
             )
 
             if has_internal_heap_leak_evidence:

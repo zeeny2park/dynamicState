@@ -628,6 +628,9 @@ class HeapWalker:
         self.result: Optional[HeapWalkResult] = None
         self._maps: List[Dict[str, Any]] = []
         self._anon_probe_done: set = set()
+        self._layout: Optional[GlibcMallocLayout] = None
+        self._arena_addrs: List[int] = []
+        self.top_extensions = 0
 
     # ---------------------------------------------------------------- gating
     def _gate(self) -> Optional[HeapWalkResult]:
@@ -945,6 +948,8 @@ class HeapWalker:
                     break
                 arenas.append(cur)
                 cur = _u64(self._arena_bytes(cur, layout), layout.ms["next"])
+            self._layout = layout
+            self._arena_addrs = list(arenas)
             for ai, a in enumerate(arenas):
                 self._walk_arena(ai, a, layout, is_main=(ai == 0))
             # did the heap move under us?  (top re-read after the walk; informational)
@@ -1130,6 +1135,76 @@ class HeapWalker:
             n += 1
         return pending, None, soft, False
 
+    # ---------------------------------------------------------------- top catch-up (IMP-008)
+    def extend_arena_top(self, ai: int) -> int:
+        """The target kept allocating after arena ``ai`` was read: chunks carved from ``top`` since then
+        are not in the table, so a pointer into the old top chunk (typically the newest element of a
+        growing list, held by its root variable) leads nowhere.  Re-read the arena's current ``top`` and
+        walk only the bytes between the old and the new top (same segment, one zero-stop batch read);
+        the old TOP entry becomes the first carved chunk.  Returns the number of chunks added (0 when
+        nothing could be added: top did not move forward, moved to another segment, or the read tore)."""
+        res = self.result
+        layout = self._layout
+        if res is None or layout is None or not (0 <= ai < len(self._arena_addrs)) or ai >= len(res.arenas):
+            return 0
+        a = self._arena_addrs[ai]
+        info = res.arenas[ai]
+        try:
+            old_top = int(str(info.get("top")), 16)
+        except (TypeError, ValueError):
+            return 0
+        ti = res.chunks.index_of_chunk(old_top)
+        if ti is None or res.chunks.states[ti] != ST_TOP:
+            return 0
+        seg = next(((s, e) for s, e in res.heap_ranges if s <= old_top < e), None)
+        if seg is None:
+            return 0
+        is_main = ai == 0
+        try:
+            tb = self.reader.read(a + layout.ms["top"], 8)
+            if not tb or len(tb) < 8:
+                return 0
+            new_top = _u64(tb, 0)
+            seg_end = seg[1]
+            if not (old_top < new_top):
+                return 0
+            if new_top + 16 > seg_end:
+                # the segment itself grew (brk / heap_info size): only the current mapping bound matters
+                if is_main:
+                    maps = list(self.adapter.get_proc_maps(self.pid) or [])
+                    m = next((mm for mm in maps if _map_bounds(mm)[0] == seg[0]), None)
+                    seg_end = _map_bounds(m)[1] if m else seg_end
+                else:
+                    hb = self.reader.read(seg[0], 24)
+                    if hb and len(hb) >= 24:
+                        seg_end = seg[0] + struct.unpack_from("<QQQ", hb, 0)[2]
+                if new_top + 16 > seg_end:
+                    return 0
+            buf = self.reader.read(old_top, new_top + 16 - old_top)
+        except HeapWalkBudgetExhausted:
+            return 0
+        if not buf or len(buf) < new_top + 16 - old_top:
+            return 0
+        pending, hard, _soft, reached = self._walk_buffer(buf, layout, old_top, old_top, new_top, is_main)
+        if hard is not None or not reached or len(pending) < 2:
+            res.warnings.append(f"arena {ai}: top catch-up 0x{old_top:x}..0x{new_top:x} not walkable (target "
+                                f"modified it while it was read)")
+            return 0
+        p0, sz0, st0 = pending[0]
+        res.chunks.sizes[ti] = sz0
+        res.chunks.states[ti] = st0
+        for p, sz, st in pending[1:]:
+            res.chunks.append(p, sz, st, ai)
+        res.chunks._sorted = False
+        res.chunks.finalize()
+        res.snapshot.add(old_top, bytes(buf))
+        if new_top + 16 > seg[1]:
+            res.heap_ranges = [(s, max(e, new_top + 16)) if (s, e) == seg else (s, e) for s, e in res.heap_ranges]
+        info["top"] = "0x%x" % new_top
+        info["top_catch_up_chunks"] = int(info.get("top_catch_up_chunks", 0)) + len(pending) - 1
+        self.top_extensions += 1
+        return len(pending) - 1
+
     # ---------------------------------------------------------------- mmapped chunks
     def _candidate_anon_maps(self) -> List[Tuple[int, int]]:
         out = []
@@ -1140,9 +1215,22 @@ class HeapWalker:
             if p or "r" not in perms or "w" not in perms:
                 continue
             s, e = _map_bounds(m)
-            if any(hs <= s < he or s <= hs < e for hs, he in heap_ranges):
-                continue
-            out.append((s, e))
+            # The kernel merges adjacent anonymous mappings with equal permissions: mmapped chunks placed
+            # right below a thread arena's heap share one VMA with the heap's writable part (IMP-008).
+            # Probe the parts of the mapping outside every arena segment instead of skipping it.
+            pieces = [(s, e)]
+            for hs, he in heap_ranges:
+                nxt = []
+                for ps, pe in pieces:
+                    if he <= ps or hs >= pe:
+                        nxt.append((ps, pe))
+                        continue
+                    if ps < hs:
+                        nxt.append((ps, hs))
+                    if he < pe:
+                        nxt.append((he, pe))
+                pieces = nxt
+            out.extend((ps, pe) for ps, pe in pieces if pe - ps >= 4096)
         return out
 
     def _valid_mmapped_header(self, hdr: bytes, addr: int, limit: int) -> Optional[int]:

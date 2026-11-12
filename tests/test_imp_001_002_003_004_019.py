@@ -31,6 +31,7 @@ from extractor.capture_plan import CaptureMode, CapturePlan
 from extractor.diagnostic_recipes import (
     DiagnosticRecipeRegistry,
     RecipeEvaluationResult,
+    RECIPE_OBJECT_LIFETIME_ANOMALIES,
     RECIPE_POTENTIAL_DEADLOCK_PATTERNS,
     RECIPE_PROCESS_MEMORY_GROWTH,
     RECIPE_STATUS_INSUFFICIENT_EVIDENCE,
@@ -267,14 +268,17 @@ class TestImp001CollectionFailureIsInconclusive(_ImpTestBase):
     def test_all_insufficient_expert_run_has_no_healthy_wording(self) -> None:
         """A run whose every recipe is INSUFFICIENT_EVIDENCE must not read as healthy / confirmed clean.
 
-        A single-recipe session on a live idle process yields one RSS sample (growth) and no lock graph
-        (deadlock), so each recipe is genuinely INSUFFICIENT_EVIDENCE through the production path.
+        A single-recipe session on a live idle process has no allocation lifetime data (object lifetime) and no
+        lock graph (deadlock), so each recipe is genuinely INSUFFICIENT_EVIDENCE through the production path.
+        (Until IMP-008 the memory-growth recipe served here - one RSS sample per run; it now observes memory >= 3
+        times per run and can measure that an idle process is stable, so it is no longer insufficient. The
+        object-lifetime recipe goes through the same memory collection path, including the heap walks.)
         """
         idle = subprocess.Popen(["sleep", "60"])
         self.addCleanup(lambda: (idle.kill(), idle.wait(timeout=5)))
         time.sleep(0.1)
         eng = ExpertDiagnosticEngine(corpus_dir=self.corpus_dir)
-        for rid in (RECIPE_PROCESS_MEMORY_GROWTH, RECIPE_POTENTIAL_DEADLOCK_PATTERNS):
+        for rid in (RECIPE_OBJECT_LIFETIME_ANOMALIES, RECIPE_POTENTIAL_DEADLOCK_PATTERNS):
             with self.subTest(recipe=rid):
                 sess = eng.start_investigation(
                     problem_statement=f"Targeted execution of diagnostic recipe {rid}", pid=idle.pid, target_recipe=rid
