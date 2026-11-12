@@ -357,6 +357,16 @@ class TestDetectionFromBinaries(unittest.TestCase):
         # a still-running native process
         sleeper = subprocess.Popen([out_sleep_free_path(self.tmp)])
         self.addCleanup(lambda: (sleeper.kill(), sleeper.wait()))
+        # The dynamic loader maps libc shortly after exec; wait for it so detection is not racing process start-up.
+        deadline = time.time() + 5.0
+        while time.time() < deadline:
+            try:
+                with open(f"/proc/{sleeper.pid}/maps") as fh:
+                    if "libc" in fh.read():
+                        break
+            except OSError:
+                pass
+            time.sleep(0.01)
         abi = detect_target_abi(LocalTargetAdapter(), sleeper.pid)
         self.assertEqual(abi.status, DETECTION_DETECTED, abi.error)
         self.assertEqual(abi.word_size, struct.calcsize("P") * 8)
