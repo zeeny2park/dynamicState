@@ -33,3 +33,7 @@ reports/
 *.raw
 *.bin
 
+
+# Packaging
+*.egg-info/
+dist/

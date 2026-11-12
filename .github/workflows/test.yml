@@ -406,6 +406,10 @@ jobs:
         run: |
           python3 -m unittest tests/test_ci_workflow_parity.py
 
+      - name: Install package into a fresh venv and run README commands (IMP-022)
+        run: |
+          scripts/check_readme_commands.sh
+
       - name: Run Performance Benchmark Smoke Test
         run: |
           python3 -m benchmarks.capture_benchmark --smoke
