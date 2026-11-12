@@ -50,6 +50,7 @@ from .heap_walker import (
     ST_IN_USE,
     ST_INTERNAL,
     ST_MMAPPED,
+    ST_TOP,
     STATE_NAMES,
     BudgetedReader,
     HeapWalker,
@@ -94,6 +95,9 @@ class ReachabilityLimits:
     max_refs_per_chunk: int = 8
     max_root_var_bytes: int = 64 * 1024 * 1024
     max_conservative_region_bytes: int = 16 * 1024 * 1024
+    # A thread stack whose stack pointer is unknown (running thread) is scanned from its top down to at most this
+    # many bytes (None = max_conservative_region_bytes).  Live frames and the thread descriptor sit at the top.
+    max_stack_without_sp_bytes: Optional[int] = None
     max_conservative_total_bytes: int = 256 * 1024 * 1024
     max_mmapped_content_bytes: int = 64 * 1024 * 1024
     max_path_tokens: int = 4096
@@ -130,6 +134,11 @@ class ReachabilityAnalyzer:
         self._hasptr_cache: Dict[Tuple[int, int], bool] = {}
         self._anon_ranges = self._anonymous_ranges()
         self._mmapped_read = 0
+        # IMP-008: typed pointers into an arena's old top chunk (target allocated after the walk read the
+        # arena) wait here until the walker caught up with the new top; bounded per arena.
+        self.pending_top: Dict[int, List[Tuple[int, str, int, int, int, int, Optional[int]]]] = {}
+        self._top_catch_up: Dict[int, int] = {}
+        self.max_top_catch_up = 4
 
     # ------------------------------------------------------------------ type helpers
     def _canon(self, mi: int, off: Optional[int]):
@@ -259,9 +268,18 @@ class ReachabilityAnalyzer:
                     pointee_off: Optional[int]) -> None:
         ci = self.ct.find_containing(value)
         if ci is None:
+            ai = self._beyond_top_arena(value)
+            if ai is not None:
+                self.pending_top.setdefault(ai, []).append((node, suffix, root, slot, value, mi, pointee_off))
+                return
             if (value & 0xFFF) == 0x10 and self._in_anon(value):
                 self.pending_probe.setdefault(value, []).append((node, suffix, root, slot, pointee_off, mi))
             return
+        if self.ct.states[ci] == ST_TOP and hasattr(self.walker, "extend_arena_top"):
+            ai = int(self.ct.arena[ci])
+            if self._top_catch_up.get(ai, 0) < self.max_top_catch_up:
+                self.pending_top.setdefault(ai, []).append((node, suffix, root, slot, value, mi, pointee_off))
+                return
         self.edges += 1
         if self.edges > self.limits.max_edges:
             if "max_edges" not in self.truncated:
@@ -291,6 +309,26 @@ class ReachabilityAnalyzer:
         user_end = self.ct.addrs[ci] + 16 + self.ct.usable_size(ci)
         as_array = esz > 0 and (user_end - value) // esz >= 2
         self.queue.append((child, value, pointee_off, as_array, mi))
+
+    def _beyond_top_arena(self, value: int) -> Optional[int]:
+        """Arena whose heap grew past the walked segment and now holds ``value`` (above its old top)."""
+        if not hasattr(self.walker, "extend_arena_top"):
+            return None
+        layout = getattr(self.walker, "_layout", None)
+        hmax = int(getattr(layout, "heap_max_size", 0) or (64 << 20))
+        for ai, info in enumerate(self.walk.arenas):
+            if self._top_catch_up.get(ai, 0) >= self.max_top_catch_up:
+                continue
+            try:
+                top = int(str(info.get("top")), 16)
+            except (TypeError, ValueError):
+                continue
+            if not (top < value < top + hmax):
+                continue
+            if ai and (value & ~(hmax - 1)) != (top & ~(hmax - 1)):
+                continue
+            return ai
+        return None
 
     def _chunk_bytes(self, ci: int) -> Optional[Tuple[bytes, int]]:
         a = self.ct.addrs[ci]
@@ -352,7 +390,7 @@ class ReachabilityAnalyzer:
         et = self._canon(mi, et_off)
         if et is not None and et.tag in _PTR_TAGS and esz == 8:
             # fast path: array of pointers
-            words = array("Q", buf[boff:boff + count * 8])
+            words = array("Q", bytes(buf[boff:boff + count * 8]))
             pt = et.target_type_offset
             find = self.ct.find_containing
             for i, v in enumerate(words):
@@ -376,7 +414,7 @@ class ReachabilityAnalyzer:
                 buf, coff = loc
                 boff = coff + (addr - self.ct.addrs[ci])
                 chunk_end = coff + 16 + self.ct.usable_size(ci)
-                view = buf if chunk_end >= len(buf) else buf[:chunk_end]
+                view = buf if chunk_end >= len(buf) else memoryview(buf)[:chunk_end]   # no copy of the whole segment per chunk
                 root = self.node_root[node]
                 pt = self._canon(mi, type_off)
                 if as_array or (pt is not None and pt.tag not in _STRUCT_TAGS):
@@ -386,6 +424,22 @@ class ReachabilityAnalyzer:
                     self._scan_elements(node, root, mi, view, boff, addr, type_off, esz, count, "", 0)
                 else:
                     self._scan(node, root, mi, view, boff, addr, type_off, "", True)
+            if self.pending_top:
+                ptop = self.pending_top
+                self.pending_top = {}
+                grown = False
+                for ai in ptop:
+                    self._top_catch_up[ai] = self._top_catch_up.get(ai, 0) + 1
+                    if self.walker.extend_arena_top(ai) > 0:
+                        grown = True
+                    else:
+                        self._top_catch_up[ai] = self.max_top_catch_up      # nothing more to gain
+                if grown:
+                    self._grow()
+                for ai, lst in ptop.items():
+                    for node, suffix, root, slot, value, mi, pointee_off in lst:
+                        self._on_pointer(node, suffix, root, slot, value, mi, pointee_off)
+                continue
             if not self.pending_probe:
                 return
             pend = self.pending_probe
@@ -577,6 +631,8 @@ class ReachabilityAnalyzer:
             sp = int(si.get("sp_int") or 0)
             frm = (sp & ~7) if s <= sp < e else s
             frm = max(frm, e - self.limits.max_conservative_region_bytes)
+            if not (s <= sp < e) and self.limits.max_stack_without_sp_bytes is not None:
+                frm = max(frm, e - int(self.limits.max_stack_without_sp_bytes))
             regions.append((KIND_STACK_CONS, {"thread": t.get("name"), "tid": t.get("tid"),
                                               "from_sp": bool(s <= sp < e)}, frm, e))
         heap_r = list(self.walk.heap_ranges)
@@ -601,9 +657,13 @@ class ReachabilityAnalyzer:
             if any(ss <= s < se for ss, se in stack_ranges) or any(hs <= s < he or s <= hs < e for hs, he in heap_r):
                 continue
             kind = KIND_DATA_CONS if p else KIND_ANON_CONS
+            is_guarded = s in guarded and not p
+            lo, hi = s, min(e, s + self.limits.max_conservative_region_bytes)
+            if is_guarded and unresolved and self.limits.max_stack_without_sp_bytes is not None:
+                # probably the stack of a running thread: its live part is at the top
+                lo, hi = max(s, e - int(self.limits.max_stack_without_sp_bytes)), e
             regions.append((kind, {"region": os.path.basename(p) if p else "anonymous 0x%x" % s,
-                                   "guarded": s in guarded and not p},
-                            s, min(e, s + self.limits.max_conservative_region_bytes)))
+                                   "guarded": is_guarded}, lo, hi))
         reads = []
         for kind, meta, s, e in regions:
             if total + (e - s) > self.limits.max_conservative_total_bytes:
