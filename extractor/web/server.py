@@ -3757,13 +3757,16 @@ class WebApiAdapter:
             except (TypeError, ValueError):
                 return {"success": False, "error": {"code": "INVALID_PARAM", "message": "time_limit_s must be a positive number"}}
             time_limit_s = min(time_limit_s, self.DIAGNOSE_MAX_TIME_LIMIT_S)
+        language = params.get("language") or "en"
+        if language not in ("en", "ko"):
+            return {"success": False, "error": {"code": "INVALID_PARAM", "message": "language must be 'en' or 'ko'"}}
         try:
-            from extractor.expert_diagnostic_engine import diagnose
-            result = diagnose(
+            from extractor.human_report import diagnose_with_summary
+            result, summary = diagnose_with_summary(
                 pid, debug_image=debug_image, symptom=symptom, time_limit_s=time_limit_s,
-                engine=self.runtime.expert_diagnostic_engine,
+                engine=self.runtime.expert_diagnostic_engine, lang=language,
             )
-            return {"success": True, "result": _to_json_serializable(result.to_dict())}
+            return {"success": True, "result": _to_json_serializable({**result, "human_summary": summary})}
         except Exception as e:
             return {"success": False, "error": {"code": "DIAGNOSE_ERROR", "message": str(e)}}
 

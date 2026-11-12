@@ -3957,6 +3957,9 @@ def diagnose(
 
         engine = engine or ExpertDiagnosticEngine(corpus_dir=corpus_dir)
         limits = ObservationBudgetLimits(max_wall_clock_ms=float(time_limit_s) * 1000.0) if time_limit_s else None
+        # IMP-020: bracket the whole collection with the target-load meter (never raises; unmeasured -> None).
+        from .collection_impact import CollectionImpactMeter, impact_summary_for_report
+        meter = CollectionImpactMeter(adapter, pid).start()
         session = None
         stage = "start_investigation"
         try:
@@ -3965,6 +3968,8 @@ def diagnose(
                 pid=pid, companion_elf=debug_image, adapter=adapter, budget_limits=limits,
             )
             res.investigation_id = session.investigation_id
+            if getattr(session, "budget_tracker", None) is not None:
+                session.budget_tracker.attach_target_cpu_probe(meter.attributable_cpu_ms)
             stage = "run_to_completion"
             conclusion = session.run_to_completion(max_steps=max_steps)
         except Exception as exc:  # noqa: BLE001
@@ -4089,6 +4094,11 @@ def diagnose(
             "samples_collected": int(getattr(metrics, "samples_collected", 0) or 0),
             "budget_exhausted": exhausted,
         }
+        rec = meter.finish(bytes_read=int(getattr(metrics, "bytes_read", 0) or 0), measured_stop_ms=stop_ms)
+        res.collection_impact.update(impact_summary_for_report(
+            rec, capture_mode=sec_b.get("collection_mode"), measured_stop_ms=stop_ms,
+            bytes_read=int(getattr(metrics, "bytes_read", 0) or 0), budget_exhausted=exhausted,
+            exhaustion_reason=getattr(metrics, "exhaustion_reason", None)))
 
         try:
             rep_dir = os.path.join(engine.corpus_dir, "reports")

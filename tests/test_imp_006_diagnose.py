@@ -220,7 +220,7 @@ class TestDiagnoseEntryPoint(unittest.TestCase):
         self.assertTrue(out["success"])
         self.assertEqual(out["result"]["verdict"], "INCONCLUSIVE")
         self.assertTrue(out["result"]["not_covered"])
-        self.assertEqual(set(out["result"]), RESULT_KEYS)
+        self.assertEqual(set(out["result"]), RESULT_KEYS | {"human_summary"})
 
     def test_mcp_cli_and_web_agree_on_same_live_target(self):
         proc = self._launch("proc_thread_circular_deadlock")
@@ -243,7 +243,7 @@ class TestDiagnoseEntryPoint(unittest.TestCase):
             return d["verdict"], sorted((f["category"], tuple(sorted(f["subjects"]))) for f in d["findings"])
 
         print(f"\n[3-interface] verdict={web_out['verdict']} findings={shape(web_out)[1]}")
-        self.assertEqual(set(web_out), RESULT_KEYS)
+        self.assertEqual(set(web_out), RESULT_KEYS | {"human_summary"})  # every interface carries the readable summary (IMP-012)
         self.assertEqual(set(mcp_out) - {"success"}, set(web_out))
         self.assertEqual(set(cli_out), set(web_out))
         self.assertEqual(shape(mcp_out), shape(web_out))
