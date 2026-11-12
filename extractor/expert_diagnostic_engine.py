@@ -4029,7 +4029,7 @@ def diagnose(
         normally stripped and is not fetched).  A path that does not exist yields an INCONCLUSIVE result.
     symptom: natural-language symptom; default "general health check" (the planner then runs its broad
         recipe set).  adapter: ready target adapter (default local).  time_limit_s: wall-clock observation
-        budget (default: 5 s local, 120 s for a remote target, where every read is an SSH round trip).  max_steps: state-machine step cap.
+        budget (default: 20 s local, 120 s for a remote target, where every read is an SSH round trip).  max_steps: state-machine step cap.
     target: remote target as a :class:`TargetSpec` or dict (``remote_host``, ``ssh_user``, ``ssh_port``,
         ``ssh_key``, ``ssh_proxy_jump``, ``auto_deploy_collector``, ``collector_path``); builds an SSH
         adapter that is closed again when the call ends.  An unreachable host or failed SSH is INCONCLUSIVE
@@ -4121,7 +4121,11 @@ def diagnose(
                 pass
 
 
-REMOTE_DEFAULT_TIME_LIMIT_S = 120.0  # default wall-clock budget of a remote diagnosis (local: ObservationBudgetLimits default)
+REMOTE_DEFAULT_TIME_LIMIT_S = 120.0  # default wall-clock budget of a remote diagnosis
+# Default wall-clock budget of a LOCAL diagnosis.  The always-run baseline (thread sampling window, memory trend,
+# fd probe, heap integrity, lock/deadlock checks) takes ~2 s idle and up to ~8 s on a loaded 4-vCPU machine; the
+# tracker's generic 5 s default cut the baseline short there and turned a real deadlock into INCONCLUSIVE.
+LOCAL_DEFAULT_TIME_LIMIT_S = 20.0
 
 
 def _remote_target_gaps(adapter: Any, already: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -4208,6 +4212,8 @@ def _diagnose_run(
             # every sample costs SSH round trips (about 0.5 s each on the slow QEMU guest): the local 5 s default
             # exhausts before the baseline checks ran.  An explicit time_limit_s is always honoured.
             limits = ObservationBudgetLimits(max_wall_clock_ms=REMOTE_DEFAULT_TIME_LIMIT_S * 1000.0)
+        elif limits is None:
+            limits = ObservationBudgetLimits(max_wall_clock_ms=LOCAL_DEFAULT_TIME_LIMIT_S * 1000.0)
         # IMP-020: bracket the whole collection with the target-load meter (never raises; unmeasured -> None).
         from .collection_impact import CollectionImpactMeter, impact_summary_for_report
         meter = CollectionImpactMeter(adapter, pid).start()
