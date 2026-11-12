@@ -393,13 +393,16 @@ class TestPhase20A39ProductionReadiness(unittest.TestCase):
                 "consumed_execution_budget",
                 "evaluation_latency_us",
                 "confidence_score",
-                "adaptive_investigation",
+                "diagnosis",
             }
             self.assertTrue(required_obs_fields.issubset(res.keys()))
-            adap = res["adaptive_investigation"]
-            self.assertIn("confidence_rationale", adap)
-            self.assertIn("evidence_coverage", adap)
-            self.assertIn("uninspected_scope", adap)
+            # IMP-017: the verification step is diagnose(); its result carries the confidence basis, the
+            # checks that ran (coverage) and what could not be examined (uninspected scope)
+            diag = res["diagnosis"]
+            self.assertIn("confidence_basis", diag)
+            self.assertIn("checks_run", diag)
+            self.assertIn("not_covered", diag)
+            self.assertEqual(res["overall_status"], diag["verdict"])
         finally:
             proc.kill()
             proc.wait()

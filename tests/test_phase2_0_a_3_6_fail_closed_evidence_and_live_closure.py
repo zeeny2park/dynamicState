@@ -421,9 +421,12 @@ class TestPhase20A36FailClosedEvidenceAndLiveClosure(unittest.TestCase):
     # -------------------------------------------------------------------------
 
     def test_2_4_adaptive_execution_failure_transparency(self):
-        """WatchSessionManager never silently swallows AdaptiveInvestigationEngine exceptions."""
+        """WatchSessionManager never silently swallows exceptions of its verification step.
+
+        IMP-017: the verification step is diagnose() (the adaptive engine it used to call is retired)."""
+        import extractor.expert_diagnostic_engine as ede
         wm = WatchSessionManager(corpus_dir=self.corpus_dir)
-        with patch.object(AdaptiveInvestigationEngine, "investigate_process_health", side_effect=RuntimeError("Simulated DWARF engine failure")):
+        with patch.object(ede, "diagnose", side_effect=RuntimeError("Simulated DWARF engine failure")):
             res = wm.investigate_symptom(
                 pid=os.getpid(),
                 companion_elf_path="/nonexistent/companion.elf",
@@ -431,8 +434,9 @@ class TestPhase20A36FailClosedEvidenceAndLiveClosure(unittest.TestCase):
             )
         self.assertEqual(res["execution_status"], "FAILED")
         self.assertEqual(res["failure_category"], "RuntimeError")
-        self.assertEqual(res["stop_reason"], "ADAPTIVE_ENGINE_EXCEPTION")
-        self.assertFalse(res["adaptive_verification_succeeded"])
+        self.assertEqual(res["stop_reason"], "DIAGNOSIS_EXCEPTION")
+        self.assertFalse(res["diagnosis_succeeded"])
+        self.assertEqual(res["overall_status"], "INCONCLUSIVE" if not res["legacy_findings"] else "PROBABLE_FAULT")
         self.assertEqual(len(res["diagnostic_error_details"]), 1)
         self.assertIn("Simulated DWARF engine failure", res["diagnostic_error_details"][0]["error"])
         self.assertIsInstance(res["legacy_findings"], list)

@@ -33,7 +33,6 @@ from .dwarf_indexer import DwarfIndex, DwarfIndexer, DwarfVariable
 from .cpp_decoder import CppContainerDecoder
 from .allocator_inspector import detect_allocator, classify_pointer_integrity, PointerClassification, AllocatorType
 from .target_adapter import TargetExecutionAdapter, LocalTargetAdapter, RemoteSshTargetAdapter
-from .collection_impact import CollectionImpactMeter, impact_summary_for_report, impact_summary_lines
 from .cfi_unwinder import (
     UNWIND_SCAN as CFI_UNWIND_SCAN,
     decode_call_before,
@@ -57,23 +56,15 @@ from .target_abi import (
 )
 from .verdict_engine import (
     VerdictEngine,
-    ZeroCdnReporter,
     AssertionEvaluation,
-    DiagnosticVerdict,
     sanitize_report_output_path,
     ASSERTION_PASS,
     ASSERTION_FAIL,
     ASSERTION_ABSTAIN,
-    DIAG_CONFIRMED,
-    DIAG_SUSPECTED,
-    DIAG_PARTIALLY_CONFIRMED,
-    DIAG_REFUTED,
-    DIAG_NO_ISSUE_DETECTED,
-    DIAG_NO_ISSUE_DETECTED_WITHIN_SCOPE,
-    DIAG_INCONCLUSIVE,
 )
 from .evidence_adapter import EvidenceAdapter
 from .evidence_ledger import EvidenceLedger
+from .diagnostic_verdict_aggregator import VERDICT_INCONCLUSIVE, health_score_for, verdict_for_scan
 from .observation_budget import ObservationBudgetTracker, ObservationBudgetLimits
 
 
@@ -1619,7 +1610,7 @@ class WatchSessionManager:
             "last_observation_timestamp": last_obs_time,
             "watch_items_count": len(session.watch_items),
             "gaps_count": len(session.gaps),
-            "health": "HEALTHY" if session.status == "RUNNING" else "STOPPED",
+            "health": "ACTIVE" if session.status == "RUNNING" else "STOPPED",
             "capabilities": session.capabilities,
         }
 
@@ -6324,7 +6315,8 @@ class WatchSessionManager:
         elif not mappings or (exprs and observed_count == 0) or (read_errors and observed_count == 0):
             audit_health_status = "INCONCLUSIVE"
         else:
-            audit_health_status = "HEALTHY"
+            # an observation status of this scan, not a verdict (verdicts come from diagnose())
+            audit_health_status = "NO_ANOMALY_FOUND"
 
         latency_us = round((time.monotonic_ns() - t_start_ns) / 1000.0, 2)
         return {
@@ -7298,29 +7290,14 @@ class WatchSessionManager:
         except Exception as idx_exc:
             limitations.append(f"DWARF linked-list sweep failed: {type(idx_exc).__name__}: {idx_exc}")
 
-        # Compute overall status and health score (IMP-001: never report HEALTHY/100 when collection failed)
+        # IMP-017: this is a finding SCAN; it decides no verdict of its own.  Its status is the one verdict
+        # vocabulary via the aggregator's explicit scan mapping (a scan never certifies health; a collection
+        # failure without findings is INCONCLUSIVE; a scan finding is at most PROBABLE_FAULT).
         sev_Order = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3}
         findings.sort(key=lambda f: sev_Order.get(f.get("severity", "LOW"), 3))
-
-        crit_cnt = sum(1 for f in findings if f.get("severity") == "CRITICAL")
-        high_cnt = sum(1 for f in findings if f.get("severity") == "HIGH")
-        has_inconclusive_subcheck = (
-            audit_res.get("health_status") == "INCONCLUSIVE"
-            or callstack_res.get("status") == "INCONCLUSIVE"
-            or bool(limitations)
-        )
-        if crit_cnt > 0:
-            overall_status = "CRITICAL_ISSUES_FOUND"
-            score: Optional[int] = max(0, 100 - crit_cnt * 30 - high_cnt * 15 - (len(findings) - crit_cnt - high_cnt) * 5)
-        elif findings:
-            overall_status = "WARNINGS_FOUND"
-            score = max(0, 100 - crit_cnt * 30 - high_cnt * 15 - (len(findings) - crit_cnt - high_cnt) * 5)
-        elif has_inconclusive_subcheck:
-            overall_status = "INCONCLUSIVE"
-            score = None
-        else:
-            overall_status = "HEALTHY"
-            score = 100
+        overall_status = verdict_for_scan(findings)
+        score = health_score_for(overall_status, findings)
+        severity_counts = {k: sum(1 for f in findings if f.get("severity") == k) for k in sev_Order}
 
         latency_us = round((time.monotonic_ns() - t_start_ns) / 1000.0, 2)
         return {
@@ -7331,7 +7308,9 @@ class WatchSessionManager:
             "stop_duration_ms": 0.0,
             "evaluation_latency_us": latency_us,
             "overall_status": overall_status,
+            "verdict": overall_status,
             "health_score": score,
+            "severity_counts": severity_counts,
             "limitations": limitations,
             "findings_count": len(findings),
             "findings": findings,
@@ -7345,8 +7324,9 @@ class WatchSessionManager:
                 if findings
                 else (
                     f"Auto-Triage inconclusive due to collection failure(s): {'; '.join(limitations[:3])}"
-                    if overall_status == "INCONCLUSIVE"
-                    else f"Auto-Triage completed (Health Score: {score}/100, Status: HEALTHY). All audited symbols, pools, locks, and linked lists are clean."
+                    if limitations
+                    else "Auto-Triage found no issue in the audited symbols, pools, locks and linked lists. A scan does "
+                         "not certify the process healthy: run diagnose for a verdict."
                 )
             ),
         }
@@ -8454,82 +8434,52 @@ class WatchSessionManager:
             if f.get("recommended_action") and f["recommended_action"] not in remediation_steps:
                 remediation_steps.append(f["recommended_action"])
 
-        adaptive_summary = None
-        adaptive_error_details: List[Dict[str, Any]] = []
-        adaptive_verification_succeeded = False
+        # IMP-017: the verification step and the verdict are diagnose() (the retired adaptive engine used to run
+        # here).  The scans above are context; they decide nothing.
+        diagnosis: Optional[Dict[str, Any]] = None
+        diagnosis_error_details: List[Dict[str, Any]] = []
         exec_status = "COMPLETED"
         fail_category: Optional[str] = None
         stop_reason = "SUFFICIENT_EVIDENCE"
-        actual_obs_cnt = 0
-        succ_obs_cnt = 0
-        fail_obs_cnt = 0
-        abs_obs_cnt = 0
-        consumed_budget: Dict[str, Any] = {}
-
         try:
-            from .adaptive_engine import AdaptiveInvestigationEngine
-            adap_engine = AdaptiveInvestigationEngine(watch_manager=self)
-            adaptive_summary = adap_engine.investigate_process_health(
-                goal=symptom_query,
-                pid=pid,
-                companion_elf_path=companion_elf_path,
-                target_adapter=target_adapter,
-            )
-            exec_status = str(adaptive_summary.get("execution_status", adaptive_summary.get("lifecycle_state", "COMPLETED")))
-            fail_category = adaptive_summary.get("failure_category")
-            stop_reason = str(adaptive_summary.get("stop_reason", "SUFFICIENT_EVIDENCE"))
-            adaptive_error_details = list(adaptive_summary.get("diagnostic_error_details") or [])
-            actual_obs_cnt = int(adaptive_summary.get("actual_observation_count", 0))
-            succ_obs_cnt = int(adaptive_summary.get("successful_observation_count", 0))
-            fail_obs_cnt = int(adaptive_summary.get("failed_observation_count", 0))
-            abs_obs_cnt = int(adaptive_summary.get("abstained_observation_count", 0))
-            consumed_budget = dict(adaptive_summary.get("consumed_execution_budget") or adaptive_summary.get("budget_usage") or {})
-            adaptive_verification_succeeded = exec_status in ("COMPLETED", "INCONCLUSIVE") and adaptive_summary.get("success", False) is True
-        except Exception as adap_exc:
+            from . import expert_diagnostic_engine as _ede
+            diagnosis = _ede.diagnose(pid, debug_image=companion_elf_path or None, symptom=symptom_query,
+                                      adapter=target_adapter, corpus_dir=self.corpus_dir).to_dict()
+            if not diagnosis.get("checks_run"):
+                exec_status = "INCONCLUSIVE"
+            stop_reason = str(diagnosis.get("stop_reason") or stop_reason)
+        except Exception as diag_exc:  # noqa: BLE001 - never swallowed: reported and capped below
             exec_status = "FAILED"
-            fail_category = type(adap_exc).__name__
-            stop_reason = "ADAPTIVE_ENGINE_EXCEPTION"
-            adaptive_verification_succeeded = False
-            adaptive_error_details.append({
-                "stage": "adaptive_investigation_engine",
-                "error_type": type(adap_exc).__name__,
-                "error": str(adap_exc),
-            })
-            adaptive_summary = {
-                "success": False,
-                "execution_status": "FAILED",
-                "failure_category": fail_category,
-                "stop_reason": stop_reason,
-                "diagnostic_error_details": list(adaptive_error_details),
-                "error": str(adap_exc),
-            }
-            # Never represent fallback legacy findings as successful adaptive verification
+            fail_category = type(diag_exc).__name__
+            stop_reason = "DIAGNOSIS_EXCEPTION"
+            diagnosis_error_details.append({"stage": "diagnose", "error_type": type(diag_exc).__name__,
+                                            "error": str(diag_exc)})
             confidence_score = min(confidence_score, 0.35)
+        checks = list((diagnosis or {}).get("checks_run") or [])
+        actual_obs_cnt = len(checks)
+        succ_obs_cnt = sum(1 for c in checks if c.get("status") in ("PASS", "FAIL"))
+        fail_obs_cnt = sum(1 for c in checks if c.get("status") == "ERROR")
+        abs_obs_cnt = actual_obs_cnt - succ_obs_cnt - fail_obs_cnt
+        consumed_budget = dict((diagnosis or {}).get("collection_impact") or {})
 
         all_symp_limitations = list(triage.get("limitations") or []) + [
             f"{e.get('stage')}: {e.get('error')}" for e in legacy_sweep_errors
         ]
-        if (all_symp_limitations or triage.get("overall_status") == "INCONCLUSIVE") and not findings:
-            if exec_status not in ("FAILED", "INCONCLUSIVE"):
-                exec_status = "INCONCLUSIVE"
-            confidence_score = min(confidence_score, 0.20)
-        # Status/score are derived from the FINAL findings list (triage findings plus heap/hotspot findings
-        # added above), not copied from triage, so a finding added after triage can never be reported HEALTHY/100.
-        if findings:
-            crit_cnt = sum(1 for f in findings if f.get("severity") == "CRITICAL")
-            high_cnt = sum(1 for f in findings if f.get("severity") == "HIGH")
-            eff_health_score = max(0, 100 - crit_cnt * 30 - high_cnt * 15 - (len(findings) - crit_cnt - high_cnt) * 5)
-            eff_overall_status = "CRITICAL_ISSUES_FOUND" if crit_cnt > 0 else "WARNINGS_FOUND"
-        elif exec_status in ("INCONCLUSIVE", "FAILED") or triage.get("overall_status") == "INCONCLUSIVE" or all_symp_limitations:
-            eff_health_score = None
-            eff_overall_status = "INCONCLUSIVE"
+        if diagnosis is not None:
+            eff_overall_status = str(diagnosis.get("verdict") or VERDICT_INCONCLUSIVE)
+            confidence_score = float(diagnosis.get("confidence") or 0.0)
+            if diagnosis.get("findings"):
+                top = diagnosis["findings"][0]
+                hypothesis = (f"[{top.get('category')}] {top.get('description')}"
+                              + (f" (subjects: {', '.join(map(str, (top.get('subjects') or [])[:4]))})"
+                                 if top.get("subjects") else ""))
         else:
-            eff_health_score = triage.get("health_score")
-            eff_overall_status = triage.get("overall_status") or "INCONCLUSIVE"
-            if eff_health_score is None:
-                eff_overall_status = "INCONCLUSIVE"
-        if eff_overall_status == "INCONCLUSIVE" and stop_reason == "SUFFICIENT_EVIDENCE":
-            stop_reason = "NO_USEFUL_SAFE_OBSERVATION_REMAINS"
+            eff_overall_status = verdict_for_scan(findings)
+        if eff_overall_status == VERDICT_INCONCLUSIVE:
+            confidence_score = min(confidence_score, 0.20)
+            if stop_reason == "SUFFICIENT_EVIDENCE":
+                stop_reason = "NO_USEFUL_SAFE_OBSERVATION_REMAINS"
+        eff_health_score = health_score_for(eff_overall_status, (diagnosis or {}).get("findings") or findings)
 
         latency_us = round((time.monotonic_ns() - t_start_ns) / 1000.0, 2)
         return {
@@ -8544,16 +8494,17 @@ class WatchSessionManager:
             "failure_category": fail_category,
             "stop_reason": stop_reason,
             "limitations": all_symp_limitations,
-            "diagnostic_error_details": adaptive_error_details,
+            "verdict": eff_overall_status,
+            "diagnostic_error_details": diagnosis_error_details,
             "collection_error_details": list(legacy_sweep_errors),
             "actual_observation_count": actual_obs_cnt,
             "successful_observation_count": succ_obs_cnt,
             "failed_observation_count": fail_obs_cnt,
             "abstained_observation_count": abs_obs_cnt,
             "consumed_execution_budget": consumed_budget,
-            "adaptive_verification_succeeded": adaptive_verification_succeeded,
+            "diagnosis_succeeded": diagnosis is not None,
             "legacy_findings": list(findings),
-            "adaptive_investigation": adaptive_summary,
+            "diagnosis": diagnosis,
             "classified_symptom": classified_symptom,
             "root_cause_hypothesis": hypothesis,
             "confidence_score": confidence_score,
@@ -11935,20 +11886,6 @@ class WatchSessionManager:
                     pass
 
         total_cnt = len(assertion_results)
-        pass_ratio = (passed_count / float(total_cnt)) if total_cnt > 0 else 0.0
-        if total_cnt > 0 and abstain_count == total_cnt:
-            verdict = "ABSTAIN"
-            diag_label = DIAG_INCONCLUSIVE
-        elif total_cnt > 0 and passed_count == total_cnt:
-            verdict = "CONFIRMED"
-            diag_label = DIAG_CONFIRMED
-        elif passed_count > 0:
-            verdict = "PARTIALLY_CONFIRMED"
-            diag_label = DIAG_PARTIALLY_CONFIRMED
-        else:
-            verdict = "REFUTED"
-            diag_label = DIAG_REFUTED
-
         latency_us = round((time.monotonic_ns() - t_start_ns) / 1000.0, 2)
         ledger = EvidenceLedger()
         ev_adapter = EvidenceAdapter()
@@ -11958,33 +11895,14 @@ class WatchSessionManager:
             session_id=ledger.session_id,
         )
         ev_adapter.record_into_ledger(sym_recs, ledger)
-
-        dv = DiagnosticVerdict(
-            hypothesis=hypothesis,
-            final_diagnosis=diag_label,
-            hypothesis_state="VERIFIED" if verdict == "CONFIRMED" else verdict,
-            confidence_score=round(pass_ratio, 3),
-            total_assertions=total_cnt,
-            passed_count=passed_count,
-            failed_count=failed_count,
-            abstain_count=abstain_count,
-            assertion_evaluations=ae_list,
-            causal_attribution_verified=False,
-            attribution_basis=None,
-            provenance_class="LIVE_RUNTIME_CAPTURE",
-            target_identity={"pid": eff_pid, "companion_elf": eff_elf},
-            limitations=[],
-            stop_reason="NO_USEFUL_SAFE_OBSERVATION_REMAINS" if diag_label == DIAG_INCONCLUSIVE else "SUFFICIENT_EVIDENCE",
-            budget_usage={
-                "metrics": {
-                    "target_stop_duration_ms": 0.0,
-                    "observation_latency_us": latency_us,
-                    "bytes_read": len(lhs_exprs) * 64,
-                }
-            },
+        # IMP-017: the assertion-outcome rollup and its report live in verdict_engine (this class only collects)
+        hv = VerdictEngine.summarize_hypothesis_verification(
+            hypothesis=hypothesis, evaluations=ae_list, total=total_cnt, passed=passed_count, failed=failed_count,
+            abstained=abstain_count, target_identity={"pid": eff_pid, "companion_elf": eff_elf},
+            latency_us=latency_us, bytes_read=len(lhs_exprs) * 64,
         )
-        report_html = ZeroCdnReporter.render_html(dv, title=f"Hypothesis Verification: {hypothesis[:40]}")
-        report_json = ZeroCdnReporter.render_json(dv)
+        verdict, pass_ratio = hv["outcome"], hv["pass_ratio"]
+        report_html, report_json = hv["report_html"], hv["report_json"]
 
         saved_html_path = None
         save_html_error = None
