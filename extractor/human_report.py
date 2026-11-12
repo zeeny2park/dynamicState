@@ -83,6 +83,8 @@ T: Dict[str, Tuple[str, str]] = {
                      "this finding are listed.",
                      "대기 고리 자체는 지금 받은 데이터에 없습니다. 이 발견에 모인 이름만 나열합니다."),
     "w_locks": ("Locks: {x}", "락: {x}"),
+    "w_res": ("Resources: {x}", "자원: {x}"),
+    "w_obs": ("Observed: {x}", "관측: {x}"),
     "w_threads": ("Threads: {x}", "스레드: {x}"),
     "w_tids": ("Thread ids: {x}", "스레드 ID: {x}"),
     "w_funcs": ("Functions: {x}", "함수: {x}"),
@@ -971,10 +973,13 @@ def render_human_report(result: Dict[str, Any], report: Optional[Dict[str, Any]]
             kinds = _by_kind(f)
             lines = [ctx.t("w_gen_cat", cat=_cat_label(ctx, str(cat)))]
             for key, kk, fmt in (("variable", "w_vars", _c), ("thread_name", "w_threads", _c), ("thread", "w_tids", str),
-                                 ("function", "w_funcs", _c), ("source_location", "w_locs", _c), ("lock", "w_locks", _c)):
+                                 ("function", "w_funcs", _c), ("source_location", "w_locs", _c), ("lock", "w_locks", _c),
+                                 ("resource", "w_res", _c)):
                 vals = _user_funcs(kinds.get(key, [])) if key == "function" else kinds.get(key, [])
                 if vals:
                     lines.append("- " + ctx.t(kk, x=_join([fmt(v) for v in vals])))
+            for obs in (f.get("observed") or [])[:3]:
+                lines.append("- " + ctx.t("w_obs", x=str(obs)))
             r = {"lines": lines, "kinds": kinds}
         renders.append(r)
 

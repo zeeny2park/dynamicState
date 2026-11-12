@@ -25,7 +25,7 @@ from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Union
 import uuid
 
 from .diagnostic_recipes import (
-    _LOCK_OWNER_DEPENDENT_RECIPES,
+    recipe_requires_lock_owner,
     BASELINE_RECIPE_IDS,
     CATEGORY_ABNORMAL_VARIABLE_CHANGES,
     CATEGORY_DATA_RACE_INDICATORS,
@@ -3823,6 +3823,7 @@ _SUBJECT_SKIP_KEYS = {"threads", "callstacks_info", "locks", "observation_window
 _SUBJECT_THREAD_ROW_KEYS = ("runaway_threads", "zombie_threads", "d_state_threads", "stalled_lock_waits")
 _SUBJECT_KEY_KIND = {
     "lock_name": "lock",
+    "fd_target": "resource",  # IMP-018: what a leaking file descriptor refers to (socket / pipe / path)
     "tid": "thread", "waiter_tid": "thread", "owner_tid": "thread", "held_by_tid": "thread",
     "waiter_name": "thread_name", "owner_name": "thread_name", "held_by_thread_name": "thread_name",
     "thread_name": "thread_name",
@@ -4286,6 +4287,9 @@ def _diagnose_run(
                 "subject_details": details,
                 "recipe_ids": rules,
                 "evidence_ids": list(rec.get("supporting_evidence_ids") or []),
+                # IMP-018: what the failing checks observed (e.g. the fd-count trend), verbatim
+                "observed": [c.technical_interpretation for c in session.checks
+                             if c.recipe_id in rules and c.status == CheckStatus.FAIL and c.technical_interpretation],
             })
 
         # A confirmed finding must name its subject (lock / thread / variable / function); one that names nothing
@@ -4329,7 +4333,7 @@ def _diagnose_run(
         lock_unsupported_checks = set()
         for c in session.checks:
             ob = c.actual_observations if isinstance(c.actual_observations, dict) else {}
-            if ob.get("lock_owner_unsupported") and c.recipe_id in _LOCK_OWNER_DEPENDENT_RECIPES:
+            if ob.get("lock_owner_unsupported") and recipe_requires_lock_owner(c.recipe_id):
                 lock_unsupported_checks.add(c.check_id)
                 why = ("not supported on this target: lock-owner decoding (%s) %s" % (
                     ob.get("lock_owner_status"), ob.get("lock_owner_status_reason") or "")).strip()
