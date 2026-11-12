@@ -821,6 +821,12 @@ class WatchSessionManager:
                     out.append(item)
                 elif isinstance(item, str) and item.strip():
                     out.append({"action": "eval", "expression": item.strip()})
+                else:
+                    out.append({
+                        "action": "malformed_step",
+                        "raw_item": item,
+                        "error": f"Invalid step format: expected dictionary or expression string, got {type(item).__name__}",
+                    })
             return out
         return []
 
@@ -3160,6 +3166,7 @@ class WatchSessionManager:
             "changed": changed,
             "unchanged": unchanged,
             "unreadable": unreadable,
+            "consistency": dict(ZERO_STOP_NON_ATOMIC_CONSISTENCY),
         }
 
     # -------------------------------------------------------------------------
@@ -4205,6 +4212,7 @@ class WatchSessionManager:
                 f"To find which thread owns a specific IN_USE slot (e.g. index {allocated_indices[0] if allocated_indices else 0}), "
                 f"call `runtime_find_symbol_owners` with target_expression='{resolved_array_expr}[{allocated_indices[0] if allocated_indices else 0}]'."
             ),
+            "consistency": dict(ZERO_STOP_NON_ATOMIC_CONSISTENCY),
         }
 
     def find_symbol_owners_and_threads(
@@ -10401,16 +10409,25 @@ class WatchSessionManager:
             if p_int == 0 and not process_name and not saved.get("pid"):
                 raise ValueError("Invalid target PID 0: PID must be an integer > 1")
 
-        eff_remote_host = remote_host if remote_host is not None else saved.get("remote_host")
-        eff_ssh_user = ssh_user if ssh_user is not None else saved.get("ssh_user")
-        coerced_port = self._coerce_int(ssh_port, 22, 1, 65535)
-        eff_ssh_port = coerced_port if (coerced_port and coerced_port != 22) else self._coerce_int(saved.get("ssh_port"), 22, 1, 65535)
-        eff_ssh_key = ssh_key if ssh_key is not None else saved.get("ssh_key")
-        eff_ssh_jump = ssh_proxy_jump if ssh_proxy_jump is not None else saved.get("ssh_proxy_jump")
-
         explicit_pid = int(pid) if (pid is not None and int(pid) > 1) else None
         saved_pid = int(saved["pid"]) if (saved.get("pid") is not None and int(saved["pid"]) > 0) else None
         eff_pid = explicit_pid if explicit_pid is not None else saved_pid
+        is_same_target = (explicit_pid is None or explicit_pid == saved_pid)
+
+        # Do NOT inherit remote SSH parameters or remote host across different target processes
+        if is_same_target:
+            eff_remote_host = remote_host if remote_host is not None else saved.get("remote_host")
+            eff_ssh_user = ssh_user if ssh_user is not None else saved.get("ssh_user")
+            coerced_port = self._coerce_int(ssh_port, 22, 1, 65535)
+            eff_ssh_port = coerced_port if (coerced_port and coerced_port != 22) else self._coerce_int(saved.get("ssh_port"), 22, 1, 65535)
+            eff_ssh_key = ssh_key if ssh_key is not None else saved.get("ssh_key")
+            eff_ssh_jump = ssh_proxy_jump if ssh_proxy_jump is not None else saved.get("ssh_proxy_jump")
+        else:
+            eff_remote_host = remote_host
+            eff_ssh_user = ssh_user
+            eff_ssh_port = self._coerce_int(ssh_port, 22, 1, 65535) or 22
+            eff_ssh_key = ssh_key
+            eff_ssh_jump = ssh_proxy_jump
 
         # If caller explicitly switched to a different PID without specifying companion_elf_path,
         # prefer auto-discovering `/proc/<pid>/exe` first if it differs from saved_pid
@@ -10419,7 +10436,7 @@ class WatchSessionManager:
             eff_proc_name = process_name
         else:
             eff_elf = companion_elf_path if (companion_elf_path and str(companion_elf_path).strip()) else saved.get("companion_elf_path")
-            eff_proc_name = process_name or saved.get("process_name")
+            eff_proc_name = process_name or (saved.get("process_name") if is_same_target else None)
 
         target_adapter = self._resolve_adapter(
             pid=eff_pid or 1,
@@ -10437,7 +10454,7 @@ class WatchSessionManager:
         previous_pid = None
 
         # Step 1: If eff_elf is known, inspect its build_id & basename for process discovery/healing
-        known_build_id = saved.get("build_id")
+        known_build_id = saved.get("build_id") if is_same_target else None
         if eff_elf:
             primary_cand, _ = self._split_companion_elf_paths(eff_elf)
             if primary_cand and os.path.isfile(primary_cand):
@@ -10554,8 +10571,10 @@ class WatchSessionManager:
                 except Exception:
                     continue
 
-            # If still not found and saved context has a valid companion_elf_path with matching build_id, fallback to saved
-            if not eff_elf and saved.get("companion_elf_path"):
+            # If still not found, fall back to the saved companion ELF only for the bound target itself
+            # Never inherit it across targets: an explicit PID that is not the bound target must not receive
+            # the bound target's debug image.
+            if not eff_elf and saved.get("companion_elf_path") and (explicit_pid is None or explicit_pid == saved_pid):
                 eff_elf = saved.get("companion_elf_path")
 
         if not eff_pid or eff_pid <= 0:
@@ -11454,7 +11473,9 @@ class WatchSessionManager:
             action = str(step.get("action") or step.get("tool") or "ask").strip().lower()
             step_t0 = time.monotonic_ns()
             try:
-                if action in ("eval", "runtime_eval_memory_path", "evaluate_symbol_paths"):
+                if action == "malformed_step":
+                    raise ValueError(step.get("error") or "Malformed step input: expected dictionary")
+                elif action in ("eval", "runtime_eval_memory_path", "evaluate_symbol_paths"):
                     exprs = step.get("expressions") or ([step["expression"]] if step.get("expression") else ["*gpMem"])
                     if isinstance(exprs, str):
                         exprs = [x.strip() for x in exprs.split(",") if x.strip()]
@@ -11510,7 +11531,37 @@ class WatchSessionManager:
                         companion_elf_path=eff_elf,
                         adapter=adapter,
                     )
-                else:
+                elif action in ("callstack", "callstacks", "locks", "runtime_inspect_thread_callstack_and_locks", "inspect_thread_callstack_and_locks", "inspect_thread_callstacks_and_locks"):
+                    raw_out = self.inspect_thread_callstacks_and_locks(
+                        pid=eff_pid,
+                        companion_elf_path=eff_elf,
+                        adapter=adapter,
+                    )
+                elif action in ("diff", "capture_diff", "capture_and_diff", "runtime_capture_and_diff"):
+                    raw_out = self.capture_and_diff_expressions(
+                        pid=eff_pid,
+                        companion_elf_path=eff_elf,
+                        expressions=step.get("expressions"),
+                        wait_ms=int(step.get("wait_ms") or 200),
+                        adapter=adapter,
+                    )
+                elif action in ("heap", "scan_heap", "runtime_scan_heap_objects", "scan_heap_objects"):
+                    raw_out = self.scan_heap_objects(
+                        pid=eff_pid,
+                        companion_elf_path=eff_elf,
+                        class_filter=step.get("class_filter"),
+                        adapter=adapter,
+                    )
+                elif action in ("verify_consistency", "runtime_verify_concurrent_read_consistency", "verify_concurrent_read_consistency"):
+                    raw_out = self.verify_concurrent_read_consistency(
+                        pid=eff_pid,
+                        companion_elf_path=eff_elf,
+                        expressions=step.get("expressions") or ["gpRegistry.magic"],
+                        retries=int(step.get("retries") or 3),
+                        inter_read_delay_ms=int(step.get("inter_read_delay_ms") or 5),
+                        adapter=adapter,
+                    )
+                elif action in ("ask", "question", "ask_runtime_question", "runtime_ask"):
                     q_txt = str(step.get("question") or step.get("expression") or "프로세스 상태 요약")
                     raw_out = self.ask_runtime_question(
                         question=q_txt,
@@ -11518,6 +11569,8 @@ class WatchSessionManager:
                         companion_elf_path=eff_elf,
                         adapter=adapter,
                     )
+                else:
+                    raise ValueError(f"Unsupported batch action '{action}'. Supported actions: eval, scan_pool, find_owners, tls, dpdk, triage, callstack, diff, heap, verify_consistency, ask.")
 
                 final_out = (
                     self.summarize_for_llm_budget(
@@ -11530,14 +11583,36 @@ class WatchSessionManager:
                     if compact
                     else raw_out
                 )
-                succeeded_count += 1
-                step_results.append({
-                    "step_id": step_id,
-                    "action": action,
-                    "success": True,
-                    "elapsed_us": round((time.monotonic_ns() - step_t0) / 1000.0, 2),
-                    "output": final_out,
-                })
+                # Check if step produced a structured failure dictionary without raising
+                is_step_failed = False
+                step_failure_msg = None
+                if isinstance(raw_out, dict):
+                    if raw_out.get("success") is False:
+                        is_step_failed = True
+                        step_failure_msg = raw_out.get("error") or raw_out.get("error_message") or "Step execution returned failure"
+                    elif raw_out.get("status") in ("FAILED", "ERROR") and "results" not in raw_out:
+                        is_step_failed = True
+                        step_failure_msg = raw_out.get("error") or f"Step returned status {raw_out.get('status')}"
+
+                if is_step_failed:
+                    failed_count += 1
+                    step_results.append({
+                        "step_id": step_id,
+                        "action": action,
+                        "success": False,
+                        "error": step_failure_msg,
+                        "elapsed_us": round((time.monotonic_ns() - step_t0) / 1000.0, 2),
+                        "output": final_out,
+                    })
+                else:
+                    succeeded_count += 1
+                    step_results.append({
+                        "step_id": step_id,
+                        "action": action,
+                        "success": True,
+                        "elapsed_us": round((time.monotonic_ns() - step_t0) / 1000.0, 2),
+                        "output": final_out,
+                    })
             except Exception as step_exc:
                 failed_count += 1
                 step_results.append({
@@ -11549,7 +11624,13 @@ class WatchSessionManager:
                 })
 
         total_latency_us = round((time.monotonic_ns() - t_start_ns) / 1000.0, 2)
-        return {
+        total_steps = len(normalized_steps)
+        overall_success = (failed_count == 0)
+        is_partial = (succeeded_count > 0 and failed_count > 0)
+
+        res: Dict[str, Any] = {
+            "success": overall_success,
+            "partial_success": is_partial,
             "pid": eff_pid,
             "companion_elf": eff_elf,
             "auto_healed_pid": ctx_info.get("auto_healed_pid", False),
@@ -11557,15 +11638,25 @@ class WatchSessionManager:
             "stop_duration_ms": 0.0,
             "batch_latency_us": total_latency_us,
             "compact_mode": compact,
-            "steps_requested": len(normalized_steps),
+            "steps_requested": total_steps,
             "steps_succeeded": succeeded_count,
             "steps_failed": failed_count,
             "cross_step_highlights": cross_step_highlights,
             "step_results": step_results,
             "llm_next_step_hint": (
-                f"Executed {succeeded_count}/{len(normalized_steps)} batch diagnostic step(s) in {total_latency_us}us without stopping the target."
+                f"Executed {succeeded_count}/{total_steps} batch diagnostic step(s) in {total_latency_us}us without stopping the target."
             ),
         }
+        if failed_count > 0:
+            if is_partial:
+                res["error_code"] = "PARTIAL_BATCH_FAILURE"
+                res["error"] = f"{failed_count} of {total_steps} batch step(s) failed"
+                res["recovery_hint"] = "Review failed steps in 'step_results' to diagnose individual action failures."
+            else:
+                res["error_code"] = "ALL_STEPS_FAILED"
+                res["error"] = f"All {failed_count} batch step(s) failed"
+                res["recovery_hint"] = "Check target process liveness and parameters for all batch steps."
+        return res
 
 
     # -------------------------------------------------------------------------

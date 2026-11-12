@@ -205,8 +205,6 @@ class TestMcpFirstPhase1(unittest.TestCase):
         finally:
             mcp_srv.runtime.watch_session_manager._active_target_context = saved_ctx
 
-    # IMP-005 baseline: real defect — runtime_capture_and_diff result has no 'consistency' key (observed keys: success,pid,...,changed,unchanged,unreadable); expected consistency.level == NON_ATOMIC like runtime_eval_memory_path. 533a0bb dropped the label; return dict at extractor/watch_session.py:3108 (capture_and_diff_expressions).
-    @unittest.expectedFailure
     def test_03_zero_stop_concurrency_and_atomicity_labeling(self) -> None:
         """Verifies that all zero-stop observations explicitly report NON_ATOMIC consistency semantics."""
         # Ensure target is connected
@@ -290,8 +288,6 @@ class TestMcpFirstPhase1(unittest.TestCase):
         # Individual expression reports error status without crashing tool call
         self.assertIn(res_unmapped["results"][0]["status"], ("UNAVAILABLE", "ARRAY_INDEX_OUT_OF_BOUNDS", "TYPE_RESOLUTION_ERROR"))
 
-    # IMP-005 baseline: real defect — runtime_batch_execute result has no 'success' (nor 'partial_success'/'error_code') key (KeyError: 'success'); expected batch['success'] is True with 4/4 steps succeeded. 533a0bb removed the overall_success/partial_success/error_code fields; return dict at extractor/watch_session.py:10992 (execute_batch_macro).
-    @unittest.expectedFailure
     def test_07_batch_macro_composite_execution(self) -> None:
         """Verifies runtime_batch_execute executes multi-step macro including callstack, pool, and diff."""
         mcp_srv.runtime_target_connect(pid=self.proc.pid, companion_elf=self.bin_path)
@@ -310,8 +306,6 @@ class TestMcpFirstPhase1(unittest.TestCase):
         self.assertEqual(batch["steps_succeeded"], 4)
         self.assertEqual(batch["steps_failed"], 0)
 
-    # IMP-005 baseline: real defect — explicit PID of a different, stripped target inherits bound target A's companion ELF; observed error_code BUILD_ID_MISMATCH (message names A's mcp_target image), expected DEBUG_IMAGE_NOT_FOUND. 533a0bb replaced the can_inherit guard with an unconditional fallback at extractor/watch_session.py:9998-9999 (resolve_target_context).
-    @unittest.expectedFailure
     def test_08_target_context_switching_and_precedence(self) -> None:
         """Verifies target switching (A -> B), explicit args precedence, and debug image isolation."""
         # Connect target A (compiled with sha1 build-id)
@@ -483,8 +477,6 @@ class TestMcpFirstPhase1(unittest.TestCase):
         self.assertFalse(c["has_causal_guarantee"])
         self.assertEqual(c["data_completeness"], "BEST_EFFORT_NON_ATOMIC")
 
-    # IMP-005 baseline: real defect — runtime_batch_execute result has no 'success'/'partial_success'/'error_code' (KeyError: 'success'); expected success False, steps_failed 1, error_code ALL_STEPS_FAILED / PARTIAL_BATCH_FAILURE. 533a0bb removed these fields; return dict at extractor/watch_session.py:10992 (execute_batch_macro).
-    @unittest.expectedFailure
     def test_11_batch_macro_failures_and_unknown_actions(self) -> None:
         """Verifies runtime_batch_execute fails cleanly on unknown actions, structured step failures, and malformed inputs."""
         mcp_srv.runtime_target_connect(pid=self.proc.pid, companion_elf=self.bin_path)
