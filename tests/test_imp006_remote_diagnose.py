@@ -379,7 +379,15 @@ class RemoteDiagnoseTests(unittest.TestCase):
         self.assertEqual(status, "OBSERVED")
         self.assertEqual(data, truth)
         # an unreadable tail: partial, never padded
-        end = libc["end_int"]
+        # (a readable mapping of >= 70000 bytes that is followed by an unmapped gap: on some layouts libc's last
+        # mapping is directly followed by another readable one, so pick the boundary from /proc/PID/maps)
+        maps = sorted(ad.get_proc_maps(proc.pid), key=lambda m: m["start_int"])
+        end = None
+        for m, nxt in zip(maps, maps[1:] + [None]):
+            if m["is_readable"] and m["size"] >= 70000 and (nxt is None or nxt["start_int"] > m["end_int"] + 4096):
+                end = m["end_int"]
+                break
+        self.assertIsNotNone(end, "no readable mapping followed by a gap")
         (data, status, _), = ad.read_memory_batch(proc.pid, [(end - 70000, 140000)])
         self.assertEqual(status, "PARTIAL")
         self.assertEqual(len(data), 70000)
