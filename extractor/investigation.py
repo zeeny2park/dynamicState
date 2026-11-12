@@ -87,6 +87,7 @@ from .evidence_adapter import (
     RESULT_OBSERVATION_UNAVAILABLE,
 )
 from .observation_budget import ObservationBudgetLimits, ObservationBudgetTracker
+from .diagnostic_verdict_aggregator import to_overall_verdict
 from .verdict_engine import (
     ASSERTION_ABSTAIN,
     ASSERTION_FAIL,
@@ -3604,10 +3605,37 @@ class InvestigationManager:
         elif not is_live_capture:
             report_prov_class = PROVENANCE_CLASS_IMPORTED_UNVERIFIED
 
+        legacy_dv = VerdictEngine.synthesize_verdict(
+            hypothesis=session.goal,
+            evaluations=[
+                AssertionEvaluation(
+                    raw_assertion=h.title,
+                    lhs_expression=h.title,
+                    resolved_expression=h.title,
+                    operator="VALIDATED",
+                    expected="TRUE",
+                    observed_value=h.validation_status,
+                    observation_status="OBSERVED",
+                    verdict=(
+                        ASSERTION_PASS
+                        if h.validation_status in (HYPOTHESIS_STATUS_VALIDATED, HYPOTHESIS_STATUS_SUPPORTED)
+                        else (ASSERTION_FAIL if h.validation_status == HYPOTHESIS_STATUS_CONTRADICTED else ASSERTION_ABSTAIN)
+                    ),
+                    reason=h.claim,
+                )
+                for h in session.hypotheses
+            ],
+            target_identity=session.stages.get("target_identity", {}).get("details", {}),
+            causal_attribution_verified=any(h.validation_status == HYPOTHESIS_STATUS_VALIDATED for h in session.hypotheses),
+            budget_usage=session.budget_tracker.to_dict(),
+            provenance_class=report_prov_class,
+        )
         return strip_sensitive_session_secrets({
             "investigation_id": session.investigation_id,
             "goal": session.goal,
             "status": session.status,
+            # IMP-017: the one verdict vocabulary, by the explicit mapping of the staged session's diagnosis label
+            "verdict": to_overall_verdict(legacy_dv.final_diagnosis),
             "provenance_class": report_prov_class,
             "created_at": session.created_at,
             "target_identity": session.stages["target_identity"].get("details", {}),
@@ -3654,31 +3682,7 @@ class InvestigationManager:
                 "budget_summary": session.budget_tracker.to_dict(),
             },
             "report_html": ZeroCdnReporter.render_html(
-                VerdictEngine.synthesize_verdict(
-                    hypothesis=session.goal,
-                    evaluations=[
-                        AssertionEvaluation(
-                            raw_assertion=h.title,
-                            lhs_expression=h.title,
-                            resolved_expression=h.title,
-                            operator="VALIDATED",
-                            expected="TRUE",
-                            observed_value=h.validation_status,
-                            observation_status="OBSERVED",
-                            verdict=(
-                                ASSERTION_PASS
-                                if h.validation_status in (HYPOTHESIS_STATUS_VALIDATED, HYPOTHESIS_STATUS_SUPPORTED)
-                                else (ASSERTION_FAIL if h.validation_status == HYPOTHESIS_STATUS_CONTRADICTED else ASSERTION_ABSTAIN)
-                            ),
-                            reason=h.claim,
-                        )
-                        for h in session.hypotheses
-                    ],
-                    target_identity=session.stages.get("target_identity", {}).get("details", {}),
-                    causal_attribution_verified=any(h.validation_status == HYPOTHESIS_STATUS_VALIDATED for h in session.hypotheses),
-                    budget_usage=session.budget_tracker.to_dict(),
-                    provenance_class=report_prov_class,
-                ),
+                legacy_dv,
                 title=f"dynamicState Investigation: {session.goal[:40]}",
                 remediation_checklist=[s.description for s in session.next_steps] if session.next_steps else None,
             ),

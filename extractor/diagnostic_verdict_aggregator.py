@@ -780,3 +780,25 @@ def verdict_for_scan(findings: Optional[List[Dict[str, Any]]]) -> str:
     if findings:
         return VERDICT_PROBABLE_FAULT
     return VERDICT_INCONCLUSIVE
+
+
+# Final-diagnosis labels of the assertion/hypothesis verifier (extractor.verdict_engine.DIAG_*) -> the one
+# vocabulary.  "No issue within the inspected scope" and "refuted" are not HEALTHY: no required-check coverage
+# stands behind them (RULE_5), so they map to INCONCLUSIVE.
+FINAL_DIAGNOSIS_TO_VERDICT = {
+    "CONFIRMED": VERDICT_CONFIRMED_FAULT,
+    "SUSPECTED": VERDICT_PROBABLE_FAULT,
+    "PARTIALLY_CONFIRMED": VERDICT_PROBABLE_FAULT,
+    "REFUTED": VERDICT_INCONCLUSIVE,
+    "NO_ISSUE_DETECTED_WITHIN_SCOPE": VERDICT_INCONCLUSIVE,
+    "NO_ISSUE_DETECTED": VERDICT_INCONCLUSIVE,
+    "INCONCLUSIVE": VERDICT_INCONCLUSIVE,
+}
+
+
+def to_overall_verdict(label: Optional[str]) -> str:
+    """Map a verdict-like label onto ALL_OVERALL_VERDICTS (identity for labels already in it; unknown ->
+    INCONCLUSIVE)."""
+    if label in ALL_OVERALL_VERDICTS:
+        return str(label)
+    return FINAL_DIAGNOSIS_TO_VERDICT.get(str(label or ""), VERDICT_INCONCLUSIVE)
