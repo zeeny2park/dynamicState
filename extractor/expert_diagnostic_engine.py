@@ -2177,7 +2177,11 @@ class AdaptiveInvestigationSession:
                         s.status = "SKIPPED"
                 # IMP-004: dynamically scheduled growth follow-ups must still execute; otherwise keep the
                 # original early stop.  Baseline checks that have not run yet also keep the loop going.
+                # (IMP-008: also the follow-ups scheduled by an EARLIER growth step - a supported first follow-up
+                # must not cut off the second one.)
                 if (not any(s.status == "PENDING" for s in dynamic_followups)
+                        and not any(s.status == "PENDING" and str(s.rationale or "").startswith("Dynamic follow-up")
+                                    for s in remaining_steps)
                         and not any(s.status == "PENDING" and s.recipe_id in BASELINE_RECIPE_IDS
                                     for s in remaining_steps)):
                     self.state = STATE_ANALYZING

@@ -13,7 +13,6 @@ Validates P2 requirements:
 
 import json
 import os
-import platform
 import shutil
 import subprocess
 import tempfile
@@ -66,11 +65,6 @@ int main() {
 """
 
 
-# IMP-015: RECIPE_PROCESS_MEMORY_GROWTH performs no memory read of its own; the physical read that a LIVE capture
-# receipt requires came from the x86_64-only thread-TCB scan in LocalTargetAdapter.get_threads, which now refuses
-# non-x86_64 targets. Known defect on other architectures (see test_phase2_3_c1_mcp_boundary_and_consistency).
-_X86_64 = platform.machine() in ("x86_64", "AMD64")
-_needs_x86_tcb_read = (lambda f: f) if _X86_64 else unittest.expectedFailure
 
 
 class TestPhase23CRealRuntimeRecipes(unittest.TestCase):
@@ -179,7 +173,6 @@ class TestPhase23CRealRuntimeRecipes(unittest.TestCase):
         self.assertIn("missing_evidence", check)
         self.assertIn("limitations", check)
 
-    @_needs_x86_tcb_read
     def test_recipe_execution_records_authoritative_ledger_entries(self):
         """Recipe execution registers authentic evidence records in EvidenceLedger."""
         res_str = runtime_run_diagnostic_recipe(
