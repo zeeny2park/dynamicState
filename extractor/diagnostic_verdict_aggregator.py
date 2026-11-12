@@ -741,3 +741,42 @@ class DiagnosticVerdictAggregator:
             decision_rule_id=rule_id,
             decision_trace=_build_trace(rule_id, overall_result, rationale),
         )
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# IMP-017: the one user-visible verdict vocabulary is ALL_OVERALL_VERDICTS above.  Older interfaces that still
+# carry a "health score" or a legacy status word get them from these explicit boundary mappings, never from a
+# verdict decided elsewhere.
+# ---------------------------------------------------------------------------------------------------------------
+
+FAULT_VERDICTS = frozenset({VERDICT_CONFIRMED_FAULT, VERDICT_PROBABLE_FAULT, VERDICT_FAULT})
+
+
+def health_score_for(verdict: str, findings: Optional[List[Dict[str, Any]]] = None) -> Optional[int]:
+    """Legacy 0..100 health score derived from a verdict of the one vocabulary (display only).
+
+    INCONCLUSIVE / ABORTED (and anything unknown) -> None: an unexamined process has no score.  HEALTHY -> 100.
+    Fault / DEGRADED -> 100 minus 30 per CRITICAL, 15 per HIGH and 5 per other finding (floor 0; at most 90 so a
+    fault never reads as a clean 100).
+    """
+    if verdict == VERDICT_HEALTHY:
+        return 100
+    if verdict not in FAULT_VERDICTS and verdict != VERDICT_DEGRADED:
+        return None
+    fs = [f for f in (findings or []) if isinstance(f, dict)]
+    crit = sum(1 for f in fs if str(f.get("severity") or "").upper() == "CRITICAL")
+    high = sum(1 for f in fs if str(f.get("severity") or "").upper() == "HIGH")
+    other = len(fs) - crit - high
+    return max(0, min(90, 100 - crit * 30 - high * 15 - other * 5))
+
+
+def verdict_for_scan(findings: Optional[List[Dict[str, Any]]]) -> str:
+    """Verdict of a single-shot finding SCAN (auto-triage, symptom scan) in the one vocabulary.
+
+    A scan has no required checks, so it can never satisfy RULE_5 (HEALTHY): a clean scan is INCONCLUSIVE ("no
+    finding within the scan; run diagnose for a verdict"), a failed collection is INCONCLUSIVE, and a scan finding
+    is at most PROBABLE_FAULT (it was not confirmed by a recipe check).
+    """
+    if findings:
+        return VERDICT_PROBABLE_FAULT
+    return VERDICT_INCONCLUSIVE

@@ -3815,7 +3815,24 @@ class WebApiAdapter:
             observation_window=params.get("observation_window"),
         )
         if res.success:
-            return {"success": True, "data": _to_json_serializable(res.data)}
+            data = dict(res.data or {})
+            # IMP-017: the verdict of a live-process investigation comes from the one entry point, diagnose()
+            # (the staged session above keeps its evidence-browsing endpoints but decides no verdict).
+            if data.get("status") in ("COMPLETED", "PARTIAL") and (data.get("target_ref") or {}).get("live_capture"):
+                try:
+                    from extractor.human_report import diagnose_with_summary
+                    diag, summary = diagnose_with_summary(
+                        int(data["target_ref"]["pid"]), debug_image=params.get("debug_image") or None, symptom=goal,
+                        engine=self.runtime.expert_diagnostic_engine,
+                    )
+                    data["diagnosis"] = {**diag, "human_summary": summary}
+                    data["verdict"] = diag.get("verdict")
+                except Exception as exc:  # noqa: BLE001
+                    data["diagnosis"] = {"verdict": "INCONCLUSIVE", "findings": [],
+                                         "not_covered": [{"kind": "unexpected_error", "item": "diagnose",
+                                                          "reason": f"{type(exc).__name__}: {exc}"}]}
+                    data["verdict"] = "INCONCLUSIVE"
+            return {"success": True, "data": _to_json_serializable(data)}
         return {
             "success": False,
             "data": _to_json_serializable(res.data) if res.data else None,
