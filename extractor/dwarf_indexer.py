@@ -234,6 +234,42 @@ class DwarfIndex:
 
         return None
 
+    def resolve_source_line(self, link_time_pc: int) -> Optional[Dict[str, Any]]:
+        """Exact source position of a link-time code address from the DWARF line table (.debug_line).
+
+        Pass ``return_address - 1`` for caller frames (the call site) and the pc itself for a leaf.
+        Returns ``{"file", "line", "inlined_chain"}`` or None when no line-table entry covers the address
+        (stripped image, no debug info, addr2line missing).  ``inlined_chain`` lists, innermost first, the
+        functions inlined at that address as ``{"function", "file", "line"}``; its last entry is the real
+        (outermost) function.  Results are cached per (image, address).
+        """
+        path = self.artifact_path
+        if link_time_pc <= 0 or not path or not os.path.isfile(path):
+            return None
+        cache = self.__dict__.setdefault("_line_cache", {})
+        if link_time_pc in cache:
+            return cache[link_time_pc]
+        res: Optional[Dict[str, Any]] = None
+        try:
+            proc = subprocess.run(["addr2line", "-i", "-f", "-C", "-e", path, f"0x{link_time_pc:x}"],
+                                  capture_output=True, text=True, timeout=10)
+            out = proc.stdout.splitlines() if proc.returncode == 0 else []
+            chain: List[Dict[str, Any]] = []
+            for i in range(0, len(out) - 1, 2):
+                fn, loc = out[i].strip(), out[i + 1].strip()
+                m = re.match(r"^(.*):(\d+|\?)(?: \(discriminator \d+\))?$", loc)
+                if not m or m.group(2) in ("0", "?") or m.group(1).startswith("??"):
+                    continue
+                chain.append({"function": fn, "file": os.path.basename(m.group(1)), "line": int(m.group(2)),
+                              "path": m.group(1)})
+            if chain:
+                res = {"file": chain[0]["file"], "line": chain[0]["line"], "path": chain[0]["path"],
+                       "inlined_chain": chain}
+        except Exception:
+            res = None
+        cache[link_time_pc] = res
+        return res
+
     def resolve_type_by_name(self, type_name: str) -> Optional[DwarfType]:
         """Resolves a C/C++ type name (including primitives and structs) to its canonical DwarfType."""
         if not type_name:

@@ -101,17 +101,21 @@ class TestHumanReportReal(unittest.TestCase):
         return self._diag("dl", "proc_thread_circular_deadlock.c")
 
     def _src_lines(self):
-        """Ground truth from the fixture source: the line where each worker function is defined.
+        """Ground truth from the fixture source: the line of the lock call each worker is blocked in.
 
-        The tool resolves a frame to its function's definition line (not the line of the blocked call); the report
-        says so in its text, and this test checks the report against what the tool can know."""
+        The tool resolves a frame to the exact line of the blocked call from the DWARF line table (the function's
+        definition line stays available separately); this test checks the report against the source."""
         with open(os.path.join(FIXTURES, "proc_thread_circular_deadlock.c")) as fh:
             lines = fh.read().splitlines()
-        want = {}
+        want, cur = {}, None
         for n, line in enumerate(lines, 1):
             m = re.match(r"static void \*(worker_\d)\(", line)
             if m:
-                want[m.group(1)] = n
+                cur, seen = m.group(1), 0
+            elif cur and "pthread_mutex_lock(" in line:
+                seen += 1
+                if seen == 2:  # the second lock of each worker is the one it blocks in
+                    want[cur] = n
         return want
 
     def test_deadlock_first_screen_names_locks_functions_and_lines_in_both_languages(self):

@@ -661,6 +661,11 @@ def _top_frame(thread_report: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     return {
         "function": f.get("function_name"),
         "source_location": f.get("source_location"),
+        "source_line_exact": bool(f.get("source_line_exact")),
+        "function_decl_location": f.get("function_decl_location"),
+        "source_line_text": f.get("source_line_text"),
+        "inlined_function": f.get("inlined_function"),
+        "inlined_into": f.get("inlined_into"),
         "estimated": bool(f.get("estimated")),
         "unwind": f.get("unwind"),
     }
@@ -897,6 +902,13 @@ def derive(series: ThreadSeries) -> Dict[str, Any]:
         d["top_function"] = known[-1] if known else None
         d["top_source_location"] = next(((r.get("top_frame") or {}).get("source_location") for r in reversed(recs)
                                          if (r.get("top_frame") or {}).get("function")), None)
+        _tf = next(((r.get("top_frame") or {}) for r in reversed(recs) if (r.get("top_frame") or {}).get("function")), {})
+        d["top_source_line_exact"] = bool(_tf.get("source_line_exact"))
+        if _tf.get("source_line_text"):
+            d["top_source_text"] = _tf.get("source_line_text")
+        if _tf.get("inlined_function"):
+            d["top_inlined_function"] = _tf.get("inlined_function")
+            d["top_inlined_into"] = _tf.get("inlined_into")
         d["same_frame_sec"] = round(_run_start(frames, times), 4) if frames[-1] else 0.0
         d["distinct_top_functions"] = len(set(known))
         # share of samples in the most common top function (the stack-scan unwinder can be noisy in a single sample)

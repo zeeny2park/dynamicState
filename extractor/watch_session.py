@@ -5424,6 +5424,44 @@ class WatchSessionManager:
             "running_sample_stable": res.get("sample_stable"),
         }
 
+    @staticmethod
+    def _apply_exact_source_line(resolved: Dict[str, Any], idx: "DwarfIndex", lookup_lt_pc: int) -> Dict[str, Any]:
+        """Replace the definition-line `source_location` of a symbolized frame by the exact line of the
+        blocked call / current instruction from the DWARF line table (`lookup_lt_pc` is pc-1 for caller
+        frames).  The definition line stays in `function_decl_line` / `function_decl_location`.  New fields:
+        `source_line_exact` (bool), `source_line_basis`, `inlined_chain` + `inlined_function` when the
+        address lies in inlined code.  Without a covering line-table entry the definition line stays."""
+        out = dict(resolved)
+        out["function_decl_line"] = resolved.get("decl_line")
+        out["function_decl_location"] = resolved.get("source_location")
+        out["source_line_exact"] = False
+        if resolved.get("resolution_source") != "DWARF_SUBPROGRAM":
+            return out
+        try:
+            ln = idx.resolve_source_line(lookup_lt_pc)
+        except Exception:
+            ln = None
+        if not ln:
+            return out
+        out["source_location"] = f"{ln['file']}:{ln['line']}"
+        out["source_line"] = ln["line"]
+        out["source_line_exact"] = True
+        out["source_line_basis"] = "DWARF_LINE_TABLE"
+        try:  # the statement text, only when the source file is present on this host
+            with open(ln["path"], encoding="utf-8", errors="replace") as sf:
+                for n, txt in enumerate(sf, 1):
+                    if n == ln["line"]:
+                        out["source_line_text"] = txt.strip()[:200]
+                        break
+        except (OSError, KeyError):
+            pass
+        chain = ln.get("inlined_chain") or []
+        if len(chain) > 1:
+            out["inlined_chain"] = [{k: c[k] for k in ("function", "file", "line")} for c in chain]
+            out["inlined_function"] = chain[0]["function"]
+            out["inlined_into"] = chain[1]["function"]
+        return out
+
     def inspect_thread_callstacks_and_locks(
         self,
         pid: int,
@@ -5511,6 +5549,7 @@ class WatchSessionManager:
                     continue
                 resolved = m_idx.resolve_code_address(lt_pc)
                 if resolved is not None:
+                    resolved = self._apply_exact_source_line(resolved, m_idx, lt_pc)
                     return {
                         "runtime_pc": f"0x{rt_pc:x}",
                         "module": mod_name,

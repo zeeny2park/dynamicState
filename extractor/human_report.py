@@ -73,6 +73,9 @@ T: Dict[str, Tuple[str, str]] = {
                   "- {waiter}이(가) 락 {lock}을(를) 기다리고 있고, 이 락은 {owner}이(가) 잡고 있습니다."),
     "w_dl_where": ("- {thr} is blocked inside {fn}, which is defined at {loc}.", "- {thr}은(는) {loc}에 정의된 {fn} 안에서 멈춰 있습니다."),
     "w_dl_where_nofn": ("- {thr} is blocked at {loc}.", "- {thr}은(는) {loc}에서 멈춰 있습니다."),
+    "w_dl_at": ("- {thr} is blocked at {loc}{call}{inl}.", "- {thr}은(는) {loc}{call}{inl}에서 멈춰 있습니다."),
+    "w_at_call": (" in {x}", " ({x} 호출)"),
+    "w_at_inl": (" (in {f}, inlined into {g})", " ({f}, {g}에 인라인됨)"),
     "w_lines_note": ("The source line given for a function is where that function is defined; the exact line of "
                      "the call it is blocked in was not resolved.",
                      "함수에 붙은 소스 줄은 그 함수가 정의된 곳입니다. 멈춰 있는 호출의 정확한 줄은 해석하지 못했습니다."),
@@ -105,6 +108,10 @@ T: Dict[str, Tuple[str, str]] = {
                "running in {fn} (defined at {loc}).",
                "스레드 {thr} (tid {tid})은(는) 샘플의 {frac}%에서 실행 가능 상태였고 CPU를 {cpu}% 사용하며 "
                "{loc}에 정의된 {fn} 안에서 돌고 있었습니다."),
+    "w_spin_at": ("Thread {thr} (tid {tid}) was runnable in {frac}% of the samples and used {cpu}% of a CPU while "
+                  "running at {loc}{call}{inl} (in {fn}).",
+                  "스레드 {thr} (tid {tid})은(는) 샘플의 {frac}%에서 실행 가능 상태였고 CPU를 {cpu}% 사용하며 "
+                  "{fn} 안의 {loc}{call}{inl}에서 돌고 있었습니다."),
     "w_spin_short": ("Thread {thr} (tid {tid}) shows an anomaly in {fn} (defined at {loc}).",
                      "스레드 {thr} (tid {tid})에서 {loc}에 정의된 {fn} 관련 이상이 관측되었습니다."),
     "w_gen_cat": ("Category: {cat}", "범주: {cat}"),
@@ -212,6 +219,13 @@ T: Dict[str, Tuple[str, str]] = {
               "두 락 {a}와 {b}가 서로 반대 순서로 잡히고 있습니다. {t1} (함수 정의 위치 {l1})과 {t2} "
               "(함수 정의 위치 {l2})가 각각 하나를 잡은 채 다른 하나를 기다립니다. 두 함수를 열어 두 락을 잡는 순서를 "
               "일관되게 바꾸세요. 예를 들어 둘 다 {a}를 먼저 {b}를 나중에 잡거나, 락 하나로 둘을 함께 보호하세요."),
+    "n_dl2x": ("The two locks {a} and {b} are taken in opposite order: {t1} (blocked at {l1}) and {t2} "
+               "(blocked at {l2}) each hold one and wait for the other. Open both places and make the "
+               "order of the two lock calls consistent, for example always take {a} before {b} in both, or protect "
+               "both with a single lock.",
+               "두 락 {a}와 {b}가 서로 반대 순서로 잡히고 있습니다. {t1} ({l1}에서 멈춤)과 {t2} "
+               "({l2}에서 멈춤)가 각각 하나를 잡은 채 다른 하나를 기다립니다. 두 위치를 열어 두 락을 잡는 순서를 "
+               "일관되게 바꾸세요. 예를 들어 둘 다 {a}를 먼저 {b}를 나중에 잡거나, 락 하나로 둘을 함께 보호하세요."),
     "n_dln": ("The locks {locks} are taken in a circular order by {thrs}. Define one global lock order and make "
               "every code path follow it.",
               "락 {locks}이(가) {thrs}에 의해 고리 모양의 순서로 잡히고 있습니다. 전역 락 순서를 하나 정하고 "
@@ -236,6 +250,10 @@ T: Dict[str, Tuple[str, str]] = {
                "condition and whether it should wait on a lock, condition variable or timer instead.",
                "{loc}에 정의된 {fn}을(를) 보세요. 스레드 {thr}이(가) 대기하지 않고 그곳에서 시간을 보냅니다. 반복 조건을 "
                "확인하고, 락·조건 변수·타이머로 기다려야 하는 곳은 아닌지 살펴보세요."),
+    "n_spin_at": ("Look at {loc} in {fn}: the thread {thr} spends its time there without blocking. Check the loop "
+                  "condition and whether it should wait on a lock, condition variable or timer instead.",
+                  "{fn} 안의 {loc}을(를) 보세요. 스레드 {thr}이(가) 대기하지 않고 그곳에서 시간을 보냅니다. 반복 조건을 "
+                  "확인하고, 락·조건 변수·타이머로 기다려야 하는 곳은 아닌지 살펴보세요."),
     "n_generic_names": ("Start with {names}.", "{names}부터 확인하세요."),
     "n_generic_none": ("No names were attached to the finding. Re-run with a more specific symptom or a debug "
                        "image so the cause can be named.",
@@ -486,7 +504,7 @@ def _render_deadlock(ctx: _Ctx, f: Dict[str, Any], report: Optional[Dict[str, An
     rows = _thread_rows(report, f.get("recipe_ids"))
     lines: List[str] = []
     diagram: List[str] = []
-    info: Dict[str, Any] = {"cycle": cyc, "locks": [], "threads": [], "where": []}
+    info: Dict[str, Any] = {"cycle": cyc, "locks": [], "threads": [], "where": [], "where_exact": []}
     if cyc:
         ctx.term("waitfor")
         names = {e.get("waiter_name") for e in cyc} | {e.get("owner_name") for e in cyc}
@@ -511,10 +529,15 @@ def _render_deadlock(ctx: _Ctx, f: Dict[str, Any], report: Optional[Dict[str, An
             r = rows.get(tid) or {}
             fn, loc = r.get("top_function") or r.get("function"), r.get("top_source_location")
             lab = _thread_label(ctx, tid, rows, (r.get("name") if not same else None), same)
-            if loc:
+            if loc and r.get("top_source_line_exact"):
+                call, inl = _at_parts(ctx, r, fn)
+                lines.append(ctx.t("w_dl_at", thr=lab, loc=_c(loc), call=call, inl=inl))
+                info["where"].append((lab, fn, loc, tid))
+                info["where_exact"].append(tid)
+            elif loc:
                 lines.append(ctx.t("w_dl_where" if fn else "w_dl_where_nofn", thr=lab, fn=_c(fn) if fn else "", loc=_c(loc)))
                 info["where"].append((lab, fn, loc, tid))
-        if info["where"]:
+        if len(info["where_exact"]) < len(info["where"]):
             lines.append(ctx.t("w_lines_note"))
         if same and names and next(iter(names)):
             lines.append(ctx.t("w_dl_samename", name=_c(next(iter(names)))))
@@ -576,14 +599,21 @@ def _render_thread(ctx: _Ctx, f: Dict[str, Any], report: Optional[Dict[str, Any]
                 spins.append(r)
     if spins:
         ctx.term("spin"); ctx.term("runnable")
+    inexact = False
     for r in spins:
         fn = r.get("top_function") or r.get("function")
         loc = r.get("top_source_location")
         if fn and loc and r.get("runnable_fraction") is not None:
             frac = round(float(r["runnable_fraction"]) * 100)
             cpu = r.get("cpu_share_pct") if r.get("cpu_share_pct") is not None else round(float(r.get("cpu_share") or 0) * 100, 1)
-            lines.append(ctx.t("w_spin", thr=_c(r.get("name")), tid=r.get("tid"), frac=frac, cpu=cpu, fn=_c(fn), loc=_c(loc)))
-    if lines:
+            if r.get("top_source_line_exact"):
+                call, inl = _at_parts(ctx, r, fn)
+                lines.append(ctx.t("w_spin_at", thr=_c(r.get("name")), tid=r.get("tid"), frac=frac, cpu=cpu,
+                                   fn=_c(fn), loc=_c(loc), call=call, inl=inl))
+            else:
+                lines.append(ctx.t("w_spin", thr=_c(r.get("name")), tid=r.get("tid"), frac=frac, cpu=cpu, fn=_c(fn), loc=_c(loc)))
+                inexact = True
+    if lines and inexact:
         lines.append(ctx.t("w_lines_note"))
     if not lines:
         for key, kk, fmt in (("thread_name", "w_threads", _c), ("thread", "w_tids", str),
@@ -608,6 +638,20 @@ def _status_word(ctx: _Ctx, st: str) -> str:
     return str(st)
 
 
+def _call_text(text: Any) -> str:
+    """The call expression of a source line (cheap: only a single-statement line holding a call)."""
+    t = re.sub(r"//.*$", "", str(text or "")).strip().rstrip(";{ ").strip()
+    t = re.sub(r"^return\s+", "", t)
+    return t if "(" in t and len(t) <= 80 and not t.startswith(("if", "for", "while", "switch")) else ""
+
+
+def _at_parts(ctx: "_Ctx", r: Dict[str, Any], fn: Any) -> Tuple[str, str]:
+    call = _call_text(r.get("top_source_text"))
+    inl = r.get("top_inlined_function")
+    return (ctx.t("w_at_call", x=_c(call)) if call else "",
+            ctx.t("w_at_inl", f=_c(inl), g=_c(r.get("top_inlined_into") or fn)) if inl else "")
+
+
 def _loc_text(info: Dict[str, Any], tid: Any) -> Optional[str]:
     for lab, fn, loc, t in info.get("where", []):
         if t == tid:
@@ -624,7 +668,7 @@ def _finding_next(ctx: _Ctx, f: Dict[str, Any], rendered: Dict[str, Any]) -> Lis
         where = info.get("where", [])
         if len(locks) == 2 and len(threads) == 2 and len(where) == 2:
             a, b = locks
-            out.append(ctx.t("n_dl2", a=_c(a), b=_c(b), t1=where[0][0], l1=_c(where[0][2]),
+            out.append(ctx.t("n_dl2x" if len(info.get("where_exact", [])) == 2 else "n_dl2", a=_c(a), b=_c(b), t1=where[0][0], l1=_c(where[0][2]),
                              t2=where[1][0], l2=_c(where[1][2])))
         elif len(locks) >= 2 and where:
             out.append(ctx.t("n_dln", locks=_join([_c(x) for x in locks]), thrs=_join([w[0] for w in where])))
@@ -648,7 +692,8 @@ def _finding_next(ctx: _Ctx, f: Dict[str, Any], rendered: Dict[str, Any]) -> Lis
         for r in rendered["spins"]:
             fn, loc = r.get("top_function") or r.get("function"), r.get("top_source_location")
             if fn and loc:
-                out.append(ctx.t("n_spin", fn=_c(fn), loc=_c(loc), thr=_c(r.get("name"))))
+                out.append(ctx.t("n_spin_at" if r.get("top_source_line_exact") else "n_spin",
+                                 fn=_c(fn), loc=_c(loc), thr=_c(r.get("name"))))
         if not out:
             out.append(ctx.t("n_generic_none"))
     else:
