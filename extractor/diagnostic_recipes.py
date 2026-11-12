@@ -2113,9 +2113,24 @@ def _evaluate_specific_recipe(recipe: DiagnosticRecipe, data: Dict[str, Any]) ->
                 status=RECIPE_STATUS_SUPPORTED,
                 confidence=0.88,
                 confidence_basis=f"Observed {len(blocked)} thread(s) blocked for {stall_sec}s without forward progress.",
-                supporting_facts=[f"Blocked threads: {len(blocked)}"],
+                supporting_facts=[f"Blocked threads: {len(blocked)}"] + list(data.get("long_wait_findings") or []),
                 recommended_action="Inspect lock holder critical section duration or futex wake signaling.",
                 details={"blocked_thread_count": len(blocked), "blocked_duration_sec": stall_sec, "deadlock_detected": deadlock_det},
+            )
+        elif data.get("long_wait_threads"):
+            # IMP-010: a thread sat in one syscall for the whole sampling window. From outside, a blocked-forever
+            # thread and an idle worker look identical, so this is an observation, never a fault verdict.
+            lw = data["long_wait_threads"]
+            return RecipeEvaluationResult(
+                recipe_id=rid,
+                status=RECIPE_STATUS_INSUFFICIENT_EVIDENCE,
+                confidence=0.40,
+                confidence_basis="Long wait observed, cannot determine whether expected: "
+                                 + "; ".join(f"'{t.get('name')}' in {t.get('syscall')}" for t in lw[:5]),
+                supporting_facts=list(data.get("long_wait_findings") or []),
+                missing_evidence=["application_work_queue_state"],
+                limitations=recipe.limitations,
+                details={"long_wait_threads": [t.get("name") for t in lw], "expectation": "UNKNOWN"},
             )
         elif "blocked_threads" in data and not blocked:
             return RecipeEvaluationResult(
@@ -2161,9 +2176,10 @@ def _evaluate_specific_recipe(recipe: DiagnosticRecipe, data: Dict[str, Any]) ->
                 status=RECIPE_STATUS_SUPPORTED,
                 confidence=0.88,
                 confidence_basis="Abnormal thread scheduling/state distribution detected.",
-                supporting_facts=["Thread state anomaly observed"],
+                supporting_facts=["Thread state anomaly observed"] + list(data.get("thread_findings") or []),
                 recommended_action="Inspect runaway or zombie thread creation sites.",
-                details={"thread_state_anomaly": True},
+                details={"thread_state_anomaly": True,
+                         "runaway_threads": [t.get("name") for t in (data.get("runaway_threads") or []) if isinstance(t, dict)]},
             )
         elif data.get("threads_healthy") is True:
             return RecipeEvaluationResult(
