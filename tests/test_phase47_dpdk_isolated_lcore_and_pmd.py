@@ -166,8 +166,6 @@ int main() {
 
 # Production unwinder/TCB discovery assumes the x86_64 ABI; on other architectures the tests below are known-defect baselines.
 # (On x86_64 the decorator is a no-op so an unexpected pass there is not reported as an unexpected success.)
-_X86_64 = platform.machine() in ("x86_64", "AMD64")
-_x86_layout_defect = (lambda f: f) if _X86_64 else unittest.expectedFailure
 
 class TestPhase47DpdkIsolatedLcoreAndPmd(unittest.TestCase):
     @classmethod
@@ -256,9 +254,6 @@ class TestPhase47DpdkIsolatedLcoreAndPmd(unittest.TestCase):
         matched_names = {m["thread_name"] for m in own_res["matched_threads"]}
         self.assertIn("lcore-worker-1", matched_names)
 
-    # IMP-005 baseline: real defect — on aarch64 (non-x86_64) lcore_id is None (expected 1) because it is derived from per-thread TLS variables which are not
-    # discovered: extractor/watch_session.py:8881-8978 _discover_thread_tcb_addresses (x86_64-only tcbhead_t self-pointer invariant).
-    @_x86_layout_defect
     def test_03_dpdk_lcores_and_rings_inspector(self):
         """Verifies inspect_dpdk_lcores_and_rings distinguishes healthy polling vs deadloop lcore and stuck rte_ring."""
         res = self.watch_mgr.inspect_dpdk_lcores_and_rings(

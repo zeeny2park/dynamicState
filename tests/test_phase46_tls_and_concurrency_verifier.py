@@ -89,11 +89,6 @@ int main() {
 """
 
 
-# Production unwinder/TCB discovery assumes the x86_64 ABI; on other architectures the tests below are known-defect baselines.
-# (On x86_64 the decorator is a no-op so an unexpected pass there is not reported as an unexpected success.)
-_X86_64 = platform.machine() in ("x86_64", "AMD64")
-_x86_layout_defect = (lambda f: f) if _X86_64 else unittest.expectedFailure
-
 class TestPhase46TlsAndConcurrencyVerifier(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -136,9 +131,6 @@ class TestPhase46TlsAndConcurrencyVerifier(unittest.TestCase):
                     pass
         shutil.rmtree(cls.tmp_dir, ignore_errors=True)
 
-    # IMP-005 baseline: real defect — on aarch64 (non-x86_64) tls_variables_discovered is 0 (expected >= 2) and tcb_resolved_count is 0 (expected 3):
-    # extractor/watch_session.py:8881-8978 _discover_thread_tcb_addresses relies on the x86_64 glibc tcbhead_t self-pointer invariant (tcb==*tcb), absent on aarch64.
-    @_x86_layout_defect
     def test_01_zero_stop_per_thread_tls_decoder(self):
         """Verifies ELF PT_TLS + DWARF DW_OP_form_tls_address + glibc TCB discovery decodes per-thread TLS variables."""
         res = self.watch_mgr.inspect_thread_local_storage(
@@ -196,9 +188,6 @@ class TestPhase46TlsAndConcurrencyVerifier(unittest.TestCase):
         self.assertEqual(by_expr["g_fast_mutating_counter"]["consistency_status"], "CONCURRENTLY_MUTATING")
         self.assertEqual(res["overall_consistency_status"], "ACTIVE_CONCURRENT_MUTATIONS_DETECTED")
 
-    # IMP-005 baseline: real defect — on aarch64 (non-x86_64) tcb_resolved_count is 0 (expected 3): same root cause,
-    # extractor/watch_session.py:8881-8978 _discover_thread_tcb_addresses (x86_64-only tcbhead_t self-pointer invariant).
-    @_x86_layout_defect
     def test_03_web_api_and_workspace_chat_integration(self):
         """Verifies REST endpoints and Korean natural-language chat router for TLS_INSPECTOR and CONCURRENCY_VERIFIER."""
         rt = AgentRuntime(corpus_dir=os.path.join(self.tmp_dir, "corpus_web"))

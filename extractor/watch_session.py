@@ -9407,6 +9407,150 @@ class WatchSessionManager:
         }
 
 
+    @staticmethod
+    def _tls_first_block_offset_aarch64(tls_align: Optional[int]) -> int:
+        """aarch64 glibc (TLS variant I): the executable's static TLS block starts `roundup(16, p_align)` bytes
+        above the thread pointer (TLS_TCB_SIZE == 16: the two-word `tcbhead_t` {dtv, private})."""
+        align = max(1, int(tls_align or 1))
+        return (16 + align - 1) // align * align
+
+    def _discover_thread_pointers_aarch64(
+        self,
+        pid: int,
+        target_adapter: TargetExecutionAdapter,
+        all_mappings: List[Dict[str, Any]],
+        target_tids: set,
+        tls_align: Optional[int] = None,
+    ) -> Dict[int, int]:
+        """aarch64/glibc thread pointers (TPIDR_EL0) without stopping or tracing any thread.
+
+        aarch64 glibc uses TLS variant I: `tp` points at `tcbhead_t {void *dtv; void *private;}` and the
+        `struct pthread` lies *before* it (`pthread_self() == tp - sizeof(struct pthread)`), the static TLS
+        blocks after it.  `struct pthread` and the static TLS are allocated at the top of a pthread-created
+        thread's stack mapping and in the initial TLS mapping (anonymous, or `[heap]` for static executables)
+        for the main thread.  Neither `sizeof(struct pthread)` nor the offset of `tid` inside it is stable across
+        glibc versions, so the layout is derived from invariants instead of a version table:
+
+        1. the thread's own TID (an int32) is located in the stack-top / initial-TLS window;
+        2. the thread pointer is the 16-byte aligned address T above it whose first word is the `dtv`
+           pointer into readable memory, and whose `dtv[1].val` (the first static TLS block, 16 bytes per
+           dtv slot, dtv[0] = generation) is a TLS block above T inside the same mapping; when the executable's
+           PT_TLS alignment is known `dtv[1].val` must equal exactly T + roundup(16, p_align);
+        3. every thread of one process shares the same T - &tid distance; threads that disagree with the
+           majority are discarded.
+
+        Returns {tid: thread pointer}; threads that cannot be validated are simply absent.
+        """
+        import bisect
+        readable: List[Tuple[int, int]] = []
+        for m in all_mappings:
+            perms = m.get("permissions") or m.get("perms") or ""
+            if "r" not in perms:
+                continue
+            ms = int(m["start_int"]) if m.get("start_int") is not None else int(str(m.get("start", "0")), 16)
+            me = int(m["end_int"]) if m.get("end_int") is not None else int(str(m.get("end", "0")), 16)
+            readable.append((ms, me))
+        readable.sort()
+        starts = [r[0] for r in readable]
+
+        def containing(addr: int) -> Optional[Tuple[int, int]]:
+            i = bisect.bisect_right(starts, addr) - 1
+            if i >= 0 and readable[i][0] <= addr < readable[i][1]:
+                return readable[i]
+            return None
+
+        dtv_cache: Dict[int, Optional[int]] = {}
+
+        def dtv_first_block(dtv_addr: int) -> Optional[int]:
+            """dtv[1].val if `dtv_addr` looks like a glibc dtv: dtv[-1].counter (slot count) and dtv[0].counter
+            (generation) are small integers; each slot is 16 bytes (`{void *val; void *to_free;}`)."""
+            if dtv_addr not in dtv_cache:
+                val = None
+                raw, st, _ = target_adapter.read_memory(pid, dtv_addr - 16, 48)
+                if st == "OBSERVED" and raw and len(raw) >= 40:
+                    n_slots = struct.unpack_from("<Q", raw, 0)[0]
+                    generation = struct.unpack_from("<Q", raw, 16)[0]
+                    if 1 <= n_slots <= 0x100000 and generation < (1 << 32):
+                        val = struct.unpack_from("<Q", raw, 32)[0]
+                dtv_cache[dtv_addr] = val
+            return dtv_cache[dtv_addr]
+
+        first_off = self._tls_first_block_offset_aarch64(tls_align) if tls_align else None
+
+        def find_tp(raw: bytes, win_base: int, tid_idx: int) -> Optional[int]:
+            lo = (win_base + tid_idx + 0x40 + 15) & ~15
+            hi = min(win_base + tid_idx + 0x4000, win_base + len(raw) - 16)
+            for t_addr in range(lo, hi + 1, 16):
+                idx = t_addr - win_base
+                dtv = struct.unpack_from("<Q", raw, idx)[0]
+                if dtv < 0x10000 or dtv % 8 or containing(dtv) is None:
+                    continue
+                block = dtv_first_block(dtv)
+                if block is None:
+                    continue
+                if first_off is not None:
+                    if block != t_addr + first_off:
+                        continue
+                else:
+                    region = containing(t_addr)
+                    if not (t_addr + 16 <= block < (region[1] if region else 0)) or block % 8:
+                        continue
+                return t_addr
+            return None
+
+        windows: List[Tuple[int, int]] = []
+        for m in all_mappings:
+            perms = m.get("permissions") or m.get("perms") or ""
+            if "r" not in perms or "w" not in perms:
+                continue
+            path = (m.get("pathname") or m.get("path") or "").strip()
+            if path and not path.startswith("[stack") and path != "[heap]":
+                continue
+            ms = int(m["start_int"]) if m.get("start_int") is not None else int(str(m.get("start", "0")), 16)
+            me = int(m["end_int"]) if m.get("end_int") is not None else int(str(m.get("end", "0")), 16)
+            size = me - ms
+            if size < 4096:
+                continue
+            if size <= (1 << 20):
+                windows.append((ms, size))
+            else:
+                windows.append((me - (256 << 10), 256 << 10))
+                if path == "[heap]":
+                    windows.append((ms, 64 << 10))
+
+        patterns = {tid: struct.pack("<i", tid) for tid in target_tids}
+        candidates: Dict[int, set] = {tid: set() for tid in target_tids}  # tid -> {(tp, tp - &tid)}
+        for win_base, win_len in windows:
+            if all(candidates.values()):
+                break
+            raw, st, _ = target_adapter.read_memory(pid, win_base, win_len)
+            if st != "OBSERVED" or not raw or len(raw) < 64:
+                continue
+            for tid, pat in patterns.items():
+                pos = raw.find(pat)
+                while pos != -1:
+                    if (win_base + pos) % 4 == 0:
+                        t_addr = find_tp(raw, win_base, pos)
+                        if t_addr is not None:
+                            candidates[tid].add((t_addr, t_addr - (win_base + pos)))
+                    pos = raw.find(pat, pos + 1)
+
+        # A stray copy of a TID in the window can pair with a wrong thread pointer; the real
+        # `tp - &struct pthread.tid` distance is the same in every thread of the process, so vote on it.
+        votes: Dict[int, int] = {}
+        for cands in candidates.values():
+            for dist in {d for _tp, d in cands}:
+                votes[dist] = votes.get(dist, 0) + 1
+        if not votes:
+            return {}
+        best = max(votes, key=lambda d: (votes[d], -d))
+        result: Dict[int, int] = {}
+        for tid, cands in candidates.items():
+            tps = {tp for tp, d in cands if d == best}
+            if len(tps) == 1:
+                result[tid] = tps.pop()
+        return result
+
     def _discover_thread_tcb_addresses(
         self,
         pid: int,
@@ -9416,8 +9560,12 @@ class WatchSessionManager:
         ptr_size: int = 8,
         endian: str = "<",
         target_abi: Optional[TargetABI] = None,
+        tls_align: Optional[int] = None,
     ) -> Dict[int, int]:
         """Discovers each thread's glibc TCB (`struct pthread *` / `fs_base`) in zero-stop mode.
+
+        aarch64/glibc dispatches to `_discover_thread_pointers_aarch64` (thread pointer == TPIDR_EL0); the
+        description below is the x86_64 algorithm.
         
         Uses the deterministic glibc `tcbhead_t` self-pointer invariant:
         - `*(uint64_t *)(tcb_addr + 0x00) == tcb_addr` (`header.tcb`)
@@ -9434,6 +9582,10 @@ class WatchSessionManager:
         target_tids = {int(t["tid"]) for t in threads if "tid" in t}
         if not target_tids:
             return tcb_by_tid
+        if target_abi.architecture == "aarch64":
+            return self._discover_thread_pointers_aarch64(
+                pid, target_adapter, all_mappings, target_tids, tls_align=tls_align,
+            )
 
         ptr_fmt = endian + ("Q" if ptr_size == 8 else "I")
         candidate_tcbs: List[Tuple[int, bytes]] = []
@@ -9602,7 +9754,19 @@ class WatchSessionManager:
             ptr_size=ptr_size,
             endian=endian,
             target_abi=target_abi,
+            tls_align=(tls_align if (pt_tls and pt_tls.get("p_memsz", 0) > 0) else None),
         )
+        is_aarch64_tls = target_abi.architecture == "aarch64"
+        tcb_status, tcb_message, tcb_ok = tcb_support.status, tcb_support.message, tcb_support.supported
+        if tcb_ok and is_aarch64_tls and threads and not tcb_by_tid:
+            # aarch64 discovery is invariant-validated: nothing validated means the layout is not the glibc one
+            # we can verify, so report the explicit unsupported status instead of guessing addresses.
+            tcb_status = SUPPORT_NOT_SUPPORTED_ON_TARGET
+            tcb_message = (
+                "tcb_scan: not supported on this target (aarch64/glibc thread pointer could not be validated: "
+                "no thread produced a dtv-consistent TCB)"
+            )
+            tcb_ok = False
 
         thread_reports: List[Dict[str, Any]] = []
         values_by_var: Dict[str, List[Any]] = {v.name: [] for v in tls_vars}
@@ -9611,7 +9775,14 @@ class WatchSessionManager:
             t_tid = int(t["tid"])
             t_name = t.get("name", f"tid-{t_tid}")
             tcb_addr = tcb_by_tid.get(t_tid)
-            tls_block_base = (tcb_addr - aligned_tls_memsz) if (tcb_addr is not None and aligned_tls_memsz > 0) else None
+            if is_aarch64_tls:
+                # TLS variant I: the executable's block sits above the thread pointer
+                tls_block_base = (
+                    tcb_addr + self._tls_first_block_offset_aarch64(tls_align)
+                    if (tcb_addr is not None and aligned_tls_memsz > 0) else None
+                )
+            else:
+                tls_block_base = (tcb_addr - aligned_tls_memsz) if (tcb_addr is not None and aligned_tls_memsz > 0) else None
 
             decoded_vars: List[Dict[str, Any]] = []
             if tls_block_base is not None:
@@ -9676,16 +9847,16 @@ class WatchSessionManager:
                 "aligned_tls_memsz": aligned_tls_memsz,
             },
             "target_abi": target_abi.to_dict(),
-            "tcb_scan_status": tcb_support.status,
-            "tcb_scan_status_reason": tcb_support.message,
+            "tcb_scan_status": tcb_status,
+            "tcb_scan_status_reason": tcb_message,
             "tls_variables_discovered": len(tls_vars),
             "variable_summaries": variable_summaries,
             "threads_count": len(thread_reports),
             "tcb_resolved_count": len(tcb_by_tid),
             "threads": thread_reports,
             "llm_next_step_hint": (
-                f"TLS decoding {tcb_support.message}; no per-thread TLS values were produced."
-                if not tcb_support.supported else
+                f"TLS decoding {tcb_message}; no per-thread TLS values were produced."
+                if not tcb_ok else
                 f"Decoded {len(tls_vars)} TLS (`__thread` / `thread_local`) variable(s) across "
                 f"{len(tcb_by_tid)}/{len(thread_reports)} thread TCB(s) in zero-stop mode."
             ),

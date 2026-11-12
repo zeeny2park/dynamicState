@@ -273,10 +273,13 @@ class TestElfParsingAndSupportTable(unittest.TestCase):
         # IMP-011: frame decoding is CFI-based now and genuinely supported on aarch64 (any libc)
         self.assertEqual(check_support(glibc_a64, FEATURE_FRAME_LAYOUT).status, SUPPORT_SUPPORTED)
         self.assertEqual(check_support(musl_a64, FEATURE_FRAME_LAYOUT).status, SUPPORT_SUPPORTED)
-        for f in (FEATURE_TCB_SCAN,):
-            d = check_support(glibc_a64, f)
-            self.assertEqual(d.status, SUPPORT_NOT_SUPPORTED_ON_TARGET)
-            self.assertIn("not supported on this target (aarch64/glibc", d.message)
+        # aarch64/glibc TCB discovery (TLS variant I, dtv-validated) is supported; musl and 32-bit arm are not
+        self.assertEqual(check_support(glibc_a64, FEATURE_TCB_SCAN).status, SUPPORT_SUPPORTED)
+        d = check_support(musl_a64, FEATURE_TCB_SCAN)
+        self.assertEqual(d.status, SUPPORT_NOT_SUPPORTED_ON_TARGET)
+        self.assertIn("not supported on this target (aarch64/musl", d.message)
+        self.assertEqual(check_support(self._abi("arm", LIBC_GLIBC, 32), FEATURE_TCB_SCAN).status,
+                         SUPPORT_NOT_SUPPORTED_ON_TARGET)
         d = check_support(self._abi("arm", LIBC_GLIBC, 32), FEATURE_FRAME_LAYOUT)
         self.assertEqual(d.status, SUPPORT_NOT_SUPPORTED_ON_TARGET)
         self.assertIn("not supported on this target (arm/glibc", d.message)
@@ -495,7 +498,8 @@ class TestDetectionFromBinaries(unittest.TestCase):
         self.addCleanup(shutil.rmtree, mgr.corpus_dir, True)
         maps = [{"permissions": "rw-p", "pathname": "", "start_int": 0x10000, "end_int": 0x20000}]
         for abi in (
-            TargetABI(status="DETECTED", architecture="aarch64", word_size=64, endianness="little", libc=LIBC_GLIBC),
+            TargetABI(status="DETECTED", architecture="aarch64", word_size=64, endianness="little", libc=LIBC_MUSL),
+            TargetABI(status="DETECTED", architecture="arm", word_size=32, endianness="little", libc=LIBC_GLIBC),
             TargetABI(status="DETECTED", architecture="x86_64", word_size=64, endianness="little", libc=LIBC_MUSL),
             TargetABI(),
         ):
@@ -504,13 +508,14 @@ class TestDetectionFromBinaries(unittest.TestCase):
                 target_abi=abi,
             )
             self.assertEqual(res, {})
-        # supported combination proceeds to read memory (FakeAdapter.read_memory raises)
-        with self.assertRaises(AssertionError):
-            mgr._discover_thread_tcb_addresses(
-                pid=1, target_adapter=FakeAdapter(None, []), all_mappings=maps, threads=[{"tid": 1}],
-                target_abi=TargetABI(status="DETECTED", architecture="x86_64", word_size=64,
-                                     endianness="little", libc=LIBC_GLIBC),
-            )
+        # supported combinations proceed to read memory (FakeAdapter.read_memory raises)
+        for arch in ("x86_64", "aarch64"):
+            with self.assertRaises(AssertionError, msg=arch):
+                mgr._discover_thread_tcb_addresses(
+                    pid=1, target_adapter=FakeAdapter(None, []), all_mappings=maps, threads=[{"tid": 1}],
+                    target_abi=TargetABI(status="DETECTED", architecture=arch, word_size=64,
+                                         endianness="little", libc=LIBC_GLIBC),
+                )
 
 
 # =====================================================================================
@@ -646,23 +651,30 @@ class TestRealProcessGating(unittest.TestCase):
         return proc
 
     def test_tls_and_frame_decoders_report_status_instead_of_garbage(self):
-        """REAL: on non-x86_64 hosts the x86-only TLS decoder returns the explicit unsupported status and no
-        values; on x86_64 it stays supported.  Frame decoding is CFI-based since IMP-011: supported on
-        x86_64 and aarch64; on a target outside the table (arm, synthetic ABI over the real process) it
-        returns the explicit unsupported status and no values."""
+        """REAL: the TLS decoder is supported on x86_64 and aarch64 (glibc) and resolves every thread's TCB;
+        on a target outside the table (arm, synthetic ABI over the real process) it returns the explicit
+        unsupported status and no values.  Frame decoding is CFI-based since IMP-011: supported on
+        x86_64 and aarch64; outside the table likewise unsupported with no values."""
         proc = self._tls_proc()
-        expected = SUPPORT_SUPPORTED if _IS_X86_64 else SUPPORT_NOT_SUPPORTED_ON_TARGET
+        expected = SUPPORT_SUPPORTED if _NATIVE_MACHINE in ("x86_64", "aarch64") else SUPPORT_NOT_SUPPORTED_ON_TARGET
         tls = self.mgr.inspect_thread_local_storage(pid=proc.pid, companion_elf_path=self.tls_bin)
         self.assertEqual(tls["tcb_scan_status"], expected)
         frames = self.mgr.inspect_thread_locals_and_frame_vars(pid=proc.pid, companion_elf_path=self.tls_bin)
         expected_frames = SUPPORT_SUPPORTED if _NATIVE_MACHINE in ("x86_64", "aarch64") else SUPPORT_NOT_SUPPORTED_ON_TARGET
         self.assertEqual(frames["frame_decode_status"], expected_frames)
-        if not _IS_X86_64:
-            self.assertEqual(tls["tcb_resolved_count"], 0)
-            self.assertIn("not supported on this target", tls["tcb_scan_status_reason"])
-            for t in tls["threads"]:
-                self.assertIsNone(t["tcb_address"])
-                self.assertEqual(t["tls_variables"], [])
+        if _NATIVE_MACHINE in ("x86_64", "aarch64"):
+            self.assertEqual(tls["tcb_resolved_count"], tls["threads_count"])
+        arm_exe_tls = make_elf(40, 32, True, "/lib/ld-linux-armhf.so.3")
+        arm_tls = self.mgr.inspect_thread_local_storage(
+            pid=proc.pid, companion_elf_path=self.tls_bin,
+            adapter=OverridingLocalAdapter(exe_bytes=arm_exe_tls, maps="/lib/libc.so.6"),
+        )
+        self.assertEqual(arm_tls["tcb_scan_status"], SUPPORT_NOT_SUPPORTED_ON_TARGET)
+        self.assertEqual(arm_tls["tcb_resolved_count"], 0)
+        self.assertIn("not supported on this target", arm_tls["tcb_scan_status_reason"])
+        for t in arm_tls["threads"]:
+            self.assertIsNone(t["tcb_address"])
+            self.assertEqual(t["tls_variables"], [])
         # a target the support table does not cover: frames may still be identified (return-address
         # scan + DWARF) but carry no decoded values, and the status says why
         arm_exe = make_elf(40, 32, True, "/lib/ld-linux-armhf.so.3")

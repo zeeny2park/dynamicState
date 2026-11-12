@@ -513,7 +513,7 @@ class DwarfIndex:
     def to_cache_dict(self) -> Dict[str, Any]:
         """Serialize DwarfIndex to a JSON-compatible dictionary for persistent disk caching."""
         return {
-            "schema_version": "1.1.0",
+            "schema_version": "1.1.1",
             "artifact_path": self.artifact_path,
             "build_id": self.build_id,
             "pointer_size": self.pointer_size,
@@ -918,7 +918,7 @@ class DwarfIndexer:
                 try:
                     with open(disk_cache_file, "r", encoding="utf-8") as cf:
                         cached_data = json.load(cf)
-                    if cached_data.get("schema_version") == "1.1.0":
+                    if cached_data.get("schema_version") == "1.1.1":
                         index = DwarfIndex.from_cache_dict(cached_data)
                         with cls._lock:
                             cls._cache[cache_key] = index
@@ -1068,6 +1068,22 @@ class DwarfIndexer:
         if m:
             return int(m.group(1), 16)
         return None
+
+    @classmethod
+    def _read_tls_symbols(cls, path: str) -> Dict[str, int]:
+        """{symbol name: st_value} of the STT_TLS symbols (offsets inside the PT_TLS segment)."""
+        out: Dict[str, int] = {}
+        try:
+            res = subprocess.run(["readelf", "-s", "-W", path], capture_output=True, text=True,
+                                 errors="replace", check=False, timeout=30)
+        except Exception:
+            return out
+        sym_re = re.compile(r"^\s*\d+:\s+([0-9a-fA-F]+)\s+\S+\s+TLS\s+\S+\s+\S+\s+(\S+)\s+(\S+)")
+        for line in res.stdout.splitlines():
+            m = sym_re.match(line)
+            if m and m.group(2) != "UND":
+                out.setdefault(m.group(3).split("@")[0], int(m.group(1), 16))
+        return out
 
     @classmethod
     def _parse_tls_offset(cls, val: str) -> Optional[int]:
@@ -1353,6 +1369,9 @@ class DwarfIndexer:
         # Location lists read from the section bytes: binutils < 2.39 cannot decode DW_FORM_loclistx (clang 14+,
         # DWARF 5) and prints an empty DW_AT_location, so DIEs without readable text fall back to this map.
         binary_loclists: Optional[Dict[int, int]] = None
+        # aarch64 gcc/clang emit no DW_AT_location for __thread variables (no DTPREL relocation in .debug_info);
+        # their offset inside the PT_TLS segment is the st_value of the STT_TLS symbol of the same name.
+        tls_symbols: Optional[Dict[str, int]] = None
 
         for die_idx, d in enumerate(dies):
             if d["tag"] == "DW_TAG_variable":
@@ -1387,6 +1406,15 @@ class DwarfIndexer:
                         v_file = file_table.get(sf_idx) or (cls._clean_str(spec_die["attrs"].get("DW_AT_decl_file", "")) if spec_die["attrs"].get("DW_AT_decl_file") else None)
                     if not v_line:
                         v_line = cls._parse_int(spec_die["attrs"].get("DW_AT_decl_line", "0")) or None
+
+                if not loc_raw and not is_decl and not is_tls_var and (name or linkage_name):
+                    if tls_symbols is None:
+                        tls_symbols = cls._read_tls_symbols(path)
+                    sym_off = tls_symbols.get(linkage_name) if linkage_name else None
+                    if sym_off is None and name:
+                        sym_off = tls_symbols.get(name)
+                    if sym_off is not None:
+                        tls_off, is_tls_var = sym_off, True
 
                 var = DwarfVariable(
                     die_offset=d["offset"],

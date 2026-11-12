@@ -1682,9 +1682,11 @@ class LocalTargetAdapter(TargetExecutionAdapter):
 
             # Resolve stack_info and TCB address for pure user-space poll-mode threads (e.g. DPDK lcores where sp_int == 0)
             unresolved_threads = [t for t in threads if t["stack_info"].get("status") != "AVAILABLE" or t["stack_info"].get("tcb_address") is None]
-            # IMP-015: the tcbhead_t self-pointer scan below is an x86_64/glibc layout; only run it there.
-            if unresolved_threads and self._memory_reader is None and check_support(
-                detect_target_abi(self, pid, probe_version=False, maps=maps), FEATURE_TCB_SCAN
+            # IMP-015: the tcbhead_t self-pointer scan below is an x86_64/glibc layout; only run it there
+            # (aarch64 thread pointers are found by WatchSessionManager._discover_thread_pointers_aarch64).
+            _tcb_abi = detect_target_abi(self, pid, probe_version=False, maps=maps) if unresolved_threads else None
+            if unresolved_threads and self._memory_reader is None and _tcb_abi.architecture == "x86_64" and check_support(
+                _tcb_abi, FEATURE_TCB_SCAN
             ).supported:
                 target_tids = {t["tid"]: t for t in threads}
                 for m in maps:
