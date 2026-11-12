@@ -690,10 +690,13 @@ class TestPhase217VerdictAuthorityAndEvidenceGraph(unittest.TestCase):
 
         report = session.build_diagnostic_report()
         excluded = report.section_c_diagnostic_strategy.recipes_excluded
-        # Total recipes in registry is 22; every recipe not in the plan must be listed (not truncated to 5).
+        # Every registered recipe (22 built-ins plus plugin recipes such as fd_leak) not in the plan must be
+        # listed, not truncated to 5.
+        from extractor.diagnostic_recipes import DiagnosticRecipeRegistry
+        total_recipes = len(DiagnosticRecipeRegistry.list_recipe_ids())
         # (IMP-009 added a sixth always-planned baseline check, so the plan for this symptom is one larger.)
         planned = {s.recipe_id for s in session.plan.steps}
-        self.assertEqual(len(excluded), 22 - len(planned))
+        self.assertEqual(len(excluded), total_recipes - len(planned))
         self.assertGreater(len(excluded), 5)
         for item in excluded:
             self.assertIn("recipe_id", item)
