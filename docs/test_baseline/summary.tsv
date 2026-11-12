@@ -1,4 +1,4 @@
-# commit=f842448+dirty date=2026-11-12T03:09Z arch=aarch64 python=3.12.3 kernel=7.0.0-1013-oracle
+# commit=d870e07 date=2026-11-12T05:47Z arch=aarch64 python=3.12.3 kernel=7.0.0-1013-oracle
 file	exit_code	tests_ran	last_line
 test_adaptive_investigation_engine	0	8	OK
 test_agent_models	0	7	OK
@@ -13,7 +13,7 @@ test_capture_benchmark	0	12	OK
 test_capture_lifecycle_seam	0	54	OK
 test_capture_safety_and_diff_accuracy	0	27	OK
 test_causal_validation_hardening	0	83	OK (expected failures=1)
-test_ci_workflow_parity	0	7	OK (skipped=2)
+test_ci_workflow_parity	0	7	OK
 test_cli	0	5	OK
 test_cli_adaptive_report_integration	0	12	OK
 test_cpp_e2e_investigation	0	5	OK
@@ -32,6 +32,8 @@ test_explorer_branching	0	1	OK
 test_fast_capture_and_state_lab	0	12	OK
 test_gdb_compat	0	6	OK
 test_harness_scenarios	0	12	OK
+test_imp016_collector_dist_and_deploy	0	11	OK
+test_imp_001_002_003_004_019	0	19	OK
 test_invariant_candidates	0	1	OK
 test_investigation_api	0	4	OK
 test_investigation_backward_compatibility	0	4	OK
@@ -80,7 +82,7 @@ test_phase24_temporal_investigation	0	12	OK
 test_phase25_grounded_investigation	0	18	
 test_phase26_real_execution_quality	0	19	
 test_phase28_memory_explorer_ux	0	11	OK
-test_phase29_browser_e2e	0	5	sys:1: ResourceWarning: unclosed file <_io.TextIOWrapper name=7 encoding='UTF-8'>
+test_phase29_browser_e2e	0	5	sys:1: ResourceWarning: unclosed <socket.socket fd=3, family=2, type=1, proto=0, laddr=('127.0.0.1', 59191)>
 test_phase2_0_a_3_10_adversarial_provenance	0	18	OK
 test_phase2_0_a_3_10_real_cpp_e2e	0	15	OK
 test_phase2_0_a_3_10_workflow	0	6	OK
@@ -162,12 +164,12 @@ test_phase2_2_temporal_object_identity	0	5	OK
 test_phase2_3_budget_adversarial	0	5	OK
 test_phase2_3_budget_enforcement	0	4	OK
 test_phase2_3_c1_all_22_recipes_accuracy	0	6	OK
-test_phase2_3_c1_mcp_boundary_and_consistency	0	4	OK
+test_phase2_3_c1_mcp_boundary_and_consistency	0	4	OK (expected failures=1)
 test_phase2_3_c1_measurement_semantics	0	8	OK
 test_phase2_3_c1_real_cpp_decoder_regression	0	5	OK
 test_phase2_3_c_budget_reservation_and_overrun	0	5	OK
 test_phase2_3_c_pipeline_and_failure_recovery	0	5	OK
-test_phase2_3_c_real_runtime_recipes	0	5	OK
+test_phase2_3_c_real_runtime_recipes	0	5	OK (expected failures=1)
 test_phase2_3_c_recursive_decoder_contract	0	5	OK
 test_phase2_3_mcp_recipe_integration	0	6	OK
 test_phase2_3_recipe_diagnostic_quality	0	8	OK
@@ -210,8 +212,8 @@ test_phase48_stateful_context_and_forgiving_expressions	0	4	OK
 test_phase49_token_budget_batch_macro_and_self_repair	0	3	OK
 test_phase50_hypothesis_verifier_and_incident_report	0	2	OK
 test_phase51_real_workspace_web_service	0	4	OK
-test_phase52_web_and_mcp_defensive_hardening	0	4	OK
-test_real_runtime_validation	0	20	  max:    1589.4 us
+test_phase52_web_and_mcp_defensive_hardening	0	8	OK
+test_real_runtime_validation	0	20	  max:    2802.3 us
 test_real_target_runner	0	14	OK
 test_serializer	0	2	OK
 test_snapshot	0	4	OK
@@ -222,6 +224,7 @@ test_state_corpus	0	4	OK
 test_state_diff	0	10	OK
 test_state_hash	0	11	OK
 test_state_restorer	0	7	OK
+test_target_abi_detection	0	27	OK
 test_target_collector	0	59	OK (expected failures=2)
 test_transition_analyzer	0	3	OK
 test_type_resolver	0	1	OK
