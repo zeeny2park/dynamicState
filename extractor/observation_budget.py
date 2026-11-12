@@ -33,7 +33,11 @@ DEFAULT_CONSERVATIVE_UNKNOWN_BYTES = 65536  # 64 KB conservative fallback when c
 @dataclass
 class ObservationBudgetLimits:
     """Configurable multi-dimensional observation limits for investigation runs."""
-    max_wall_clock_ms: float = 5000.0
+    # Default wall-clock budget of an investigation.  The always-run baseline (thread sampling window, memory trend,
+    # fd probe, heap integrity + use-after-free re-reads, lock/deadlock checks) takes ~2-3 s idle and more under
+    # load; the old 5 s default cut healthy investigations short with BUDGET_EXHAUSTED.  Matches diagnose()'s
+    # LOCAL_DEFAULT_TIME_LIMIT_S.  Callers that want a tighter bound pass explicit limits.
+    max_wall_clock_ms: float = 20000.0
     max_bytes_read: int = 33554432  # 32 MB
     min_poll_interval_ms: float = 10.0
     max_consecutive_read_failures: int = 3
@@ -62,7 +66,7 @@ class ObservationBudgetLimits:
             return cls()
         return cls(
             max_wall_clock_ms=float(
-                d.get("max_wall_clock_ms", d.get("max_wall_time_ms", d.get("timeout_ms", 5000.0)))
+                d.get("max_wall_clock_ms", d.get("max_wall_time_ms", d.get("timeout_ms", 20000.0)))
             ),
             max_bytes_read=int(d.get("max_bytes_read", d.get("max_bytes", 33554432))),
             min_poll_interval_ms=float(d.get("min_poll_interval_ms", 10.0)),
