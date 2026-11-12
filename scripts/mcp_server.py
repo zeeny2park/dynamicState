@@ -724,6 +724,43 @@ def runtime_get_investigation_report(investigation_id: str, format: str = "json"
 
 
 @server.tool()
+def runtime_diagnose_process(
+    pid: int,
+    debug_image: Optional[str] = None,
+    symptom: Optional[str] = None,
+    time_limit_s: Optional[float] = None,
+) -> str:
+    """Diagnose a live Linux process end to end in ONE call and return the final verdict.
+
+    Use this when the user says "diagnose PID N" / "what is wrong with this process" and you want a
+    conclusion, not a multi-step workflow. It classifies the symptom, plans, executes the checks against
+    the live process (zero-stop: the process is never paused), concludes and writes a report.
+
+    Returns JSON with: verdict (CONFIRMED_FAULT, PROBABLE_FAULT, FAULT, DEGRADED, HEALTHY, INCONCLUSIVE,
+    ABORTED), confidence, summary, findings (category, severity, subjects = concrete lock/thread/function/
+    variable names), checks_run, not_covered (what could not be examined and why), collection_impact,
+    report_path, investigation_id and target. An unreadable PID or missing debug image gives INCONCLUSIVE
+    with the cause in not_covered; it is never reported as healthy.
+
+    Args:
+        pid: PID of the target process (required).
+        debug_image: Path to the ELF with DWARF symbols. Defaults to the target's own executable.
+        symptom: Optional natural-language symptom (e.g. 'process hangs', 'memory keeps growing').
+            Defaults to a general health check.
+        time_limit_s: Optional wall-clock observation budget in seconds.
+    """
+    try:
+        from extractor.expert_diagnostic_engine import diagnose
+        result = diagnose(
+            pid, debug_image=debug_image, symptom=symptom, time_limit_s=time_limit_s,
+            engine=runtime.expert_diagnostic_engine,
+        )
+        return _format_watch_result(result.to_dict())
+    except Exception as e:
+        return _format_watch_result({"success": False, "error": str(e), "error_code": type(e).__name__})
+
+
+@server.tool()
 def runtime_checkpoint(checkpoint_id: Optional[str] = None) -> str:
     """Create a branch-safe execution savepoint.
     
