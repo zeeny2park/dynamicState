@@ -27,7 +27,7 @@ import time
 import unittest
 
 import scripts.mcp_server as mcp_srv
-from extractor.expert_diagnostic_engine import ExpertDiagnosticEngine, ReportNotProducibleError, TargetSpec, diagnose
+from extractor.expert_diagnostic_engine import ExpertDiagnosticEngine, TargetSpec, diagnose
 from extractor.heap_walker import STATUS_OK, HeapWalker
 from extractor.target_abi import detect_target_abi
 from extractor.target_adapter import LocalTargetAdapter, RemoteSshTargetAdapter
@@ -385,37 +385,36 @@ class RemoteDiagnoseTests(unittest.TestCase):
         self.assertEqual(len(data), 70000)
 
     # ------------------------------------------------------------------------------------------ g
-    def test_g_planned_only_session_cannot_produce_a_report(self):
+    def test_g_planned_only_session_never_yields_a_diagnosis(self):
+        from unittest import mock
+        from extractor.expert_diagnostic_engine import AdaptiveInvestigationSession
         proc, binary, _ = self._launch("proc_thread_circular_deadlock.c", ready=False)
         engine = ExpertDiagnosticEngine(corpus_dir=self.corpus)
         session = engine.start_investigation(problem_statement="process hangs", pid=proc.pid, companion_elf=binary,
                                              adapter=LocalTargetAdapter())
         self.assertEqual(session.executed_check_count(), 0)
-        with self.assertRaises(ReportNotProducibleError):
-            session.build_diagnostic_report()
-        for fmt in ("json", "markdown", "html"):
-            out = session.export_report(format=fmt)
-            if fmt == "json":
-                self.assertIs(out["report_available"], False)
-                self.assertEqual(out["error_code"], "NO_EXECUTED_CHECKS")
-                self.assertEqual(out["overall_result"], "INCONCLUSIVE")
-                self.assertNotIn("section_a_executive_summary", out)
-            else:
-                self.assertTrue(out.startswith("NO REPORT"))
-        # MCP: same refusal through the multi-step tool
-        engine_prev = mcp_srv.runtime.expert_diagnostic_engine
-        mcp_srv.runtime.expert_diagnostic_engine = engine
-        try:
-            out = json.loads(mcp_srv.runtime_get_investigation_report(session.investigation_id))
-        finally:
-            mcp_srv.runtime.expert_diagnostic_engine = engine_prev
-        self.assertFalse(out["success"])
-        self.assertEqual(out["error_code"], "NO_EXECUTED_CHECKS")
-        # an executed session still reports
-        session.run_to_completion(max_steps=30)
-        self.assertGreater(session.executed_check_count(), 0)
+        # an engine-built report of a planned-only session is built, but unmistakably marked, never PASS
         rep = session.export_report(format="json")
-        self.assertIn("section_a_executive_summary", rep)
+        self.assertEqual(rep["report_completeness"], "PLANNED_ONLY")
+        self.assertEqual(rep["section_a_executive_summary"]["overall_result"], "INCONCLUSIVE")
+        self.assertTrue(any("PLANNED_ONLY" in x for x in rep["section_h_limitations_and_unverified"]["unexecuted_checks"]))
+        statuses = {c["status"] for c in rep["section_d_detailed_inspection_results"]["checks"]}
+        self.assertNotIn("PASS", statuses)
+        self.assertNotIn("FAIL", statuses)
+        # diagnose() on a session that plans but executes nothing: INCONCLUSIVE, no report, no findings
+        with mock.patch.object(AdaptiveInvestigationSession, "run_to_completion", lambda self_, max_steps=30: None):
+            res = diagnose(proc.pid, binary, corpus_dir=self.corpus, include_report=True).to_dict()
+        self.assertEqual(res["verdict"], "INCONCLUSIVE")
+        self.assertIn("not_executed", {n["kind"] for n in res["not_covered"]})
+        self.assertIsNone(res["report"])
+        self.assertIsNone(res["report_path"])
+        self.assertEqual(res["findings"], [])
+        # an executed session is COMPLETE
+        session2 = engine.start_investigation(problem_statement="process hangs", pid=proc.pid, companion_elf=binary,
+                                              adapter=LocalTargetAdapter())
+        session2.run_to_completion(max_steps=30)
+        self.assertGreater(session2.executed_check_count(), 0)
+        self.assertEqual(session2.export_report(format="json")["report_completeness"], "COMPLETE")
 
 
 if __name__ == "__main__":

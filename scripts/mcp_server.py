@@ -738,10 +738,6 @@ def runtime_get_investigation_report(investigation_id: str, format: str = "json"
     try:
         session = runtime.expert_diagnostic_engine.get_session(investigation_id)
         if session:
-            why = session.report_blocked_reason()
-            if why:
-                return _format_watch_result({"success": False, "investigation_id": investigation_id,
-                                             "error": why, "error_code": "NO_EXECUTED_CHECKS"})
             return _format_watch_result({
                 "success": True,
                 "investigation_id": investigation_id,

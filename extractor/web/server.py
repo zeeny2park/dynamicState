@@ -3914,9 +3914,6 @@ class WebApiAdapter:
             exp_sess = exp_eng.get_session(investigation_id)
             if exp_sess:
                 fmt = (format_type or "json").lower()
-                why = exp_sess.report_blocked_reason()
-                if why:
-                    return {"success": False, "error": {"code": "NO_EXECUTED_CHECKS", "message": why}}
                 if fmt in ("markdown", "md", "html"):
                     rendered = exp_sess.export_report(format=fmt)
                     json_rep = exp_sess.export_report(format="json")
@@ -4076,9 +4073,6 @@ class WebApiAdapter:
         sess = self.runtime.expert_diagnostic_engine.get_session(investigation_id)
         if not sess:
             return {"success": False, "error": {"code": "NOT_FOUND", "message": f"Investigation '{investigation_id}' not found"}}
-        why = sess.report_blocked_reason()
-        if why:
-            return {"success": False, "error": {"code": "NO_EXECUTED_CHECKS", "message": why}}
         report = sess.export_report(format=format)
         return {"success": True, "investigation_id": investigation_id, "format": format, "report": report}
 

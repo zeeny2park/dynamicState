@@ -324,6 +324,7 @@ class DiagnosticReport:
     """Master structured diagnostic report for Phase 2.1.8 (Sections A–I + 20 Required Engineering Items)."""
     report_id: str
     investigation_id: str
+    report_completeness: str = "COMPLETE"   # "PLANNED_ONLY": no check was executed; not a diagnosis
     schema_version: str = SCHEMA_VERSION
     generated_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
     section_a_executive_summary: Optional[ExecutiveSummarySection] = None
@@ -492,6 +493,7 @@ class DiagnosticReport:
             "schema_version": self.schema_version,
             "report_id": self.report_id,
             "investigation_id": self.investigation_id,
+            "report_completeness": self.report_completeness,
             "generated_at": self.generated_at,
             "section_a_executive_summary": self.section_a_executive_summary.to_dict() if self.section_a_executive_summary else {},
             "section_b_target_context": self.section_b_target_context.to_dict() if self.section_b_target_context else {},
@@ -511,6 +513,7 @@ class DiagnosticReport:
         return cls(
             report_id=data.get("report_id", "rep_unknown"),
             investigation_id=data.get("investigation_id", "inv_unknown"),
+            report_completeness=data.get("report_completeness", "COMPLETE"),
             schema_version=data.get("schema_version", SCHEMA_VERSION),
             generated_at=data.get("generated_at", datetime.now(timezone.utc).isoformat()),
             section_a_executive_summary=ExecutiveSummarySection.from_dict(data["section_a_executive_summary"]) if data.get("section_a_executive_summary") else None,

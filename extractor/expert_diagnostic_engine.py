@@ -1181,11 +1181,6 @@ class DiagnosticConclusion:
     overall_verdict: Optional[str] = None
 
 
-class ReportNotProducibleError(ValueError):
-    """IMP-006: a report was requested for a session that only planned and never executed a check."""
-    error_code = "NO_EXECUTED_CHECKS"
-
-
 # States in which a session without any executed check still has a truthful report: it says why nothing ran.
 _REPORTABLE_WITHOUT_CHECKS = {STATE_BLOCKED, STATE_FAILED, STATE_BUDGET_EXHAUSTED, STATE_INCONCLUSIVE}
 
@@ -3034,7 +3029,7 @@ class AdaptiveInvestigationSession:
         """Why no report may be produced for this session (planned-only), or None."""
         if not self.executed_check_count() and self.state not in _REPORTABLE_WITHOUT_CHECKS:
             return (f"investigation {self.investigation_id} is in state {self.state} and no check has been executed; "
-                    "a planned-only investigation produces no report (run the investigation first)")
+                    "this report is PLANNED_ONLY and is not a diagnosis (run the investigation first)")
         return None
 
     def executed_check_count(self) -> int:
@@ -3043,12 +3038,11 @@ class AdaptiveInvestigationSession:
     def build_diagnostic_report(self) -> DiagnosticReport:
         """Assembles unified, master DiagnosticReport adhering to Phase 2.1.8 schema (Part E1 & E2).
 
-        IMP-006 guard: a session that only planned (no check ever executed) and did not end in a state that
-        explains why nothing ran (BLOCKED / FAILED / BUDGET_EXHAUSTED / INCONCLUSIVE) yields no report:
-        raises :class:`ReportNotProducibleError` (``export_report`` turns it into an explicit marker)."""
-        why = self.report_blocked_reason()
-        if why:
-            raise ReportNotProducibleError(why)
+        IMP-006: a report may be built at any time (unexecuted recipes appear as NOT_EXECUTED, never PASS).
+        When no check was ever executed (planned-only) and the session did not end in a state that explains why
+        nothing ran, the report is marked ``report_completeness: PLANNED_ONLY`` with overall_result INCONCLUSIVE
+        and a limitation line; the one-call ``diagnose()`` never returns a verdict for such a session."""
+        planned_only = self.report_blocked_reason()      # before finalising: that changes the state
         if not self.conclusion:
             self._finalize_conclusion("EXPORT_REQUESTED", "Diagnostic report requested prior to terminal state.")
 
@@ -3356,7 +3350,12 @@ class AdaptiveInvestigationSession:
             decision_trace=agg_verdict.decision_trace,
         )
 
+        if planned_only:
+            sec_a.overall_result = "INCONCLUSIVE"
+            sec_a.limiting_factors = list(sec_a.limiting_factors or []) + [planned_only]
+            sec_h.unexecuted_checks = list(sec_h.unexecuted_checks or []) + [planned_only]
         return DiagnosticReport(
+            report_completeness="PLANNED_ONLY" if planned_only else "COMPLETE",
             report_id=f"rep_{self.investigation_id}",
             investigation_id=self.investigation_id,
             generated_at=det_end,
@@ -3372,20 +3371,9 @@ class AdaptiveInvestigationSession:
         )
 
     def export_report(self, format: str = "json") -> Union[Dict[str, Any], str]:
-        """Exports master diagnostic report as JSON, Markdown, or HTML.
-
-        A planned-only session returns an explicit marker instead of a report: a dict with
-        ``report_available: False`` / ``error_code`` / ``overall_result: INCONCLUSIVE`` for JSON, the same
-        sentence as text for the other formats."""
+        """Exports master diagnostic report as JSON, Markdown, or HTML."""
         fmt = format.lower()
-        try:
-            report = self.build_diagnostic_report()
-        except ReportNotProducibleError as exc:
-            if fmt in ("html", "markdown", "md", "json_str"):
-                return f"NO REPORT: {exc}"
-            return {"report_available": False, "error_code": exc.error_code, "error": str(exc),
-                    "overall_result": "INCONCLUSIVE", "investigation_id": self.investigation_id,
-                    "state": self.state}
+        report = self.build_diagnostic_report()
         if fmt == "html":
             return report.to_html()
         elif fmt == "markdown" or fmt == "md":
