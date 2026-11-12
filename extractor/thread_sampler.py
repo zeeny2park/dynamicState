@@ -53,6 +53,9 @@ class ThreadSamplingConfig:
     samples: int = 5
     interval_sec: float = 0.15
     runaway_cpu_share: float = 0.50
+    # A spinner can still take a stray voluntary switch (page-fault lock, start-up tail). Requiring exactly zero
+    # made the verdict flip on a single event; tolerate a negligible rate instead.
+    runaway_max_voluntary_switches_per_sec: float = 2.0
     min_samples_for_verdict: int = 3
     max_window_fraction_of_budget: float = 0.5
 
@@ -907,7 +910,7 @@ def judge(series: ThreadSeries) -> Dict[str, Any]:
         # --- CPU monopoly without observable progress -----------------------------------
         share = d["cpu_share"] or 0.0
         if (share >= cfg.runaway_cpu_share and all(s == "R" for s in states)
-                and d["voluntary_switches_delta"] == 0
+                and (d["voluntary_switches_delta"] or 0) <= cfg.runaway_max_voluntary_switches_per_sec * max(window, 1e-6)
                 and d["io_syscalls_delta"] in (0, None)
                 and (d["top_function_dominance"] is None or d["top_function_dominance"] >= 0.8)):
             fn = d["top_function"] or "unresolved"
