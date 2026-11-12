@@ -16,6 +16,8 @@ This directory contains the automated CI workflows for dynamicState.
    - Builds the containerized legacy GDB 9.2 environment (`docker/gdb92/Dockerfile`).
    - Runs `tests/integration_gdb92.py` verifying GDB 9.2 compatibility for multithread inferior inspection, low-impact observation, and process lifecycle handling.
 
+3. **`ci/workflows/embedded-matrix.yml`** (IMP-014): manual (`workflow_dispatch`) and weekly only; boots ARM32/aarch64 QEMU guests and runs the embedded-target matrix (`docs/EMBEDDED_TARGET_MATRIX.md`). Not run on push.
+
 ### Activating in GitHub Actions & Drift Prevention
 
 The canonical workflow definitions are maintained under `ci/workflows/test.yml` and `ci/workflows/gdb92.yml`.

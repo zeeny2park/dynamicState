@@ -2614,10 +2614,10 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
             "for p in /proc/[0-9]*; do "
             "[ -d \"$p\" ] || continue; "
             "pid=$(basename \"$p\"); "
-            "comm=$(cat \"$p/comm\" 2>/dev/null | tr -d '\n' || true); "
+            "comm=$(cat \"$p/comm\" 2>/dev/null | tr -d '\\n' || true); "
             "[ -n \"$comm\" ] || continue; "
             "exe=$(readlink -f \"$p/exe\" 2>/dev/null || readlink \"$p/exe\" 2>/dev/null || true); "
-            "cmd=$(tr '\000' ' ' < \"$p/cmdline\" 2>/dev/null | head -c 200 || true); "
+            "cmd=$(tr '\\000' ' ' < \"$p/cmdline\" 2>/dev/null | head -c 200 || true); "
             "echo \"$pid|$comm|$exe|$cmd\"; "
             "done"
         )

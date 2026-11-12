@@ -1,0 +1,72 @@
+name: Embedded Target Matrix (QEMU)
+
+# Slow (software emulation, one guest per matrix entry) and downloads guest packages: NOT run on push or
+# pull_request.  Manual trigger and a weekly schedule only.  See docs/EMBEDDED_TARGET_MATRIX.md.
+on:
+  workflow_dispatch:
+    inputs:
+      entries:
+        description: 'Space separated matrix entries (empty = all): arm32-glibc arm32-musl aarch64-glibc'
+        required: false
+        default: ''
+  schedule:
+    - cron: '23 3 * * 1'
+
+jobs:
+  qemu-matrix:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install system dependencies (QEMU, cross compilers, ssh client)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends qemu-system-arm gcc gcc-arm-linux-gnueabihf gcc-aarch64-linux-gnu gcc-x86-64-linux-gnu make binutils openssh-client dpkg-dev xz-utils
+          qemu-system-arm --version
+          qemu-system-aarch64 --version
+
+      - name: Install Python test dependencies
+        run: |
+          python3 -m pip install --upgrade pip
+          python3 -m pip install -r requirements-test.txt
+
+      - name: Cache guest images
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/dynamicstate-qemu
+          key: qemu-matrix-images-${{ hashFiles('scripts/qemu_matrix/images.py', 'scripts/qemu_matrix/entries.py') }}
+
+      - name: Build static collectors for arm, aarch64 and x86_64
+        run: |
+          make -C target/collector dist
+
+      - name: Matrix harness unit tests (no QEMU needed)
+        run: |
+          python3 -m unittest tests/test_imp014_qemu_matrix_logic.py
+
+      - name: Prepare guest images (explicit download, checksum verified)
+        run: |
+          python3 -m scripts.qemu_matrix prepare ${{ github.event.inputs.entries }}
+
+      - name: Run the QEMU matrix
+        run: |
+          python3 -m scripts.qemu_matrix run ${{ github.event.inputs.entries }} --out qemu_matrix_results
+
+      - name: Verify no QEMU process is left behind
+        if: always()
+        run: |
+          if pgrep -fa "[q]emu-system"; then echo "leftover qemu processes"; pkill -f "[q]emu-system" || true; exit 1; fi
+
+      - name: Upload matrix results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: qemu-matrix-results
+          path: qemu_matrix_results/

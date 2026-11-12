@@ -1,0 +1,236 @@
+{
+ "host": {
+  "machine": "aarch64",
+  "python": "3.12.3",
+  "kernel": "7.0.0-1013-oracle",
+  "kvm_available": false,
+  "qemu_arm": "QEMU emulator version 8.2.2 (Debian 1:8.2.2+ds-0ubuntu1.18)",
+  "qemu_aarch64": "QEMU emulator version 8.2.2 (Debian 1:8.2.2+ds-0ubuntu1.18)",
+  "cross_cc": {
+   "arm-linux-gnueabihf-gcc": "arm-linux-gnueabihf-gcc (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0",
+   "aarch64-linux-gnu-gcc": "aarch64-linux-gnu-gcc (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0"
+  }
+ },
+ "host_deadlock_reference": {
+  "available": true,
+  "deadlock_detected": true,
+  "locks": [
+   "g_mutex_a",
+   "g_mutex_b"
+  ],
+  "recipe_status": "SUPPORTED",
+  "host_arch": "aarch64"
+ },
+ "downloads": [
+  {
+   "sha256": "ed56aac47e7911e65ee63aae8d67e29f20e023f840e49f8ed037043a33de138a",
+   "size": 138612,
+   "url": "https://deb.debian.org/debian/dists/trixie/Release",
+   "verified_against": "none (recorded only)"
+  },
+  {
+   "sha256": "be16b37b2f740f066ea93d35d56f04f94d63693e5a3eb421b052bf86fae75bcd",
+   "size": 9614192,
+   "url": "https://deb.debian.org/debian/dists/trixie/main/binary-arm64/Packages.xz",
+   "verified_against": "published checksum"
+  },
+  {
+   "sha256": "2ec499ef1d8375da19217b500d389c3d40410d930fe709013758c1746aba5cec",
+   "size": 9246492,
+   "url": "https://deb.debian.org/debian/dists/trixie/main/binary-armhf/Packages.xz",
+   "verified_against": "published checksum"
+  },
+  {
+   "sha256": "c833be48abfa16bc19c4966ec93e289ff1ce5d2f1476cad3a57bd105378cd15c",
+   "size": 847552,
+   "url": "https://deb.debian.org/debian/pool/main/b/busybox/busybox-static_1.37.0-6+b9_arm64.deb",
+   "verified_against": "published checksum"
+  },
+  {
+   "sha256": "8b35210e08d559ecc0ddb660dd96f6f9694f69eb27f1dc608f5eeda56d94509e",
+   "size": 827896,
+   "url": "https://deb.debian.org/debian/pool/main/b/busybox/busybox-static_1.37.0-6+b9_armhf.deb",
+   "verified_against": "published checksum"
+  },
+  {
+   "sha256": "1cfab9f1d5dbf89a8ad790cafe5585a8e08a7c0e0ce098c7a89f957a6428976e",
+   "size": 174696,
+   "url": "https://deb.debian.org/debian/pool/main/d/dropbear/dropbear-bin_2025.89-1~deb13u1_arm64.deb",
+   "verified_against": "published checksum"
+  },
+  {
+   "sha256": "afef10179f2a9403e1f98c22a40fe5d4f2d394fdadcac2c1ac0acddf9454494b",
+   "size": 168628,
+   "url": "https://deb.debian.org/debian/pool/main/d/dropbear/dropbear-bin_2025.89-1~deb13u1_armhf.deb",
+   "verified_against": "published checksum"
+  },
+  {
+   "sha256": "34ee90679b018c0e64234747a4c4c0ae6b7f63541115037465a8627c2dfbc594",
+   "size": 49444,
+   "url": "https://deb.debian.org/debian/pool/main/g/gcc-14/gcc-14-base_14.2.0-19_arm64.deb",
+   "verified_against": "published checksum"
+  },
+  {
+   "sha256": "0f702fdd5e5471efda9fece892e09ce73e3447968083e1f8c341f8b66b1fb340",
+   "size": 49392,
+   "url": "https://deb.debian.org/debian/pool/main/g/gcc-14/gcc-14-base_14.2.0-19_armhf.deb",
+   "verified_against": "published checksum"
+  },
+  {
+   "sha256": "1108bc87879833d6d9a145f22a4a15cddb34e065b4b5f4b97bee586adbac2851",
+   "size": 54104,
+   "url": "https://deb.debian.org/debian/pool/main/g/gcc-14/libgcc-s1_14.2.0-19_arm64.deb",
+   "verified_against": "published checksum"
+  },
+  {
+   "sha256": "25910c3a0bce3985e388de445244578b7922dc670c9bba1c8673779b89447873",
+   "size": 37008,
+   "url": "https://deb.debian.org/debian/pool/main/g/gcc-14/libgcc-s1_14.2.0-19_armhf.deb",
+   "verified_against": "published checksum"
+  },
+  {
+   "sha256": "8784eda966b189c777a384dac5ce009e8fc9b52d006926c5a013e7fa8aa688cc",
+   "size": 2483572,
+   "url": "https://deb.debian.org/debian/pool/main/g/glibc/libc6_2.41-12+deb13u4_arm64.deb",
+   "verified_against": "published checksum"
+  },
+  {
+   "sha256": "4fc6fed8d77d01c0dacb5fda8b880a8c8a669575936de5761b693077a6f6c2ec",
+   "size": 2260832,
+   "url": "https://deb.debian.org/debian/pool/main/g/glibc/libc6_2.41-12+deb13u4_armhf.deb",
+   "verified_against": "published checksum"
+  },
+  {
+   "sha256": "a27bbc27f119161ea9702c8dd66f54131cdf0d2ca73000f50ea91ef2fdfef0fb",
+   "size": 535088,
+   "url": "https://deb.debian.org/debian/pool/main/g/gmp/libgmp10_6.3.0+dfsg-3_arm64.deb",
+   "verified_against": "published checksum"
+  },
+  {
+   "sha256": "b74d0fa0aa9d1e2f7addae5d3c235fc881e1507d98559ab158362bef56877a56",
+   "size": 512384,
+   "url": "https://deb.debian.org/debian/pool/main/g/gmp/libgmp10_6.3.0+dfsg-3_armhf.deb",
+   "verified_against": "published checksum"
+  },
+  {
+   "sha256": "20c92f3f97dd466e0400a6fcb792bde85af842fbb5e8b471370065e3de9d9fc9",
+   "size": 92902468,
+   "url": "https://deb.debian.org/debian/pool/main/l/linux-signed-arm64/linux-image-6.12.107+deb13-arm64_6.12.107-1_arm64.deb",
+   "verified_against": "published checksum"
+  },
+  {
+   "sha256": "9db6efc15fcc408acdc417911bdb7ac2c3ee0dd04fd1535a16b34744293a4380",
+   "size": 56512584,
+   "url": "https://deb.debian.org/debian/pool/main/l/linux/linux-image-6.12.107+deb13-armmp_6.12.107-1_armhf.deb",
+   "verified_against": "published checksum"
+  },
+  {
+   "sha256": "30c14959f4ae9ba1b41dab47f6d7ca212b7cf45ce340d1a3a52e1fd25a5b643b",
+   "size": 409860,
+   "url": "https://deb.debian.org/debian/pool/main/libt/libtomcrypt/libtomcrypt1_1.18.2+dfsg-7+b2_arm64.deb",
+   "verified_against": "published checksum"
+  },
+  {
+   "sha256": "2b76b7fa88ac363588007bd8bfc5b7a7154fcad5c0d3a9270fce6fe2492ff70a",
+   "size": 388556,
+   "url": "https://deb.debian.org/debian/pool/main/libt/libtomcrypt/libtomcrypt1_1.18.2+dfsg-7+b2_armhf.deb",
+   "verified_against": "published checksum"
+  },
+  {
+   "sha256": "7e53ae5d16d06801b1c0c88e2fcb3b38e08d76aa3855bcbd6abc8e9639cb6945",
+   "size": 64536,
+   "url": "https://deb.debian.org/debian/pool/main/libt/libtommath/libtommath1_1.3.0-1_arm64.deb",
+   "verified_against": "published checksum"
+  },
+  {
+   "sha256": "ef6dfd8afc4437c832ca28483ef19cc572d18a40a15fc4bebdba4bb415e1403c",
+   "size": 54048,
+   "url": "https://deb.debian.org/debian/pool/main/libt/libtommath/libtommath1_1.3.0-1_armhf.deb",
+   "verified_against": "published checksum"
+  },
+  {
+   "sha256": "b9aaa808aa3812b3de3e54eb5dfb16762c1779db032604abef2354c02fdc29b8",
+   "size": 91760,
+   "url": "https://deb.debian.org/debian/pool/main/libx/libxcrypt/libcrypt1_4.4.38-1_arm64.deb",
+   "verified_against": "published checksum"
+  },
+  {
+   "sha256": "42cb49bb5dbc41d8f2df55b60f4d3fb7c08b1146f59b3584d498c4858bdc9ade",
+   "size": 95644,
+   "url": "https://deb.debian.org/debian/pool/main/libx/libxcrypt/libcrypt1_4.4.38-1_armhf.deb",
+   "verified_against": "published checksum"
+  },
+  {
+   "sha256": "209aa5cf671e97b9eb0410844fa6df4cae2e75b0c72e7802ab6c8ece13e6ddef",
+   "size": 85116,
+   "url": "https://deb.debian.org/debian/pool/main/z/zlib/zlib1g_1.3.dfsg+really1.3.1-1+b1_arm64.deb",
+   "verified_against": "published checksum"
+  },
+  {
+   "sha256": "81c55a59e1570477ecef6a449bf6dce44dad67ba4ce9e04760451d4cfe200534",
+   "size": 75196,
+   "url": "https://deb.debian.org/debian/pool/main/z/zlib/zlib1g_1.3.dfsg+really1.3.1-1+b1_armhf.deb",
+   "verified_against": "published checksum"
+  },
+  {
+   "sha256": "ccf67150c647a507116863346d60f5d25469bb630b82aaed390ed2c6106f92da",
+   "size": 498997,
+   "url": "https://dl-cdn.alpinelinux.org/alpine/v3.22/main/armv7/APKINDEX.tar.gz",
+   "verified_against": "none (recorded only)"
+  },
+  {
+   "sha256": "d3707db7a21661910662cf6b20a452b11c079b58c618ae532e2050b1d6f49e5f",
+   "size": 192219,
+   "url": "https://dl-cdn.alpinelinux.org/alpine/v3.22/main/armv7/dropbear-2025.88-r1.apk",
+   "verified_against": "none (recorded only)"
+  },
+  {
+   "sha256": "5d2219a155aa7838c9c741413656711f57598fbc23d56ccf893e0d73ebda233b",
+   "size": 19878,
+   "url": "https://dl-cdn.alpinelinux.org/alpine/v3.22/main/armv7/libgcc-14.2.0-r6.apk",
+   "verified_against": "none (recorded only)"
+  },
+  {
+   "sha256": "f6f874092f120ea418d72abf554ac114c4aa34618ae5be84dc7cb3e48e614422",
+   "size": 385568,
+   "url": "https://dl-cdn.alpinelinux.org/alpine/v3.22/main/armv7/musl-1.2.5-r13.apk",
+   "verified_against": "none (recorded only)"
+  },
+  {
+   "sha256": "64cb621ca0ccf1cff50689a4bdde97a28204433c0c3ae70d590a71b99cb61e60",
+   "size": 2289276,
+   "url": "https://dl-cdn.alpinelinux.org/alpine/v3.22/main/armv7/musl-dev-1.2.5-r13.apk",
+   "verified_against": "none (recorded only)"
+  },
+  {
+   "sha256": "073660103134862edeb6a7abaae2f63899caa0c5303e2e9ebda8710f05151f69",
+   "size": 81178,
+   "url": "https://dl-cdn.alpinelinux.org/alpine/v3.22/main/armv7/skalibs-libs-2.14.4.0-r0.apk",
+   "verified_against": "none (recorded only)"
+  },
+  {
+   "sha256": "6d7618de5e6e2f5fc4e52655fba4b56f0005aac7d2d9a0d9917f63750117a115",
+   "size": 5400,
+   "url": "https://dl-cdn.alpinelinux.org/alpine/v3.22/main/armv7/utmps-libs-0.1.3.1-r0.apk",
+   "verified_against": "none (recorded only)"
+  },
+  {
+   "sha256": "9221831e1794df19108e0b36a6f4e5ea5683e77bb29cf127990b629c7e59c8e1",
+   "size": 44100,
+   "url": "https://dl-cdn.alpinelinux.org/alpine/v3.22/main/armv7/zlib-1.4-r0.apk",
+   "verified_against": "none (recorded only)"
+  },
+  {
+   "sha256": "a641f002abf617db94379110ffa798e0ed9903dbcec2bb1caa79df1fc7af8e8c",
+   "size": 3130793,
+   "url": "https://dl-cdn.alpinelinux.org/alpine/v3.22/releases/armv7/alpine-minirootfs-3.22.8-armv7.tar.gz",
+   "verified_against": "published checksum"
+  },
+  {
+   "sha256": "1b83608f57487a5c479c62ef948b16ad85e151238ff0f9a6c219e7b298dcdba2",
+   "size": 104,
+   "url": "https://dl-cdn.alpinelinux.org/alpine/v3.22/releases/armv7/alpine-minirootfs-3.22.8-armv7.tar.gz.sha256",
+   "verified_against": "none (recorded only)"
+  }
+ ]
+}

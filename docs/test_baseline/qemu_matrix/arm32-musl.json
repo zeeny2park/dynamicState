@@ -1,0 +1,471 @@
+{
+ "schema": "dynamicstate.qemu_matrix.v1",
+ "entry": "arm32-musl",
+ "title": "ARM32 + musl (Alpine v3.22 userland, BusyBox)",
+ "started_utc": "2026-11-12T08:26:43Z",
+ "duration_s": 248.1,
+ "overall": "PASS",
+ "infrastructure_error": null,
+ "guest": {
+  "uname": [
+   "Linux 6.12.107+deb13-armmp armv7l",
+   "BusyBox v1.37.0 (2025-11-21 22:40:56 UTC) multi-call binary."
+  ],
+  "boot_to_ssh_s": 16.5,
+  "vcpus": 1,
+  "mem_mb": 128,
+  "cpu_model": "cortex-a15",
+  "machine": "virt,highmem=off",
+  "accel": "tcg",
+  "packages": [
+   "kernel:linux-image-6.12.107+deb13-armmp",
+   "alpine-minirootfs=3.22.8",
+   "libgcc=14.2.0-r6",
+   "musl=1.2.5-r13",
+   "dropbear=2025.88-r1",
+   "zlib=1.4-r0",
+   "utmps-libs=0.1.3.1-r0",
+   "skalibs-libs=2.14.4.0-r0"
+  ],
+  "qemu_args": [
+   "qemu-system-arm",
+   "-M",
+   "virt,highmem=off",
+   "-cpu",
+   "cortex-a15",
+   "-smp",
+   "1",
+   "-m",
+   "128",
+   "-accel",
+   "tcg,thread=single",
+   "-display",
+   "none",
+   "-monitor",
+   "none",
+   "-serial",
+   "file:/home/ubuntu/.cache/dynamicstate-qemu/dsqemu_arm32-musl_bd84x5__/console.log",
+   "-no-reboot",
+   "-kernel",
+   "/home/ubuntu/.cache/dynamicstate-qemu/arm32-musl/vmlinuz",
+   "-initrd",
+   "/home/ubuntu/.cache/dynamicstate-qemu/dsqemu_arm32-musl_bd84x5__/initrd.cpio.gz",
+   "-append",
+   "console=ttyAMA0 panic=-1 quiet loglevel=3",
+   "-netdev",
+   "user,id=n0,hostfwd=tcp:127.0.0.1:49017-:22",
+   "-device",
+   "virtio-net-pci,netdev=n0,romfile="
+  ]
+ },
+ "checks": [
+  {
+   "id": "C1_collector_deploy_and_slice",
+   "name": "Collector deploys (arch, static, version) + slice read returns expected bytes",
+   "status": "PASS",
+   "summary": "DEPLOYED_BINARY arm collector v1.0.0, 567328 bytes; slice of 48 bytes at 0x4fc000 matches",
+   "details": {
+    "deploy": {
+     "deployed": true,
+     "status": "DEPLOYED_BINARY",
+     "collector_path": "/tmp/dynamicstate-collector",
+     "bytes_transferred": 567328,
+     "architecture": "arm",
+     "collector_version": "1.0.0",
+     "local_binary": "/home/ubuntu/workspace/ut/.claude/worktrees/agent-a657b6e0aca8d6461/target/collector/dist/arm/dynamicstate-collector",
+     "transfer": "ssh_stdin"
+    },
+    "deploy_reason": "Successfully deployed dynamicstate-collector (567328 bytes) to /tmp/dynamicstate-collector",
+    "guest_uname_m": "armv7l",
+    "local_binary": "target/collector/dist/arm/dynamicstate-collector",
+    "local_binary_elf": {
+     "architecture": "arm",
+     "word_size": 32,
+     "endianness": "little",
+     "interpreter": null
+    },
+    "remote_version_output": "dynamicstate-collector 1.0.0",
+    "expected_version": "1.0.0",
+    "slice_read": {
+     "address": "0x4fc000",
+     "size": 48,
+     "status": "OBSERVED",
+     "error": null,
+     "bytes": "DYNAMICSTATE-MATRIX-KNOWN-BUFFER-0123456789abcd\u0000"
+    },
+    "daemon_stats_after_slice": {
+     "opens": 1,
+     "requests": 1,
+     "reopens": 0,
+     "fallbacks": 0
+    },
+    "remote_commands": 14
+   },
+   "remote_commands": 14,
+   "duration_s": 6.46
+  },
+  {
+   "id": "C1b_noexec_fallback_location",
+   "name": "Deploy falls back to another location when the primary is noexec",
+   "status": "PASS",
+   "summary": "noexec primary rejected, collector deployed to /tmp/dsmx_fallback/dynamicstate-collector and used",
+   "details": {
+    "noexec_really_blocks_execution": true,
+    "deploy": {
+     "deployed": true,
+     "status": "DEPLOYED_BINARY",
+     "collector_path": "/tmp/dsmx_fallback/dynamicstate-collector",
+     "bytes_transferred": 567328,
+     "architecture": "arm",
+     "collector_version": "1.0.0",
+     "local_binary": "/home/ubuntu/workspace/ut/.claude/worktrees/agent-a657b6e0aca8d6461/target/collector/dist/arm/dynamicstate-collector",
+     "transfer": "ssh_stdin"
+    },
+    "reason": "Successfully deployed dynamicstate-collector (567328 bytes) to /tmp/dsmx_fallback/dynamicstate-collector",
+    "read_via_fallback_copy": "OBSERVED"
+   },
+   "remote_commands": 6,
+   "duration_s": 4.1
+  },
+  {
+   "id": "C2a_daemon_channel",
+   "name": "Daemon channel: N reads, one collector process",
+   "status": "PASS",
+   "summary": "30 reads, 1 collector process, 1 ssh channel, 0 left after close",
+   "details": {
+    "reads": 30,
+    "bad_reads": [],
+    "wall_s": 0.46,
+    "daemon_stats": {
+     "opens": 1,
+     "requests": 30,
+     "reopens": 0,
+     "fallbacks": 0
+    },
+    "collector_processes_before": 0,
+    "collector_processes_during": 1,
+    "collector_processes_after_close": 0,
+    "ssh_commands": {
+     "commands": 1,
+     "stream_opens": 1
+    }
+   },
+   "remote_commands": 1,
+   "duration_s": 3.35
+  },
+  {
+   "id": "C2b_no_collector_fallback",
+   "name": "No-collector fallback with the guest's BusyBox dd/tail/head, unaligned ranges",
+   "status": "PASS",
+   "summary": "7 unaligned/page-crossing ranges correct singly and as one batch; unmapped read -> UNAVAILABLE",
+   "details": {
+    "applets": [
+     "BusyBox v1.37.0 (2025-11-21 22:40:56 UTC) multi-call binary.",
+     "BusyBox v1.37.0 (2025-11-21 22:40:56 UTC) multi-call binary.",
+     "BusyBox v1.37.0 (2025-11-21 22:40:56 UTC) multi-call binary."
+    ],
+    "single": [
+     {
+      "case": "known+1 len 40 (unaligned head)",
+      "ok": true,
+      "status": "OBSERVED",
+      "got_len": 40,
+      "err": null
+     },
+     {
+      "case": "region+1 len 7",
+      "ok": true,
+      "status": "OBSERVED",
+      "got_len": 7,
+      "err": null
+     },
+     {
+      "case": "region+4093 len 10 (crosses page 0/1)",
+      "ok": true,
+      "status": "OBSERVED",
+      "got_len": 10,
+      "err": null
+     },
+     {
+      "case": "region+4095 len 2 (1 byte each side)",
+      "ok": true,
+      "status": "OBSERVED",
+      "got_len": 2,
+      "err": null
+     },
+     {
+      "case": "region+4097 len 4096 (unaligned, spans pages 1/2)",
+      "ok": true,
+      "status": "OBSERVED",
+      "got_len": 4096,
+      "err": null
+     },
+     {
+      "case": "region+12283 len 5 (ends on region end)",
+      "ok": true,
+      "status": "OBSERVED",
+      "got_len": 5,
+      "err": null
+     },
+     {
+      "case": "region len 1 (single byte)",
+      "ok": true,
+      "status": "OBSERVED",
+      "got_len": 1,
+      "err": null
+     }
+    ],
+    "batch_ok": [
+     true,
+     true,
+     true,
+     true,
+     true,
+     true,
+     true
+    ],
+    "unmapped_read_status": "UNAVAILABLE",
+    "ssh_commands": {
+     "commands": 10,
+     "stream_opens": 0
+    }
+   },
+   "remote_commands": 10,
+   "duration_s": 6.52
+  },
+  {
+   "id": "C3_abi_detection",
+   "name": "ABI detection via remote adapter (arch / word size / endianness / libc)",
+   "status": "PASS",
+   "summary": "arm/32-bit/little-endian/musl; support table as expected",
+   "details": {
+    "detected": {
+     "status": "DETECTED",
+     "architecture": "arm",
+     "word_size": 32,
+     "endianness": "little",
+     "libc": "musl",
+     "libc_version": null,
+     "interpreter": "/lib/ld-musl-armhf.so.1",
+     "libc_path": "/lib/ld-musl-armhf.so.1",
+     "evidence": [
+      "ELF header: arm, 32-bit, little-endian",
+      "PT_INTERP /lib/ld-musl-armhf.so.1",
+      "mapped /lib/ld-musl-armhf.so.1"
+     ],
+     "error": null
+    },
+    "expected": {
+     "architecture": "arm",
+     "word_size": 32,
+     "endianness": "little",
+     "libc": "musl"
+    },
+    "support": {
+     "mutex_owner": "NOT_SUPPORTED_ON_TARGET",
+     "allocator_chunks": "NOT_SUPPORTED_ON_TARGET",
+     "syscall_names": "SUPPORTED",
+     "tcb_scan": "NOT_SUPPORTED_ON_TARGET",
+     "frame_layout": "NOT_SUPPORTED_ON_TARGET",
+     "cfi_unwind": "NOT_SUPPORTED_ON_TARGET"
+    },
+    "expected_support": {
+     "mutex_owner": "NOT_SUPPORTED_ON_TARGET",
+     "allocator_chunks": "NOT_SUPPORTED_ON_TARGET",
+     "syscall_names": "SUPPORTED",
+     "tcb_scan": "NOT_SUPPORTED_ON_TARGET",
+     "frame_layout": "NOT_SUPPORTED_ON_TARGET",
+     "cfi_unwind": "NOT_SUPPORTED_ON_TARGET"
+    }
+   },
+   "remote_commands": 2,
+   "duration_s": 0.82
+  },
+  {
+   "id": "C4a_deadlock_diagnosis",
+   "name": "Deadlock diagnosis vs. host result (or explicit unsupported)",
+   "status": "UNSUPPORTED-AS-EXPECTED",
+   "summary": "mutex owner decoding explicitly NOT_SUPPORTED_ON_TARGET (mutex_owner: not supported on this target (arm/musl, 32-bit little-endian)); no owner TID, no cycle reported",
+   "details": {
+    "host_reference": {
+     "available": true,
+     "deadlock_detected": true,
+     "locks": [
+      "g_mutex_a",
+      "g_mutex_b"
+     ],
+     "recipe_status": "SUPPORTED",
+     "host_arch": "aarch64"
+    },
+    "remote": {
+     "deadlock_detected": false,
+     "locks": [],
+     "recipe_status": "CONTRADICTED",
+     "lock_owner_status": "NOT_SUPPORTED_ON_TARGET",
+     "collections": 3,
+     "wall_s": 59.02,
+     "ssh_commands": 91
+    }
+   },
+   "duration_s": 59.02,
+   "remote_commands": 91
+  },
+  {
+   "id": "C4b_glibc_only_gating",
+   "name": "glibc-only checks (heap walk, mutex owner) gated",
+   "status": "UNSUPPORTED-AS-EXPECTED",
+   "summary": "heap walking -> UNSUPPORTED_ALLOCATOR (unsupported allocator: glibc ptmalloc heap walking is not supported on this target (alloca); mutex owner decoding gated, see C4a",
+   "details": {
+    "heap_walk_status": "UNSUPPORTED_ALLOCATOR",
+    "heap_walk_message": "unsupported allocator: glibc ptmalloc heap walking is not supported on this target (allocator_chunks: not supported on this target (arm/musl, 32-bit little-endian))",
+    "chunks": 0,
+    "arenas": 0,
+    "wall_s": 0.73,
+    "ssh_commands": 1
+   },
+   "duration_s": 0.73
+  },
+  {
+   "id": "C4c_futex_syscall_names",
+   "name": "futex waiters carry the right syscall name",
+   "status": "BLOCKED",
+   "summary": "RemoteSshTargetAdapter.get_threads returns no syscall/wchan fields (only tid/name/state); the table maps the guest's raw numbers [240] to futex, but the product path cannot report them until the collector thread-info command lands",
+   "details": {
+    "guest_raw_syscalls": {
+     "883": 29,
+     "885": 240,
+     "886": 240
+    },
+    "futex_waiters_by_abi_table": [
+     885,
+     886
+    ],
+    "table_names": {
+     "883": "pause",
+     "885": "futex",
+     "886": "futex"
+    },
+    "remote_get_threads_fields": [
+     "local_variables",
+     "name",
+     "stack_info",
+     "state",
+     "tid"
+    ]
+   },
+   "duration_s": 1.86
+  },
+  {
+   "id": "C4d_recipe_verdict_on_unsupported",
+   "name": "Recipe verdict on an unsupported target",
+   "status": "FAIL",
+   "summary": "recipe reports CONTRADICTED ('Wait-for graph is a verified complete acyclic directed graph with no wait cycles.') although the evidence layer says lock-owner decoding is NOT_SUPPORTED_ON_TARGET; a definite verdict (esp. 'no wait cycles') on an unsupported target is a silent misdiagnosis - should be INSUFFICIENT_EVIDENCE/NOT_APPLICABLE",
+   "details": {
+    "recipe_status": "CONTRADICTED",
+    "recipe_basis": "Wait-for graph is a verified complete acyclic directed graph with no wait cycles.",
+    "recipe_details": {
+     "deadlock_confirmed": false,
+     "thread_contention": false
+    },
+    "lock_owner_status": "NOT_SUPPORTED_ON_TARGET"
+   },
+   "known_defect": "DEF-ARM-1",
+   "duration_s": 0.0
+  },
+  {
+   "id": "C5_collection_cost",
+   "name": "Collection cost (wall time, remote commands)",
+   "status": "PASS",
+   "summary": "deadlock 59.02s/91 cmds; 100 reads: daemon channel 1.09s/1 cmds, one collector process per call 41.27s/100 cmds, no collector 52.56s/100 cmds",
+   "details": {
+    "read_modes": [
+     {
+      "mode": "daemon channel (collector)",
+      "reads": 100,
+      "wall_s": 1.09,
+      "ssh_commands": 1,
+      "per_read_ms": 10.9,
+      "wrong_reads": 0
+     },
+     {
+      "mode": "one collector process per call",
+      "reads": 100,
+      "wall_s": 41.27,
+      "ssh_commands": 100,
+      "per_read_ms": 412.7,
+      "wrong_reads": 0
+     },
+     {
+      "mode": "no collector (busybox dd block pipeline)",
+      "reads": 100,
+      "wall_s": 52.56,
+      "ssh_commands": 100,
+      "per_read_ms": 525.6,
+      "wrong_reads": 0
+     },
+     {
+      "mode": "daemon channel + pinned identity",
+      "reads": 20,
+      "wall_s": 32.71,
+      "ssh_commands": 81,
+      "per_read_ms": 1635.3,
+      "wrong_reads": 0
+     }
+    ],
+    "deadlock_diagnosis": {
+     "wall_s": 59.02,
+     "ssh_commands": 91,
+     "collections": 3
+    },
+    "guest": {
+     "vcpus": 1,
+     "mem_mb": 128,
+     "accel": "tcg (software emulation; absolute times are pessimistic)"
+    }
+   },
+   "duration_s": 186.65
+  },
+  {
+   "id": "C6_process_discovery_and_identity",
+   "name": "Process discovery / identity / maps via BusyBox shell tools",
+   "status": "PASS",
+   "summary": "found pid 171, build-id 7e1bffa2a5c9, 15 maps entries, rw region located",
+   "details": {
+    "find_processes": [
+     {
+      "pid": 171,
+      "name": "memtarget",
+      "executable": "/tmp/memtarget"
+     }
+    ],
+    "identity": {
+     "architecture": "arm",
+     "elf_type": "ET_DYN",
+     "build_id": "7e1bffa2a5c9166ef0471d1658158755b9ec1d81",
+     "start_time": "1375",
+     "executable": "/tmp/memtarget"
+    },
+    "maps": {
+     "entries": 15,
+     "region_mapping": "rw-p"
+    },
+    "status_fields": [
+     "CapAmb",
+     "CapBnd",
+     "CapEff",
+     "CapInh",
+     "CapPrm",
+     "CoreDumping"
+    ]
+   },
+   "remote_commands": 8,
+   "duration_s": 12.87
+  }
+ ],
+ "teardown": {
+  "was_running": true,
+  "killed": false,
+  "returncode": 0,
+  "leftover_qemu_processes": []
+ }
+}

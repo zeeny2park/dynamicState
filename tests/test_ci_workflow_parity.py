@@ -29,6 +29,8 @@ class TestCIWorkflowParity(unittest.TestCase):
         self.ci_gdb_yml = os.path.join(self.ci_dir, "gdb92.yml")
         self.github_test_yml = os.path.join(self.github_dir, "test.yml")
         self.github_gdb_yml = os.path.join(self.github_dir, "gdb92.yml")
+        self.ci_matrix_yml = os.path.join(self.ci_dir, "embedded-matrix.yml")
+        self.github_matrix_yml = os.path.join(self.github_dir, "embedded-matrix.yml")
         self.sync_script = os.path.join(self.repo_root, "scripts", "sync_workflows.sh")
         self.readme_path = os.path.join(self.repo_root, "ci", "README.md")
 
@@ -48,7 +50,17 @@ class TestCIWorkflowParity(unittest.TestCase):
             f"Expected {self.github_gdb_yml} to exist in repository",
         )
 
+        self.assertTrue(
+            os.path.exists(self.github_matrix_yml),
+            f"Expected {self.github_matrix_yml} to exist in repository",
+        )
+
         canonical_files = sorted([f for f in os.listdir(self.ci_dir) if f.endswith((".yml", ".yaml"))])
+        self.assertEqual(
+            canonical_files,
+            ["embedded-matrix.yml", "gdb92.yml", "test.yml"],
+            "unexpected set of canonical workflow files",
+        )
         github_files = sorted([f for f in os.listdir(self.github_dir) if f.endswith((".yml", ".yaml"))])
 
         # Parity must fail if any workflow file is missing or any stale file is present
@@ -183,6 +195,25 @@ class TestCIWorkflowParity(unittest.TestCase):
         all_runs = "\n".join(s.get("run", "") for s in steps if isinstance(s, dict))
         self.assertIn("docker/gdb92/Dockerfile", all_runs)
         self.assertIn("tests/integration_gdb92.py", all_runs)
+
+    def test_embedded_matrix_workflow_is_manual_and_scheduled_only(self):
+        """IMP-014: the slow QEMU matrix must not run on push / pull_request."""
+        target_yml = self.github_matrix_yml if os.path.exists(self.github_matrix_yml) else self.ci_matrix_yml
+        with open(target_yml, "r", encoding="utf-8") as f:
+            doc = yaml.safe_load(f)
+        triggers = doc.get("on") or doc.get(True)
+        self.assertIsInstance(triggers, dict)
+        self.assertIn("workflow_dispatch", triggers)
+        self.assertIn("schedule", triggers)
+        self.assertNotIn("push", triggers)
+        self.assertNotIn("pull_request", triggers)
+        steps = doc["jobs"]["qemu-matrix"]["steps"]
+        all_runs = "\n".join(s.get("run", "") for s in steps if isinstance(s, dict))
+        self.assertIn("qemu-system-arm", all_runs)
+        self.assertIn("python3 -m scripts.qemu_matrix run", all_runs)
+        self.assertIn("make -C target/collector dist", all_runs)
+        uploads = [s for s in steps if isinstance(s, dict) and str(s.get("uses", "")).startswith("actions/upload-artifact")]
+        self.assertTrue(uploads, "matrix results must be uploaded")
 
     def test_sync_script_is_executable(self):
         """Verify scripts/sync_workflows.sh exists and is marked executable."""
