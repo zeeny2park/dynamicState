@@ -601,8 +601,17 @@ def _top_frame(thread_report: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     cs = thread_report.get("callstack") or []
     if not cs:
         return None
-    f = cs[0]
-    return {"function": f.get("function_name"), "source_location": f.get("source_location")}
+    # IMP-011: for blocked threads frame 0 is now the libc wait frame, and for running threads a stale
+    # libc callee can sit above the real leaf. Report the first frame that belongs to code with debug
+    # info (the "top user frame"); fall back to frame 0 when the unwinder gives no such index.
+    idx = thread_report.get("top_user_frame_index")
+    f = cs[idx] if isinstance(idx, int) and 0 <= idx < len(cs) else cs[0]
+    return {
+        "function": f.get("function_name"),
+        "source_location": f.get("source_location"),
+        "estimated": bool(f.get("estimated")),
+        "unwind": f.get("unwind"),
+    }
 
 
 @dataclass
