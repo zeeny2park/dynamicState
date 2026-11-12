@@ -1,0 +1,30 @@
+{
+  "id": "overflow_ring",
+  "origin": "external_style",
+  "naming": "neutral",
+  "kind": "heap_overflow",
+  "source": "benchmarks/diagnosis_accuracy/targets/overflow_ring.c",
+  "language": "c",
+  "symptom": "this program shows occasional strange data and I suspect memory corruption",
+  "ready": {
+    "mode": "stdout_marker"
+  },
+  "causes": {
+    "variables": [
+      "rb"
+    ],
+    "locks": [],
+    "threads": [],
+    "functions": [
+      "rb_put"
+    ]
+  },
+  "locations": [
+    {
+      "file": "benchmarks/diagnosis_accuracy/targets/overflow_ring.c",
+      "line": 24,
+      "text": "memcpy(r->buf + r->head, src, len)"
+    }
+  ],
+  "notes": "96-byte copy into 64-byte buffer"
+}

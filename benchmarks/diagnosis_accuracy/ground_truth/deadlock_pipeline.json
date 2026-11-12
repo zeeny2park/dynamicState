@@ -1,0 +1,50 @@
+{
+  "id": "deadlock_pipeline",
+  "origin": "new",
+  "naming": "neutral",
+  "kind": "deadlock",
+  "source": "benchmarks/diagnosis_accuracy/targets/deadlock_pipeline.c",
+  "language": "c",
+  "symptom": "the service stopped responding",
+  "ready": {
+    "mode": "stdout_marker"
+  },
+  "causes": {
+    "variables": [],
+    "locks": [
+      "m_in",
+      "m_out"
+    ],
+    "threads": [
+      "ingest",
+      "flush"
+    ],
+    "functions": [
+      "ingest",
+      "flush"
+    ]
+  },
+  "locations": [
+    {
+      "file": "benchmarks/diagnosis_accuracy/targets/deadlock_pipeline.c",
+      "line": 13,
+      "text": "pthread_mutex_lock(&m_in)"
+    },
+    {
+      "file": "benchmarks/diagnosis_accuracy/targets/deadlock_pipeline.c",
+      "line": 15,
+      "text": "pthread_mutex_lock(&m_out)"
+    },
+    {
+      "file": "benchmarks/diagnosis_accuracy/targets/deadlock_pipeline.c",
+      "line": 25,
+      "text": "pthread_mutex_lock(&m_out)"
+    },
+    {
+      "file": "benchmarks/diagnosis_accuracy/targets/deadlock_pipeline.c",
+      "line": 27,
+      "text": "pthread_mutex_lock(&m_in)"
+    }
+  ],
+  "notes": "AB/BA forced with a barrier; named threads"
+}

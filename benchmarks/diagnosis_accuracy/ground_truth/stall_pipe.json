@@ -1,0 +1,30 @@
+{
+  "id": "stall_pipe",
+  "origin": "new",
+  "naming": "neutral",
+  "kind": "long_stall",
+  "source": "benchmarks/diagnosis_accuracy/targets/stall_pipe.c",
+  "language": "c",
+  "symptom": "requests are not being processed anymore",
+  "ready": {
+    "mode": "stdout_marker"
+  },
+  "causes": {
+    "variables": [],
+    "locks": [],
+    "threads": [
+      "worker"
+    ],
+    "functions": [
+      "fetch_next"
+    ]
+  },
+  "locations": [
+    {
+      "file": "benchmarks/diagnosis_accuracy/targets/stall_pipe.c",
+      "line": 11,
+      "text": "read(inbox[0], &c, 1)"
+    }
+  ],
+  "notes": "worker blocked in read() on a pipe nobody writes"
+}

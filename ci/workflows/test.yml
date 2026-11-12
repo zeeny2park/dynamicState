@@ -412,3 +412,15 @@ jobs:
 
 
 
+
+      - name: Run Diagnosis Accuracy Benchmark (IMP-013, reports score, never fails on a low score)
+        run: |
+          python3 benchmarks/diagnosis_accuracy/run_benchmark.py --output diagnosis-accuracy/results.json
+
+      - name: Upload diagnosis accuracy results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: diagnosis-accuracy-results
+          path: diagnosis-accuracy/
+          if-no-files-found: warn

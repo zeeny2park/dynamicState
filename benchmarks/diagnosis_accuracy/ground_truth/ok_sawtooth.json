@@ -1,0 +1,20 @@
+{
+  "id": "ok_sawtooth",
+  "origin": "new",
+  "naming": "neutral",
+  "kind": "none",
+  "source": "benchmarks/diagnosis_accuracy/targets/ok_sawtooth.c",
+  "language": "c",
+  "symptom": "memory usage looks high, is it leaking?",
+  "ready": {
+    "mode": "stdout_marker"
+  },
+  "causes": {
+    "variables": [],
+    "locks": [],
+    "threads": [],
+    "functions": []
+  },
+  "locations": [],
+  "notes": "memory grows then is freed"
+}

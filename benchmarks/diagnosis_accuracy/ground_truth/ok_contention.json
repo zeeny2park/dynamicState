@@ -1,0 +1,20 @@
+{
+  "id": "ok_contention",
+  "origin": "new",
+  "naming": "neutral",
+  "kind": "none",
+  "source": "benchmarks/diagnosis_accuracy/targets/ok_contention.c",
+  "language": "c",
+  "symptom": "the process feels slow, check for lock problems",
+  "ready": {
+    "mode": "stdout_marker"
+  },
+  "causes": {
+    "variables": [],
+    "locks": [],
+    "threads": [],
+    "functions": []
+  },
+  "locations": [],
+  "notes": "heavy lock contention that always resolves"
+}

@@ -1,0 +1,20 @@
+{
+  "id": "ok_busy_server",
+  "origin": "new",
+  "naming": "neutral",
+  "kind": "none",
+  "source": "benchmarks/diagnosis_accuracy/targets/ok_busy_server.c",
+  "language": "c",
+  "symptom": "this process uses a lot of CPU, is something wrong?",
+  "ready": {
+    "mode": "stdout_marker"
+  },
+  "causes": {
+    "variables": [],
+    "locks": [],
+    "threads": [],
+    "functions": []
+  },
+  "locations": [],
+  "notes": "busy but progressing"
+}

@@ -1,0 +1,30 @@
+{
+  "id": "leak_lru_cache",
+  "origin": "external_style",
+  "naming": "neutral",
+  "kind": "memory_leak",
+  "source": "benchmarks/diagnosis_accuracy/targets/leak_lru_cache.c",
+  "language": "c",
+  "symptom": "memory usage of this process keeps growing",
+  "ready": {
+    "mode": "stdout_marker"
+  },
+  "causes": {
+    "variables": [],
+    "locks": [],
+    "threads": [
+      "filler"
+    ],
+    "functions": [
+      "lru_evict"
+    ]
+  },
+  "locations": [
+    {
+      "file": "benchmarks/diagnosis_accuracy/targets/leak_lru_cache.c",
+      "line": 41,
+      "text": "c->n--"
+    }
+  ],
+  "notes": "evicted nodes unlinked but never freed (dropped pointers)"
+}

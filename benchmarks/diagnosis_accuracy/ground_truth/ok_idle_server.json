@@ -1,0 +1,20 @@
+{
+  "id": "ok_idle_server",
+  "origin": "new",
+  "naming": "neutral",
+  "kind": "none",
+  "source": "benchmarks/diagnosis_accuracy/targets/ok_idle_server.c",
+  "language": "c",
+  "symptom": "general health check",
+  "ready": {
+    "mode": "stdout_marker"
+  },
+  "causes": {
+    "variables": [],
+    "locks": [],
+    "threads": [],
+    "functions": []
+  },
+  "locations": [],
+  "notes": "idle in poll()"
+}

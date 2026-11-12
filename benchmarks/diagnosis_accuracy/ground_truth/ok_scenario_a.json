@@ -1,0 +1,21 @@
+{
+  "id": "ok_scenario_a",
+  "origin": "project_fixture",
+  "naming": "project",
+  "kind": "none",
+  "source": "tests/fixtures/real_runtime/proc_scenario_a_healthy.c",
+  "language": "c",
+  "symptom": "general health check",
+  "ready": {
+    "mode": "settle",
+    "seconds": 1.0
+  },
+  "causes": {
+    "variables": [],
+    "locks": [],
+    "threads": [],
+    "functions": []
+  },
+  "locations": [],
+  "notes": "existing healthy fixture"
+}
