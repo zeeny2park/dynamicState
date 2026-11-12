@@ -8,6 +8,9 @@ Validates:
 5. GDB 9.2 compatibility for multithreaded branch isolation.
 """
 
+# BASELINE_SERIAL: GDB restart-based restore of a multithreaded inferior is timing-sensitive; the state-hash
+# determinism checks (test_05) fail under parallel test load (seen on the 4-vCPU CI runner), so
+# scripts/run_test_baseline.sh runs this file alone after the parallel batch.
 import os
 import shutil
 import subprocess
