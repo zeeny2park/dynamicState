@@ -2180,6 +2180,128 @@ def runtime_scan_heap_objects(
         return _format_watch_result({"success": False, "error": str(e), "error_code": type(e).__name__})
 
 
+def _heap_ownership_analysis(
+    pid: Optional[int],
+    companion_elf: Optional[str],
+    analysis_id: Optional[str],
+    include_typed_locals: bool,
+    max_bytes_read: int,
+    max_wall_clock_ms: float,
+    remote_host: Optional[str],
+    ssh_user: Optional[str],
+    ssh_port: int,
+    ssh_key: Optional[str],
+    ssh_proxy_jump: Optional[str],
+):
+    """IMP-007: reuse a cached heap ownership analysis or run a new zero-stop one."""
+    from extractor.reachability import analyze_heap_ownership, get_cached_analysis
+
+    cached = get_cached_analysis(analysis_id) if analysis_id else None
+    if cached is not None:
+        return cached
+    if analysis_id:
+        raise ValueError(f"unknown or expired analysis_id '{analysis_id}' (only the last 4 analyses are kept)")
+    if pid is None or companion_elf is None or runtime.watch_session_manager.get_active_target_context().get('pid') == pid:
+        _ctx = _resolve_mcp_target(pid=pid, companion_elf=companion_elf, remote_host=remote_host, ssh_user=ssh_user,
+                                   ssh_port=ssh_port, ssh_key=ssh_key, ssh_proxy_jump=ssh_proxy_jump)
+        pid = _ctx['pid']
+        companion_elf = _ctx['companion_elf_path']
+    mgr = runtime.watch_session_manager
+    adapter = mgr._resolve_adapter(pid=pid, remote_host=remote_host, ssh_user=ssh_user, ssh_port=ssh_port,
+                                   ssh_key=ssh_key, ssh_proxy_jump=ssh_proxy_jump)
+    return analyze_heap_ownership(
+        pid=int(pid),
+        companion_elf_path=companion_elf,
+        adapter=adapter,
+        manager=mgr,
+        include_typed_locals=bool(include_typed_locals),
+        budget_limits={"max_bytes_read": int(max_bytes_read), "max_wall_clock_ms": float(max_wall_clock_ms)},
+    )
+
+
+@server.tool()
+def runtime_heap_owner_lookup(
+    addresses: Union[str, List[Any]],
+    pid: Optional[int] = None,
+    companion_elf: Optional[str] = None,
+    analysis_id: Optional[str] = None,
+    include_typed_locals: bool = True,
+    max_bytes_read: int = 1073741824,
+    max_wall_clock_ms: float = 300000.0,
+    remote_host: Optional[str] = None,
+    ssh_user: Optional[str] = None,
+    ssh_port: int = 22,
+    ssh_key: Optional[str] = None,
+    ssh_proxy_jump: Optional[str] = None,
+) -> str:
+    """Reverse lookup address -> owning variable (glibc ptmalloc, zero-stop, budgeted).
+    Walks the heap (arenas, thread arenas, tcache/fastbins, mmapped chunks) and a DWARF type-driven
+    reachability graph, then for each address returns: containing chunk (size, usable size, in-use/free),
+    the variable path(s) pointing to it (e.g. `g_cache.entries[3].data`), each referrer's root kind
+    (global/static/local typed, or conservative stack/data/heap reference), and whether it is a leak
+    candidate. Non-glibc or unsupported targets are refused with an explicit status.
+    `addresses` may be a list or a comma-separated string of hex/decimal addresses.
+    Pass the returned `analysis_id` to query more addresses without re-walking the heap.
+    """
+    try:
+        if isinstance(addresses, str):
+            raw = [a for a in addresses.replace(";", ",").split(",") if a.strip()]
+        else:
+            raw = list(addresses or [])
+        addrs = [int(str(a).strip(), 0) if not isinstance(a, int) else int(a) for a in raw]
+        an = _heap_ownership_analysis(pid, companion_elf, analysis_id, include_typed_locals, max_bytes_read,
+                                      max_wall_clock_ms, remote_host, ssh_user, ssh_port, ssh_key, ssh_proxy_jump)
+        summary = an.summary()
+        return _format_watch_result({
+            "success": an.ok,
+            "analysis_id": an.analysis_id,
+            "status": an.status,
+            "message": an.message,
+            "heap_counts": (summary.get("heap_walk") or {}).get("counts"),
+            "arena_location": (summary.get("heap_walk") or {}).get("arena_location"),
+            "reachability": summary.get("reachability"),
+            "root_sources": summary.get("root_sources"),
+            "cost": summary.get("cost"),
+            "results": [an.lookup(a) for a in addrs],
+        })
+    except Exception as e:
+        return _format_watch_result({"success": False, "error": str(e), "error_code": type(e).__name__})
+
+
+@server.tool()
+def runtime_heap_leak_candidates(
+    pid: Optional[int] = None,
+    companion_elf: Optional[str] = None,
+    analysis_id: Optional[str] = None,
+    max_examples_per_class: int = 8,
+    include_typed_locals: bool = True,
+    max_bytes_read: int = 1073741824,
+    max_wall_clock_ms: float = 300000.0,
+    remote_host: Optional[str] = None,
+    ssh_user: Optional[str] = None,
+    ssh_port: int = 22,
+    ssh_key: Optional[str] = None,
+    ssh_proxy_jump: Optional[str] = None,
+) -> str:
+    """List heap leak candidates: in-use glibc chunks reached by NO root (typed globals/statics/locals,
+    conservative stacks / module data / anonymous mappings / contents of reachable chunks), grouped by
+    chunk size class with example addresses. Freed blocks (tcache, fastbin, bins) are never candidates.
+    Zero-stop and budgeted; refused with an explicit status on non-glibc / unsupported targets.
+    """
+    try:
+        an = _heap_ownership_analysis(pid, companion_elf, analysis_id, include_typed_locals, max_bytes_read,
+                                      max_wall_clock_ms, remote_host, ssh_user, ssh_port, ssh_key, ssh_proxy_jump)
+        summary = an.summary()
+        return _format_watch_result({
+            "success": an.ok,
+            "analysis_id": an.analysis_id,
+            "heap_counts": (summary.get("heap_walk") or {}).get("counts"),
+            "reachability": summary.get("reachability"),
+            "cost": summary.get("cost"),
+            **an.leak_report(max_examples_per_class=max(1, int(max_examples_per_class))),
+        })
+    except Exception as e:
+        return _format_watch_result({"success": False, "error": str(e), "error_code": type(e).__name__})
 
 
 @server.tool()
