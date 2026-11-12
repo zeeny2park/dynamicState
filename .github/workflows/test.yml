@@ -1,0 +1,414 @@
+name: Test Suite
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  test:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gdb gcc g++ make
+
+      - name: Install Python test dependencies
+        run: |
+          python3 -m pip install --upgrade pip
+          python3 -m pip install -r requirements-test.txt
+
+      - name: Allow same-user process memory reads (tests inspect live fixture processes)
+        run: |
+          sudo sysctl -w kernel.yama.ptrace_scope=0
+
+      - name: Build target collector and test fixtures
+        run: |
+          make -C target/collector
+          g++ -fPIE -pie -g -O0 -fno-inline -fno-omit-frame-pointer -Wl,--build-id=sha1 tests/fixtures/real_runtime/main.cpp -o /tmp/real_runtime_app_debug.elf -lpthread
+          strip -s -o /tmp/real_runtime_app_prod.stripped /tmp/real_runtime_app_debug.elf
+
+      - name: Run Capture Safety and Diff Accuracy Tests
+        run: |
+          python3 -m unittest tests/test_capture_safety_and_diff_accuracy.py
+
+      - name: Run Process Lifecycle and Seam Invariants Tests
+        run: |
+          python3 -m unittest tests/test_capture_lifecycle_seam.py
+
+      - name: Run Real Runtime Validation Tests
+        run: |
+          python3 -m unittest tests/test_real_runtime_validation.py
+
+      - name: Run End-to-End C++ Investigation Pipeline Tests
+        run: |
+          python3 -m unittest tests/test_cpp_e2e_investigation.py
+
+      - name: Run Causal Validation and Evidence Authenticity Tests
+        run: |
+          python3 -m unittest tests/test_causal_validation_hardening.py
+
+      - name: Run Security Gates and Independent Trust Verification Tests
+        run: |
+          python3 -m unittest tests/test_phase10_ci_security_gates.py
+
+      - name: Run Real-Target Validation and Release Readiness Tests
+        run: |
+          python3 -m unittest tests/test_phase11_real_target_release_readiness.py
+
+      - name: Run Evidence-Driven Investigation Loop and Conversational Validation Tests
+        run: |
+          python3 -m unittest tests/test_phase12_investigation_loop.py
+
+      - name: Run Phase 13 End-to-End Operational Acceptance Tests
+        run: |
+          python3 -m unittest tests/test_phase13_operational_acceptance.py
+
+      - name: Run Phase 13 Operational Acceptance Demonstration Script
+        run: |
+          python3 scripts/run_e2e_operational_acceptance.py
+
+      - name: Run Phase 14 Production Pilot and Release Qualification Tests
+        run: |
+          python3 -m unittest tests/test_phase14_production_pilot.py
+
+      - name: Run Phase 14 Production Pilot Demonstration Script
+        run: |
+          python3 scripts/run_production_pilot.py --smoke
+
+      - name: Run Phase 15 Conversational LLM and Simplified Investigation UX Tests
+        run: |
+          python3 -m unittest tests/test_phase15_conversational_llm.py
+
+      - name: Run Phase 16 CLI Provider Security, Process Control and Truthfulness Tests
+        run: |
+          python3 -m unittest tests/test_phase16_cli_security_and_truthfulness.py
+
+      - name: Run Phase 17 CLI Process Isolation Hardening and Regression Tests
+        run: |
+          python3 -m unittest tests/test_phase17_process_isolation_regression.py
+
+      - name: Run Phase 20 Benchmark Execution Integrity and Trustworthy Results Tests
+        run: |
+          python3 -m unittest tests/test_investigation_quality_benchmark.py
+
+      - name: Run Phase 20 Benchmark Demonstration Script
+        run: |
+          python3 benchmarks/investigation_quality/run_benchmark.py --smoke
+
+      - name: Run Phase 21 Watch Session and Temporal Memory Explorer Foundation Tests
+        run: |
+          python3 -m unittest tests/test_phase21_watch_session.py
+
+      - name: Run Phase 22 Zero-Configuration Live Capture and UX Tests
+        run: |
+          python3 -m unittest tests/test_phase22_zero_config_live_capture.py
+
+      - name: Run Phase 23 Remote Watch Sessions and MCP Integration Tests
+        run: |
+          python3 -m unittest tests/test_phase23_remote_watch_session.py
+
+      - name: Run Phase 24 Evidence-First Temporal Investigation Workflow Tests
+        run: |
+          python3 -m unittest tests/test_phase24_temporal_investigation.py
+
+      - name: Run Phase 25 Evidence-Grounded LLM Investigation and End-to-End Quality Validation Tests
+        run: |
+          python3 -m unittest tests/test_phase25_grounded_investigation.py
+
+      - name: Run Phase 26 Real-Execution Quality Verification and Agent-First UX Tests
+        run: |
+          python3 -m unittest tests/test_phase26_real_execution_quality.py
+
+      - name: Run Phase 2.0-A.3.6 Fail-Closed Evidence and Live Closure Tests
+        run: |
+          python3 -m unittest tests/test_phase2_0_a_3_6_fail_closed_evidence_and_live_closure.py
+
+      - name: Run Phase 2.0-A.3.7 Confidence Calibration Tests
+        run: |
+          python3 -m unittest tests/test_phase2_0_a_3_7_confidence_calibration.py
+
+      - name: Run Phase 2.0-A.3.8 Adaptive Quality Validation Tests
+        run: |
+          python3 -m unittest tests/test_phase2_0_a_3_8_adaptive_quality_validation.py
+
+      - name: Run Phase 2.0-A.3.9 Production Readiness Tests
+        run: |
+          python3 -m unittest tests/test_phase2_0_a_3_9_production_readiness.py
+
+      - name: Run Phase 2.0-A.3.10 Adversarial Provenance Tests
+        run: |
+          python3 -m unittest tests/test_phase2_0_a_3_10_adversarial_provenance.py
+
+      - name: Run Phase 2.0-A.3.10 Investigation Workflow Engine Tests
+        run: |
+          python3 -m unittest tests/test_phase2_0_a_3_10_workflow.py
+
+      - name: Run Phase 2.0-A.3.10 Real C++ Live Integration Tests
+        run: |
+          python3 -m unittest tests/test_phase2_0_a_3_10_real_cpp_e2e.py
+
+      - name: Run Phase 2.0-A.3.11 Attestation Security Tests
+        run: |
+          python3 -m unittest tests/test_phase2_0_a_3_11_attestation_security.py
+
+      - name: Run Phase 2.0-A.3.11 Executable Workflow Tests
+        run: |
+          python3 -m unittest tests/test_phase2_0_a_3_11_executable_workflow.py
+
+      - name: Run Phase 2.0-A.3.11 Real C++ Live Integration Tests
+        run: |
+          python3 -m unittest tests/test_phase2_0_a_3_11_real_cpp_e2e.py
+
+      - name: Run Phase 2.0-A.3.12 Capture Transaction Isolation Tests
+        run: |
+          python3 -m unittest tests/test_phase2_0_a_3_12_transaction_isolation.py
+
+      - name: Run Phase 2.0-A.3.12 Diagnostic Reasoning Tests
+        run: |
+          python3 -m unittest tests/test_phase2_0_a_3_12_diagnostic_reasoning.py
+
+      - name: Run Phase 2.0-A.3.12 Workflow Recovery Tests
+        run: |
+          python3 -m unittest tests/test_phase2_0_a_3_12_workflow_recovery.py
+
+      - name: Run Phase 2.0-A.3.12 Real C++ Live Integration Tests
+        run: |
+          python3 -m unittest tests/test_phase2_0_a_3_12_real_cpp_e2e.py
+
+      - name: Run Phase 2.0-A.3.13 Transaction Context Security Tests
+        run: |
+          python3 -m unittest tests/test_phase2_0_a_3_13_transaction_context_security.py
+
+      - name: Run Phase 2.0-A.3.13 Causal Attestation Verification Tests
+        run: |
+          python3 -m unittest tests/test_phase2_0_a_3_13_causal_attestation.py
+
+      - name: Run Phase 2.0-A.3.13 Ledger Trust Closure Tests
+        run: |
+          python3 -m unittest tests/test_phase2_0_a_3_13_ledger_trust_closure.py
+
+      - name: Run Phase 2.0-A.3.13 Workflow Exactly-Once Execution Tests
+        run: |
+          python3 -m unittest tests/test_phase2_0_a_3_13_workflow_exactly_once.py
+
+      - name: Run Phase 2.0-A.3.13 Identity Fail-Closed Tests
+        run: |
+          python3 -m unittest tests/test_phase2_0_a_3_13_identity_fail_closed.py
+
+      - name: Run Phase 2.0-A.3.13 SLA Monotonic Latency Measurement Tests
+        run: |
+          python3 -m unittest tests/test_phase2_0_a_3_13_sla_measurement.py
+
+      - name: Run Phase 2.0-A.3.14 Explicit Transaction Receipt Tests
+        run: |
+          python3 -m unittest tests/test_phase2_0_a_3_14_explicit_transaction_receipt.py
+
+      - name: Run Phase 2.0-A.3.14 Context Isolation Tests
+        run: |
+          python3 -m unittest tests/test_phase2_0_a_3_14_context_isolation.py
+
+      - name: Run Phase 2.0-A.3.14 Durable Causal Attestation Trust Tests
+        run: |
+          python3 -m unittest tests/test_phase2_0_a_3_14_durable_causal_trust.py
+
+      - name: Run Phase 2.0-A.3.14 Authoritative Evidence Ledger Boundary Tests
+        run: |
+          python3 -m unittest tests/test_phase2_0_a_3_14_authoritative_ledger_boundary.py
+
+      - name: Run Phase 2.0-A.3.14 Real Exactly-Once Workflow Recovery Tests
+        run: |
+          python3 -m unittest tests/test_phase2_0_a_3_14_workflow_crash_boundaries.py
+
+      - name: Run Phase 2.0-A.3.14 Target Identity Trust and SLA Measurement Tests
+        run: |
+          python3 -m unittest tests/test_phase2_0_a_3_14_target_identity_and_measurement.py
+
+      - name: Run Phase 2.0-A.3.15 Causal Authority Bypass Hardening Tests
+        run: |
+          python3 -m unittest tests/test_phase2_0_a_3_15_causal_authority_bypass.py
+
+      - name: Run Phase 2.0-A.3.15 Causal Evidence Chain Closure Tests
+        run: |
+          python3 -m unittest tests/test_phase2_0_a_3_15_causal_chain_closure.py
+
+      - name: Run Phase 2.0-A.3.15 Operation Provenance and Ledger Serialization Tests
+        run: |
+          python3 -m unittest tests/test_phase2_0_a_3_15_operation_provenance.py
+
+      - name: Run Phase 2.0-A.3.15 Durable Trust Store and Restart Tests
+        run: |
+          python3 -m unittest tests/test_phase2_0_a_3_15_durable_trust_restart.py
+
+      - name: Run Phase 2.0-A.3.15 Crash Safe Workflow Recovery Tests
+        run: |
+          python3 -m unittest tests/test_phase2_0_a_3_15_crash_safe_recovery.py
+
+      - name: Run Phase 2.0-A.3.15 Transaction Accounting and SLA Measurement Tests
+        run: |
+          python3 -m unittest tests/test_phase2_0_a_3_15_accounting_and_sla_integrity.py
+
+      - name: Run Phase 2.0-A.3.16 Strict Target Identity Verification Tests
+        run: |
+          python3 -m unittest tests/test_phase2_0_a_3_16_strict_identity_verification.py
+
+      - name: Run Phase 2.0-A.3.16 Durable Trust Store Integration Tests
+        run: |
+          python3 -m unittest tests/test_phase2_0_a_3_16_durable_trust_store_integration.py
+
+      - name: Run Phase 2.0-A.3.16 Durable Anti-Replay Tests
+        run: |
+          python3 -m unittest tests/test_phase2_0_a_3_16_durable_anti_replay.py
+
+      - name: Run Phase 2.0-A.3.16 Evidence Ledger Transactional Validation Tests
+        run: |
+          python3 -m unittest tests/test_phase2_0_a_3_16_ledger_transactional_validation.py
+
+      - name: Run Phase 2.0-A.3.16 Filesystem Hardening Tests
+        run: |
+          python3 -m unittest tests/test_phase2_0_a_3_16_filesystem_hardening.py
+
+      - name: Run Phase 2.0-A.3.16 Multiprocess Verification Tests
+        run: |
+          python3 -m unittest tests/test_phase2_0_a_3_16_multiprocess_verification.py
+
+      - name: Run Phase 2.0-A.3.17 Atomic Trust Consumption Tests
+        run: |
+          python3 -m unittest tests/test_phase2_0_a_3_17_atomic_trust_consumption.py
+
+      - name: Run Phase 2.0-A.3.17 Operation Lifecycle Integration Tests
+        run: |
+          python3 -m unittest tests/test_phase2_0_a_3_17_operation_lifecycle_integration.py
+
+      - name: Run Phase 2.0-A.3.17 Idempotent Ledger Recovery Tests
+        run: |
+          python3 -m unittest tests/test_phase2_0_a_3_17_idempotent_ledger_recovery.py
+
+      - name: Run Phase 2.0-A.3.17 Authoritative Index Reconstruction Tests
+        run: |
+          python3 -m unittest tests/test_phase2_0_a_3_17_authoritative_index_reconstruction.py
+
+      - name: Run Phase 2.0-A.3.17 Trust Store Hardening Tests
+        run: |
+          python3 -m unittest tests/test_phase2_0_a_3_17_trust_store_hardening.py
+
+      - name: Run Phase 2.0-A.3.17 Multiprocess Crash Boundaries Tests
+        run: |
+          python3 -m unittest tests/test_phase2_0_a_3_17_multiprocess_crash_boundaries.py
+
+      - name: Run Phase 2.0-A.3.18 Persistence Failure Closure Tests
+        run: |
+          python3 -m unittest tests/test_phase2_0_a_3_18_persistence_failure_closure.py
+
+      - name: Run Phase 2.0-A.3.18 Immutable Operation Bindings Tests
+        run: |
+          python3 -m unittest tests/test_phase2_0_a_3_18_immutable_operation_bindings.py
+
+      - name: Run Phase 2.0-A.3.18 Strict Index Equality Tests
+        run: |
+          python3 -m unittest tests/test_phase2_0_a_3_18_strict_index_equality.py
+
+      - name: Run Phase 2.0-A.3.18 Schema and Nested Validation Tests
+        run: |
+          python3 -m unittest tests/test_phase2_0_a_3_18_schema_and_nested_validation.py
+
+      - name: Run Phase 2.0-A.3.18 Deterministic Multiprocess Barriers Tests
+        run: |
+          python3 -m unittest tests/test_phase2_0_a_3_18_deterministic_multiprocess_barriers.py
+
+      - name: Run Phase 2.0-A.3.19 Durable Commit Semantics Tests
+        run: |
+          python3 -m unittest tests/test_phase2_0_a_3_19_durable_commit_semantics.py
+
+      - name: Run Phase 2.0-A.3.19 Verifiable Multi-Evidence Derivation Tests
+        run: |
+          python3 -m unittest tests/test_phase2_0_a_3_19_verifiable_derivation.py
+
+      - name: Run Phase 2.0-A.3.19 Strict Operation Metadata Reconstruction Tests
+        run: |
+          python3 -m unittest tests/test_phase2_0_a_3_19_strict_metadata_reconstruction.py
+
+      - name: Run Phase 2.0-A.3.19 Repaired Multiprocess Crash Tests
+        run: |
+          python3 -m unittest tests/test_phase2_0_a_3_19_multiprocess_crash_repaired.py
+
+      - name: Run Phase 2.1 Problem Classification and Planning Tests
+        run: |
+          python3 -m unittest tests/test_phase2_1_classification_and_planning.py
+
+      - name: Run Phase 2.1 Deterministic Diagnostic Recipes Tests
+        run: |
+          python3 -m unittest tests/test_phase2_1_deterministic_recipes.py
+
+      - name: Run Phase 2.1 Evidence-to-Source Correlation Pipeline Tests
+        run: |
+          python3 -m unittest tests/test_phase2_1_evidence_source_correlation.py
+
+      - name: Run Phase 2.1 Adaptive Investigation Lifecycle Tests
+        run: |
+          python3 -m unittest tests/test_phase2_1_adaptive_investigation_lifecycle.py
+
+      - name: Run Phase 2.1 MCP Tools and Web UI Integration Tests
+        run: |
+          python3 -m unittest tests/test_phase2_1_mcp_and_ui_integration.py
+
+      - name: Run Phase 2.1 Real C/C++ Target Diagnostic Scenarios Tests
+        run: |
+          python3 -m unittest tests/test_phase2_1_real_cpp_diagnostic_scenarios.py
+
+      - name: Run Phase 2.1.1 Runtime Evidence Acquisition Tests
+        run: |
+          python3 -m unittest tests/test_phase2_1_1_live_evidence_acquisition.py
+
+      - name: Run Phase 2.1.1 Evidence-Driven Hypotheses Tests
+        run: |
+          python3 -m unittest tests/test_phase2_1_1_evidence_driven_hypotheses.py
+
+      - name: Run Phase 2.1.1 Adaptive Replanning and Session Recovery Tests
+        run: |
+          python3 -m unittest tests/test_phase2_1_1_adaptive_replanning.py
+
+      - name: Run Phase 2.1.1 Scenarios A through J Tests
+        run: |
+          python3 -m unittest tests/test_phase2_1_1_scenarios_a_to_j.py
+
+      - name: Run Deadlock Real-Process Baseline Tests (2 positive, 2 negative controls)
+        run: |
+          python3 -m unittest -v tests/test_deadlock_real_process_baseline.py
+
+      - name: Run All Remaining Tests
+        run: |
+          python3 -m unittest discover tests
+
+      - name: Record per-file test baseline
+        if: always()
+        run: |
+          scripts/run_test_baseline.sh test-baseline
+
+      - name: Upload test baseline
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-baseline
+          path: test-baseline/
+
+      - name: Run CI Workflow Parity Tests
+        run: |
+          python3 -m unittest tests/test_ci_workflow_parity.py
+
+      - name: Run Performance Benchmark Smoke Test
+        run: |
+          python3 -m benchmarks.capture_benchmark --smoke
+
+
+
