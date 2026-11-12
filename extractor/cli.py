@@ -520,6 +520,15 @@ def main():
     er_p.add_argument("-d", "--debug-image", "--companion-elf", dest="debug_image", type=str, default=None)
     er_p.add_argument("--corpus", type=str, default="corpus")
 
+    dx_p = subparsers.add_parser("diagnose", help="Diagnose a live process end to end in one call and print the verdict (zero-stop)")
+    dx_p.add_argument("-p", "--pid", type=int, required=True, help="Target process PID")
+    dx_p.add_argument("-d", "--debug-image", "--companion-elf", dest="debug_image", type=str, default=None,
+                      help="ELF with DWARF symbols (default: the target's own executable)")
+    dx_p.add_argument("--symptom", type=str, default=None, help="Optional natural-language symptom (default: general health check)")
+    dx_p.add_argument("--time-limit", dest="time_limit_s", type=float, default=None, help="Wall-clock observation budget in seconds")
+    dx_p.add_argument("--corpus", type=str, default="corpus", help="State Corpus directory (reports are written under <corpus>/reports)")
+    dx_p.add_argument("--json", action="store_true", default=False, help="Print the full result as JSON")
+
     args = parser.parse_args()
 
     if args.command == "capture-memory":
@@ -1709,6 +1718,20 @@ def main():
         out_payload = dict(res)
         out_payload.setdefault("success", True)
         print(json.dumps(out_payload, indent=2, ensure_ascii=False))
+        sys.exit(0)
+
+    elif args.command == "diagnose":
+        from .expert_diagnostic_engine import ExpertDiagnosticEngine, diagnose
+        result = diagnose(
+            args.pid, debug_image=args.debug_image, symptom=args.symptom, time_limit_s=args.time_limit_s,
+            engine=ExpertDiagnosticEngine(corpus_dir=os.path.abspath(args.corpus)),
+        )
+        if args.json:
+            print(json.dumps(result.to_dict(), indent=2, ensure_ascii=False))
+        else:
+            print(result.summary)
+            if result.report_path:
+                print(f"Report: {result.report_path}")
         sys.exit(0)
 
 

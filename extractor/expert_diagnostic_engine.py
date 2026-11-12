@@ -3649,3 +3649,334 @@ class ExpertDiagnosticEngine:
     def list_sessions(self) -> List[Dict[str, Any]]:
         """Lists metadata for all active and completed sessions."""
         return [sess.get_status() for sess in self.sessions.values()]
+
+
+# =============================================================================
+# IMP-006 (thin version): single `diagnose` entry point
+# =============================================================================
+# One call: classify -> assess -> plan -> execute (run_to_completion) -> conclude -> report.
+# It composes ExpertDiagnosticEngine.start_investigation / run_to_completion /
+# build_diagnostic_report; it adds no engine and no verdict logic.  The verdict is the
+# DiagnosticVerdictAggregator's (HEALTHY, INCONCLUSIVE, ...), copied unchanged.
+#
+# DiagnoseResult schema (all keys always present, JSON-serialisable via ``to_dict``):
+#   schema_version   str   "1"
+#   verdict          str   aggregator vocabulary: CONFIRMED_FAULT | PROBABLE_FAULT | FAULT | DEGRADED |
+#                          HEALTHY | INCONCLUSIVE | ABORTED.  INCONCLUSIVE whenever the diagnosis could
+#                          not run to completion (bad PID, missing debug image, stage exception, ...).
+#   confidence       float 0..1 (engine's conclusion confidence; 0.0 when nothing ran)
+#   confidence_basis str
+#   summary          str   one or two plain sentences
+#   findings         list  {category, severity, status, description, subjects, subject_details,
+#                           recipe_ids, evidence_ids}.  category = the engine's problem identifier
+#                          (e.g. DEADLOCK_INDICATORS, MEMORY_LEAK); subjects = flat list of the
+#                          concrete names the evidence exposed (lock names, thread ids, function names,
+#                          variable names, "file:line"); [] when the evidence exposed none.
+#                          subject_details = same names as {kind, name}.
+#   checks_run       list  {check_id, recipe_id, name, status, duration_s, limitations}; executed only
+#   not_covered      list  {kind, item, reason}; everything that could not be examined (check statuses
+#                          INCONCLUSIVE/ERROR/NOT_APPLICABLE/UNSUPPORTED/NOT_EXECUTED, engine limitations,
+#                          features unsupported on the target ABI, budget exhaustion, missing debug image,
+#                          pre-flight / stage failures).
+#   collection_impact {capture_mode, measured_stop_ms, zero_stop (bool), bytes_read, wall_clock_ms,
+#                          samples_collected, budget_exhausted}.  diagnose never requests a stop mode.
+#   report_path      str|None  JSON report written to <corpus>/reports/<investigation_id>.report.json
+#   report           dict|None only with include_report=True
+#   investigation_id str|None
+#   target           {pid, process_name, abi (target_abi.TargetABI.to_dict() or None), debug_image}
+#   state            str   final session lifecycle state (or "NOT_RUN")
+#   stop_reason      str|None
+#   duration_s       float wall time of the call
+DIAGNOSE_SCHEMA_VERSION = "1"
+DIAGNOSE_DEFAULT_SYMPTOM = "general health check"
+
+_SUBJECT_SKIP_KEYS = {"threads", "callstacks_info", "locks", "observation_window"}
+_SUBJECT_KEY_KIND = {
+    "lock_name": "lock",
+    "tid": "thread", "waiter_tid": "thread", "owner_tid": "thread", "held_by_tid": "thread",
+    "waiter_name": "thread_name", "owner_name": "thread_name", "held_by_thread_name": "thread_name",
+    "thread_name": "thread_name",
+    "function_name": "function",
+    "source_location": "source_location",
+    "variable": "variable", "variable_name": "variable", "symbol": "variable",
+    "expression": "variable", "source_variable": "variable",
+}
+
+
+@dataclass
+class DiagnoseResult:
+    """Stable result of :func:`diagnose`; see the schema comment above."""
+    verdict: str = "INCONCLUSIVE"
+    confidence: float = 0.0
+    confidence_basis: str = ""
+    summary: str = ""
+    findings: List[Dict[str, Any]] = field(default_factory=list)
+    checks_run: List[Dict[str, Any]] = field(default_factory=list)
+    not_covered: List[Dict[str, Any]] = field(default_factory=list)
+    collection_impact: Dict[str, Any] = field(default_factory=dict)
+    report_path: Optional[str] = None
+    report: Optional[Dict[str, Any]] = None
+    investigation_id: Optional[str] = None
+    target: Dict[str, Any] = field(default_factory=dict)
+    state: str = "NOT_RUN"
+    stop_reason: Optional[str] = None
+    duration_s: float = 0.0
+    schema_version: str = DIAGNOSE_SCHEMA_VERSION
+
+    def to_dict(self) -> Dict[str, Any]:
+        return json.loads(json.dumps(asdict(self), default=str))
+
+
+def _collect_subjects(obj: Any, out: List[Tuple[str, str]], depth: int = 0) -> None:
+    if depth > 8:
+        return
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            if k in _SUBJECT_SKIP_KEYS:
+                continue
+            kind = _SUBJECT_KEY_KIND.get(k)
+            if kind and isinstance(v, (str, int)) and not isinstance(v, bool) and str(v) != "":
+                out.append((kind, str(v)))
+            elif isinstance(v, (dict, list)):
+                _collect_subjects(v, out, depth + 1)
+    elif isinstance(obj, list):
+        for v in obj:
+            _collect_subjects(v, out, depth + 1)
+
+
+def _finding_subjects(session: "AdaptiveInvestigationSession", rule_ids: List[str]) -> List[Dict[str, str]]:
+    pairs: List[Tuple[str, str]] = []
+    wanted = set(rule_ids or [])
+    for chk in session.checks:
+        if chk.recipe_id in wanted and chk.status == CheckStatus.FAIL:
+            _collect_subjects(chk.actual_observations, pairs)
+            for rec in session.collected_evidence_records:
+                if rec.evidence_id in chk.supporting_evidence_ids and rec.source_variable:
+                    pairs.append(("variable", str(rec.source_variable)))
+    seen, details = set(), []
+    for kind, name in pairs:
+        if (kind, name) not in seen:
+            seen.add((kind, name))
+            details.append({"kind": kind, "name": name})
+    return details
+
+
+def _preflight_target(pid: Any, adapter: Any) -> Tuple[Optional[str], Optional[str]]:
+    """Returns (process_name, failure_reason).  Never raises."""
+    try:
+        if isinstance(pid, bool) or int(pid) != pid or int(pid) <= 0:
+            return None, f"invalid PID {pid!r}"
+        pid = int(pid)
+    except (TypeError, ValueError):
+        return None, f"invalid PID {pid!r}"
+    if isinstance(adapter, LocalTargetAdapter):
+        if not os.path.isdir(f"/proc/{pid}"):
+            return None, f"process {pid} does not exist"
+        try:
+            with open(f"/proc/{pid}/comm", "r", encoding="utf-8", errors="replace") as fh:
+                name = fh.read().strip()
+        except OSError as exc:
+            return None, f"process {pid} is not readable or has exited: {exc}"
+        try:
+            with open(f"/proc/{pid}/mem", "rb"):
+                pass
+        except OSError as exc:
+            return name, f"process {pid} memory is not readable by this user: {exc}"
+        return name, None
+    try:
+        raw = adapter.read_target_file(pid, f"/proc/{pid}/comm", 256)
+    except Exception as exc:  # noqa: BLE001
+        return None, f"cannot reach target process {pid}: {exc}"
+    if not raw:
+        return None, f"process {pid} does not exist or is not readable on the target host"
+    return raw.decode("utf-8", errors="replace").strip(), None
+
+
+def _diagnose_check_row(c: Any) -> Dict[str, Any]:
+    return {
+        "check_id": c.check_id, "recipe_id": c.recipe_id, "name": c.name, "status": str(c.status),
+        "duration_s": round(float(getattr(c, "duration_seconds", 0.0) or 0.0), 4),
+        "limitations": list(c.limitations or []),
+    }
+
+
+def diagnose(
+    pid: int,
+    debug_image: Optional[str] = None,
+    symptom: Optional[str] = None,
+    *,
+    adapter: Optional[TargetExecutionAdapter] = None,
+    corpus_dir: Optional[str] = None,
+    time_limit_s: Optional[float] = None,
+    max_steps: int = 30,
+    include_report: bool = False,
+    engine: Optional["ExpertDiagnosticEngine"] = None,
+) -> DiagnoseResult:
+    """Diagnose live process ``pid`` end to end in one call and return a :class:`DiagnoseResult`.
+
+    debug_image: ELF with DWARF; default is the target's own executable (/proc/PID/exe).  A path that
+        does not exist yields an INCONCLUSIVE result.
+    symptom: natural-language symptom; default "general health check" (the planner then runs its broad
+        recipe set).  adapter: target adapter (default local).  time_limit_s: wall-clock observation
+        budget.  max_steps: state-machine step cap.
+
+    Target-side problems never raise: they produce verdict INCONCLUSIVE with the cause in
+    ``not_covered``.  A result is only produced after the session executed to a terminal state; a
+    session that only planned yields INCONCLUSIVE and no report.
+    """
+    t0 = time.monotonic()
+    res = DiagnoseResult()
+    res.collection_impact = {
+        "capture_mode": "NOT_RUN", "measured_stop_ms": 0.0, "zero_stop": True, "bytes_read": 0,
+        "wall_clock_ms": 0.0, "samples_collected": 0, "budget_exhausted": False,
+    }
+    res.target = {"pid": pid, "process_name": None, "abi": None, "debug_image": debug_image}
+    nc = res.not_covered
+
+    def _finish(summary: str) -> DiagnoseResult:
+        res.summary = summary
+        res.duration_s = round(time.monotonic() - t0, 3)
+        return res
+
+    try:
+        adapter = adapter or LocalTargetAdapter()
+        name, bad = _preflight_target(pid, adapter)
+        res.target["process_name"] = name
+        if bad:
+            nc.append({"kind": "target_unreadable", "item": f"pid {pid}", "reason": bad})
+            return _finish(f"The process could not be examined: {bad}. No conclusion was reached.")
+        pid = int(pid)
+        res.target["pid"] = pid
+        if debug_image is None and isinstance(adapter, LocalTargetAdapter):
+            debug_image = f"/proc/{pid}/exe"
+        res.target["debug_image"] = debug_image
+        if isinstance(adapter, LocalTargetAdapter) and (not debug_image or not os.path.exists(debug_image)):
+            nc.append({"kind": "missing_debug_image", "item": str(debug_image),
+                       "reason": "debug image does not exist; symbol-level diagnosis is impossible"})
+            return _finish("The debug image was not found, so the process was not diagnosed. No conclusion was reached.")
+        try:
+            from .target_abi import detect_target_abi, abi_support_summary
+            abi = detect_target_abi(adapter, pid, probe_version=False)
+            res.target["abi"] = abi.to_dict()
+            for feat, dec in abi_support_summary(abi).items():
+                if dec.get("status") != "SUPPORTED":
+                    nc.append({"kind": "unsupported_on_target", "item": feat,
+                               "reason": f"{dec.get('status')}: {dec.get('message')}"})
+        except Exception as exc:  # noqa: BLE001
+            nc.append({"kind": "abi_detection_failed", "item": "target ABI", "reason": f"{type(exc).__name__}: {exc}"})
+
+        engine = engine or ExpertDiagnosticEngine(corpus_dir=corpus_dir)
+        limits = ObservationBudgetLimits(max_wall_clock_ms=float(time_limit_s) * 1000.0) if time_limit_s else None
+        session = None
+        stage = "start_investigation"
+        try:
+            session = engine.start_investigation(
+                problem_statement=symptom or DIAGNOSE_DEFAULT_SYMPTOM,
+                pid=pid, companion_elf=debug_image, adapter=adapter, budget_limits=limits,
+            )
+            res.investigation_id = session.investigation_id
+            stage = "run_to_completion"
+            conclusion = session.run_to_completion(max_steps=max_steps)
+        except Exception as exc:  # noqa: BLE001
+            nc.append({"kind": "stage_failed", "item": stage, "reason": f"{type(exc).__name__}: {exc}"})
+            if session is not None:
+                res.state = session.state
+                res.checks_run = [_diagnose_check_row(c) for c in session.checks
+                                  if c.status not in (CheckStatus.NOT_EXECUTED, CheckStatus.SKIPPED)]
+            return _finish(f"The diagnosis failed during '{stage}' ({type(exc).__name__}). No conclusion was reached.")
+
+        res.state = session.state
+        res.stop_reason = conclusion.stop_reason if conclusion else None
+        executed = [c for c in session.checks if c.status not in (CheckStatus.NOT_EXECUTED, CheckStatus.SKIPPED)]
+        res.checks_run = [_diagnose_check_row(c) for c in executed]
+        if session.state not in TERMINAL_STATES or not executed:
+            nc.append({"kind": "not_executed", "item": "investigation",
+                       "reason": f"session ended in state {session.state} with {len(executed)} executed check(s); "
+                                 "a planned-only investigation produces no report"})
+            return _finish("The investigation was planned but no check was executed, so no conclusion was reached.")
+
+        stage = "build_diagnostic_report"
+        try:
+            report = session.build_diagnostic_report().to_dict()
+        except Exception as exc:  # noqa: BLE001
+            nc.append({"kind": "stage_failed", "item": stage, "reason": f"{type(exc).__name__}: {exc}"})
+            return _finish("The checks ran but the report could not be built. No conclusion was reached.")
+
+        sec_a = report.get("section_a_executive_summary", {})
+        sec_b = report.get("section_b_target_context", {})
+        res.verdict = str(sec_a.get("overall_result") or "INCONCLUSIVE")
+        res.confidence = float(getattr(conclusion, "confidence", 0.0) or 0.0)
+        res.confidence_basis = str(getattr(conclusion, "confidence_basis", "") or "")
+
+        sec_e = report.get("section_e_findings_and_root_cause", {})
+        for rec in list(sec_e.get("confirmed_root_causes", [])) + list(sec_e.get("probable_causes", [])):
+            rules = list(rec.get("applicable_diagnostic_rules") or [])
+            details = _finding_subjects(session, rules)
+            res.findings.append({
+                "category": rec.get("affected_entity"),
+                "severity": rec.get("severity"),
+                "status": rec.get("classification"),
+                "description": rec.get("problem_description"),
+                "subjects": [d["name"] for d in details],
+                "subject_details": details,
+                "recipe_ids": rules,
+                "evidence_ids": list(rec.get("supporting_evidence_ids") or []),
+            })
+
+        for c in session.checks:
+            if c.status in (CheckStatus.PASS, CheckStatus.FAIL):
+                continue
+            why = "; ".join(list(c.limitations or []) + list(c.missing_evidence or [])) or (c.error_details or "") \
+                or (c.technical_interpretation or "")
+            nc.append({"kind": f"check_{str(c.status).lower()}", "item": c.recipe_id, "reason": why or str(c.status)})
+        for lim in (list(getattr(conclusion, "diagnostic_limitations", []) or [])
+                    + list(getattr(conclusion, "missing_evidence_and_unknowns", []) or [])
+                    + list(sec_b.get("environmental_limitations") or [])
+                    + list(sec_b.get("collection_failures") or [])
+                    + list(report.get("section_h_limitations_and_unverified", {}).get("missing_symbols_or_dwarf") or [])):
+            nc.append({"kind": "limitation", "item": "engine", "reason": str(lim)})
+        excluded = [e.get("recipe_id") for e in report.get("section_c_diagnostic_strategy", {}).get("recipes_excluded", [])]
+        if excluded:
+            nc.append({"kind": "recipes_not_planned", "item": ",".join(map(str, excluded)),
+                       "reason": "not selected by the planner for this symptom classification"})
+
+        metrics = getattr(session.budget_tracker, "metrics", None)
+        exhausted = bool(getattr(metrics, "is_budget_exhausted", False)) or session.state == STATE_BUDGET_EXHAUSTED
+        if exhausted:
+            nc.append({"kind": "budget_exhausted", "item": "observation budget",
+                       "reason": str(getattr(metrics, "exhaustion_reason", None) or res.stop_reason)})
+        stop_ms = float(sec_b.get("target_stop_duration_ms") or 0.0)
+        res.collection_impact = {
+            "capture_mode": sec_b.get("collection_mode"),
+            "measured_stop_ms": stop_ms,
+            "zero_stop": stop_ms == 0.0,
+            "bytes_read": int(getattr(metrics, "bytes_read", 0) or 0),
+            "wall_clock_ms": float(getattr(metrics, "wall_clock_elapsed_ms", 0.0) or 0.0),
+            "samples_collected": int(getattr(metrics, "samples_collected", 0) or 0),
+            "budget_exhausted": exhausted,
+        }
+
+        try:
+            rep_dir = os.path.join(engine.corpus_dir, "reports")
+            os.makedirs(rep_dir, exist_ok=True)
+            path = os.path.join(rep_dir, f"{session.investigation_id}.report.json")
+            with open(path, "w", encoding="utf-8") as fh:
+                json.dump(report, fh, default=str)
+            res.report_path = path
+        except OSError as exc:
+            nc.append({"kind": "report_not_saved", "item": "report", "reason": str(exc)})
+        if include_report:
+            res.report = json.loads(json.dumps(report, default=str))
+
+        passed = sum(1 for r in res.checks_run if r["status"] == CheckStatus.PASS)
+        if res.findings:
+            cats = ", ".join(dict.fromkeys(str(f["category"]) for f in res.findings))
+            head = f"Verdict {res.verdict}: found {cats}."
+        else:
+            head = f"Verdict {res.verdict}: no problem finding was produced."
+        return _finish(f"{head} {passed} of {len(res.checks_run)} executed checks passed; "
+                       f"{len(nc)} item(s) could not be examined (see not_covered).")
+    except Exception as exc:  # noqa: BLE001 - diagnose must not raise for target-side problems
+        res.verdict = "INCONCLUSIVE"
+        nc.append({"kind": "unexpected_error", "item": "diagnose", "reason": f"{type(exc).__name__}: {exc}"})
+        return _finish(f"The diagnosis failed unexpectedly ({type(exc).__name__}). No conclusion was reached.")
