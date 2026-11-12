@@ -31,6 +31,46 @@ from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 import uuid
 
 from .debug_image import BinaryIdentity, inspect_elf
+from .target_abi import FEATURE_TCB_SCAN, check_support, detect_target_abi
+
+# Host-side directory holding the collector sources and `make dist` output (dist/<arch>/).
+COLLECTOR_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "target", "collector"))
+# Remote deployment location; override with DYNAMICSTATE_COLLECTOR_DEST (or the remote_dest argument).
+DEFAULT_COLLECTOR_DEST = os.environ.get("DYNAMICSTATE_COLLECTOR_DEST") or "/tmp/dynamicstate-collector"
+# Tried in order when the primary location is noexec / unwritable; override with
+# DYNAMICSTATE_COLLECTOR_FALLBACK_DESTS (comma-separated).
+DEFAULT_COLLECTOR_FALLBACK_DESTS: Tuple[str, ...] = tuple(
+    x.strip()
+    for x in (
+        os.environ.get("DYNAMICSTATE_COLLECTOR_FALLBACK_DESTS")
+        or "/var/tmp/dynamicstate-collector,/dev/shm/dynamicstate-collector"
+    ).split(",")
+    if x.strip()
+)
+# Canonical collector architecture (dist/<arch>/ directory name) -> `uname -m` / ELF aliases.
+COLLECTOR_ARCH_ALIASES: Dict[str, Tuple[str, ...]] = {
+    "x86_64": ("x86_64", "amd64"),
+    "aarch64": ("aarch64", "arm64", "aarch64_be"),
+    "arm": ("arm", "armv7l", "armv6l", "armv5tel", "armv8l", "armhf"),
+    "riscv64": ("riscv64",),
+    "mips": ("mips", "mips64", "mipsel"),
+}
+
+
+def canonical_collector_arch(name: str) -> str:
+    """Maps a `uname -m` / ELF architecture string to the dist/<arch> directory name."""
+    n = (name or "").strip().lower()
+    for canon, aliases in COLLECTOR_ARCH_ALIASES.items():
+        if n == canon or n in aliases:
+            return canon
+    return n
+
+
+def collector_binary_version(data: bytes) -> Optional[str]:
+    """Extracts the version embedded in a collector binary (DS_COLLECTOR_VERSION=<v>), if any."""
+    m = re.search(rb"DS_COLLECTOR_VERSION=([0-9A-Za-z._+-]+)", data)
+    return m.group(1).decode("ascii") if m else None
+
 
 
 
@@ -905,6 +945,14 @@ class TargetExecutionAdapter(ABC):
         """
         pass
 
+    def read_target_file(self, pid: int, path: str, max_bytes: int) -> Optional[bytes]:
+        """Reads up to ``max_bytes`` of a file as seen on the TARGET host (e.g. /proc/PID/exe).
+
+        Used for ABI detection (IMP-015). Adapters that cannot do this return None, which makes
+        ABI detection fail closed (dependent checks become inconclusive).
+        """
+        return None
+
     def read_memory_batch(
         self,
         pid: int,
@@ -1034,6 +1082,13 @@ class LocalTargetAdapter(TargetExecutionAdapter):
             "is_remote": False,
             "host": self.target_host(),
         }
+
+    def read_target_file(self, pid: int, path: str, max_bytes: int) -> Optional[bytes]:
+        try:
+            with open(path, "rb") as fh:
+                return fh.read(max(0, int(max_bytes)))
+        except OSError:
+            return None
 
     def get_proc_maps(self, pid: int) -> List[Dict[str, Any]]:
         maps_path = f"/proc/{pid}/maps"
@@ -1318,7 +1373,10 @@ class LocalTargetAdapter(TargetExecutionAdapter):
 
             # Resolve stack_info and TCB address for pure user-space poll-mode threads (e.g. DPDK lcores where sp_int == 0)
             unresolved_threads = [t for t in threads if t["stack_info"].get("status") != "AVAILABLE" or t["stack_info"].get("tcb_address") is None]
-            if unresolved_threads and self._memory_reader is None:
+            # IMP-015: the tcbhead_t self-pointer scan below is an x86_64/glibc layout; only run it there.
+            if unresolved_threads and self._memory_reader is None and check_support(
+                detect_target_abi(self, pid, probe_version=False, maps=maps), FEATURE_TCB_SCAN
+            ).supported:
                 target_tids = {t["tid"]: t for t in threads}
                 for m in maps:
                     if not m.get("is_readable") or not m.get("is_writable"):
@@ -1531,8 +1589,22 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
         p = f":{self.port}" if self.port != 22 else ""
         return f"{u}{self.host}{p}"
 
-    def _default_command_runner(self, cmd_args: List[str], timeout: float) -> Tuple[int, str, str]:
+    def _default_command_runner(
+        self, cmd_args: List[str], timeout: float, input_bytes: Optional[bytes] = None
+    ) -> Tuple[int, str, str]:
         try:
+            if input_bytes is not None:
+                res_b = subprocess.run(
+                    cmd_args,
+                    input=input_bytes,
+                    capture_output=True,
+                    timeout=timeout,
+                )
+                return (
+                    res_b.returncode,
+                    res_b.stdout.decode("utf-8", "replace"),
+                    res_b.stderr.decode("utf-8", "replace"),
+                )
             res = subprocess.run(
                 cmd_args,
                 capture_output=True,
@@ -1545,8 +1617,17 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
         except Exception as e:
             return -1, "", f"SSH execution error: {e}"
 
-    def run_ssh(self, remote_shell_cmd: str, timeout: Optional[float] = None) -> Tuple[int, str, str]:
-        """Runs a command on the remote target using configured SSH parameters."""
+    def run_ssh(
+        self,
+        remote_shell_cmd: str,
+        timeout: Optional[float] = None,
+        input_bytes: Optional[bytes] = None,
+    ) -> Tuple[int, str, str]:
+        """Runs a command on the remote target using configured SSH parameters.
+
+        ``input_bytes`` (optional) is streamed to the remote command's stdin; custom command
+        runners then receive it as the ``input_bytes`` keyword argument.
+        """
         t = timeout or self.timeout_sec
         args = [
             self.ssh_bin,
@@ -1579,6 +1660,8 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
         args.append(target_spec)
         args.append(remote_shell_cmd)
         try:
+            if input_bytes is not None:
+                return self._command_runner(args, t, input_bytes=input_bytes)
             return self._command_runner(args, t)
         except subprocess.TimeoutExpired:
             return -1, "", f"SSH command timed out after {t:.1f}s"
@@ -1676,6 +1759,16 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
             "is_remote": True,
             "host": self.target_host(),
         }
+
+    def read_target_file(self, pid: int, path: str, max_bytes: int) -> Optional[bytes]:
+        cmd = f"head -c {int(max_bytes)} {shlex.quote(str(path))} 2>/dev/null | base64"
+        rc, out, _ = self.run_ssh(cmd, timeout=self.timeout_sec * 1.5)
+        if rc != 0 or not out.strip():
+            return None
+        try:
+            return base64.b64decode(out.strip())
+        except Exception:  # noqa: BLE001
+            return None
 
     def get_proc_maps(self, pid: int) -> List[Dict[str, Any]]:
         cmd = f"cat /proc/{int(pid)}/maps 2>/dev/null"
@@ -2036,71 +2129,103 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
     def ensure_remote_collector(
         self,
         local_collector_bin: Optional[str] = None,
-        remote_dest: str = "/tmp/dynamicstate-collector",
+        remote_dest: str = DEFAULT_COLLECTOR_DEST,
+        fallback_dests: Optional[Tuple[str, ...]] = None,
     ) -> Dict[str, Any]:
-        """Checks if dynamicstate-collector is present on the remote target, and if not,
-        automatically deploys a matching architecture binary over SSH without requiring scp.
-        Falls back gracefully to batched POSIX shell mode if binary architecture mismatches.
-        """
-        dest = (remote_dest or "/tmp/dynamicstate-collector").strip()
-        check_cmd = f"[ -x {shlex.quote(dest)} ] && {shlex.quote(dest)} --help >/dev/null 2>&1 && echo READY || echo MISSING"
-        rc, stdout, stderr = self.run_ssh(f"sh -c {shlex.quote(check_cmd)}")
-        if rc != 0:
-            return {
-                "deployed": False,
-                "status": "SSH_ERROR",
-                "collector_path": None,
-                "reason": stderr.strip() or f"SSH exited with {rc}",
-            }
+        """Ensures an up-to-date dynamicstate-collector exists on the remote target.
 
-        if "READY" in stdout:
-            self.collector_path = dest
+        * Picks the binary matching the target's ``uname -m`` from
+          ``target/collector/dist/<arch>/`` (built by ``make dist``) unless
+          ``local_collector_bin`` is given explicitly.
+        * Streams the binary over SSH stdin (``cat > path``), so size is not limited by ARG_MAX.
+        * Tries ``remote_dest`` first, then ``fallback_dests`` (e.g. when /tmp is mounted noexec).
+        * Redeploys when the remote ``--version`` differs from the local binary's version.
+        Falls back gracefully to batched POSIX shell mode when nothing suitable can be deployed.
+        """
+        dest = (remote_dest or DEFAULT_COLLECTOR_DEST).strip()
+        if fallback_dests is None:
+            fallback_dests = DEFAULT_COLLECTOR_FALLBACK_DESTS
+        dests: List[str] = []
+        for d in (dest, *fallback_dests):
+            d = (d or "").strip()
+            if d and d not in dests:
+                dests.append(d)
+
+        # Target architecture (also used to pick the local binary).
+        rc_u, out_u, _ = self.run_ssh("uname -m 2>/dev/null")
+        rem_arch_raw = out_u.strip().lower() if rc_u == 0 else ""
+        rem_canon = canonical_collector_arch(rem_arch_raw)
+
+        # Choose the local binary.
+        cand_bin = local_collector_bin
+        if not cand_bin:
+            collector_dir = COLLECTOR_DIR
+            candidates = []
+            if rem_canon:
+                candidates.append(os.path.join(collector_dir, "dist", rem_canon, "dynamicstate-collector"))
+            candidates.append(os.path.join(collector_dir, "dynamicstate-collector"))
+            for c in candidates:
+                if os.path.isfile(c):
+                    cand_bin = c
+                    break
+
+        local_arch = ""
+        raw_bytes = b""
+        local_version: Optional[str] = None
+        if cand_bin and os.path.isfile(cand_bin):
+            try:
+                local_arch = (inspect_elf(cand_bin).architecture or "").lower()
+            except Exception as e:
+                return {
+                    "deployed": False,
+                    "status": "FALLBACK_SHELL",
+                    "collector_path": None,
+                    "reason": f"Local collector binary is not a valid ELF: {e}",
+                }
+            with open(cand_bin, "rb") as bf:
+                raw_bytes = bf.read()
+            local_version = collector_binary_version(raw_bytes)
+
+        # Is a current collector already present on the target (in any candidate location)?
+        for d in dests:
+            qd = shlex.quote(d)
+            check_cmd = f"[ -x {qd} ] && {qd} --help >/dev/null 2>&1 && echo READY || echo MISSING"
+            rc, stdout, stderr = self.run_ssh(f"sh -c {shlex.quote(check_cmd)}")
+            if rc != 0:
+                return {
+                    "deployed": False,
+                    "status": "SSH_ERROR",
+                    "collector_path": None,
+                    "reason": stderr.strip() or f"SSH exited with {rc}",
+                }
+            if "READY" not in stdout:
+                continue
+            remote_version = None
+            if local_version:
+                rc_v, out_v, _ = self.run_ssh(f"{qd} --version 2>/dev/null")
+                if rc_v == 0:
+                    m = re.search(r"dynamicstate-collector\s+(\S+)", out_v)
+                    remote_version = m.group(1) if m else None
+                if remote_version != local_version:
+                    continue  # stale or unversioned collector: redeploy
+            self.collector_path = d
             return {
                 "deployed": True,
                 "status": "ALREADY_PRESENT",
-                "collector_path": dest,
+                "collector_path": d,
+                "collector_version": remote_version,
                 "reason": "Collector binary already present and executable on target",
             }
 
-        # Check if local collector binary is available
-        cand_bin = local_collector_bin
-        if not cand_bin:
-            repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-            default_bin = os.path.join(repo_root, "target", "collector", "dynamicstate-collector")
-            if os.path.isfile(default_bin):
-                cand_bin = default_bin
-
-        if not cand_bin or not os.path.isfile(cand_bin):
+        if not raw_bytes:
             return {
                 "deployed": False,
                 "status": "FALLBACK_SHELL",
                 "collector_path": None,
-                "reason": "No local dynamicstate-collector binary found to deploy; using batched POSIX shell fallback",
+                "reason": "No local dynamicstate-collector binary found to deploy (run `make dist` in target/collector); using batched POSIX shell fallback",
             }
 
-        # Check architecture compatibility between local collector binary and remote uname -m
-        try:
-            local_ident = inspect_elf(cand_bin)
-            local_arch = (local_ident.architecture or "").lower()
-        except Exception as e:
-            return {
-                "deployed": False,
-                "status": "FALLBACK_SHELL",
-                "collector_path": None,
-                "reason": f"Local collector binary is not a valid ELF: {e}",
-            }
-
-        rc_u, out_u, _ = self.run_ssh("uname -m 2>/dev/null")
-        rem_arch_raw = out_u.strip().lower() if rc_u == 0 else ""
-        arch_aliases = {
-            "x86_64": ("x86_64", "amd64"),
-            "aarch64": ("aarch64", "arm64"),
-            "arm": ("arm", "armv7l", "armv6l", "armhf"),
-            "riscv64": ("riscv64",),
-            "mips": ("mips", "mips64", "mipsel"),
-        }
-        compatible_remotes = arch_aliases.get(local_arch, (local_arch,))
-        if rem_arch_raw and local_arch and rem_arch_raw not in compatible_remotes:
+        if rem_arch_raw and local_arch and canonical_collector_arch(local_arch) != rem_canon:
             return {
                 "deployed": False,
                 "status": "FALLBACK_SHELL",
@@ -2109,34 +2234,41 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
                 "remote_architecture": rem_arch_raw,
                 "reason": (
                     f"Architecture mismatch: local collector is '{local_arch}' but remote target is '{rem_arch_raw}'. "
-                    f"Cross-compile collector with CC=<arch>-gcc or use batched POSIX shell fallback."
+                    f"Run `make dist` in target/collector or cross-compile with CC=<arch>-gcc, or use batched POSIX shell fallback."
                 ),
             }
 
-        with open(cand_bin, "rb") as bf:
-            raw_bytes = bf.read()
-        b64_payload = base64.b64encode(raw_bytes).decode("ascii")
-        upload_cmd = (
-            f"sh -c 'echo {shlex.quote(b64_payload)} | base64 -d > {shlex.quote(dest)} && "
-            f"chmod 755 {shlex.quote(dest)} && {shlex.quote(dest)} --help >/dev/null 2>&1 && echo DEPLOY_OK'"
-        )
-        rc_up, out_up, err_up = self.run_ssh(upload_cmd, timeout=max(10.0, self.timeout_sec * 2))
-        if rc_up == 0 and "DEPLOY_OK" in out_up:
-            self.collector_path = dest
-            return {
-                "deployed": True,
-                "status": "DEPLOYED_BINARY",
-                "collector_path": dest,
-                "bytes_transferred": len(raw_bytes),
-                "architecture": local_arch,
-                "reason": f"Successfully deployed dynamicstate-collector ({len(raw_bytes)} bytes) to {dest}",
-            }
+        errors: List[str] = []
+        for d in dests:
+            qd = shlex.quote(d)
+            tmp = shlex.quote(d + ".new")
+            upload_cmd = (
+                f"sh -c 'cat > {tmp} && chmod 755 {tmp} && mv -f {tmp} {qd} && "
+                f"{qd} --help >/dev/null 2>&1 && echo DEPLOY_OK || {{ rm -f {tmp}; exit 1; }}'"
+            )
+            rc_up, out_up, err_up = self.run_ssh(
+                upload_cmd, timeout=max(10.0, self.timeout_sec * 2), input_bytes=raw_bytes
+            )
+            if rc_up == 0 and "DEPLOY_OK" in out_up:
+                self.collector_path = d
+                return {
+                    "deployed": True,
+                    "status": "DEPLOYED_BINARY",
+                    "collector_path": d,
+                    "bytes_transferred": len(raw_bytes),
+                    "architecture": local_arch,
+                    "collector_version": local_version,
+                    "local_binary": cand_bin,
+                    "transfer": "ssh_stdin",
+                    "reason": f"Successfully deployed dynamicstate-collector ({len(raw_bytes)} bytes) to {d}",
+                }
+            errors.append(f"{d}: {err_up.strip() or out_up.strip() or f'exit {rc_up}'}")
 
         return {
             "deployed": False,
             "status": "FALLBACK_SHELL",
             "collector_path": None,
-            "reason": f"Failed deploying collector to {dest}: {err_up.strip() or out_up.strip()}",
+            "reason": "Failed deploying collector to any location (" + "; ".join(errors) + ")",
         }
 
 

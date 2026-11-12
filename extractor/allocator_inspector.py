@@ -110,6 +110,9 @@ class AllocatorDetectionResult:
     confidence: str  # "CONFIRMED", "PROBABLE", "UNKNOWN"
     basis: str
     limitations: List[str] = field(default_factory=list)
+    # IMP-015: target-ABI support decision when the caller supplied the detected target ABI
+    # (None: ABI not consulted; "SUPPORTED" / "NOT_SUPPORTED_ON_TARGET" / "INCONCLUSIVE_ABI_UNDETECTED").
+    support_status: Optional[str] = None
 
     @property
     def allocator_type(self) -> AllocatorType:
@@ -651,8 +654,36 @@ def detect_allocator(
     maps: List[Dict[str, Any]],
     symbols: Optional[List[str]] = None,
     custom_schema: Optional[Dict[str, Any]] = None,
+    target_abi: Optional[Any] = None,
 ) -> AllocatorDetectionResult:
-    """Detects target runtime allocator from memory maps and symbol signatures with confidence distinction."""
+    """Detects target runtime allocator from memory maps and symbol signatures with confidence distinction.
+
+    ``target_abi`` (a ``target_abi.TargetABI`` detected from the target) enables the IMP-015 gate: the
+    glibc ptmalloc chunk layout is only interpreted when the (arch, libc) combination is in the support
+    table; otherwise the result is the UNKNOWN inspector with an explicit support_status/limitation.
+    ``target_abi=None`` keeps the ABI-agnostic behaviour for offline callers that have no live target.
+    """
+    res = _detect_allocator_unchecked(maps, symbols, custom_schema)
+    if target_abi is not None and isinstance(res.inspector, GlibcPtMallocInspector):
+        from .target_abi import FEATURE_ALLOCATOR_CHUNKS, check_support
+        decision = check_support(target_abi, FEATURE_ALLOCATOR_CHUNKS)
+        if not decision.supported:
+            return AllocatorDetectionResult(
+                inspector=UnknownAllocatorInspector(),
+                confidence="UNKNOWN",
+                basis=decision.message,
+                limitations=[decision.message, "glibc ptmalloc chunk layout not interpreted on this target"],
+                support_status=decision.status,
+            )
+        res.support_status = decision.status
+    return res
+
+
+def _detect_allocator_unchecked(
+    maps: List[Dict[str, Any]],
+    symbols: Optional[List[str]] = None,
+    custom_schema: Optional[Dict[str, Any]] = None,
+) -> AllocatorDetectionResult:
     if custom_schema:
         return AllocatorDetectionResult(
             inspector=CustomAllocatorInspector(schema=custom_schema),

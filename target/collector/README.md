@@ -122,3 +122,9 @@ For high-frequency remote watch sessions and deep pointer-chain traversal withou
 #   READ 1234 0x555555558000:16,0x555555558020:4
 #   QUIT
 ```
+
+### Multi-architecture static builds (`make dist`)
+```bash
+make dist   # dist/{arm,aarch64,x86_64}/dynamicstate-collector, static; prints which arches were skipped
+```
+Host-side deployment (`ensure_remote_collector`) picks `dist/<arch>/` by the target's `uname -m`, streams it over SSH stdin, tries fallback locations (`/var/tmp`, `/dev/shm`; override with `DYNAMICSTATE_COLLECTOR_DEST` / `DYNAMICSTATE_COLLECTOR_FALLBACK_DESTS`) when the primary is noexec, and redeploys when `dynamicstate-collector --version` differs from the local binary's version (see `VERSION`).

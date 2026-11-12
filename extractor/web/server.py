@@ -1759,7 +1759,7 @@ class WebApiAdapter:
                 return {"success": False, "error": {"code": "UNSUPPORTED_ADAPTER", "message": "Target adapter is not remote SSH"}}
             res = adapter.ensure_remote_collector(
                 local_collector_bin=(params.get("local_collector_bin") or "").strip() or None,
-                remote_dest=str(params.get("remote_dest") or "/tmp/dynamicstate-collector"),
+                **({"remote_dest": str(params["remote_dest"])} if params.get("remote_dest") else {}),
             )
             return {"success": True, "data": res}
         except Exception as e:

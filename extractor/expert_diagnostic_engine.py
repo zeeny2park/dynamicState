@@ -652,7 +652,11 @@ class TargetAssessor:
             limitations.append("No companion ELF provided: variable names and struct field offsets unavailable, relying on raw memory patterns and /proc info")
 
         # 3. Allocator detection
-        allocator_det = detect_allocator(maps=maps, symbols=None)
+        allocator_abi = None
+        if pid is not None and pid > 1 and accessible:
+            from .target_abi import detect_target_abi
+            allocator_abi = detect_target_abi(target_adapter, pid, probe_version=False)
+        allocator_det = detect_allocator(maps=maps, symbols=None, target_abi=allocator_abi)
         if allocator_det and allocator_det.allocator_type != AllocatorType.UNKNOWN:
             capabilities.append(f"ALLOCATOR_{allocator_det.allocator_type.value.upper()}")
             capabilities.append(f"ALLOCATOR_CONFIDENCE_{allocator_det.confidence.upper()}")
