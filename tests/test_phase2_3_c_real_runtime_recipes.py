@@ -110,7 +110,8 @@ class TestPhase23CRealRuntimeRecipes(unittest.TestCase):
 
     def test_all_22_recipes_dispatch_and_execute_through_mcp(self):
         """All 22 recipes in DiagnosticRecipeRegistry execute through runtime_run_diagnostic_recipe without crashing."""
-        all_recipe_ids = DiagnosticRecipeRegistry.list_recipe_ids()
+        from extractor.diagnostic_recipes import BUILTIN_RECIPE_IDS  # IMP-018: plugins add recipes
+        all_recipe_ids = list(BUILTIN_RECIPE_IDS)
         self.assertEqual(len(all_recipe_ids), 22)
 
         for rid in all_recipe_ids:

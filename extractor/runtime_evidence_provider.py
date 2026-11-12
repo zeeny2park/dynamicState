@@ -909,10 +909,10 @@ class RuntimeEvidenceProvider:
 
         # If an address was observed, check its VMA mapping & probe memory
         if observed_addr is not None:
-            # In healthy processes, an idle pointer may be nullptr (0x0) without being a crash fault.
-            # Only flag 0x0 as an invalid memory access if corruption or crash symptoms were observed.
-            is_crash_query = bool(classification and any(s in str(classification.extracted_entities).lower() for s in ["sigsegv", "crash", "fault"]))
-            if observed_addr == 0 and not magic_corrupted and not is_crash_query:
+            # IMP-018: a NULL pointer VALUE is an observed fact; a dereference is not observable from outside
+            # (no fault is caught), so a NULL value is never reported as "dereferenced" - with or without a
+            # crash symptom.  Other evidence (a corrupted magic) still counts on its own.
+            if observed_addr == 0 and not magic_corrupted:
                 observation_data["pointer_name"] = ptr_name
                 observation_data["pointer_value"] = "0x0"
                 observation_data["is_mapped"] = True
@@ -927,11 +927,13 @@ class RuntimeEvidenceProvider:
                 observation_data["pointer_name"] = ptr_name
                 observation_data["pointer_value"] = f"0x{observed_addr:x}"
 
-                # Check NULL page
-                if 0 <= observed_addr <= 4096:
+                # NULL page: record the observed pointer value only (IMP-018: not a dereference)
+                if observed_addr == 0:
+                    observation_data["null_pointer_value"] = True
+                elif 0 < observed_addr <= 4096:
                     observation_data["is_mapped"] = False
                     observation_data["vma_permissions"] = "---p"
-                    observation_data["violation_type"] = "NULL_POINTER_DEREFERENCE"
+                    observation_data["violation_type"] = "NULL_PAGE_POINTER_VALUE"
                 else:
                     # Check in maps
                     matching_map = None
@@ -1322,14 +1324,8 @@ class RuntimeEvidenceProvider:
             observation_data["variable_name"] = main_var
             observation_data["observed_value"] = val
             observation_data["value"] = val
-            try:
-                val_int = int(val, 16) if isinstance(val, str) and val.startswith("0x") else int(val)
-                if val_int >= 100 or val_int < 0:
-                    observation_data["observed_transitions"] = [1, val_int]
-                    observation_data["allowed_transitions"] = {0: [1], 1: [0, 2], 2: [0, 1]}
-                    observation_data["transition_violation"] = True
-            except Exception:
-                pass
+            # IMP-018: a value is only an observation.  A transition violation needs an observed transition
+            # and a state specification; "value >= 100" was neither, so it no longer counts as one.
 
         # Inspect related fields for consistency (e.g. capacity vs length pairs)
         if companion_elf and os.path.exists(companion_elf):
