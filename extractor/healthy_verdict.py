@@ -85,6 +85,30 @@ def _obs(c: Any) -> Dict[str, Any]:
     return ob if isinstance(ob, dict) else {}
 
 
+def _uaf_cap_scope_limit(c: Any) -> Optional[Dict[str, Any]]:
+    """RECIPE_FREED_MEMORY_USE that could not run only because the heap was not walked under the baseline cap.
+
+    The use-after-free check reuses the heap-integrity walk; when that walk was skipped for the declared cost
+    limit (heap above the baseline cap) the UAF observation is NOT_CHECKED.  That is the same scope limit as the
+    integrity check, not missing evidence, so it is reported in ``not_checked`` instead of blocking HEALTHY."""
+    obs = _obs(c)
+    u = None
+    for k, v in obs.items():
+        if "freed_memory" in str(k) and isinstance(v, dict):
+            u = v
+            break
+    if not isinstance(u, dict) or u.get("status") != "NOT_CHECKED" or u.get("findings"):
+        return None
+    heap = ((obs.get("memory_integrity") or {}).get("heap") or {})
+    lims = " ".join(str(x) for x in (u.get("limitations") or []))
+    if heap.get("not_checked_reason") != "above_baseline_cap" and "above" not in lims and "cap" not in lims:
+        return None
+    return {"kind": "uaf_not_checked", "item": "use_after_free",
+            "label": ("use-after-free (heap above the baseline walk cap; a memory-corruption symptom runs the full walk)",
+                      "해제 후 사용 (힙이 기본 검사 상한보다 큼; 메모리 손상 증상을 주면 전체 순회를 실행함)"),
+            "reason": "use-after-free not checked: heap larger than the baseline cap"}
+
+
 def _plain(recipe_id: str) -> str:
     return str(recipe_id).replace("RECIPE_", "").replace("_", " ").lower()
 
@@ -170,10 +194,15 @@ def evaluate(*, verdict: str, findings: List[Dict[str, Any]], checks: List[Any],
             st = _st(c)
             if st == CheckStatus.PASS:
                 continue
-            lim = _heap_cap_scope_limit(c) if rid == "RECIPE_HEAP_METADATA_CORRUPTION" and \
-                st == CheckStatus.INCONCLUSIVE else None
+            lim = None
+            if st == CheckStatus.INCONCLUSIVE:
+                if rid == "RECIPE_HEAP_METADATA_CORRUPTION":
+                    lim = _heap_cap_scope_limit(c)
+                elif rid == "RECIPE_FREED_MEMORY_USE":
+                    lim = _uaf_cap_scope_limit(c)
             if lim is not None:
-                partial.append("global arrays and stack margins checked, heap not walked (above the baseline cap)")
+                partial.append("global arrays and stack margins checked, heap not walked (above the baseline cap)"
+                               if rid == "RECIPE_HEAP_METADATA_CORRUPTION" else "heap not walked (above the baseline cap)")
                 not_checked.append({"kind": lim["kind"], "item": lim["item"], "label": lim["label"][0],
                                     "label_ko": lim["label"][1], "reason": lim["reason"]})
                 continue
