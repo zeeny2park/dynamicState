@@ -472,7 +472,8 @@ class TestPhase243ProductionPathAndCounterValidation(unittest.TestCase):
 
     def test_09_rigorous_22_recipe_categorization_audit(self):
         """Explicitly categorizes and asserts validation status for all 22 recipes without inflation."""
-        all_recipe_ids = DiagnosticRecipeRegistry.list_recipe_ids()
+        from extractor.diagnostic_recipes import BUILTIN_RECIPE_IDS
+        all_recipe_ids = list(BUILTIN_RECIPE_IDS)  # IMP-018: plugins add recipes
         self.assertEqual(len(all_recipe_ids), 22)
 
         # Honest classification criteria:

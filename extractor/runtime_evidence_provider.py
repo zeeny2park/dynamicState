@@ -1375,6 +1375,12 @@ class RuntimeEvidenceProvider:
             observation_data["value"] = val
             # IMP-018: a value is only an observation.  A transition violation needs an observed transition
             # and a state specification; "value >= 100" was neither, so it no longer counts as one.
+            # The observed value is the current state; with a caller-supplied specification (allowed_states) the
+            # rule compares the two - an observed value against a declared contract.
+            try:
+                observation_data["current_state"] = int(val, 16) if isinstance(val, str) and val.startswith("0x") else int(val)
+            except (TypeError, ValueError):
+                pass
 
         # Inspect related fields for consistency (e.g. capacity vs length pairs)
         if companion_elf and os.path.exists(companion_elf):

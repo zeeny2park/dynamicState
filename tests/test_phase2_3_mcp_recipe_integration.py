@@ -148,7 +148,8 @@ class TestPhase23McpRecipeIntegration(unittest.TestCase):
     def test_all_22_recipes_execute_meaningfully(self):
         """All 22 DiagnosticRecipeRegistry recipes can be executed through MCP and return structured results."""
         proc = self._start_target()
-        recipe_ids = DiagnosticRecipeRegistry.list_recipe_ids()
+        from extractor.diagnostic_recipes import BUILTIN_RECIPE_IDS
+        recipe_ids = list(BUILTIN_RECIPE_IDS)  # IMP-018: plugins add recipes
         self.assertEqual(len(recipe_ids), 22, f"Expected 22 recipes, got {len(recipe_ids)}")
 
         for rid in recipe_ids:
