@@ -139,6 +139,9 @@ class ReachabilityAnalyzer:
         self.pending_top: Dict[int, List[Tuple[int, str, int, int, int, int, Optional[int]]]] = {}
         self._top_catch_up: Dict[int, int] = {}
         self.max_top_catch_up = 4
+        # IMP-009: ci -> (node, suffix, root, sizeof pointee, type name, module, type die) of the first typed
+        # struct pointer to the start of the block (input of the "allocation smaller than its type" check)
+        self.typed_pointee: Dict[int, Tuple[int, str, int, int, str, int, int]] = {}
 
     # ------------------------------------------------------------------ type helpers
     def _canon(self, mi: int, off: Optional[int]):
@@ -290,6 +293,10 @@ class ReachabilityAnalyzer:
         if self.ct.states[ci] not in IN_USE_STATES:
             return                                  # dangling pointer to a free block: do not descend
         pt = self._canon(mi, pointee_off)
+        if value == user and ci not in self.typed_pointee and pt is not None and pt.tag in _STRUCT_TAGS \
+                and int(pt.byte_size or 0) > 0 and (pt.members or getattr(pt, "base_classes", None)):
+            # IMP-009: first typed pointer to the start of the block, with its pointee struct size
+            self.typed_pointee[ci] = (node, suffix, root, int(pt.byte_size), pt.name or "", mi, pt.die_offset)
         if pt is None or pt.tag in ("DW_TAG_base_type", "DW_TAG_enumeration_type", "DW_TAG_subroutine_type") or (
                 pt.tag in _STRUCT_TAGS and not pt.members and not getattr(pt, "base_classes", None)):
             self.untyped_reached.add(ci)            # void*, char*, opaque struct: edge only
@@ -464,6 +471,7 @@ class ReachabilityAnalyzer:
         self.refs = {new_index[old_addrs[i]]: v for i, v in self.refs.items()}
         self.ref_counts = {new_index[old_addrs[i]]: v for i, v in self.ref_counts.items()}
         self.untyped_reached = {new_index[old_addrs[i]] for i in self.untyped_reached}
+        self.typed_pointee = {new_index[old_addrs[i]]: v for i, v in self.typed_pointee.items()}
         self._addr_of_index = list(self.ct.addrs)
 
     # ------------------------------------------------------------------ roots
@@ -983,6 +991,47 @@ def _module_contexts(adapter: Any, pid: int, companion_elf_path: Optional[str], 
     return out
 
 
+def build_reachability(walk: HeapWalkResult, walker: HeapWalker, reader: BudgetedReader, adapter: Any, pid: int,
+                       companion_elf_path: Optional[str], manager: Any, include_typed_locals: bool,
+                       limits: Optional[ReachabilityLimits], info: Dict[str, Any]) -> Optional[ReachabilityAnalyzer]:
+    """Reverse reference map over an existing walk (roots: globals/statics, typed locals, conservative).
+    Fills ``info`` (root sources / reachability_error).  Split out of :func:`analyze_heap_ownership` so a caller
+    can walk first and pay for reachability only when it needs owner names (IMP-009 baseline integrity walk)."""
+    analyzer: Optional[ReachabilityAnalyzer] = None
+    try:
+        modules = _module_contexts(adapter, pid, companion_elf_path, manager, walk.mappings)
+        info["typed_modules"] = [m[0] for m in modules]
+        analyzer = ReachabilityAnalyzer(walk, walker, reader, modules, limits=limits)
+        analyzer.prepare()
+        if modules:
+            info["root_sources"]["globals_statics"] = analyzer.add_global_roots()
+        else:
+            info["root_sources"]["globals_statics"] = "no companion ELF with DWARF: no typed global roots"
+        before = adapter.cumulative_physical_bytes_read
+        threads = adapter.get_threads(pid) or []
+        reader.account_external(adapter.cumulative_physical_bytes_read - before, "thread discovery")
+        if include_typed_locals and manager is not None and modules:
+            before = adapter.cumulative_physical_bytes_read
+            try:
+                frames = manager.inspect_thread_locals_and_frame_vars(
+                    pid=pid, companion_elf_path=companion_elf_path, adapter=adapter, max_frames=16)
+            except Exception as exc:  # noqa: BLE001
+                frames = {"error": str(exc)}
+            reader.account_external(adapter.cumulative_physical_bytes_read - before, "frame decoder")
+            loc = analyzer.add_local_roots(frames)
+            statuses = set((loc.get("decoder_status") or {}).values())
+            loc["note"] = ("typed locals from the frame decoder" if "SUPPORTED" in statuses else
+                           "frame-locals decoder not supported on this target (%s): stack references are "
+                           "conservative (no variable names)" % ", ".join(sorted(str(s) for s in statuses)))
+            info["root_sources"]["locals"] = loc
+        else:
+            info["root_sources"]["locals"] = "typed locals not requested / no companion ELF"
+        info["root_sources"]["conservative"] = analyzer.add_conservative_roots(threads)
+    except HeapWalkBudgetExhausted as exc:
+        info["reachability_error"] = "observation budget exhausted during reachability: %s" % exc
+    return analyzer
+
+
 def analyze_heap_ownership(
     pid: int,
     companion_elf_path: Optional[str] = None,
@@ -1012,37 +1061,8 @@ def analyze_heap_ownership(
     info: Dict[str, Any] = {"companion_elf": companion_elf_path, "root_sources": {}}
     analyzer: Optional[ReachabilityAnalyzer] = None
     if walk.ok:
-        try:
-            modules = _module_contexts(adapter, pid, companion_elf_path, manager, walk.mappings)
-            info["typed_modules"] = [m[0] for m in modules]
-            analyzer = ReachabilityAnalyzer(walk, walker, reader, modules, limits=limits)
-            analyzer.prepare()
-            if modules:
-                info["root_sources"]["globals_statics"] = analyzer.add_global_roots()
-            else:
-                info["root_sources"]["globals_statics"] = "no companion ELF with DWARF: no typed global roots"
-            before = adapter.cumulative_physical_bytes_read
-            threads = adapter.get_threads(pid) or []
-            reader.account_external(adapter.cumulative_physical_bytes_read - before, "thread discovery")
-            if include_typed_locals and manager is not None and modules:
-                before = adapter.cumulative_physical_bytes_read
-                try:
-                    frames = manager.inspect_thread_locals_and_frame_vars(
-                        pid=pid, companion_elf_path=companion_elf_path, adapter=adapter, max_frames=16)
-                except Exception as exc:  # noqa: BLE001
-                    frames = {"error": str(exc)}
-                reader.account_external(adapter.cumulative_physical_bytes_read - before, "frame decoder")
-                loc = analyzer.add_local_roots(frames)
-                statuses = set((loc.get("decoder_status") or {}).values())
-                loc["note"] = ("typed locals from the frame decoder" if "SUPPORTED" in statuses else
-                               "frame-locals decoder not supported on this target (%s): stack references are "
-                               "conservative (no variable names)" % ", ".join(sorted(str(s) for s in statuses)))
-                info["root_sources"]["locals"] = loc
-            else:
-                info["root_sources"]["locals"] = "typed locals not requested / no companion ELF"
-            info["root_sources"]["conservative"] = analyzer.add_conservative_roots(threads)
-        except HeapWalkBudgetExhausted as exc:
-            info["reachability_error"] = "observation budget exhausted during reachability: %s" % exc
+        analyzer = build_reachability(walk, walker, reader, adapter, pid, companion_elf_path, manager,
+                                      include_typed_locals, limits, info)
     info["wall_ms"] = round((time.monotonic() - t0) * 1000.0, 2)
     an = HeapOwnershipAnalysis(pid, walk, analyzer, budget, reader, info)
     if cache:

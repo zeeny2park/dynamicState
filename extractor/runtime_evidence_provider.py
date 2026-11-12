@@ -866,6 +866,10 @@ class RuntimeEvidenceProvider:
                                 observation_data["chunk_state"] = "CORRUPTED"
                                 observation_data["magic_corrupted"] = True
                                 observation_data["observed_magic"] = f"0x{m_int:x}"
+                                # IMP-009: a hint only (name contains magic/canary/guard + a poison constant);
+                                # the rules cap it at probable - damage is proven by heap/global/stack checks
+                                observation_data["corruption_hint_source"] = "variable_name_poison_value"
+                                observation_data["corruption_hint_variable"] = mc
                                 break
                         except Exception:
                             pass
@@ -953,6 +957,12 @@ class RuntimeEvidenceProvider:
                     provenance_class=PROVENANCE_LIVE_RUNTIME_CAPTURE,
                 )
                 all_records.append(rec_lim)
+
+            if recipe_id == "RECIPE_HEAP_METADATA_CORRUPTION" and self.memory_observation is not None:
+                # IMP-009: heap metadata integrity (+ global adjacency, stack margins) of a diagnose run
+                from .memory_integrity import attach_integrity_observation
+                attach_integrity_observation(self, recipe, pid, companion_elf, classification, session_id,
+                                             observation_data, all_records)
 
             return observation_data, all_records
 
