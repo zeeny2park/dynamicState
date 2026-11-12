@@ -1,0 +1,21 @@
+{
+  "id": "ok_normal_cv",
+  "origin": "project_fixture",
+  "naming": "project",
+  "kind": "none",
+  "source": "tests/fixtures/real_runtime/proc_thread_normal_cv.c",
+  "language": "c",
+  "symptom": "the process seems stuck, please check",
+  "ready": {
+    "mode": "settle",
+    "seconds": 1.0
+  },
+  "causes": {
+    "variables": [],
+    "locks": [],
+    "threads": [],
+    "functions": []
+  },
+  "locations": [],
+  "notes": "timed cond wait with progress"
+}

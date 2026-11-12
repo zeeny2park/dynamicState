@@ -1,0 +1,30 @@
+{
+  "id": "stall_sleep",
+  "origin": "new",
+  "naming": "neutral",
+  "kind": "long_stall",
+  "source": "benchmarks/diagnosis_accuracy/targets/stall_sleep.c",
+  "language": "c",
+  "symptom": "requests are not being processed anymore",
+  "ready": {
+    "mode": "stdout_marker"
+  },
+  "causes": {
+    "variables": [],
+    "locks": [],
+    "threads": [
+      "syncer"
+    ],
+    "functions": [
+      "flush_remote"
+    ]
+  },
+  "locations": [
+    {
+      "file": "benchmarks/diagnosis_accuracy/targets/stall_sleep.c",
+      "line": 9,
+      "text": "sleep(86400)"
+    }
+  ],
+  "notes": "thread in a 24 h sleep"
+}

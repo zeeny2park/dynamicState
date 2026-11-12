@@ -1,0 +1,35 @@
+{
+  "id": "uaf_sessions",
+  "origin": "new",
+  "naming": "project",
+  "kind": "use_after_free",
+  "source": "benchmarks/diagnosis_accuracy/targets/uaf_sessions.c",
+  "language": "c",
+  "symptom": "this program crashes sometimes and data looks wrong",
+  "ready": {
+    "mode": "stdout_marker"
+  },
+  "causes": {
+    "variables": [
+      "g_sessions"
+    ],
+    "locks": [],
+    "threads": [],
+    "functions": [
+      "sess_close"
+    ]
+  },
+  "locations": [
+    {
+      "file": "benchmarks/diagnosis_accuracy/targets/uaf_sessions.c",
+      "line": 17,
+      "text": "free(g_sessions[i])"
+    },
+    {
+      "file": "benchmarks/diagnosis_accuracy/targets/uaf_sessions.c",
+      "line": 27,
+      "text": "g_sessions[1]->bytes += 4096"
+    }
+  ],
+  "notes": "slot freed but not cleared, then written"
+}

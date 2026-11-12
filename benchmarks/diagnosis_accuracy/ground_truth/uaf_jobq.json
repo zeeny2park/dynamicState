@@ -1,0 +1,35 @@
+{
+  "id": "uaf_jobq",
+  "origin": "external_style",
+  "naming": "neutral",
+  "kind": "use_after_free",
+  "source": "benchmarks/diagnosis_accuracy/targets/uaf_jobq.c",
+  "language": "c",
+  "symptom": "this program crashes sometimes and data looks wrong",
+  "ready": {
+    "mode": "stdout_marker"
+  },
+  "causes": {
+    "variables": [
+      "cur"
+    ],
+    "locks": [],
+    "threads": [],
+    "functions": [
+      "job_finish"
+    ]
+  },
+  "locations": [
+    {
+      "file": "benchmarks/diagnosis_accuracy/targets/uaf_jobq.c",
+      "line": 37,
+      "text": "free(cur)"
+    },
+    {
+      "file": "benchmarks/diagnosis_accuracy/targets/uaf_jobq.c",
+      "line": 38,
+      "text": "cur->runs++"
+    }
+  ],
+  "notes": "write through global pointer after free"
+}

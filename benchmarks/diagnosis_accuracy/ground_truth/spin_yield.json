@@ -1,0 +1,32 @@
+{
+  "id": "spin_yield",
+  "origin": "new",
+  "naming": "neutral",
+  "kind": "busy_wait",
+  "source": "benchmarks/diagnosis_accuracy/targets/spin_yield.c",
+  "language": "c",
+  "symptom": "this process uses a full CPU core while doing nothing useful",
+  "ready": {
+    "mode": "stdout_marker"
+  },
+  "causes": {
+    "variables": [
+      "ev"
+    ],
+    "locks": [],
+    "threads": [
+      "waiter"
+    ],
+    "functions": [
+      "await_event"
+    ]
+  },
+  "locations": [
+    {
+      "file": "benchmarks/diagnosis_accuracy/targets/spin_yield.c",
+      "line": 10,
+      "text": "while (ev == 0)"
+    }
+  ],
+  "notes": "sched_yield polling loop"
+}

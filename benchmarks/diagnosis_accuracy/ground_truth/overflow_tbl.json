@@ -1,0 +1,30 @@
+{
+  "id": "overflow_tbl",
+  "origin": "new",
+  "naming": "neutral",
+  "kind": "heap_overflow",
+  "source": "benchmarks/diagnosis_accuracy/targets/overflow_tbl.c",
+  "language": "c",
+  "symptom": "this program shows occasional strange data and I suspect memory corruption",
+  "ready": {
+    "mode": "stdout_marker"
+  },
+  "causes": {
+    "variables": [
+      "tbl"
+    ],
+    "locks": [],
+    "threads": [],
+    "functions": [
+      "tbl_put"
+    ]
+  },
+  "locations": [
+    {
+      "file": "benchmarks/diagnosis_accuracy/targets/overflow_tbl.c",
+      "line": 17,
+      "text": "strcpy(tbl[i]->key, key)"
+    }
+  ],
+  "notes": "unbounded strcpy into 16-byte key overruns into next chunk"
+}

@@ -1,0 +1,48 @@
+{
+  "id": "deadlock_circular",
+  "origin": "project_fixture",
+  "naming": "project",
+  "kind": "deadlock",
+  "source": "tests/fixtures/real_runtime/proc_thread_circular_deadlock.c",
+  "language": "c",
+  "symptom": "the service stopped responding",
+  "ready": {
+    "mode": "settle",
+    "seconds": 1.0
+  },
+  "causes": {
+    "variables": [],
+    "locks": [
+      "g_mutex_a",
+      "g_mutex_b"
+    ],
+    "threads": [],
+    "functions": [
+      "worker_1",
+      "worker_2"
+    ]
+  },
+  "locations": [
+    {
+      "file": "tests/fixtures/real_runtime/proc_thread_circular_deadlock.c",
+      "line": 26,
+      "text": "pthread_mutex_lock(&g_mutex_a)"
+    },
+    {
+      "file": "tests/fixtures/real_runtime/proc_thread_circular_deadlock.c",
+      "line": 28,
+      "text": "pthread_mutex_lock(&g_mutex_b)"
+    },
+    {
+      "file": "tests/fixtures/real_runtime/proc_thread_circular_deadlock.c",
+      "line": 36,
+      "text": "pthread_mutex_lock(&g_mutex_b)"
+    },
+    {
+      "file": "tests/fixtures/real_runtime/proc_thread_circular_deadlock.c",
+      "line": 38,
+      "text": "pthread_mutex_lock(&g_mutex_a)"
+    }
+  ],
+  "notes": "AB/BA; threads are unnamed"
+}

@@ -1,0 +1,20 @@
+{
+  "id": "ok_worker_pool",
+  "origin": "new",
+  "naming": "neutral",
+  "kind": "none",
+  "source": "benchmarks/diagnosis_accuracy/targets/ok_worker_pool.c",
+  "language": "c",
+  "symptom": "are the worker threads deadlocked?",
+  "ready": {
+    "mode": "stdout_marker"
+  },
+  "causes": {
+    "variables": [],
+    "locks": [],
+    "threads": [],
+    "functions": []
+  },
+  "locations": [],
+  "notes": "threads parked on a condition variable"
+}

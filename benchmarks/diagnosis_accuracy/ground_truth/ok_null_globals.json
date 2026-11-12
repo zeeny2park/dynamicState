@@ -1,0 +1,20 @@
+{
+  "id": "ok_null_globals",
+  "origin": "new",
+  "naming": "neutral",
+  "kind": "none",
+  "source": "benchmarks/diagnosis_accuracy/targets/ok_null_globals.c",
+  "language": "c",
+  "symptom": "general health check",
+  "ready": {
+    "mode": "stdout_marker"
+  },
+  "causes": {
+    "variables": [],
+    "locks": [],
+    "threads": [],
+    "functions": []
+  },
+  "locations": [],
+  "notes": "intentionally NULL global pointers at idle"
+}

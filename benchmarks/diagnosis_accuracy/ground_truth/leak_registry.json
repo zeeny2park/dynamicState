@@ -1,0 +1,32 @@
+{
+  "id": "leak_registry",
+  "origin": "new",
+  "naming": "neutral",
+  "kind": "memory_leak",
+  "source": "benchmarks/diagnosis_accuracy/targets/leak_registry.c",
+  "language": "c",
+  "symptom": "memory usage of this process keeps growing",
+  "ready": {
+    "mode": "stdout_marker"
+  },
+  "causes": {
+    "variables": [
+      "reg_head"
+    ],
+    "locks": [],
+    "threads": [
+      "intake"
+    ],
+    "functions": [
+      "intake"
+    ]
+  },
+  "locations": [
+    {
+      "file": "benchmarks/diagnosis_accuracy/targets/leak_registry.c",
+      "line": 21,
+      "text": "calloc(1, sizeof *e)"
+    }
+  ],
+  "notes": "still-referenced growing linked list"
+}
