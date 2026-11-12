@@ -166,7 +166,7 @@ class TestPhase52WebAndMcpDefensiveHardening(unittest.TestCase):
             {"action": "eval", "expressions": "gpMem.active_buffers"},
         ])
         bm = json.loads(mcp_srv.runtime_batch_execute(steps=batch_json_str))  # type: ignore[arg-type]
-        self.assertNotEqual(bm.get("success"), False)  # batch macro reports per-step status; no top-level success key (dba6b8e)
+        self.assertNotEqual(bm.get("success"), False)  # batch macro reports its own batch-level success (all steps ok)
         self.assertEqual(bm["steps_failed"], 0)
         self.assertTrue(all(s["success"] for s in bm["step_results"]))
         self.assertEqual(bm["steps_succeeded"], 2)

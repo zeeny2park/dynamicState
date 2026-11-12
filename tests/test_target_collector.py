@@ -1729,11 +1729,6 @@ int unlinkat(int dirfd, const char *pathname, int flags) {
         with self.assertRaises(FileNotFoundError):
             RawMemorySnapshot.load(snap_dir)
 
-    # IMP-005 baseline: real defect — an UNVERIFIED (legacy, uncommitted) offline snapshot yields capture_quality_assessment.trust_level == "TRUSTED"
-    # (expected "UNVERIFIED") and the HTML report says CONFIRMED/LIVE_RUNTIME_CAPTURE for a VALIDATED hypothesis (expected capped at SUSPECTED, IMPORTED_UNVERIFIED):
-    # InvestigationManager.generate_report (extractor/investigation.py:3431 trust_level only reads capture stage status, never snapshot verdict;
-    # extractor/investigation.py:3565-3590 synthesize_verdict() called without provenance_class so it defaults to LIVE_RUNTIME_CAPTURE). Regressed in 533a0bb.
-    @unittest.expectedFailure
     def test_44_investigation_end_to_end_unverified_provenance(self):
         """UNVERIFIED snapshot propagates through OfflineMemoryAnalyzer and InvestigationManager, capping final diagnosis at SUSPECTED."""
         from extractor.memory_snapshot import CapturedRegion, RawMemorySnapshot
@@ -2591,10 +2586,6 @@ int unlinkat(int dirfd, const char *pathname, int flags) {
         self.assertFalse(is_valid)
         self.assertTrue(any("UNCERTAIN_DURABILITY" in w for w in warnings))
 
-    # IMP-005 baseline: real defect — forged live_capture is rejected, but session.target_ref has no "provenance_class" key (observed None,
-    # expected IMPORTED_UNVERIFIED) and generate_report() omits "provenance_class" (observed None): extractor/investigation.py:1285-1292
-    # (target_ref built without provenance_class/live_capture) and extractor/investigation.py:3520 (report dict has no provenance_class). Removed in 533a0bb.
-    @unittest.expectedFailure
     def test_63_provenance_forgery_rejection_in_investigation(self):
         """External callers cannot forge live capture or trusted provenance in investigation sessions."""
         from extractor.investigation import InvestigationManager, PROVENANCE_CLASS_IMPORTED_UNVERIFIED, PROVENANCE_CLASS_LIVE_RUNTIME_CAPTURE
