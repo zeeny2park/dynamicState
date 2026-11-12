@@ -15,13 +15,6 @@ import tempfile
 import unittest
 
 from extractor.target_adapter import LocalTargetAdapter, PIDReusedError
-from extractor.workflow import (
-    InvestigationWorkflowEngine,
-    STAGE_INITIALIZING,
-    STAGE_PROBING,
-    STAGE_BLOCKED,
-    STOP_TARGET_TERMINATED,
-)
 
 
 class TestPhase20A313IdentityFailClosed(unittest.TestCase):
@@ -97,62 +90,7 @@ class TestPhase20A313IdentityFailClosed(unittest.TestCase):
         self.assertFalse(ok)
         self.assertIn("missing mandatory identity field", err.lower())
 
-    def test_03_pid_reuse_detected_on_workflow_resume(self):
-        """Resume detects PID reuse when start_time or executable changes."""
-        ad_orig = self._setup_adapter()
-        engine = InvestigationWorkflowEngine(target_adapter=ad_orig)
-        inst = engine.create_instance(self.session_id, self.pid, "PID reuse check")
-        engine.execute_stage_initializing(inst)
-        engine.execute_stage_probing(inst)
 
-        ckpt_file = os.path.join(self.tmp_dir, "resume_pid_reuse.json")
-        engine.persist_state(inst, ckpt_file)
-
-        # 1. Start time changed (new process took over PID)
-        ad_reused_time = self._setup_adapter(ident_override={"start_time": "999999"})
-        resume_eng1 = InvestigationWorkflowEngine(target_adapter=ad_reused_time)
-        with self.assertRaises(PIDReusedError) as ctx1:
-            resume_eng1.resume_investigation(ckpt_file)
-        self.assertIn("pid reuse detected on resume", str(ctx1.exception).lower())
-
-        # 2. Executable changed
-        ad_reused_exe = self._setup_adapter(ident_override={"executable": "/usr/bin/hijacked_binary"})
-        resume_eng2 = InvestigationWorkflowEngine(target_adapter=ad_reused_exe)
-        with self.assertRaises(PIDReusedError) as ctx2:
-            resume_eng2.resume_investigation(ckpt_file)
-        self.assertIn("executable replacement detected on resume", str(ctx2.exception).lower())
-
-        # 3. Executable inode changed
-        ad_reused_inode = self._setup_adapter(ident_override={"exe_inode": 888888})
-        resume_eng3 = InvestigationWorkflowEngine(target_adapter=ad_reused_inode)
-        with self.assertRaises(PIDReusedError) as ctx3:
-            resume_eng3.resume_investigation(ckpt_file)
-        self.assertIn("executable inode changed on resume", str(ctx3.exception).lower())
-
-        # 4. Build ID changed
-        ad_reused_bid = self._setup_adapter(ident_override={"build_id": "sha1:altered_build_id_000"})
-        resume_eng4 = InvestigationWorkflowEngine(target_adapter=ad_reused_bid)
-        with self.assertRaises(PIDReusedError) as ctx4:
-            resume_eng4.resume_investigation(ckpt_file)
-        self.assertIn("build id changed on resume", str(ctx4.exception).lower())
-
-    def test_04_target_terminated_prior_to_resume_raises_process_lookup_error(self):
-        """If the target process terminates before resume, resume fails closed with ProcessLookupError."""
-        ad_orig = self._setup_adapter()
-        engine = InvestigationWorkflowEngine(target_adapter=ad_orig)
-        inst = engine.create_instance(self.session_id, self.pid, "Terminated check")
-        engine.execute_stage_initializing(inst)
-        engine.execute_stage_probing(inst)
-
-        ckpt_file = os.path.join(self.tmp_dir, "resume_dead.json")
-        engine.persist_state(inst, ckpt_file)
-
-        # Target is dead on resume
-        ad_dead = self._setup_adapter(liveness=(False, "ESRCH: Process terminated"))
-        resume_engine = InvestigationWorkflowEngine(target_adapter=ad_dead)
-        with self.assertRaises(ProcessLookupError) as ctx:
-            resume_engine.resume_investigation(ckpt_file)
-        self.assertIn("terminated prior to resume", str(ctx.exception).lower())
 
 
 if __name__ == "__main__":

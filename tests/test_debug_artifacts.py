@@ -16,7 +16,6 @@ from extractor.debug_image import BinaryIdentity, CompatibilityResult
 from extractor.debug_info import (
     DebugInfoProvider,
     GdbDebugInfoProvider,
-    NativeDwarfDebugInfoProvider,
 )
 from extractor.modules import RuntimeModule
 
@@ -226,21 +225,6 @@ class TestDebugArtifacts(unittest.TestCase):
         self.assertFalse(compat.compatible)
         self.assertEqual(compat.reason, "DEBUG_IMAGE_MISMATCH")
 
-    def test_native_dwarf_debug_info_provider_stub(self):
-        provider = NativeDwarfDebugInfoProvider()
-        mod = RuntimeModule(
-            module_id="main",
-            path="/bin/app",
-            runtime_base=0x1000,
-            runtime_end=0x2000,
-            load_bias=0,
-            build_id=None,
-            architecture="x86_64",
-            endianness="little",
-            elf_class="ELF64",
-        )
-        with self.assertRaises(NotImplementedError):
-            provider.load(mod, "/bin/app.debug")
 
 
 if __name__ == "__main__":

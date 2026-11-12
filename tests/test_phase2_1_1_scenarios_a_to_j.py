@@ -139,7 +139,10 @@ class TestPhase211ScenariosAToJ(unittest.TestCase):
         self.assertTrue(any("g_alloc_count" in str(r.source_variable) for r in obs_records))
 
     def test_scenario_e_abnormal_global_variable_transition(self):
-        """Scenario E: Boundary jump violation to 999 confirmed."""
+        """Scenario E: g_worker_state holds 999.
+
+        IMP-018: a large value alone is an observation, not an observed transition: with no transition and no
+        state specification it is no longer confirmed as a state-transition violation."""
         proc = self._spawn_target("abnormal_state")
         session = self.engine.start_investigation(
             problem_statement="Unexpected state transition in g_worker_state",
@@ -150,9 +153,10 @@ class TestPhase211ScenariosAToJ(unittest.TestCase):
 
         self.assertEqual(session.state, STATE_COMPLETED)
         self.assertIsNotNone(conclusion)
-        self.assertTrue("STATE_TRANSITION" in conclusion.primary_finding or "ABNORMAL" in conclusion.primary_finding)
-        top_hyp = session.active_hypotheses[0]
-        self.assertEqual(top_hyp.status, "CONFIRMED")
+        trans = [c for c in session.checks if c.recipe_id == "RECIPE_STATE_TRANSITION_VIOLATIONS"]
+        self.assertTrue(trans)
+        self.assertNotEqual(trans[0].status, "FAIL")  # no confirmed transition violation from a value alone
+        self.assertTrue(any("g_worker_state" in str(c.actual_observations.get("variable_name") or "") for c in trans))
 
     def test_scenario_f_related_field_inconsistency(self):
         """Scenario F: Buffer length > capacity invariant violation confirmed."""

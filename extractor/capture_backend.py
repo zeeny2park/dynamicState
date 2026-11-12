@@ -5550,105 +5550,10 @@ class ProcfsCaptureBackend(RuntimeCaptureBackend):
         )
 
 
-class PtraceCaptureBackend(RuntimeCaptureBackend):
-    """Ptrace-assisted capture backend for register state and thread capture."""
-
-    @property
-    def name(self) -> str:
-        return "ptrace"
-
-    @property
-    def capabilities(self) -> Dict[str, Any]:
-        return {
-            "name": self.name,
-            "can_suspend_inferior": True,
-            "can_read_registers": True,
-            "can_read_memory": True,
-            "atomicity": "STOPPED",
-            "zero_stop_supported": False,
-        }
-
-    def is_available(self, pid: Optional[int] = None) -> bool:
-        if platform.system() != "Linux":
-            return False
-        return True
-
-    def capture(
-        self,
-        pid: int,
-        plan: Optional[CapturePlan] = None,
-        policy: Optional[CaptureSafetyPolicy] = None,
-        snapshot_id: Optional[str] = None,
-        observation_point: Optional[Dict[str, Any]] = None,
-        handle: Optional[ProcessTargetHandle] = None,
-        allow_stop: bool = False,
-        authorize_stop: bool = False,
-    ) -> RawRuntimeSnapshot:
-        backend = ProcessVmCaptureBackend()
-        snap = backend.capture(
-            pid, plan=plan, policy=policy, snapshot_id=snapshot_id, observation_point=observation_point,
-            handle=handle, allow_stop=allow_stop, authorize_stop=authorize_stop,
-        )
-        snap.capture_backend = self.name
-        snap.provenance["capture_backend"] = self.name
-        snap.provenance["capabilities"] = self.capabilities
-        snap.observation_metadata["capabilities"] = self.capabilities
-        return snap
-
-
-class GdbCaptureBackend(RuntimeCaptureBackend):
-    """GDB compatibility capture backend for when GDB is attached."""
-
-    def __init__(self, controller: Optional[Any] = None):
-        self.controller = controller
-
-    @property
-    def name(self) -> str:
-        return "gdb"
-
-    @property
-    def capabilities(self) -> Dict[str, Any]:
-        return {
-            "name": self.name,
-            "can_suspend_inferior": True,
-            "can_read_registers": True,
-            "can_read_memory": True,
-            "atomicity": "STOPPED",
-            "zero_stop_supported": False,
-        }
-
-    def is_available(self, pid: Optional[int] = None) -> bool:
-        return self.controller is not None and getattr(self.controller, "is_attached", False)
-
-    def capture(
-        self,
-        pid: int,
-        plan: Optional[CapturePlan] = None,
-        policy: Optional[CaptureSafetyPolicy] = None,
-        snapshot_id: Optional[str] = None,
-        observation_point: Optional[Dict[str, Any]] = None,
-        handle: Optional[ProcessTargetHandle] = None,
-        allow_stop: bool = False,
-        authorize_stop: bool = False,
-    ) -> RawRuntimeSnapshot:
-        backend = ProcessVmCaptureBackend()
-        snap = backend.capture(
-            pid, plan=plan, policy=policy, snapshot_id=snapshot_id, observation_point=observation_point,
-            handle=handle, allow_stop=allow_stop, authorize_stop=authorize_stop,
-        )
-        snap.capture_backend = self.name
-        snap.provenance["capture_backend"] = self.name
-        snap.provenance["capabilities"] = self.capabilities
-        snap.observation_metadata["capabilities"] = self.capabilities
-        return snap
-
-
 def get_default_capture_backend() -> RuntimeCaptureBackend:
     """Returns the fastest available capture backend for the current environment."""
     vm_backend = ProcessVmCaptureBackend()
     if vm_backend.is_available():
         return vm_backend
-    proc_backend = ProcfsCaptureBackend()
-    if proc_backend.is_available():
-        return proc_backend
-    return PtraceCaptureBackend()
+    # IMP-017: the "ptrace" and "gdb" backends were relabelled copies of ProcessVmCaptureBackend; removed.
+    return ProcfsCaptureBackend()

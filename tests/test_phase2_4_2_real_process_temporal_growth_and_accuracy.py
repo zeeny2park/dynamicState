@@ -295,7 +295,8 @@ class TestPhase242RealProcessTemporalGrowthAndAccuracy(unittest.TestCase):
         NOTE: This test verifies deterministic rule-conformance and logic predicates in DiagnosticRecipeRegistry.
         It does NOT measure real-process diagnostic accuracy, which requires compiled Linux binaries and adapter collection.
         """
-        all_recipe_ids = DiagnosticRecipeRegistry.list_recipe_ids()
+        from extractor.diagnostic_recipes import BUILTIN_RECIPE_IDS  # IMP-018: plugins add recipes
+        all_recipe_ids = list(BUILTIN_RECIPE_IDS)
         self.assertEqual(len(all_recipe_ids), 22)
 
         # Ground truth paired test vectors

@@ -196,10 +196,11 @@ class TestImp001CollectionFailureIsInconclusive(_ImpTestBase):
         self.assertTrue(rep["limitations"], "inconclusive report must carry the failure reason")
         if expect_limitation:
             self.assertTrue(any(expect_limitation in lim for lim in rep["limitations"]), rep["limitations"])
+        # IMP-017: report_json is the diagnose() result (the one report contract)
         rj = json.loads(rep["report_json"])
-        self.assertEqual(rj["final_diagnosis"], DIAG_INCONCLUSIVE)
-        self.assertNotEqual(rj["stop_reason"], "SUFFICIENT_EVIDENCE")
-        self.assertLessEqual(rj["confidence_score"], 0.2)
+        self.assertEqual(rj["verdict"], DIAG_INCONCLUSIVE)
+        self.assertEqual(rj["findings"], [])
+        self.assertLessEqual(rj["confidence"], 0.2)
         for item in rep["remediation_checklist"]:
             self.assertNotIn(self.HEALTHY_REMEDIATION, item)
         self.assertIn("N/A", re.search(r"\*\*Overall Status\*\*.*", rep["report_markdown"]).group(0))
@@ -207,8 +208,9 @@ class TestImp001CollectionFailureIsInconclusive(_ImpTestBase):
 
     def test_triage_exception_yields_inconclusive_report(self) -> None:
         wsm = WatchSessionManager(corpus_dir=self.corpus_dir)
+        # IMP-017: the export runs diagnose(); fail its collection stage instead of the retired auto-triage
         with mock.patch.object(
-            WatchSessionManager, "auto_triage_incident", side_effect=RuntimeError("simulated triage failure")
+            ExpertDiagnosticEngine, "start_investigation", side_effect=RuntimeError("simulated triage failure")
         ) as m_triage:
             rep = wsm.export_incident_report(
                 title="IMP-001 triage failure",
@@ -230,7 +232,7 @@ class TestImp001CollectionFailureIsInconclusive(_ImpTestBase):
         )
         self.assertEqual(hyp["verdict"], "CONFIRMED")
         with mock.patch.object(
-            WatchSessionManager, "auto_triage_incident", side_effect=RuntimeError("simulated triage failure")
+            ExpertDiagnosticEngine, "start_investigation", side_effect=RuntimeError("simulated triage failure")
         ):
             rep = wsm.export_incident_report(
                 title="IMP-001 triage failure with passing hypothesis",

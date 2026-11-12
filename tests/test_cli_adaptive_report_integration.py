@@ -371,7 +371,7 @@ class TestCliAdaptiveReportIntegration(unittest.TestCase):
         self.assertIn("PARTIALLY_CONFIRMED</div>", html_b)
 
     def test_12_export_report_health_no_issue_detected(self):
-        """export-report on healthy target without assertions reflects NO_ISSUE_DETECTED in HTML banner."""
+        """export-report on a healthy target without assertions reports no fault (verdict shown in the HTML)."""
         html_out = os.path.join(self.tmp_dir, "healthy_export.html")
         cmd = [
             sys.executable, "-m", "extractor.cli", "export-report",
@@ -384,11 +384,16 @@ class TestCliAdaptiveReportIntegration(unittest.TestCase):
         res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env)
         self.assertEqual(res.returncode, 0)
         data = json.loads(res.stdout)
-        self.assertEqual(data.get("overall_status"), "HEALTHY")
+        # IMP-017: the export runs diagnose(); its strict gate gives HEALTHY only when every required check
+        # passed, otherwise INCONCLUSIVE. A healthy target must never be reported as a fault.
+        self.assertIn(data.get("overall_status"), ("HEALTHY", "INCONCLUSIVE"))
+        self.assertEqual(data.get("verdict"), data.get("overall_status"))
+        self.assertEqual(data.get("findings"), [])
 
         with open(html_out, "r", encoding="utf-8") as f:
             html_content = f.read()
-        self.assertIn("NO_ISSUE_DETECTED</div>", html_content)
+        self.assertIn(data["verdict"], html_content)
+        self.assertNotIn("CONFIRMED_FAULT", html_content)
 
 
 if __name__ == "__main__":

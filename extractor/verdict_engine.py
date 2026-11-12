@@ -83,6 +83,15 @@ VALID_FINAL_DIAGNOSES = {
     DIAG_INCONCLUSIVE,
 }
 
+# Hypothesis-verification outcome (whether the user's assertions held) -> final-diagnosis label.  Explicit
+# boundary mapping (IMP-017): process-health verdicts are only the aggregator's ALL_OVERALL_VERDICTS.
+HYPOTHESIS_OUTCOME_TO_DIAGNOSIS = {
+    "CONFIRMED": DIAG_CONFIRMED,
+    "PARTIALLY_CONFIRMED": DIAG_PARTIALLY_CONFIRMED,
+    "REFUTED": DIAG_REFUTED,
+    "ABSTAIN": DIAG_INCONCLUSIVE,
+}
+
 # 5. Explicit Stopping Reasons (Phase 2.0 Section 7)
 STOP_SUFFICIENT_EVIDENCE = "SUFFICIENT_EVIDENCE"
 STOP_ALL_HYPOTHESES_REFUTED = "ALL_HYPOTHESES_REFUTED"
@@ -494,6 +503,61 @@ class VerdictEngine:
             inferences=list(inferences or []),
             unknowns=list(unknowns or []),
         )
+
+    @staticmethod
+    def summarize_hypothesis_verification(
+        hypothesis: str,
+        evaluations: List[AssertionEvaluation],
+        total: int,
+        passed: int,
+        failed: int,
+        abstained: int,
+        target_identity: Dict[str, Any],
+        latency_us: float,
+        bytes_read: int,
+    ) -> Dict[str, Any]:
+        """Roll the assertion results of ``runtime_verify_hypothesis`` up into its outcome and report.
+
+        The outcome (CONFIRMED / PARTIALLY_CONFIRMED / REFUTED / ABSTAIN) states whether the USER'S ASSERTIONS
+        held; it is not a process-health verdict (those come only from diagnose() in the aggregator vocabulary)
+        and is mapped explicitly onto the final-diagnosis labels by HYPOTHESIS_OUTCOME_TO_DIAGNOSIS.
+        """
+        if total > 0 and abstained == total:
+            outcome = "ABSTAIN"
+        elif total > 0 and passed == total:
+            outcome = "CONFIRMED"
+        elif passed > 0:
+            outcome = "PARTIALLY_CONFIRMED"
+        else:
+            outcome = "REFUTED"
+        diag_label = HYPOTHESIS_OUTCOME_TO_DIAGNOSIS[outcome]
+        pass_ratio = (passed / float(total)) if total > 0 else 0.0
+        dv = DiagnosticVerdict(
+            hypothesis=hypothesis,
+            final_diagnosis=diag_label,
+            hypothesis_state="VERIFIED" if outcome == "CONFIRMED" else outcome,
+            confidence_score=round(pass_ratio, 3),
+            total_assertions=total,
+            passed_count=passed,
+            failed_count=failed,
+            abstain_count=abstained,
+            assertion_evaluations=evaluations,
+            causal_attribution_verified=False,
+            attribution_basis=None,
+            provenance_class="LIVE_RUNTIME_CAPTURE",
+            target_identity=target_identity,
+            limitations=[],
+            stop_reason="NO_USEFUL_SAFE_OBSERVATION_REMAINS" if diag_label == DIAG_INCONCLUSIVE else "SUFFICIENT_EVIDENCE",
+            budget_usage={"metrics": {"target_stop_duration_ms": 0.0, "observation_latency_us": latency_us,
+                                      "bytes_read": bytes_read}},
+        )
+        return {
+            "outcome": outcome,
+            "final_diagnosis": diag_label,
+            "pass_ratio": pass_ratio,
+            "report_html": ZeroCdnReporter.render_html(dv, title=f"Hypothesis Verification: {hypothesis[:40]}"),
+            "report_json": ZeroCdnReporter.render_json(dv),
+        }
 
     @classmethod
     def synthesize_process_health_verdict(

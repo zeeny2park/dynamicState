@@ -25,7 +25,7 @@ from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Union
 import uuid
 
 from .diagnostic_recipes import (
-    _LOCK_OWNER_DEPENDENT_RECIPES,
+    recipe_requires_lock_owner,
     BASELINE_RECIPE_IDS,
     CATEGORY_ABNORMAL_VARIABLE_CHANGES,
     CATEGORY_DATA_RACE_INDICATORS,
@@ -1262,6 +1262,7 @@ class AdaptiveInvestigationSession:
             default_interval=self.observation_interval,
         )
         self.competing_hypotheses: List[CompetingHypothesis] = []
+        self.observation_selection_log: List[Dict[str, Any]] = []  # discriminating-selector decisions (replanning)
         self.invariant_evaluator = InvariantEvaluator()
         self.allocator_inspector: Optional[AllocatorInspector] = None
         self.structural_discovery = CppStructuralDiscovery()
@@ -2209,6 +2210,21 @@ class AdaptiveInvestigationSession:
 
             # Re-rank competing hypotheses to find next discriminating recipe
             comp_res = CompetingHypothesisManager.compare(self.competing_hypotheses)
+            # IMP-017: the discriminating-observation selector (ported from the retired adaptive engine) picks
+            # the cheapest budget-feasible recipe whose declared observations test the most unresolved
+            # hypotheses; the comparison's own recommendation is the fallback.
+            from .observation_selector import select_discriminating_recipe
+            _cand_ids = sorted({r for ch in self.competing_hypotheses for r in (ch.applicable_diagnostic_rules or [])})
+            _cands = [rc for rc in (self.recipe_registry.get_recipe(r) for r in _cand_ids) if rc is not None]
+            _done = {s.recipe_id for s in self.plan.steps[:self.plan.current_step_index + 1]}
+            sel_rid, sel_log, sel_why = select_discriminating_recipe(
+                self.competing_hypotheses, _cands, budget_tracker=self.budget_tracker, executed_recipe_ids=_done)
+            self.observation_selection_log.append({"after_recipe": recipe.recipe_id, "selected": sel_rid,
+                                                   "fallback": comp_res.recommended_discriminating_recipe,
+                                                   "rationale": sel_why, "candidates": sel_log})
+            if sel_rid:
+                comp_res.recommended_discriminating_recipe = sel_rid
+                comp_res.discrimination_rationale = sel_why
             if comp_res.recommended_discriminating_recipe:
                 next_rec_id = comp_res.recommended_discriminating_recipe
                 already_executed = any(s.recipe_id == next_rec_id for s in self.plan.steps[:self.plan.current_step_index + 1])
@@ -3795,6 +3811,7 @@ _SUBJECT_SKIP_KEYS = {"threads", "callstacks_info", "locks", "observation_window
 _SUBJECT_THREAD_ROW_KEYS = ("runaway_threads", "zombie_threads", "d_state_threads", "stalled_lock_waits")
 _SUBJECT_KEY_KIND = {
     "lock_name": "lock",
+    "fd_target": "resource",  # IMP-018: what a leaking file descriptor refers to (socket / pipe / path)
     "tid": "thread", "waiter_tid": "thread", "owner_tid": "thread", "held_by_tid": "thread",
     "waiter_name": "thread_name", "owner_name": "thread_name", "held_by_thread_name": "thread_name",
     "thread_name": "thread_name",
@@ -4258,6 +4275,9 @@ def _diagnose_run(
                 "subject_details": details,
                 "recipe_ids": rules,
                 "evidence_ids": list(rec.get("supporting_evidence_ids") or []),
+                # IMP-018: what the failing checks observed (e.g. the fd-count trend), verbatim
+                "observed": [c.technical_interpretation for c in session.checks
+                             if c.recipe_id in rules and c.status == CheckStatus.FAIL and c.technical_interpretation],
             })
 
         # A confirmed finding must name its subject (lock / thread / variable / function); one that names nothing
@@ -4301,7 +4321,7 @@ def _diagnose_run(
         lock_unsupported_checks = set()
         for c in session.checks:
             ob = c.actual_observations if isinstance(c.actual_observations, dict) else {}
-            if ob.get("lock_owner_unsupported") and c.recipe_id in _LOCK_OWNER_DEPENDENT_RECIPES:
+            if ob.get("lock_owner_unsupported") and recipe_requires_lock_owner(c.recipe_id):
                 lock_unsupported_checks.add(c.check_id)
                 why = ("not supported on this target: lock-owner decoding (%s) %s" % (
                     ob.get("lock_owner_status"), ob.get("lock_owner_status_reason") or "")).strip()

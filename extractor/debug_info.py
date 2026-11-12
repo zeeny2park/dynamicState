@@ -184,24 +184,3 @@ print('__DWARF_JSON_END__')
 
     def get_global_roots(self) -> List[Dict[str, Any]]:
         return [s for s in self._symbols if s.get("address") is not None]
-
-
-class NativeDwarfDebugInfoProvider(DebugInfoProvider):
-    """Interface placeholder for future native in-process DWARF parsing.
-
-    Designed for subsequent phases to eliminate the GDB batch CLI subprocess.
-    """
-
-    def load(self, module: RuntimeModule, debug_artifact_path: str) -> None:
-        raise NotImplementedError(
-            "NativeDwarfDebugInfoProvider is not yet implemented in Phase 5.2. Use GdbDebugInfoProvider."
-        )
-
-    def get_symbols(self) -> List[Dict[str, Any]]:
-        raise NotImplementedError()
-
-    def get_types(self) -> Dict[str, Any]:
-        raise NotImplementedError()
-
-    def get_global_roots(self) -> List[Dict[str, Any]]:
-        raise NotImplementedError()

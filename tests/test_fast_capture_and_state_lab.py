@@ -25,7 +25,6 @@ import unittest
 from extractor.capture_backend import (
     CaptureLatencyReport,
     CaptureSafetyPolicy,
-    GdbCaptureBackend,
     ProcessVmCaptureBackend,
 )
 from extractor.capture_plan import CaptureMode, CapturePlan, CapturePlanBuilder
@@ -455,29 +454,6 @@ class TestFastCaptureAndStateLab(unittest.TestCase):
             self.assertEqual(raw_snap.capture_backend, "process_vm_readv")
             self.assertGreater(raw_snap.provenance["captured_bytes"], 0)
             self.assertGreaterEqual(len(raw_snap.thread_metadata), 1)
-        finally:
-            proc.terminate()
-            proc.wait()
-
-    # --------------------------------------------------------------------------
-    # Test L: GDB backward compatibility
-    # --------------------------------------------------------------------------
-    def test_L_gdb_backward_compatibility(self):
-        proc = subprocess.Popen(
-            [sys.executable, "-c", "import time; [time.sleep(0.01) for _ in range(500)]"],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-        try:
-            time.sleep(0.05)
-            backend = GdbCaptureBackend()
-            plan = CapturePlanBuilder.build_full_plan(allow_stop=True)
-            raw_snap = backend.capture(proc.pid, plan)
-
-            self.assertEqual(raw_snap.pid, proc.pid)
-            self.assertEqual(raw_snap.capture_backend, "gdb")
-            self.assertIn("latency_report", raw_snap.provenance)
-            self.assertLess(raw_snap.latency_report.total_stop_time_ms, 10.0)
         finally:
             proc.terminate()
             proc.wait()

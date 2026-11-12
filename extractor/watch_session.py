@@ -33,7 +33,6 @@ from .dwarf_indexer import DwarfIndex, DwarfIndexer, DwarfVariable
 from .cpp_decoder import CppContainerDecoder
 from .allocator_inspector import detect_allocator, classify_pointer_integrity, PointerClassification, AllocatorType
 from .target_adapter import TargetExecutionAdapter, LocalTargetAdapter, RemoteSshTargetAdapter
-from .collection_impact import CollectionImpactMeter, impact_summary_for_report, impact_summary_lines
 from .cfi_unwinder import (
     UNWIND_SCAN as CFI_UNWIND_SCAN,
     decode_call_before,
@@ -57,23 +56,15 @@ from .target_abi import (
 )
 from .verdict_engine import (
     VerdictEngine,
-    ZeroCdnReporter,
     AssertionEvaluation,
-    DiagnosticVerdict,
     sanitize_report_output_path,
     ASSERTION_PASS,
     ASSERTION_FAIL,
     ASSERTION_ABSTAIN,
-    DIAG_CONFIRMED,
-    DIAG_SUSPECTED,
-    DIAG_PARTIALLY_CONFIRMED,
-    DIAG_REFUTED,
-    DIAG_NO_ISSUE_DETECTED,
-    DIAG_NO_ISSUE_DETECTED_WITHIN_SCOPE,
-    DIAG_INCONCLUSIVE,
 )
 from .evidence_adapter import EvidenceAdapter
 from .evidence_ledger import EvidenceLedger
+from .diagnostic_verdict_aggregator import VERDICT_INCONCLUSIVE, health_score_for, verdict_for_scan
 from .observation_budget import ObservationBudgetTracker, ObservationBudgetLimits
 
 
@@ -1619,7 +1610,7 @@ class WatchSessionManager:
             "last_observation_timestamp": last_obs_time,
             "watch_items_count": len(session.watch_items),
             "gaps_count": len(session.gaps),
-            "health": "HEALTHY" if session.status == "RUNNING" else "STOPPED",
+            "health": "ACTIVE" if session.status == "RUNNING" else "STOPPED",
             "capabilities": session.capabilities,
         }
 
@@ -5612,7 +5603,9 @@ class WatchSessionManager:
                 nl = var.name.lower()
                 tl = t_name.lower()
                 is_explicit = bool(lock_expressions and var.name in lock_expressions)
-                is_lock_like = any(k in nl or k in tl for k in ("mutex", "lock", "rwlock", "spinlock", "sem"))
+                # IMP-018: a lock is selected by its TYPE; the name is used only when the type name is unknown
+                is_lock_like = any(k in tl for k in ("mutex", "lock", "rwlock", "spinlock", "sem_t")) or (
+                    not tl.strip() and any(k in nl for k in ("mutex", "lock", "rwlock", "spinlock")))
                 if (is_explicit or is_lock_like) and var.name not in seen_lock_names:
                     seen_lock_names.add(var.name)
                     rt_addr = (m_bias + var.link_time_address) if m_dyn else var.link_time_address
@@ -6324,7 +6317,8 @@ class WatchSessionManager:
         elif not mappings or (exprs and observed_count == 0) or (read_errors and observed_count == 0):
             audit_health_status = "INCONCLUSIVE"
         else:
-            audit_health_status = "HEALTHY"
+            # an observation status of this scan, not a verdict (verdicts come from diagnose())
+            audit_health_status = "NO_ANOMALY_FOUND"
 
         latency_us = round((time.monotonic_ns() - t_start_ns) / 1000.0, 2)
         return {
@@ -7298,29 +7292,14 @@ class WatchSessionManager:
         except Exception as idx_exc:
             limitations.append(f"DWARF linked-list sweep failed: {type(idx_exc).__name__}: {idx_exc}")
 
-        # Compute overall status and health score (IMP-001: never report HEALTHY/100 when collection failed)
+        # IMP-017: this is a finding SCAN; it decides no verdict of its own.  Its status is the one verdict
+        # vocabulary via the aggregator's explicit scan mapping (a scan never certifies health; a collection
+        # failure without findings is INCONCLUSIVE; a scan finding is at most PROBABLE_FAULT).
         sev_Order = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3}
         findings.sort(key=lambda f: sev_Order.get(f.get("severity", "LOW"), 3))
-
-        crit_cnt = sum(1 for f in findings if f.get("severity") == "CRITICAL")
-        high_cnt = sum(1 for f in findings if f.get("severity") == "HIGH")
-        has_inconclusive_subcheck = (
-            audit_res.get("health_status") == "INCONCLUSIVE"
-            or callstack_res.get("status") == "INCONCLUSIVE"
-            or bool(limitations)
-        )
-        if crit_cnt > 0:
-            overall_status = "CRITICAL_ISSUES_FOUND"
-            score: Optional[int] = max(0, 100 - crit_cnt * 30 - high_cnt * 15 - (len(findings) - crit_cnt - high_cnt) * 5)
-        elif findings:
-            overall_status = "WARNINGS_FOUND"
-            score = max(0, 100 - crit_cnt * 30 - high_cnt * 15 - (len(findings) - crit_cnt - high_cnt) * 5)
-        elif has_inconclusive_subcheck:
-            overall_status = "INCONCLUSIVE"
-            score = None
-        else:
-            overall_status = "HEALTHY"
-            score = 100
+        overall_status = verdict_for_scan(findings)
+        score = health_score_for(overall_status, findings)
+        severity_counts = {k: sum(1 for f in findings if f.get("severity") == k) for k in sev_Order}
 
         latency_us = round((time.monotonic_ns() - t_start_ns) / 1000.0, 2)
         return {
@@ -7331,7 +7310,9 @@ class WatchSessionManager:
             "stop_duration_ms": 0.0,
             "evaluation_latency_us": latency_us,
             "overall_status": overall_status,
+            "verdict": overall_status,
             "health_score": score,
+            "severity_counts": severity_counts,
             "limitations": limitations,
             "findings_count": len(findings),
             "findings": findings,
@@ -7345,8 +7326,9 @@ class WatchSessionManager:
                 if findings
                 else (
                     f"Auto-Triage inconclusive due to collection failure(s): {'; '.join(limitations[:3])}"
-                    if overall_status == "INCONCLUSIVE"
-                    else f"Auto-Triage completed (Health Score: {score}/100, Status: HEALTHY). All audited symbols, pools, locks, and linked lists are clean."
+                    if limitations
+                    else "Auto-Triage found no issue in the audited symbols, pools, locks and linked lists. A scan does "
+                         "not certify the process healthy: run diagnose for a verdict."
                 )
             ),
         }
@@ -8454,82 +8436,52 @@ class WatchSessionManager:
             if f.get("recommended_action") and f["recommended_action"] not in remediation_steps:
                 remediation_steps.append(f["recommended_action"])
 
-        adaptive_summary = None
-        adaptive_error_details: List[Dict[str, Any]] = []
-        adaptive_verification_succeeded = False
+        # IMP-017: the verification step and the verdict are diagnose() (the retired adaptive engine used to run
+        # here).  The scans above are context; they decide nothing.
+        diagnosis: Optional[Dict[str, Any]] = None
+        diagnosis_error_details: List[Dict[str, Any]] = []
         exec_status = "COMPLETED"
         fail_category: Optional[str] = None
         stop_reason = "SUFFICIENT_EVIDENCE"
-        actual_obs_cnt = 0
-        succ_obs_cnt = 0
-        fail_obs_cnt = 0
-        abs_obs_cnt = 0
-        consumed_budget: Dict[str, Any] = {}
-
         try:
-            from .adaptive_engine import AdaptiveInvestigationEngine
-            adap_engine = AdaptiveInvestigationEngine(watch_manager=self)
-            adaptive_summary = adap_engine.investigate_process_health(
-                goal=symptom_query,
-                pid=pid,
-                companion_elf_path=companion_elf_path,
-                target_adapter=target_adapter,
-            )
-            exec_status = str(adaptive_summary.get("execution_status", adaptive_summary.get("lifecycle_state", "COMPLETED")))
-            fail_category = adaptive_summary.get("failure_category")
-            stop_reason = str(adaptive_summary.get("stop_reason", "SUFFICIENT_EVIDENCE"))
-            adaptive_error_details = list(adaptive_summary.get("diagnostic_error_details") or [])
-            actual_obs_cnt = int(adaptive_summary.get("actual_observation_count", 0))
-            succ_obs_cnt = int(adaptive_summary.get("successful_observation_count", 0))
-            fail_obs_cnt = int(adaptive_summary.get("failed_observation_count", 0))
-            abs_obs_cnt = int(adaptive_summary.get("abstained_observation_count", 0))
-            consumed_budget = dict(adaptive_summary.get("consumed_execution_budget") or adaptive_summary.get("budget_usage") or {})
-            adaptive_verification_succeeded = exec_status in ("COMPLETED", "INCONCLUSIVE") and adaptive_summary.get("success", False) is True
-        except Exception as adap_exc:
+            from . import expert_diagnostic_engine as _ede
+            diagnosis = _ede.diagnose(pid, debug_image=companion_elf_path or None, symptom=symptom_query,
+                                      adapter=target_adapter, corpus_dir=self.corpus_dir).to_dict()
+            if not diagnosis.get("checks_run"):
+                exec_status = "INCONCLUSIVE"
+            stop_reason = str(diagnosis.get("stop_reason") or stop_reason)
+        except Exception as diag_exc:  # noqa: BLE001 - never swallowed: reported and capped below
             exec_status = "FAILED"
-            fail_category = type(adap_exc).__name__
-            stop_reason = "ADAPTIVE_ENGINE_EXCEPTION"
-            adaptive_verification_succeeded = False
-            adaptive_error_details.append({
-                "stage": "adaptive_investigation_engine",
-                "error_type": type(adap_exc).__name__,
-                "error": str(adap_exc),
-            })
-            adaptive_summary = {
-                "success": False,
-                "execution_status": "FAILED",
-                "failure_category": fail_category,
-                "stop_reason": stop_reason,
-                "diagnostic_error_details": list(adaptive_error_details),
-                "error": str(adap_exc),
-            }
-            # Never represent fallback legacy findings as successful adaptive verification
+            fail_category = type(diag_exc).__name__
+            stop_reason = "DIAGNOSIS_EXCEPTION"
+            diagnosis_error_details.append({"stage": "diagnose", "error_type": type(diag_exc).__name__,
+                                            "error": str(diag_exc)})
             confidence_score = min(confidence_score, 0.35)
+        checks = list((diagnosis or {}).get("checks_run") or [])
+        actual_obs_cnt = len(checks)
+        succ_obs_cnt = sum(1 for c in checks if c.get("status") in ("PASS", "FAIL"))
+        fail_obs_cnt = sum(1 for c in checks if c.get("status") == "ERROR")
+        abs_obs_cnt = actual_obs_cnt - succ_obs_cnt - fail_obs_cnt
+        consumed_budget = dict((diagnosis or {}).get("collection_impact") or {})
 
         all_symp_limitations = list(triage.get("limitations") or []) + [
             f"{e.get('stage')}: {e.get('error')}" for e in legacy_sweep_errors
         ]
-        if (all_symp_limitations or triage.get("overall_status") == "INCONCLUSIVE") and not findings:
-            if exec_status not in ("FAILED", "INCONCLUSIVE"):
-                exec_status = "INCONCLUSIVE"
-            confidence_score = min(confidence_score, 0.20)
-        # Status/score are derived from the FINAL findings list (triage findings plus heap/hotspot findings
-        # added above), not copied from triage, so a finding added after triage can never be reported HEALTHY/100.
-        if findings:
-            crit_cnt = sum(1 for f in findings if f.get("severity") == "CRITICAL")
-            high_cnt = sum(1 for f in findings if f.get("severity") == "HIGH")
-            eff_health_score = max(0, 100 - crit_cnt * 30 - high_cnt * 15 - (len(findings) - crit_cnt - high_cnt) * 5)
-            eff_overall_status = "CRITICAL_ISSUES_FOUND" if crit_cnt > 0 else "WARNINGS_FOUND"
-        elif exec_status in ("INCONCLUSIVE", "FAILED") or triage.get("overall_status") == "INCONCLUSIVE" or all_symp_limitations:
-            eff_health_score = None
-            eff_overall_status = "INCONCLUSIVE"
+        if diagnosis is not None:
+            eff_overall_status = str(diagnosis.get("verdict") or VERDICT_INCONCLUSIVE)
+            confidence_score = float(diagnosis.get("confidence") or 0.0)
+            if diagnosis.get("findings"):
+                top = diagnosis["findings"][0]
+                hypothesis = (f"[{top.get('category')}] {top.get('description')}"
+                              + (f" (subjects: {', '.join(map(str, (top.get('subjects') or [])[:4]))})"
+                                 if top.get("subjects") else ""))
         else:
-            eff_health_score = triage.get("health_score")
-            eff_overall_status = triage.get("overall_status") or "INCONCLUSIVE"
-            if eff_health_score is None:
-                eff_overall_status = "INCONCLUSIVE"
-        if eff_overall_status == "INCONCLUSIVE" and stop_reason == "SUFFICIENT_EVIDENCE":
-            stop_reason = "NO_USEFUL_SAFE_OBSERVATION_REMAINS"
+            eff_overall_status = verdict_for_scan(findings)
+        if eff_overall_status == VERDICT_INCONCLUSIVE:
+            confidence_score = min(confidence_score, 0.20)
+            if stop_reason == "SUFFICIENT_EVIDENCE":
+                stop_reason = "NO_USEFUL_SAFE_OBSERVATION_REMAINS"
+        eff_health_score = health_score_for(eff_overall_status, (diagnosis or {}).get("findings") or findings)
 
         latency_us = round((time.monotonic_ns() - t_start_ns) / 1000.0, 2)
         return {
@@ -8544,16 +8496,17 @@ class WatchSessionManager:
             "failure_category": fail_category,
             "stop_reason": stop_reason,
             "limitations": all_symp_limitations,
-            "diagnostic_error_details": adaptive_error_details,
+            "verdict": eff_overall_status,
+            "diagnostic_error_details": diagnosis_error_details,
             "collection_error_details": list(legacy_sweep_errors),
             "actual_observation_count": actual_obs_cnt,
             "successful_observation_count": succ_obs_cnt,
             "failed_observation_count": fail_obs_cnt,
             "abstained_observation_count": abs_obs_cnt,
             "consumed_execution_budget": consumed_budget,
-            "adaptive_verification_succeeded": adaptive_verification_succeeded,
+            "diagnosis_succeeded": diagnosis is not None,
             "legacy_findings": list(findings),
-            "adaptive_investigation": adaptive_summary,
+            "diagnosis": diagnosis,
             "classified_symptom": classified_symptom,
             "root_cause_hypothesis": hypothesis,
             "confidence_score": confidence_score,
@@ -11935,20 +11888,6 @@ class WatchSessionManager:
                     pass
 
         total_cnt = len(assertion_results)
-        pass_ratio = (passed_count / float(total_cnt)) if total_cnt > 0 else 0.0
-        if total_cnt > 0 and abstain_count == total_cnt:
-            verdict = "ABSTAIN"
-            diag_label = DIAG_INCONCLUSIVE
-        elif total_cnt > 0 and passed_count == total_cnt:
-            verdict = "CONFIRMED"
-            diag_label = DIAG_CONFIRMED
-        elif passed_count > 0:
-            verdict = "PARTIALLY_CONFIRMED"
-            diag_label = DIAG_PARTIALLY_CONFIRMED
-        else:
-            verdict = "REFUTED"
-            diag_label = DIAG_REFUTED
-
         latency_us = round((time.monotonic_ns() - t_start_ns) / 1000.0, 2)
         ledger = EvidenceLedger()
         ev_adapter = EvidenceAdapter()
@@ -11958,33 +11897,14 @@ class WatchSessionManager:
             session_id=ledger.session_id,
         )
         ev_adapter.record_into_ledger(sym_recs, ledger)
-
-        dv = DiagnosticVerdict(
-            hypothesis=hypothesis,
-            final_diagnosis=diag_label,
-            hypothesis_state="VERIFIED" if verdict == "CONFIRMED" else verdict,
-            confidence_score=round(pass_ratio, 3),
-            total_assertions=total_cnt,
-            passed_count=passed_count,
-            failed_count=failed_count,
-            abstain_count=abstain_count,
-            assertion_evaluations=ae_list,
-            causal_attribution_verified=False,
-            attribution_basis=None,
-            provenance_class="LIVE_RUNTIME_CAPTURE",
-            target_identity={"pid": eff_pid, "companion_elf": eff_elf},
-            limitations=[],
-            stop_reason="NO_USEFUL_SAFE_OBSERVATION_REMAINS" if diag_label == DIAG_INCONCLUSIVE else "SUFFICIENT_EVIDENCE",
-            budget_usage={
-                "metrics": {
-                    "target_stop_duration_ms": 0.0,
-                    "observation_latency_us": latency_us,
-                    "bytes_read": len(lhs_exprs) * 64,
-                }
-            },
+        # IMP-017: the assertion-outcome rollup and its report live in verdict_engine (this class only collects)
+        hv = VerdictEngine.summarize_hypothesis_verification(
+            hypothesis=hypothesis, evaluations=ae_list, total=total_cnt, passed=passed_count, failed=failed_count,
+            abstained=abstain_count, target_identity={"pid": eff_pid, "companion_elf": eff_elf},
+            latency_us=latency_us, bytes_read=len(lhs_exprs) * 64,
         )
-        report_html = ZeroCdnReporter.render_html(dv, title=f"Hypothesis Verification: {hypothesis[:40]}")
-        report_json = ZeroCdnReporter.render_json(dv)
+        verdict, pass_ratio = hv["outcome"], hv["pass_ratio"]
+        report_html, report_json = hv["report_html"], hv["report_json"]
 
         saved_html_path = None
         save_html_error = None
@@ -12068,370 +11988,36 @@ class WatchSessionManager:
         ssh_proxy_jump: Optional[str] = None,
         adapter: Optional[TargetExecutionAdapter] = None,
     ) -> Dict[str, Any]:
-        """1-Call Comprehensive Incident Report & Source-Level Remediation Exporter (`runtime_export_incident_report`)."""
-        t_start_ns = time.monotonic_ns()
-        limitations: List[str] = []
-        if pid is not None and pid <= 0:
-            return {
-                "success": False,
-                "pid": pid,
-                "overall_status": "INCONCLUSIVE",
-                "verdict": DIAG_INCONCLUSIVE,
-                "health_score": None,
-                "limitations": [f"Invalid target PID {pid}."],
-                "error": f"Target process PID {pid} is invalid.",
-            }
+        """1-Call Incident Report exporter (`runtime_export_incident_report`, CLI `export-report`, web).
 
+        IMP-017: delegates to :func:`extractor.incident_report.export_incident_report`, which runs ``diagnose()``
+        once; this class no longer decides a verdict or builds the report.  Only the target context (bound PID /
+        ELF / SSH settings) is resolved here.
+        """
+        from .incident_report import export_incident_report as _export
+        pre: List[str] = []
+        build_id = None
+        if pid is not None and (isinstance(pid, bool) or pid <= 0):
+            return _export(title=title, pid=pid)
         try:
             ctx_info = self.resolve_target_context(
-                pid=pid,
-                companion_elf_path=companion_elf_path,
-                process_name=process_name,
-                remote_host=remote_host,
-                ssh_user=ssh_user,
-                ssh_port=ssh_port,
-                ssh_key=ssh_key,
-                ssh_proxy_jump=ssh_proxy_jump,
-                adapter=adapter,
+                pid=pid, companion_elf_path=companion_elf_path, process_name=process_name,
+                remote_host=remote_host, ssh_user=ssh_user, ssh_port=ssh_port, ssh_key=ssh_key,
+                ssh_proxy_jump=ssh_proxy_jump, adapter=adapter,
             )
-            eff_pid = ctx_info["pid"]
-            eff_elf = ctx_info["companion_elf_path"]
-        except Exception as ctx_exc:
-            eff_pid = pid or 0
-            eff_elf = companion_elf_path or ""
-            ctx_info = {
-                "pid": eff_pid,
-                "companion_elf_path": eff_elf,
-                "process_name": process_name or "target",
-                "build_id": None,
-                "remote_host": remote_host,
-                "ssh_user": ssh_user,
-                "ssh_port": ssh_port,
-                "ssh_key": ssh_key,
-                "ssh_proxy_jump": ssh_proxy_jump,
-            }
-            limitations.append(f"resolve_target_context failed: {type(ctx_exc).__name__}: {ctx_exc}")
-
-        if eff_pid and not remote_host and adapter is None and eff_pid != os.getpid() and not os.path.exists(f"/proc/{eff_pid}"):
-            limitations.append(f"Target process PID {eff_pid} does not exist or has exited (ESRCH).")
-
-        # IMP-020: bracket the whole collection with a target load snapshot (local, or via the given adapter)
-        impact_meter: Optional[CollectionImpactMeter] = None
-        impact_record = None
-        if not limitations and eff_pid and (adapter is not None or not remote_host):
-            try:
-                impact_meter = CollectionImpactMeter(adapter or LocalTargetAdapter(), eff_pid).start()
-            except Exception:  # noqa: BLE001 - measuring must never break the report
-                impact_meter = None
-
-        if not limitations:
-            try:
-                triage = self.auto_triage_incident(
-                    pid=eff_pid,
-                    companion_elf_path=eff_elf,
-                    remote_host=ctx_info.get("remote_host"),
-                    ssh_user=ctx_info.get("ssh_user"),
-                    ssh_port=ctx_info.get("ssh_port", 22),
-                    ssh_key=ctx_info.get("ssh_key"),
-                    ssh_proxy_jump=ctx_info.get("ssh_proxy_jump"),
-                    adapter=adapter,
-                )
-                for lim in (triage.get("limitations") or []):
-                    if lim not in limitations:
-                        limitations.append(lim)
-            except Exception as tr_exc:
-                err_str = f"auto_triage_incident failed: {type(tr_exc).__name__}: {tr_exc}"
-                limitations.append(err_str)
-                triage = {"overall_status": "INCONCLUSIVE", "health_score": None, "findings": [], "limitations": [err_str]}
-            try:
-                cs_locks = self.inspect_thread_callstacks_and_locks(
-                    pid=eff_pid,
-                    companion_elf_path=eff_elf,
-                    remote_host=ctx_info.get("remote_host"),
-                    ssh_user=ctx_info.get("ssh_user"),
-                    ssh_port=ctx_info.get("ssh_port", 22),
-                    ssh_key=ctx_info.get("ssh_key"),
-                    ssh_proxy_jump=ctx_info.get("ssh_proxy_jump"),
-                    adapter=adapter,
-                )
-                for lim in (cs_locks.get("limitations") or []):
-                    if lim not in limitations:
-                        limitations.append(lim)
-            except Exception as cs_exc:
-                err_str = f"inspect_thread_callstacks_and_locks failed: {type(cs_exc).__name__}: {cs_exc}"
-                limitations.append(err_str)
-                cs_locks = {"threads": [], "status": "INCONCLUSIVE", "limitations": [err_str]}
-        else:
-            triage = {"overall_status": "INCONCLUSIVE", "health_score": None, "findings": [], "limitations": list(limitations)}
-            cs_locks = {"threads": [], "status": "INCONCLUSIVE", "limitations": list(limitations)}
-
-        if impact_meter is not None:
-            try:
-                impact_record = impact_meter.finish(
-                    measured_stop_ms=round(
-                        float(triage.get("stop_duration_ms", 0.0) or 0.0) + float(cs_locks.get("stop_duration_ms", 0.0) or 0.0), 3
-                    )
-                )
-            except Exception:  # noqa: BLE001
-                impact_record = None
-
-        hyp_res: Optional[Dict[str, Any]] = None
-        if hypothesis or assertions:
-            try:
-                hyp_res = self.verify_runtime_hypothesis(
-                    hypothesis=hypothesis or "Runtime State Verification",
-                    assertions=assertions or [],
-                    pid=eff_pid,
-                    companion_elf_path=eff_elf,
-                    adapter=adapter,
-                )
-                if hyp_res.get("verdict") in (DIAG_INCONCLUSIVE, "ABSTAIN"):
-                    for ar in hyp_res.get("assertion_results", []):
-                        if ar.get("verdict") == "ABSTAIN" and ar.get("reason"):
-                            if ar["reason"] not in limitations:
-                                limitations.append(ar["reason"])
-            except Exception as hyp_exc:
-                limitations.append(f"verify_runtime_hypothesis failed: {type(hyp_exc).__name__}: {hyp_exc}")
-                hyp_res = None
-
-        findings = triage.get("findings") or []
-        overall_status = triage.get("overall_status") or ("INCONCLUSIVE" if limitations else "HEALTHY")
-        if (limitations or cs_locks.get("status") == "INCONCLUSIVE") and not findings and overall_status == "HEALTHY":
-            overall_status = "INCONCLUSIVE"
-        health_score = None if overall_status == "INCONCLUSIVE" else triage.get("health_score", 100)
-
-        measured_stop_ms = round(
-            float(triage.get("stop_duration_ms", 0.0) or 0.0) + float(cs_locks.get("stop_duration_ms", 0.0) or 0.0),
-            3,
+        except Exception as ctx_exc:  # noqa: BLE001
+            ctx_info = {"pid": pid, "companion_elf_path": companion_elf_path, "process_name": process_name,
+                        "remote_host": remote_host, "ssh_user": ssh_user, "ssh_port": ssh_port, "ssh_key": ssh_key,
+                        "ssh_proxy_jump": ssh_proxy_jump}
+            pre.append(f"resolve_target_context failed: {type(ctx_exc).__name__}: {ctx_exc}")
+        build_id = ctx_info.get("build_id")
+        return _export(
+            title=title, hypothesis=hypothesis, assertions=assertions, output_path=output_path,
+            report_html_path=report_html_path, template_path=template_path,
+            pid=ctx_info.get("pid") or pid, companion_elf_path=ctx_info.get("companion_elf_path") or companion_elf_path,
+            process_name=ctx_info.get("process_name"), build_id=build_id,
+            remote_host=ctx_info.get("remote_host"), ssh_user=ctx_info.get("ssh_user"),
+            ssh_port=ctx_info.get("ssh_port") or 22, ssh_key=ctx_info.get("ssh_key"),
+            ssh_proxy_jump=ctx_info.get("ssh_proxy_jump"), adapter=adapter, corpus_dir=self.corpus_dir,
+            hypothesis_verifier=self.verify_runtime_hypothesis, pre_limitations=pre,
         )
-        collection_mode = str(triage.get("collection_mode") or ("STOPPED" if measured_stop_ms > 0.0 else "ZERO_STOP"))
-        collection_impact = impact_summary_for_report(
-            impact_record, capture_mode=collection_mode, measured_stop_ms=measured_stop_ms,
-            bytes_read=impact_record.bytes_read if impact_record is not None else None,
-        )
-
-        remediation_checklist: List[str] = []
-        for f_item in findings:
-            act = f_item.get("recommended_action")
-            if act and act not in remediation_checklist:
-                remediation_checklist.append(act)
-        if not remediation_checklist:
-            if overall_status == "INCONCLUSIVE" or limitations:
-                remediation_checklist.append(
-                    f"Investigation inconclusive due to collection failure(s): {'; '.join(limitations)}. "
-                    "Verify target process accessibility and read permissions."
-                )
-            else:
-                remediation_checklist.append("All inspected memory pools, pointers, and locks are within expected parameters.")
-
-        now_iso = datetime.now(timezone.utc).isoformat()
-        status_line = (
-            f"- **Overall Status**: `{overall_status}` (Health Score: `{health_score}/100`)"
-            if health_score is not None
-            else f"- **Overall Status**: `{overall_status}` (Health Score: `N/A — Inconclusive`)"
-        )
-        md_lines = [
-            f"# {title}",
-            "",
-            "## 1. Target Identity & Zero-Stop Telemetry",
-            f"- **PID**: `{eff_pid}` (`{ctx_info.get('process_name') or 'target'}`)",
-            f"- **Companion ELF**: `{eff_elf}`",
-            f"- **Build ID**: `{ctx_info.get('build_id') or 'N/A'}`",
-            f"- **Collection Mode**: `{collection_mode}`",
-            f"- **Process Stop Duration**: `{measured_stop_ms:.2f}ms` (Measured)",
-            *impact_summary_lines(collection_impact),
-            status_line,
-            f"- **Generated At**: `{now_iso}`",
-            "",
-            "## 2. Root-Cause Findings",
-        ]
-        if findings:
-            md_lines.append("| Severity | Category | Title | Source Location | Recommended Action |")
-            md_lines.append("| :--- | :--- | :--- | :--- | :--- |")
-            for f_item in findings:
-                md_lines.append(
-                    f"| **{f_item.get('severity')}** | `{f_item.get('category')}` | {f_item.get('title')} | `{f_item.get('source_location') or '-'}` | {f_item.get('recommended_action') or '-'} |"
-                )
-        elif overall_status == "INCONCLUSIVE" or limitations:
-            md_lines.append("- Diagnostic inspection inconclusive: collection failed or target memory was unreadable.")
-            for lim in limitations:
-                md_lines.append(f"  - Limitation: `{lim}`")
-        else:
-            md_lines.append("- No critical memory corruption, deadlock, or pool exhaustion detected.")
-
-        if hyp_res is not None:
-            md_lines.extend([
-                "",
-                f"## 3. Hypothesis Verification (`{hyp_res['verdict']}` · Confidence `{round(hyp_res['confidence_score'] * 100, 1)}%`)",
-                f"- **Hypothesis**: {hyp_res['hypothesis']}",
-                "",
-                "| Assertion | Resolved Expression | Observed Value | Expected | Passed |",
-                "| :--- | :--- | :--- | :--- | :--- |",
-            ])
-            for ar in hyp_res.get("assertion_results", []):
-                md_lines.append(
-                    f"| `{ar['assertion']}` | `{ar['resolved_expression']}` | `{ar['observed_value']}` | `{ar['expected']}` | **{'PASS' if ar['passed'] else 'FAIL'}** |"
-                )
-
-        md_lines.extend([
-            "",
-            "## 4. Active Thread Callstacks Summary",
-        ])
-        for th in (cs_locks.get("threads") or [])[:12]:
-            frames = th.get("callstack") or []
-            top_f = frames[0]["function_name"] if frames else "unknown"
-            top_loc = frames[0].get("source_location") if frames else "-"
-            md_lines.append(f"- **TID {th['tid']} (`{th['name']}`)**: State `{th.get('state')}` · Top Frame `{top_f}()` (`{top_loc}`)")
-
-        md_lines.extend([
-            "",
-            "## 5. Remediation Checklist",
-        ])
-        for idx_r, r_step in enumerate(remediation_checklist, start=1):
-            md_lines.append(f"{idx_r}. [ ] {r_step}")
-
-        report_markdown = "\n".join(md_lines) + "\n"
-        latency_us = round((time.monotonic_ns() - t_start_ns) / 1000.0, 2)
-
-        # IMP-001: map the hypothesis verifier's assertion-level vocabulary onto the diagnosis vocabulary
-        # (ABSTAIN -> INCONCLUSIVE), and never let a passing hypothesis override a failed collection.
-        hyp_diag = None
-        if hyp_res:
-            hyp_diag = DIAG_INCONCLUSIVE if hyp_res.get("verdict") == "ABSTAIN" else hyp_res.get("verdict")
-        collection_failed = bool(limitations) or overall_status == "INCONCLUSIVE"
-        diag_verdict = (
-            hyp_diag
-            if hyp_diag
-            else (
-                DIAG_CONFIRMED
-                if any(f.get("severity") in ("CRITICAL", "HIGH") for f in findings)
-                else (
-                    DIAG_SUSPECTED
-                    if findings
-                    else (DIAG_INCONCLUSIVE if (overall_status == "INCONCLUSIVE" or limitations) else DIAG_NO_ISSUE_DETECTED)
-                )
-            )
-        )
-        if collection_failed and diag_verdict in (
-            DIAG_CONFIRMED, DIAG_PARTIALLY_CONFIRMED, DIAG_NO_ISSUE_DETECTED, DIAG_NO_ISSUE_DETECTED_WITHIN_SCOPE, DIAG_REFUTED,
-        ) and not any(f.get("severity") in ("CRITICAL", "HIGH") for f in findings):
-            diag_verdict = DIAG_INCONCLUSIVE
-        verdict_confidence = (
-            hyp_res["confidence_score"] if hyp_res else (0.2 if diag_verdict == DIAG_INCONCLUSIVE else (0.9 if not findings else 0.8))
-        )
-        if diag_verdict == DIAG_INCONCLUSIVE:
-            verdict_confidence = min(float(verdict_confidence or 0.0), 0.2)
-        dv = DiagnosticVerdict(
-            hypothesis=hypothesis or title,
-            final_diagnosis=diag_verdict,
-            hypothesis_state="SUPPORTED" if diag_verdict in (DIAG_CONFIRMED, DIAG_NO_ISSUE_DETECTED) else "INCONCLUSIVE",
-            confidence_score=verdict_confidence,
-            total_assertions=hyp_res["total_assertions"] if hyp_res else 0,
-            passed_count=hyp_res["passed_assertions"] if hyp_res else 0,
-            failed_count=hyp_res["failed_assertions"] if hyp_res else 0,
-            abstain_count=hyp_res.get("abstain_assertions", 0) if hyp_res else 0,
-            assertion_evaluations=[],
-            causal_attribution_verified=False,
-            attribution_basis=None,
-            provenance_class="LIVE_RUNTIME_CAPTURE",
-            target_identity={"pid": eff_pid, "companion_elf": eff_elf},
-            limitations=list(limitations),
-            collection_limitations=list(limitations),
-            stop_reason=(
-                "REPEATED_OBSERVATION_FAILURE" if (diag_verdict == DIAG_INCONCLUSIVE and collection_failed)
-                else ("NO_USEFUL_SAFE_OBSERVATION_REMAINS" if diag_verdict == DIAG_INCONCLUSIVE else "SUFFICIENT_EVIDENCE")
-            ),
-            stop_explanation=(
-                f"Collection failed: {'; '.join(limitations[:3])}" if (diag_verdict == DIAG_INCONCLUSIVE and limitations) else ""
-            ),
-            budget_usage={
-                "metrics": {
-                    "target_stop_duration_ms": measured_stop_ms,
-                    "observation_latency_us": latency_us,
-                    "bytes_read": 0 if overall_status == "INCONCLUSIVE" else 4096,
-                }
-            },
-        )
-        if template_path and os.path.exists(template_path):
-            with open(template_path, "r", encoding="utf-8") as tf:
-                tpl_str = tf.read()
-            report_html = tpl_str.replace("{{VERDICT}}", diag_verdict)
-        else:
-            report_html = ZeroCdnReporter.render_html(dv, title=title, remediation_checklist=remediation_checklist)
-        report_json = ZeroCdnReporter.render_json(dv)
-
-        saved_path = None
-        save_error = None
-        if output_path and str(output_path).strip():
-            san_out, out_err = sanitize_report_output_path(output_path, file_type="incident report")
-            if out_err or not san_out:
-                save_error = out_err or f"Refusing to write incident report to protected system path: {output_path}"
-                print(f"WARNING: {save_error}", file=sys.stderr)
-            else:
-                try:
-                    os.makedirs(os.path.dirname(san_out), exist_ok=True)
-                    with open(san_out, "w", encoding="utf-8") as rf:
-                        rf.write(report_markdown)
-                    saved_path = san_out
-                except OSError as os_err:
-                    save_error = f"Failed to write report to {san_out}: {os_err}"
-
-        saved_html_path = None
-        save_html_error = None
-        if report_html_path and str(report_html_path).strip():
-            if saved_path and os.path.abspath(str(report_html_path).strip()) == saved_path:
-                save_html_error = f"Refusing to overwrite primary output path '{saved_path}' with HTML report."
-                print(f"WARNING: {save_html_error}", file=sys.stderr)
-            else:
-                san_html, html_err = sanitize_report_output_path(report_html_path, file_type="HTML report")
-                if html_err or not san_html:
-                    save_html_error = html_err or f"Refusing to write HTML report to protected system path: {report_html_path}"
-                    print(f"WARNING: {save_html_error}", file=sys.stderr)
-                else:
-                    try:
-                        os.makedirs(os.path.dirname(san_html), exist_ok=True)
-                        with open(san_html, "w", encoding="utf-8") as hf:
-                            hf.write(report_html)
-                        saved_html_path = san_html
-                    except OSError as os_err:
-                        save_html_error = f"Failed to write HTML report to {san_html}: {os_err}"
-
-        return {
-            "success": True,
-            "pid": eff_pid,
-            "companion_elf": eff_elf,
-            "build_id": ctx_info.get("build_id"),
-            "collection_mode": collection_mode,
-            "stop_duration_ms": measured_stop_ms,
-            "target_stop_duration_ms": measured_stop_ms,
-            "collection_impact": collection_impact,
-            "collection_impact_record": impact_record.to_dict() if impact_record is not None else None,
-            "report_latency_us": latency_us,
-            "observation_latency_us": latency_us,
-            "title": title,
-            "verdict": diag_verdict,
-            "overall_status": overall_status,
-            "health_score": health_score,
-            "limitations": list(limitations),
-            "findings_count": len(findings),
-            "findings": findings,
-            "hypothesis_verification": hyp_res,
-            "remediation_checklist": remediation_checklist,
-            "report_markdown": report_markdown,
-            "report_html": report_html,
-            "report_json": report_json,
-            "saved_path": saved_path,
-            "save_error": save_error,
-            "saved_html_path": saved_html_path,
-            "save_html_error": save_html_error,
-            "llm_next_step_hint": (
-                f"Incident report for PID {eff_pid} is INCONCLUSIVE ({len(limitations)} limitation(s): {'; '.join(limitations[:2])})"
-                + (f" and saved to {saved_path}." if saved_path else ".")
-                if overall_status == "INCONCLUSIVE"
-                else (
-                    f"Generated incident report for PID {eff_pid} (Health Score: "
-                    f"{(str(health_score) + '/100') if health_score is not None else 'N/A'}, "
-                    f"{len(findings)} finding(s))" + (f" and saved to {saved_path}." if saved_path else ".")
-                )
-            ),
-        }

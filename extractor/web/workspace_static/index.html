@@ -1773,7 +1773,7 @@
             <div class="flex items-center justify-between bg-slate-50 border border-slate-200 rounded-xl p-3 text-xs mono">
               <span>감사 완료 심볼: <strong>${d.checked_symbols_count || 0}개</strong></span>
               <span class="px-2.5 py-0.5 rounded-full font-bold ${anomalies.length > 0 ? "bg-rose-100 text-rose-800 border border-rose-200" : "bg-emerald-100 text-emerald-800 border border-emerald-200"}">
-                ${escapeHtml(d.health_status || "HEALTHY")} (이상 ${anomalies.length}건)
+                ${escapeHtml(d.health_status || "NO_ANOMALY_FOUND")} (이상 ${anomalies.length}건)
               </span>
             </div>
             ${anomalies.map(a => `

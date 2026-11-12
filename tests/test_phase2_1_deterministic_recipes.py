@@ -12,6 +12,7 @@ Tests positive, negative, ambiguous, and insufficient-evidence criteria.
 import unittest
 
 from extractor.diagnostic_recipes import (
+    BUILTIN_RECIPE_IDS,
     DOMAIN_ABNORMAL_STATE,
     DOMAIN_CONCURRENCY,
     DOMAIN_MEMORY_GROWTH,
@@ -53,7 +54,8 @@ class TestPhase21DeterministicRecipes(unittest.TestCase):
 
     def test_all_22_recipes_registered_and_metadata_complete(self):
         """Verifies that all 22 deterministic recipes exist and contain mandatory fields."""
-        recipes = self.registry.list_recipes()
+        # IMP-018: the 22 built-in recipes (recipe definition files under extractor/recipe_plugins add more)
+        recipes = [self.registry.get_recipe(r) for r in BUILTIN_RECIPE_IDS]
         self.assertEqual(len(recipes), 22, f"Expected 22 recipes, found {len(recipes)}")
 
         for r in recipes:

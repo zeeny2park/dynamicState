@@ -298,7 +298,8 @@ class TestPhase241RecipeAccuracyAndEvidencePath(unittest.TestCase):
 
     def test_04_systematic_accuracy_evaluation_all_22_recipes(self):
         """Audit all 22 registered recipes, documenting prerequisites, validation category, and accuracy."""
-        all_recipes = DiagnosticRecipeRegistry.list_recipes()
+        from extractor.diagnostic_recipes import BUILTIN_RECIPE_IDS
+        all_recipes = [DiagnosticRecipeRegistry.get_recipe(r) for r in BUILTIN_RECIPE_IDS]  # IMP-018: plugins add recipes
         self.assertEqual(len(all_recipes), 22)
 
         # Classification containers

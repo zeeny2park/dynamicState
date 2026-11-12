@@ -19,6 +19,7 @@ import time
 import unittest
 
 from extractor.diagnostic_recipes import (
+    BUILTIN_RECIPE_IDS,
     DiagnosticRecipeRegistry,
     RECIPE_STATUS_SUPPORTED,
     RECIPE_STATUS_CONTRADICTED,
@@ -124,7 +125,7 @@ class TestPhase23C1All22RecipesAccuracy(unittest.TestCase):
 
     def test_enumerate_all_22_recipes_complete_registry(self):
         """Registry contains exactly the 22 canonical recipes with complete specifications."""
-        recipe_ids = DiagnosticRecipeRegistry.list_recipe_ids()
+        recipe_ids = list(BUILTIN_RECIPE_IDS)
         self.assertEqual(len(recipe_ids), 22)
         for rid in recipe_ids:
             r = DiagnosticRecipeRegistry.get_recipe(rid)
@@ -162,7 +163,7 @@ class TestPhase23C1All22RecipesAccuracy(unittest.TestCase):
             "RECIPE_SHARED_STATE_INCONSISTENCIES": {"shared_invariant_violated": True},
         }
 
-        for rid in registry.list_recipe_ids():
+        for rid in list(BUILTIN_RECIPE_IDS):
             with self.subTest(recipe_id=rid):
                 obs = defect_observations.get(rid, {"positive_evidence_found": True})
                 res = registry.evaluate_recipe(rid, obs, prerequisites_met=True)
@@ -203,7 +204,7 @@ class TestPhase23C1All22RecipesAccuracy(unittest.TestCase):
             "RECIPE_SHARED_STATE_INCONSISTENCIES": {"shared_invariant_intact": True},
         }
 
-        for rid in registry.list_recipe_ids():
+        for rid in list(BUILTIN_RECIPE_IDS):
             with self.subTest(recipe_id=rid):
                 obs = healthy_observations.get(rid, {"negative_evidence_found": True})
                 res = registry.evaluate_recipe(rid, obs, prerequisites_met=True)
@@ -219,7 +220,7 @@ class TestPhase23C1All22RecipesAccuracy(unittest.TestCase):
         """When observation data is empty, recipe returns INSUFFICIENT_EVIDENCE or NOT_APPLICABLE."""
         registry = DiagnosticRecipeRegistry()
 
-        for rid in registry.list_recipe_ids():
+        for rid in list(BUILTIN_RECIPE_IDS):
             with self.subTest(recipe_id=rid):
                 res = registry.evaluate_recipe(rid, {}, prerequisites_met=True)
                 self.assertIn(
@@ -233,7 +234,7 @@ class TestPhase23C1All22RecipesAccuracy(unittest.TestCase):
         """When prerequisites are not met, recipe explicitly returns INSUFFICIENT_EVIDENCE with missing prerequisites."""
         registry = DiagnosticRecipeRegistry()
 
-        for rid in registry.list_recipe_ids():
+        for rid in list(BUILTIN_RECIPE_IDS):
             with self.subTest(recipe_id=rid):
                 res = registry.evaluate_recipe(rid, {"prerequisites_missing": True}, prerequisites_met=False)
                 self.assertEqual(res.status, RECIPE_STATUS_INSUFFICIENT_EVIDENCE)

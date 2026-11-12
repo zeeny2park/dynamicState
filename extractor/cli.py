@@ -110,7 +110,7 @@ def main():
                              help="Optional output path to save semantic state JSON")
 
     # 8. investigate
-    inv_parser = subparsers.add_parser("investigate", help="Execute an evidence-first investigation workflow")
+    inv_parser = subparsers.add_parser("investigate", help="Investigate a live process (-p: runs diagnose with the goal as symptom) or an offline snapshot")
     inv_parser.add_argument("--goal", type=str, required=True, help="Natural language investigation goal")
     inv_parser.add_argument("--snapshot", type=str, default=None, help="Snapshot ID or path")
     inv_parser.add_argument("--memory-snapshot", type=str, default=None, help="Path to raw memory snapshot directory")
@@ -885,6 +885,66 @@ def main():
             print(f"\nSaved semantic state to {out_p}")
 
         sys.exit(0 if status in ("COMPLETE", "PARTIAL") else 1)
+
+    elif args.command == "investigate" and args.pid is not None and not args.snapshot and not args.memory_snapshot:
+        # IMP-017: a live-process investigation is the one diagnosis entry point, diagnose(); the goal is the
+        # symptom.  (Offline snapshots below still use the snapshot investigation manager: diagnose needs a live
+        # process.)  The investigation is read-only, so --authorize-target is not needed and is ignored.
+        from .expert_diagnostic_engine import ExpertDiagnosticEngine, diagnose
+        from .human_report import render_human_report
+        from .diagnostic_report import DiagnosticReport
+        res = diagnose(args.pid, debug_image=args.debug_image, symptom=args.goal, include_report=True,
+                       engine=ExpertDiagnosticEngine(corpus_dir=os.path.abspath(args.corpus))).to_dict()
+        full = res.pop("report", None)
+        summary = render_human_report(res, full)
+        report = dict(res)
+        report.update({
+            "goal": args.goal,
+            "status": "COMPLETED" if res.get("checks_run") else "FAILED",
+            "human_summary": summary,
+        })
+        if isinstance(full, dict):
+            try:
+                report["report_html"] = DiagnosticReport.from_dict(full).to_html().replace(
+                    "<body>", "<body>\n<h1>" + __import__("html").escape(args.goal) + "</h1>", 1)
+            except Exception as exc:  # noqa: BLE001
+                print(f"WARNING: HTML report could not be rendered: {exc}", file=sys.stderr)
+        sanitized_out = None
+        if args.output:
+            sanitized_out, out_err = sanitize_report_output_path(args.output, file_type="investigation JSON report")
+            if out_err:
+                print(f"WARNING: {out_err}", file=sys.stderr)
+            elif sanitized_out:
+                try:
+                    os.makedirs(os.path.dirname(sanitized_out), exist_ok=True)
+                    with open(sanitized_out, "w", encoding="utf-8") as f:
+                        json.dump(report, f, indent=2, default=str)
+                    if not args.json:
+                        print(f"Investigation report saved to {sanitized_out}")
+                except OSError as os_err:
+                    print(f"WARNING: Failed to write report to {sanitized_out}: {os_err}", file=sys.stderr)
+        if getattr(args, "report_html_path", None) and report.get("report_html"):
+            sanitized_html, html_err = sanitize_report_output_path(args.report_html_path, file_type="HTML report")
+            if html_err:
+                print(f"WARNING: {html_err}", file=sys.stderr)
+            elif sanitized_html:
+                if sanitized_out and os.path.realpath(sanitized_out) == os.path.realpath(sanitized_html):
+                    print(f"WARNING: Refusing to overwrite JSON output path '{sanitized_out}' with HTML report. "
+                          "Specify distinct paths.", file=sys.stderr)
+                else:
+                    try:
+                        os.makedirs(os.path.dirname(sanitized_html), exist_ok=True)
+                        with open(sanitized_html, "w", encoding="utf-8") as f:
+                            f.write(report["report_html"])
+                        if not args.json:
+                            print(f"HTML investigation report saved to {sanitized_html}")
+                    except OSError as os_err:
+                        print(f"WARNING: Failed to write HTML report to {sanitized_html}: {os_err}", file=sys.stderr)
+        if args.json:
+            print(json.dumps(report, indent=2, ensure_ascii=False, default=str))
+        else:
+            print(summary)
+        sys.exit(0 if report["status"] == "COMPLETED" else 1)
 
     elif args.command == "investigate":
         mgr = InvestigationManager(corpus_dir=args.corpus)

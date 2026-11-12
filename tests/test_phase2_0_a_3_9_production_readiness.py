@@ -26,7 +26,6 @@ import time
 import unittest
 from unittest.mock import patch
 
-from extractor.adaptive_engine import AdaptiveInvestigationEngine
 from extractor.agent_runtime import AgentRuntime
 from extractor.capture_backend import (
     CaptureReceipt,
@@ -287,15 +286,15 @@ class TestPhase20A39ProductionReadiness(unittest.TestCase):
                 self.assertEqual(s_rep.completeness, "COMPLETE")
 
             # Scenario 12: Concurrent investigation requests across 4 worker threads
-            mgr = InvestigationManager(corpus_dir=os.path.join(self.tmp_dir, "corpus_conc"))
+            # IMP-017: the concurrent investigations go through the one entry point, diagnose() (the adaptive
+            # engine behind InvestigationManager.investigate_process_health was retired)
+            from extractor.expert_diagnostic_engine import ExpertDiagnosticEngine, diagnose
+            conc_engine = ExpertDiagnosticEngine(corpus_dir=os.path.join(self.tmp_dir, "corpus_conc"))
             conc_results = []
             def _worker(idx: int):
-                r = mgr.investigate_process_health(
-                    goal=f"Concurrent health check {idx}",
-                    pid=proc.pid,
-                    debug_image=self.debug_elf,
-                )
-                conc_results.append(r.get("success", False))
+                r = diagnose(proc.pid, debug_image=self.debug_elf, symptom=f"Concurrent health check {idx}",
+                             engine=conc_engine)
+                conc_results.append(bool(r.checks_run) and r.investigation_id is not None)
             threads = [threading.Thread(target=_worker, args=(i,)) for i in range(4)]
             for t in threads:
                 t.start()
@@ -393,13 +392,16 @@ class TestPhase20A39ProductionReadiness(unittest.TestCase):
                 "consumed_execution_budget",
                 "evaluation_latency_us",
                 "confidence_score",
-                "adaptive_investigation",
+                "diagnosis",
             }
             self.assertTrue(required_obs_fields.issubset(res.keys()))
-            adap = res["adaptive_investigation"]
-            self.assertIn("confidence_rationale", adap)
-            self.assertIn("evidence_coverage", adap)
-            self.assertIn("uninspected_scope", adap)
+            # IMP-017: the verification step is diagnose(); its result carries the confidence basis, the
+            # checks that ran (coverage) and what could not be examined (uninspected scope)
+            diag = res["diagnosis"]
+            self.assertIn("confidence_basis", diag)
+            self.assertIn("checks_run", diag)
+            self.assertIn("not_covered", diag)
+            self.assertEqual(res["overall_status"], diag["verdict"])
         finally:
             proc.kill()
             proc.wait()

@@ -153,7 +153,9 @@ int main() {
         res = json.loads(raw_out)
         self.assertTrue(res["success"], f"Failed: {res}")
         self.assertEqual(res["stop_duration_ms"], 0.0)
-        self.assertEqual(res["overall_status"], "CRITICAL_ISSUES_FOUND")
+        # IMP-017: the scan's status is the one verdict vocabulary (a scan finding is at most PROBABLE_FAULT)
+        self.assertEqual(res["overall_status"], "PROBABLE_FAULT")
+        self.assertGreater(res["severity_counts"]["CRITICAL"], 0)
 
         categories = {f["category"] for f in res["findings"]}
         self.assertIn("MEMORY_CORRUPTION", categories)
