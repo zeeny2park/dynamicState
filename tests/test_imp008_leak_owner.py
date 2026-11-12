@@ -234,7 +234,15 @@ class TestImp008LeakOwner(unittest.TestCase):
                      for c in r["report"]["section_d_detailed_inspection_results"]["checks"]
                      if c["recipe_id"] == "RECIPE_PROCESS_MEMORY_GROWTH")
         self.assertGreaterEqual(trend["samples"], 3)
-        self.assertLess(r["collection_impact"]["bytes_read"], 256 * 1024)
+        # IMP-009: the always-run heap-integrity check makes ONE bounded walk of a small heap by design; the
+        # envelope of everything else (no leak walks) is unchanged
+        mi = next((c.get("actual_observations") or {}).get("memory_integrity")
+                  for c in r["report"]["section_d_detailed_inspection_results"]["checks"]
+                  if c["recipe_id"] == "RECIPE_HEAP_METADATA_CORRUPTION")
+        self.assertEqual(mi["mode"], "baseline")
+        mi_bytes = int(mi["cost"]["bytes_read"])
+        self.assertLess(mi_bytes, 4 * 1024 * 1024)
+        self.assertLess(r["collection_impact"]["bytes_read"] - mi_bytes, 256 * 1024)
         # previous envelope ~1.1-1.3 s on this class of host; generous bound for loaded CI machines
         self.assertLess(r["duration_s"], 3.0)
         self.assertEqual(self._leak_findings(r), [])

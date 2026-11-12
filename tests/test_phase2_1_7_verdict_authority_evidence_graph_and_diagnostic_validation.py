@@ -690,8 +690,11 @@ class TestPhase217VerdictAuthorityAndEvidenceGraph(unittest.TestCase):
 
         report = session.build_diagnostic_report()
         excluded = report.section_c_diagnostic_strategy.recipes_excluded
-        # Total recipes in registry is 22; plan schedules ~4-6. Excluded should be > 10, not truncated to 5!
-        self.assertGreater(len(excluded), 10)
+        # Total recipes in registry is 22; every recipe not in the plan must be listed (not truncated to 5).
+        # (IMP-009 added a sixth always-planned baseline check, so the plan for this symptom is one larger.)
+        planned = {s.recipe_id for s in session.plan.steps}
+        self.assertEqual(len(excluded), 22 - len(planned))
+        self.assertGreater(len(excluded), 5)
         for item in excluded:
             self.assertIn("recipe_id", item)
             self.assertIn("reason_excluded", item)

@@ -113,6 +113,9 @@ BASELINE_RECIPE_IDS = (
     "RECIPE_POTENTIAL_DEADLOCK_PATTERNS",
     # ~0.1 s: /proc/<pid>/status + statm RSS read (trend comes from the session's own samples).
     "RECIPE_PROCESS_MEMORY_GROWTH",
+    # IMP-009, ~0.05-0.1 s on a small heap: one bounded heap-integrity walk (heap <= 8 MiB, else "not checked"),
+    # global array adjacency (DWARF), stack margins (/proc).  Re-uses the leak investigation's walk when it ran.
+    "RECIPE_HEAP_METADATA_CORRUPTION",
 )
 
 
@@ -1132,12 +1135,128 @@ def _evaluate_leak_investigation(recipe: "DiagnosticRecipe", data: Dict[str, Any
     )
 
 
+_NAME_HINT_CAP_REASON = ("the only corruption evidence is a variable whose name suggests a canary / magic / guard "
+                         "holding a poison constant: a hint, not proof of damage (IMP-009)")
+
+
+def _name_hint_only(data: Dict[str, Any]) -> bool:
+    """The legacy corruption signal comes only from the variable-name / poison-value heuristic of the provider
+    (``magic_corrupted`` / ``chunk_state == CORRUPTED``), with no observed fault context."""
+    hint = bool(data.get("magic_corrupted")) or data.get("chunk_state") == "CORRUPTED" \
+        or data.get("canary_corrupted") is True
+    other = bool(data.get("fault_context") or data.get("is_fault_address") or data.get("dereferenced")
+                 or data.get("object_valid") is False
+                 or data.get("violation_type") not in (None, "NONE", "NONE_VALID_VMA"))
+    return hint and not other
+
+
+def _cap_name_hint(res: "RecipeEvaluationResult", data: Dict[str, Any]) -> "RecipeEvaluationResult":
+    if res.status == RECIPE_STATUS_SUPPORTED and _name_hint_only(data):
+        res.details = dict(res.details or {}, certainty_cap="PROBABLE", certainty_cap_reason=_NAME_HINT_CAP_REASON,
+                           corruption_hint_only=True)
+    return res
+
+
+def _evaluate_integrity_investigation(recipe: "DiagnosticRecipe", data: Dict[str, Any]) -> Optional[RecipeEvaluationResult]:
+    """IMP-009: RECIPE_HEAP_METADATA_CORRUPTION from the memory-integrity investigation (extractor.memory_integrity).
+
+    * a stable damaged heap header whose previous chunk has a named owner, with an impossible header value or a
+      content pattern continuing the buffer -> SUPPORTED, corruption confirmed (MEMORY_CORRUPTION);
+    * other stable heap damage (owner unknown, free-list pointers, links), undersized-for-type blocks and global
+      adjacent-overwrite candidates -> SUPPORTED capped at probable;
+    * stack margin below the threshold only -> SUPPORTED, RESOURCE_EXHAUSTION, capped at probable, WARNING
+      severity (an SP at / inside the guard region is STACK_CORRUPTION);
+    * the heap was checked and nothing is damaged (the name/poison hint alone does not count) -> CONTRADICTED;
+    * heap not checked (cap, unsupported, budget) and nothing else found -> INSUFFICIENT_EVIDENCE.
+    None when there is no integrity record (legacy rules)."""
+    mi = data.get("memory_integrity")
+    if not isinstance(mi, dict):
+        return None
+    rid = recipe.recipe_id
+    heap = mi.get("heap") or {}
+    defects = list(heap.get("defects") or [])
+    undersized = list(heap.get("undersized_allocations") or [])
+    glob = list((mi.get("globals") or {}).get("candidates") or [])
+    stack_w = list((mi.get("stacks") or {}).get("warnings") or [])
+    lims = list(mi.get("limitations") or [])
+    hint = bool(data.get("magic_corrupted"))
+    facts = [d["description"] for d in defects] + [u["description"] for u in undersized] + \
+        [g["description"] for g in glob]
+    stack_facts = [w["description"] for w in stack_w]
+    confirmed = any(d.get("status") == "confirmed" for d in defects)
+    base = {"memory_integrity_mode": mi.get("mode"), "heap_check_status": heap.get("status"), "limitations": lims}
+    if facts:
+        d = dict(base, finding_category=CATEGORY_MEMORY_CORRUPTION, corruption_confirmed=confirmed,
+                 finding_summary="; ".join(facts[:4]))
+        if not confirmed:
+            why = []
+            if defects:
+                why.append("heap metadata damage whose overflowing block has no named owner, or free-list / link "
+                           "damage (overflow or use-after-free write)")
+            if undersized:
+                why.append("a block smaller than the type of the pointer that reaches it")
+            if glob:
+                why.append("a global with an invalid value right after a full array (adjacent-overwrite candidate)")
+            d["certainty_cap"] = "PROBABLE"
+            d["certainty_cap_reason"] = "memory damage observed but not attributable with certainty: " + "; ".join(why)
+        if hint:
+            facts.append("additional hint: %s holds poison value %s" % (data.get("corruption_hint_variable"),
+                                                                        data.get("observed_magic")))
+        return RecipeEvaluationResult(
+            recipe_id=rid, status=RECIPE_STATUS_SUPPORTED, confidence=0.95 if confirmed else 0.75,
+            confidence_basis=facts[0], supporting_facts=facts + stack_facts, limitations=lims,
+            recommended_action="Bound the writes into the named buffer (size of the copy / string length) and "
+                               "rebuild with AddressSanitizer to find the write site.",
+            details=d)
+    if stack_w:
+        guard = [w for w in stack_w if w.get("kind") == "SP_IN_GUARD"]
+        return RecipeEvaluationResult(
+            recipe_id=rid, status=RECIPE_STATUS_SUPPORTED, confidence=0.9 if guard else 0.7,
+            confidence_basis=stack_facts[0], supporting_facts=stack_facts, limitations=lims,
+            recommended_action="Reduce recursion depth / large stack locals or raise the thread's stack size.",
+            details=dict(base, finding_category=CATEGORY_STACK_CORRUPTION if guard else CATEGORY_RESOURCE_EXHAUSTION,
+                         finding_severity="HIGH" if guard else "WARNING",
+                         **({} if guard else {"certainty_cap": "PROBABLE",
+                                              "certainty_cap_reason": "stack nearly exhausted: a warning, not a "
+                                                                      "fault (the guard region was not reached)"})))
+    if heap.get("status") in ("COMPLETED", "PARTIAL") and not hint:
+        chk = heap.get("checked") or {}
+        txt = ("heap metadata intact: %d chunks walked, top chunk(s), free lists and bin links consistent%s"
+               % (int(chk.get("chunks") or 0),
+                  ("; %d inconsistent read(s) changed between re-reads (target mutating the heap), not evidence"
+                   % len(heap.get("inconsistent_reads_not_evidence") or []))
+                  if heap.get("inconsistent_reads_not_evidence") else ""))
+        return RecipeEvaluationResult(
+            recipe_id=rid, status=RECIPE_STATUS_CONTRADICTED, confidence=0.85, confidence_basis=txt,
+            contradicting_facts=[txt], limitations=lims,
+            recommended_action="Refute heap metadata corruption in the walked heap.",
+            details=dict(base, corruption_confirmed=False))
+    if hint:
+        return None                          # legacy (capped) rule for the name/poison hint
+    return RecipeEvaluationResult(
+        recipe_id=rid, status=RECIPE_STATUS_INSUFFICIENT_EVIDENCE, confidence=0.2,
+        confidence_basis="; ".join(lims) or "heap integrity not checked",
+        missing_evidence=["heap_integrity_walk"], limitations=lims, details=dict(base, corruption_confirmed=False))
+
+
 def _evaluate_specific_recipe(recipe: DiagnosticRecipe, data: Dict[str, Any]) -> RecipeEvaluationResult:
     rid = recipe.recipe_id
     if rid in ("RECIPE_PROCESS_MEMORY_GROWTH", "RECIPE_HEAP_GROWTH", "RECIPE_LONG_LIVED_OBJECT_ACCUMULATION"):
         _li_res = _evaluate_leak_investigation(recipe, data)
         if _li_res is not None:
             return _li_res
+    if rid == "RECIPE_HEAP_METADATA_CORRUPTION":
+        _mi_res = _evaluate_integrity_investigation(recipe, data)
+        if _mi_res is not None:
+            return _mi_res
+    if rid in ("RECIPE_INVALID_MEMORY_ACCESS", "RECIPE_HEAP_METADATA_CORRUPTION"):
+        # IMP-009: the name/poison-value heuristic can no longer confirm corruption on its own
+        return _cap_name_hint(_evaluate_specific_recipe_rules(recipe, data), data)
+    return _evaluate_specific_recipe_rules(recipe, data)
+
+
+def _evaluate_specific_recipe_rules(recipe: DiagnosticRecipe, data: Dict[str, Any]) -> RecipeEvaluationResult:
+    rid = recipe.recipe_id
 
     # 1. RECIPE_INVALID_MEMORY_ACCESS
     if rid == "RECIPE_INVALID_MEMORY_ACCESS":
