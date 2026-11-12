@@ -98,6 +98,23 @@ RECIPE_POTENTIAL_DEADLOCK_PATTERNS = "RECIPE_POTENTIAL_DEADLOCK_PATTERNS"
 RECIPE_LONG_RUNNING_BLOCKED_THREADS = "RECIPE_LONG_RUNNING_BLOCKED_THREADS"
 RECIPE_SHARED_STATE_INCONSISTENCIES = "RECIPE_SHARED_STATE_INCONSISTENCIES"
 
+# Baseline checks: planned and executed for EVERY investigation, whatever the symptom wording says.  They are the
+# cheap, read-only, zero-stop checks; the symptom text only orders them and adds more specific / costlier recipes.
+# Order = execution order when the symptom gives no preference (cheapest first).
+BASELINE_RECIPE_IDS = (
+    # ~0.8 s: one shared /proc/<pid>/task sampling window (state, ticks, syscall, top frame per thread).
+    # Finds runaway (spinning), zombie and D-state threads.  The window is shared with the next recipe per run.
+    "RECIPE_THREAD_STATE_ANOMALIES",
+    # ~0 s extra: re-uses the shared thread series; adds blocked-without-owner-progress lock waits and long waits.
+    "RECIPE_LONG_RUNNING_BLOCKED_THREADS",
+    # ~0.1 s: one lock inspection (callstacks + mutex words, read-only memory reads).  Orphaned / circular owners.
+    "RECIPE_SUSPICIOUS_LOCK_OWNERSHIP",
+    # ~0.1-0.5 s: wait-for graph reconstruction and cycle persistence re-sample (read-only memory reads).
+    "RECIPE_POTENTIAL_DEADLOCK_PATTERNS",
+    # ~0.1 s: /proc/<pid>/status + statm RSS read (trend comes from the session's own samples).
+    "RECIPE_PROCESS_MEMORY_GROWTH",
+)
+
 
 # -----------------------------------------------------------------------------
 # Diagnostic Recipe Data Model
@@ -2179,7 +2196,9 @@ def _evaluate_specific_recipe(recipe: DiagnosticRecipe, data: Dict[str, Any]) ->
                 confidence_basis="Abnormal thread scheduling/state distribution detected.",
                 supporting_facts=["Thread state anomaly observed"] + list(data.get("thread_findings") or []),
                 recommended_action="Inspect runaway or zombie thread creation sites.",
+                # Decided by what fired: runaway / zombie / D-state threads are not a deadlock.
                 details={"thread_state_anomaly": True,
+                         "finding_category": CATEGORY_PROCESS_INSTABILITY,
                          "runaway_threads": [t.get("name") for t in (data.get("runaway_threads") or []) if isinstance(t, dict)]},
             )
         elif data.get("threads_healthy") is True:

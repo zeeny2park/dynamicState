@@ -25,6 +25,7 @@ from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Union
 import uuid
 
 from .diagnostic_recipes import (
+    BASELINE_RECIPE_IDS,
     CATEGORY_ABNORMAL_VARIABLE_CHANGES,
     CATEGORY_DATA_RACE_INDICATORS,
     CATEGORY_DEADLOCK_INDICATORS,
@@ -867,6 +868,13 @@ class InvestigationPlanner:
             for r in self.recipe_registry.list_recipes()[:4]:
                 candidate_recipes.append((r, 0.5))
 
+        # Baseline checks always run; the symptom only orders them (relevance) and adds recipes around them.
+        for r_id in BASELINE_RECIPE_IDS:
+            if not any(cr[0].recipe_id == r_id for cr in candidate_recipes):
+                r = self.recipe_registry.get_recipe(r_id)
+                if r:
+                    candidate_recipes.append((r, 0.4))
+
         # Multi-factor scoring for each candidate recipe
         # Weights: relevance (0.30), diagnostic value (0.25), info gain (0.20),
         #          availability (0.15), cost (0.05), safety (0.05)
@@ -891,7 +899,7 @@ class InvestigationPlanner:
         plan_rationale = (
             f"Synthesized {len(steps)} deterministic investigation steps for primary "
             f"category '{classification.primary_category}'. Ordered by relevance, diagnostic value, "
-            f"and zero-stop safety."
+            f"and zero-stop safety. Baseline checks always planned: {', '.join(BASELINE_RECIPE_IDS)}."
         )
 
         return InvestigationPlan(
@@ -1235,6 +1243,8 @@ class AdaptiveInvestigationSession:
             k: v for k, v in self.recipe_thresholds.items()
             if k in ("thread_sample_count", "thread_sample_interval_sec", "runaway_cpu_share")
         }
+        # One thread sample series per run, shared by the thread recipes (the baseline runs two of them)
+        self.evidence_provider.thread_series_cache = {}
         self.temporal_memory_samples: List[Dict[str, Any]] = []
         self.observation_window = ObservationWindow(
             target_pid=pid or 0,
@@ -1903,6 +1913,11 @@ class AdaptiveInvestigationSession:
 
         # Deterministic recipe evaluation against real acquired observations
         eval_result = self.recipe_registry.evaluate_recipe(recipe, eval_context)
+        # The evaluated rules are done with live objects; what is recorded in checks / reports must be plain data
+        # (an object repr carries a memory address and differs between a session and its reloaded copy).
+        for _k, _v in list(obs_data.items()):
+            if isinstance(_v, ObservationWindow):
+                obs_data[_k] = {"observation_window_samples": _v.sample_count()}
         consumed_step_ev_ids: List[str] = []
 
         eff_step_prov = PROVENANCE_CLASS_LIVE_RUNTIME_CAPTURE if step_rcpt is not None else (
@@ -1941,7 +1956,9 @@ class AdaptiveInvestigationSession:
             consumed_step_ev_ids.append(ev_id)
             ev_payload = {
                 "evidence_id": ev_id,
-                "problem_category": recipe.problem_category,
+                # The observed rule decides the category (e.g. a runaway thread is PROCESS_INSTABILITY, not a
+                # deadlock); recipes that do not say fall back to their primary category.
+                "problem_category": eval_result.details.get("finding_category") or recipe.problem_category,
                 "recipe_id": recipe.recipe_id,
                 "domain": recipe.domain,
                 "finding": fact,
@@ -2149,11 +2166,15 @@ class AdaptiveInvestigationSession:
             # Early stop condition: if definitive fault confirmed with high confidence (>= 0.90) and no contradiction
             if eval_result.confidence >= 0.90 and not eval_result.contradicting_facts:
                 for s in remaining_steps:
-                    if s.category != recipe.problem_category:
+                    # Baseline checks are never skipped: a process can have two problems and the report must be
+                    # able to say the other cheap checks were clean (or not).
+                    if s.category != recipe.problem_category and s.recipe_id not in BASELINE_RECIPE_IDS:
                         s.status = "SKIPPED"
                 # IMP-004: dynamically scheduled growth follow-ups must still execute; otherwise keep the
-                # original early stop.
-                if not any(s.status == "PENDING" for s in dynamic_followups):
+                # original early stop.  Baseline checks that have not run yet also keep the loop going.
+                if (not any(s.status == "PENDING" for s in dynamic_followups)
+                        and not any(s.status == "PENDING" and s.recipe_id in BASELINE_RECIPE_IDS
+                                    for s in remaining_steps)):
                     self.state = STATE_ANALYZING
                     self.plan.current_step_index += 1
                     return {"action": "COLLECT_STEP", "step_id": step.step_id, "eval_result": asdict(eval_result), "adaptive_action": "EARLY_ANOMALY_CONFIRMED"}
@@ -2198,7 +2219,7 @@ class AdaptiveInvestigationSession:
                     self.plan.steps = self.plan.steps[:self.plan.current_step_index + 1] + remaining_steps
             else:
                 for s in remaining_steps:
-                    if s.category == recipe.problem_category:
+                    if s.category == recipe.problem_category and s.recipe_id not in BASELINE_RECIPE_IDS:
                         s.status = "SKIPPED"
 
         # Deduct actual consumed resources into budget_tracker
@@ -3907,6 +3928,14 @@ def diagnose(
         res.stop_reason = conclusion.stop_reason if conclusion else None
         executed = [c for c in session.checks if c.status not in (CheckStatus.NOT_EXECUTED, CheckStatus.SKIPPED)]
         res.checks_run = [_diagnose_check_row(c) for c in executed]
+        # Baseline checks that never ran (budget / time limit / step cap) must be visible, with the reason
+        ran = {c.recipe_id for c in executed}
+        why_stopped = res.stop_reason or session.state
+        for st in (session.plan.steps if session.plan else []):
+            if st.recipe_id in BASELINE_RECIPE_IDS and st.recipe_id not in ran:
+                nc.append({"kind": "baseline_check_not_run", "item": st.recipe_id,
+                           "reason": f"baseline check not executed: investigation ended with {why_stopped}"
+                                     f" (step status {st.status})"})
         if session.state not in TERMINAL_STATES or not executed:
             nc.append({"kind": "not_executed", "item": "investigation",
                        "reason": f"session ended in state {session.state} with {len(executed)} executed check(s); "
