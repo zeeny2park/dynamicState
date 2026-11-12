@@ -414,6 +414,7 @@ jobs:
 
 
       - name: Run Diagnosis Accuracy Benchmark (IMP-013, reports score, never fails on a low score)
+        if: always()
         run: |
           python3 benchmarks/diagnosis_accuracy/run_benchmark.py --output diagnosis-accuracy/results.json
 

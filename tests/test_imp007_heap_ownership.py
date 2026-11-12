@@ -588,8 +588,13 @@ class TestHeapWalk64MBNoStop(unittest.TestCase):
         self.assertEqual(s["cost"]["budget_target_stop_ms"], 0.0)
         # ground truth: every leaked block reported, no live block reported as leak
         cands = set(an.leak_candidate_addresses())
-        self.assertEqual(gt_leaks - cands, set())
-        self.assertLessEqual(len(cands - gt_leaks), 2)
+        missed = gt_leaks - cands
+        self.assertEqual(
+            missed, set(),
+            "leaked blocks not reported (referrers shown to tell a stale root from a walker miss): %s"
+            % {hex(a): an.lookup(a) for a in sorted(missed)})
+        self.assertLessEqual(len(cands - gt_leaks), 2,
+                             "unexpected extra candidates: %s" % sorted(hex(a) for a in cands - gt_leaks))
         self.assertGreaterEqual(s["heap_walk"]["counts"]["by_state"].get("in_use", 0), live + leaked)
         self.assertGreaterEqual(s["heap_walk"]["counts"]["in_use_chunk_bytes"], 60 * 1024 * 1024)
 

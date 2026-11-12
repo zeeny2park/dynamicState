@@ -71,13 +71,22 @@ static void __attribute__((noinline)) build(size_t target)
     printf("STATS %zu %zu %zu %zu %zu\n", g_many_count - freed - leaked, leaked, freed, total, g_many_count);
 }
 
+/* Un-obfuscated leaked pointers are only materialised inside this noinline helper, so no copy is left in
+ * main's callee-saved registers / frame slots (a stale copy there is a legitimate conservative root that makes
+ * the block look reachable, which would depend on compiler register allocation). */
+static void __attribute__((noinline)) report_leaks(void)
+{
+    for (size_t k = 0; k < g_nleak; k++)
+        printf("LEAK 0x%lx %zu\n", (unsigned long)(g_leak_obf[k] ^ OBF), g_leak_size[k]);
+    scrub_stack();
+}
+
 int main(void)
 {
     setvbuf(stdout, NULL, _IOFBF, 1 << 16);
     build((size_t)64 * 1024 * 1024);
     printf("PROGRESS %p\n", (void *)&g_progress);
-    for (size_t k = 0; k < g_nleak; k++)
-        printf("LEAK 0x%lx %zu\n", (unsigned long)(g_leak_obf[k] ^ OBF), g_leak_size[k]);
+    report_leaks();
     pthread_t th;
     pthread_create(&th, NULL, spinner, NULL);
     printf("READY\n");

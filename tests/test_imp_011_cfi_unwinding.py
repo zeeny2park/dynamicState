@@ -276,6 +276,34 @@ def _cell_of(rule, names):
     return "exp" if kind == "expression" else "vexp"
 
 
+def _readelf_raw_fde_ops(path):
+    """{fde pc_begin: [raw DW_CFA_* op lines]} from the plain (non-interpreted) frames dump, whose
+    format is a simple op listing that is stable across binutils versions."""
+    out = subprocess.run([_READELF, "--debug-dump=frames", path], stdout=subprocess.PIPE,
+                         stderr=subprocess.DEVNULL, check=False).stdout.decode("utf-8", "replace")
+    ops, cur = {}, None
+    for line in out.splitlines():
+        m = re.match(r"^[0-9a-f]+ [0-9a-f]+ [0-9a-f]+ FDE cie=[0-9a-f]+ pc=([0-9a-f]+)\.\.", line)
+        if m:
+            cur = int(m.group(1), 16)
+            ops[cur] = []
+        elif re.match(r"^[0-9a-f]+ [0-9a-f]+ [0-9a-f]+ CIE", line):
+            cur = None
+        elif cur is not None and line.startswith("  DW_CFA_"):
+            ops[cur].append(line.strip())
+    return ops
+
+
+def _ra_undefined_deferred_by_advance(raw_ops, ra_col):
+    """True when the FDE program is `DW_CFA_advance_loc ...; DW_CFA_undefined <ra>`: per DWARF the RA is
+    still the CIE rule (not undefined) at pc_begin and only becomes undefined at the advanced location
+    (the `endbr64; cfi_undefined(rip)` shape of glibc's _start on CET toolchains)."""
+    ops = [o for o in raw_ops if not o.startswith("DW_CFA_nop")]
+    if not ops or not ops[0].startswith("DW_CFA_advance_loc"):
+        return False
+    return any(o.startswith("DW_CFA_undefined") and re.search(rf"\br{ra_col}\b", o) for o in ops[1:])
+
+
 def _compare_with_readelf(testcase, path, max_fdes=None):
     img = load_elf_image(path)
     testcase.assertIsNotNone(img, path)
@@ -283,6 +311,7 @@ def _compare_with_readelf(testcase, path, max_fdes=None):
     tables = _readelf_tables(path)
     fdes = {f.pc_begin: f for f in img.all_fdes() if f.source == ".eh_frame"}
     checked_rows = 0
+    raw_ops_cache = {}
     keys = sorted(tables)
     if max_fdes:
         keys = keys[:: max(1, len(keys) // max_fdes)]
@@ -303,6 +332,17 @@ def _compare_with_readelf(testcase, path, max_fdes=None):
                 if reg is None:
                     continue
                 mine = _cell_of(row.rules.get(img_reg), names)
+                if mine != cell and col == "ra" and cell == "u" and loc == pc_begin:
+                    # Observed with binutils 2.38 (ubuntu-22.04): readelf prints the RA column as `u` already on
+                    # the FDE's first row for `advance_loc; DW_CFA_undefined ra` programs (glibc _start/libc
+                    # entry points), where DWARF says the CIE rule (c-8) holds until the advanced location.
+                    # Not loosened blindly: the raw op listing must prove the undefined comes after an
+                    # advance_loc, and our row at that later location must be `u`.
+                    raw = raw_ops_cache.setdefault("ops", _readelf_raw_fde_ops(path)).get(pc_begin, [])
+                    later = [r for r in rows if r[0] > pc_begin]
+                    if (_ra_undefined_deferred_by_advance(raw, img_reg)
+                            and later and _cell_of(img.row_at(later[0][0], fde)[1].rules.get(img_reg), names) == "u"):
+                        continue
                 testcase.assertEqual(mine, cell, f"{path} FDE 0x{pc_begin:x} loc 0x{loc:x} column {col}")
             checked_rows += 1
     return checked_rows
@@ -402,6 +442,33 @@ class TestCfaProgramOracle(unittest.TestCase):
 # --------------------------------------------------------------------------------------------
 # Synthetic x86_64 stacks built from the binaries' own CFI
 # --------------------------------------------------------------------------------------------
+class TestRaUndefinedAfterAdvance(unittest.TestCase):
+    """`endbr64; cfi_undefined(rip)` (glibc _start on CET toolchains): the RA rule is the CIE's c-8 at
+    pc_begin and `undefined` only from the advanced location - the outermost-frame marker must still hold."""
+
+    def test_undefined_applies_from_advanced_location(self):
+        cc = shutil.which("x86_64-linux-gnu-gcc") or (_GCC if platform.machine() == "x86_64" else None)
+        ld = shutil.which("x86_64-linux-gnu-ld") or (shutil.which("ld") if platform.machine() == "x86_64" else None)
+        if not (cc and ld and _READELF):
+            self.skipTest("no x86_64 assembler/linker")
+        src = (".text\n.globl _start\n_start:\n .cfi_startproc\n nop\n .cfi_endproc\n"
+               ".globl f2\nf2:\n .cfi_startproc\n .byte 0xf3,0x0f,0x1e,0xfa\n .cfi_undefined rip\n"
+               " xorl %ebp,%ebp\n ret\n .cfi_endproc\n")
+        with tempfile.TemporaryDirectory() as d:
+            with open(os.path.join(d, "s.S"), "w") as f:
+                f.write(src)
+            subprocess.run([cc, "-c", os.path.join(d, "s.S"), "-o", os.path.join(d, "s.o")], check=True)
+            subprocess.run([ld, "-e", "_start", "-o", os.path.join(d, "s"), os.path.join(d, "s.o")], check=True)
+            path = os.path.join(d, "s")
+            img = load_elf_image(path)
+            fde = [f for f in img.all_fdes() if f.source == ".eh_frame"][-1]
+            self.assertEqual(img.row_at(fde.pc_begin, fde)[1].rules[16], (R_OFFSET, -8))
+            self.assertEqual(img.row_at(fde.pc_begin + 4, fde)[1].rules[16][0], R_UNDEFINED)
+            raw = _readelf_raw_fde_ops(path)[fde.pc_begin]
+            self.assertTrue(_ra_undefined_deferred_by_advance(raw, 16), raw)
+            self.assertFalse(_ra_undefined_deferred_by_advance(["DW_CFA_undefined: r16 (rip)"], 16))
+
+
 class _FakeStack:
     def __init__(self, lo, hi):
         self.lo, self.hi = lo, hi

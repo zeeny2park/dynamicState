@@ -926,6 +926,13 @@ class TestDwarfEvaluatorCorrectness(unittest.TestCase):
                     self.assertIn("prologue frame establishment", res.reason)
                     self.assertIsNone(res.value)
                     continue
+                if gdb_prints[vname] == "<optimized out>":
+                    # GDB itself has no value for this variable at this PC (e.g. clang -O2 emits no location
+                    # for an argument it proved dead): the evaluator must agree and must not invent a value.
+                    self.assertIn(res.status, (EVAL_STATUS_OPTIMIZED_OUT, EVAL_STATUS_UNAVAILABLE),
+                                  f"{label} {vname}: GDB says <optimized out> but evaluator gave {res.status}")
+                    self.assertIsNone(res.value)
+                    continue
                 self.assertEqual(res.status, EVAL_STATUS_OBSERVED, f"{label} {vname} failed: {res.reason}")
                 self.assertEqual(
                     res.value,

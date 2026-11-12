@@ -163,6 +163,9 @@ class OverridingLocalAdapter(LocalTargetAdapter):
 # =====================================================================================
 # 1. Pure table / parsing tests
 # =====================================================================================
+_NON_SYSCALL_NR = {"syscalls", "arch_specific_syscall", "Linux", "SYSCALL_BASE", "Linux_syscalls", "OABI_SYSCALL_BASE"}
+
+
 class TestSyscallTables(unittest.TestCase):
     def test_required_futex_numbers(self):
         self.assertEqual(SYSCALL_TABLES["x86_64"][202], "futex")
@@ -197,6 +200,10 @@ class TestSyscallTables(unittest.TestCase):
             return None
         nums = {}
         for m in re.finditer(r"^#define __NR(?:3264)?_(\w+) \(?(?:__NR_SYSCALL_BASE\s*\+\s*)?(\d+)\)?$", out.stdout, re.M):
+            # Skip bookkeeping macros that share the __NR_ prefix but are not syscalls (e.g. __NR_syscalls is the
+            # table size: 449 on Ubuntu 22.04's aarch64 headers).
+            if m.group(1) in _NON_SYSCALL_NR or m.group(1).startswith(("arch_specific_syscall", "Linux", "SYSCALL_BASE")):
+                continue
             nums[m.group(1)] = int(m.group(2))
         return nums or None
 
