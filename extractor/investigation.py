@@ -1291,6 +1291,9 @@ class InvestigationManager:
             "constraints": sanitized_constraints,
             "watch_session_id": watch_session_id,
             "observation_window": observation_window or {},
+            # Provenance is never caller-supplied: it is upgraded only after an authentic live capture below
+            "provenance_class": PROVENANCE_CLASS_IMPORTED_UNVERIFIED,
+            "live_capture": False,
         }
 
         # Check for temporal investigation routing (Phase 24)
@@ -1502,6 +1505,7 @@ class InvestigationManager:
                 session.target_ref["memory_snapshot_path"] = snap_dir
                 session.target_ref["live_capture"] = True
                 session.target_ref["capture_source"] = "LIVE_PROCESS"
+                session.target_ref["provenance_class"] = PROVENANCE_CLASS_LIVE_RUNTIME_CAPTURE
             except ProcessLookupError as proc_err:
                 session.status = "FAILED"
                 session.stages["capture_quality"] = {
@@ -3470,16 +3474,19 @@ class InvestigationManager:
         if cap_status in ("FAILED", "INVALID"):
             trust_level = "UNTRUSTED"
             trust_caveat = f"Capture quality is {cap_status}. Data is untrusted and cannot substantiate verified runtime facts."
+        elif cap_status == "UNVERIFIED":
+            trust_level = "UNVERIFIED"
+            trust_caveat = "Capture quality is UNVERIFIED. Data is unverified and cannot substantiate verified runtime facts."
         elif cap_status == "PARTIAL":
             trust_level = "PARTIALLY_TRUSTED"
             trust_caveat = "Capture quality is PARTIAL. Findings may reflect incomplete memory layout, unread regions, or execution skew."
 
-        # Monotonicity & trust boundary: when capture is UNTRUSTED, suppress observed_facts
-        if trust_level == "UNTRUSTED":
+        # Monotonicity & trust boundary: when capture is UNTRUSTED or UNVERIFIED, suppress observed_facts
+        if trust_level in ("UNTRUSTED", "UNVERIFIED"):
             for f in session.findings:
                 if f.category == "fact":
                     f.category = "unknown"
-                    f.status = "UNTRUSTED"
+                    f.status = "UNTRUSTED" if trust_level == "UNTRUSTED" else "UNVERIFIED"
                     f.confidence = "low"
                     f.uncertainty = trust_caveat
             for h in session.hypotheses:
@@ -3554,10 +3561,21 @@ class InvestigationManager:
             ),
         }
 
+        # Report provenance: unverified/untrusted data and non-live sessions are never reported as a live capture
+        is_live_capture = bool(session.target_ref.get("live_capture"))
+        report_prov_class = PROVENANCE_CLASS_LIVE_RUNTIME_CAPTURE if is_live_capture else PROVENANCE_CLASS_IMPORTED_UNVERIFIED
+        if trust_level in ("UNTRUSTED", "UNVERIFIED") or cap_status in ("FAILED", "INVALID", "UNVERIFIED"):
+            report_prov_class = PROVENANCE_CLASS_IMPORTED_UNVERIFIED
+        elif session.target_ref.get("provenance_class") in (PROVENANCE_CLASS_IMPORTED_UNVERIFIED, PROVENANCE_CLASS_SYNTHETIC_FIXTURE):
+            report_prov_class = session.target_ref.get("provenance_class")
+        elif not is_live_capture:
+            report_prov_class = PROVENANCE_CLASS_IMPORTED_UNVERIFIED
+
         return strip_sensitive_session_secrets({
             "investigation_id": session.investigation_id,
             "goal": session.goal,
             "status": session.status,
+            "provenance_class": report_prov_class,
             "created_at": session.created_at,
             "target_identity": session.stages["target_identity"].get("details", {}),
             "collection_mode": cap_details.get("collection_mode", "ZERO_STOP"),
@@ -3626,6 +3644,7 @@ class InvestigationManager:
                     target_identity=session.stages.get("target_identity", {}).get("details", {}),
                     causal_attribution_verified=any(h.validation_status == HYPOTHESIS_STATUS_VALIDATED for h in session.hypotheses),
                     budget_usage=session.budget_tracker.to_dict(),
+                    provenance_class=report_prov_class,
                 ),
                 title=f"dynamicState Investigation: {session.goal[:40]}",
                 remediation_checklist=[s.description for s in session.next_steps] if session.next_steps else None,
@@ -4264,16 +4283,16 @@ class InvestigationManager:
         # Resolve raw snapshot or semantic snapshot
         raw_snap = None
         if mem_snap_path and os.path.exists(mem_snap_path):
-            raw_snap = RawRuntimeSnapshot.load(mem_snap_path)
+            raw_snap = self._load_capture_snapshot(mem_snap_path)
         elif snap_id:
             # Check corpus memory_snapshots
             candidate_p = os.path.join(self.corpus_dir, "memory_snapshots", snap_id)
             if os.path.exists(candidate_p):
-                raw_snap = RawRuntimeSnapshot.load(candidate_p)
+                raw_snap = self._load_capture_snapshot(candidate_p)
 
-        target_exec = raw_snap.executable if raw_snap else None
-        target_build_id = raw_snap.executable_build_id if raw_snap else None
-        pid = raw_snap.pid if raw_snap else t_ref.get("pid")
+        target_exec = getattr(raw_snap, "executable", getattr(raw_snap, "binary", None)) if raw_snap else None
+        target_build_id = getattr(raw_snap, "executable_build_id", None) if raw_snap else None
+        pid = getattr(raw_snap, "pid", None) if raw_snap else t_ref.get("pid")
 
         dbg_build_id = None
         if dbg_path and os.path.exists(dbg_path):
@@ -4375,16 +4394,24 @@ class InvestigationManager:
             "details": identity_details,
         }
 
+    @staticmethod
+    def _load_capture_snapshot(path: str) -> Any:
+        """Loads a capture directory as a RawMemorySnapshot (metadata.json) or RawRuntimeSnapshot (snapshot_metadata.json)."""
+        if os.path.exists(os.path.join(path, "metadata.json")):
+            from .memory_snapshot import RawMemorySnapshot
+            return RawMemorySnapshot.load(path)
+        return RawRuntimeSnapshot.load(path)
+
     def _execute_stage_capture_quality(self, session: InvestigationSession) -> None:
         """Stage 2: Validate Capture Quality and Consistency Constraints."""
         t_ref = session.target_ref
         raw_snap = None
         if t_ref.get("memory_snapshot_path") and os.path.exists(t_ref["memory_snapshot_path"]):
-            raw_snap = RawRuntimeSnapshot.load(t_ref["memory_snapshot_path"])
+            raw_snap = self._load_capture_snapshot(t_ref["memory_snapshot_path"])
         elif t_ref.get("snapshot_id"):
             cand = os.path.join(self.corpus_dir, "memory_snapshots", t_ref["snapshot_id"])
             if os.path.exists(cand):
-                raw_snap = RawRuntimeSnapshot.load(cand)
+                raw_snap = self._load_capture_snapshot(cand)
 
         consistency_level = "UNKNOWN"
         collection_mode = "ZERO_STOP"
@@ -4403,15 +4430,15 @@ class InvestigationManager:
         limitations: List[str] = []
 
         if raw_snap:
-            duration_us = raw_snap.capture_duration_us
-            bytes_captured = raw_snap.bytes_captured
+            duration_us = getattr(raw_snap, "capture_duration_us", getattr(raw_snap, "duration_us", 0.0))
+            bytes_captured = getattr(raw_snap, "bytes_captured", 0)
             prov = getattr(raw_snap, "provenance", {}) or {}
             obs_meta = getattr(raw_snap, "observation_metadata", {}) or {}
             lat_rep = prov.get("latency_report") or obs_meta.get("latency_report") or {}
 
-            bytes_requested = prov.get("bytes_requested") or obs_meta.get("bytes_requested") or bytes_captured
+            bytes_requested = getattr(raw_snap, "bytes_requested", None) or prov.get("bytes_requested") or obs_meta.get("bytes_requested") or bytes_captured
             bytes_omitted = prov.get("bytes_omitted") or obs_meta.get("bytes_omitted") or 0
-            regions_attempted = prov.get("regions_attempted") or obs_meta.get("regions_attempted") or len(raw_snap.memory_regions)
+            regions_attempted = getattr(raw_snap, "regions_requested", None) or prov.get("regions_attempted") or obs_meta.get("regions_attempted") or len(getattr(raw_snap, "memory_regions", getattr(raw_snap, "regions", [])))
             stop_mechanism = prov.get("stop_mechanism") or obs_meta.get("stop_mechanism") or ("SIGSTOP" if prov.get("stop_state_machine", {}).get("stop_confirmed") else "NONE")
             stopped_threads = prov.get("stopped_threads", False)
             collection_mode = str(prov.get("capture_mode") or obs_meta.get("capture_mode") or ("FULL" if stop_mechanism == "SIGSTOP" else "ZERO_STOP"))
@@ -4424,18 +4451,22 @@ class InvestigationManager:
                     session.budget_tracker.metrics.target_stop_duration_ms = round(stop_duration_ms, 3)
 
             # Examine memory regions
-            for r in raw_snap.memory_regions:
-                st = r.get("status")
+            for r in (getattr(raw_snap, "memory_regions", None) or getattr(raw_snap, "regions", [])):
+                st = r.get("status") if isinstance(r, dict) else getattr(r, "status", None)
                 if st == "PARTIAL":
                     partial_reads += 1
                 elif st == "FAILED":
                     failed_reads += 1
-                    missing_regions.append(r.get("pathname", r.get("region_id", "unknown")))
+                    missing_regions.append(
+                        r.get("pathname", r.get("region_id", "unknown")) if isinstance(r, dict)
+                        else (getattr(r, "pathname", None) or getattr(r, "region_id", "unknown"))
+                    )
                 elif st == "OMITTED":
                     omitted_regions += 1
-                    missing_regions.append(f"{r.get('region_id', 'unknown')} (omitted: policy limit)")
+                    rid = r.get("region_id", "unknown") if isinstance(r, dict) else getattr(r, "region_id", "unknown")
+                    missing_regions.append(f"{rid} (omitted: policy limit)")
 
-            backend = raw_snap.capture_backend or "unknown"
+            backend = getattr(raw_snap, "capture_backend", getattr(raw_snap, "backend", "unknown")) or "unknown"
             raw_consistency = prov.get("snapshot_consistency") or obs_meta.get("consistency_classification")
             if raw_consistency == NON_ATOMIC or ("process_vm_readv" in backend and not stopped_threads):
                 consistency_level = NON_ATOMIC
@@ -4533,9 +4564,12 @@ class InvestigationManager:
 
         # Assign honest stage status
         if raw_snap:
-            if getattr(raw_snap, "completeness", None) in ("INVALID", "FAILED") or (bytes_captured == 0 and regions_attempted > 0):
+            val_verdict = getattr(raw_snap, "validation_verdict", None)
+            if getattr(raw_snap, "completeness", None) in ("INVALID", "FAILED") or val_verdict == "INVALID" or (bytes_captured == 0 and regions_attempted > 0):
                 stage_status = "FAILED"
-            elif getattr(raw_snap, "completeness", None) == "PARTIAL" or failed_reads > 0 or partial_reads > 0 or omitted_regions > 0:
+            elif val_verdict == "UNVERIFIED":
+                stage_status = "UNVERIFIED"
+            elif getattr(raw_snap, "completeness", None) == "PARTIAL" or getattr(raw_snap, "status", None) == "DEGRADED" or failed_reads > 0 or partial_reads > 0 or omitted_regions > 0:
                 stage_status = "PARTIAL"
             else:
                 stage_status = "COMPLETED"
