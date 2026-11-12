@@ -249,10 +249,19 @@ class DwarfIndex:
         cache = self.__dict__.setdefault("_line_cache", {})
         if link_time_pc in cache:
             return cache[link_time_pc]
+        path = os.path.abspath(path)  # never depend on the caller's cwd
         res: Optional[Dict[str, Any]] = None
-        try:
-            proc = subprocess.run(["addr2line", "-i", "-f", "-C", "-e", path, f"0x{link_time_pc:x}"],
-                                  capture_output=True, text=True, timeout=10)
+        definitive = False  # only a completed addr2line run may be memoised; timeouts/OS errors must be retried
+        for timeout in (15, 60):
+            try:
+                proc = subprocess.run(["addr2line", "-i", "-f", "-C", "-e", path, f"0x{link_time_pc:x}"],
+                                      capture_output=True, text=True, timeout=timeout,
+                                      cwd=os.path.dirname(path) or None)
+            except subprocess.TimeoutExpired:
+                continue  # loaded host: retry once with a longer budget
+            except Exception:
+                break
+            definitive = True
             out = proc.stdout.splitlines() if proc.returncode == 0 else []
             chain: List[Dict[str, Any]] = []
             for i in range(0, len(out) - 1, 2):
@@ -265,9 +274,9 @@ class DwarfIndex:
             if chain:
                 res = {"file": chain[0]["file"], "line": chain[0]["line"], "path": chain[0]["path"],
                        "inlined_chain": chain}
-        except Exception:
-            res = None
-        cache[link_time_pc] = res
+            break
+        if definitive:
+            cache[link_time_pc] = res
         return res
 
     def resolve_type_by_name(self, type_name: str) -> Optional[DwarfType]:
@@ -954,8 +963,10 @@ class DwarfIndexer:
                 try:
                     with open(disk_cache_file, "r", encoding="utf-8") as cf:
                         cached_data = json.load(cf)
-                    if cached_data.get("schema_version") == "1.1.1":
+                    if (cached_data.get("schema_version") == "1.1.1"
+                            and cached_data.get("build_id") == elf_info.build_id):
                         index = DwarfIndex.from_cache_dict(cached_data)
+                        index.artifact_path = abs_path  # the image actually opened, not the path recorded at write time
                         with cls._lock:
                             cls._cache[cache_key] = index
                         return index
