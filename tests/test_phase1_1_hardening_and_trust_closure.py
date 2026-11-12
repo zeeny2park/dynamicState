@@ -30,6 +30,7 @@ import subprocess
 import time
 import unittest
 
+from tests.fixture_builds import ensure_expert_diagnostic_fixture
 from extractor.capture_backend import (
     LiveCaptureReceipt,
     get_trusted_capture_authority_token,
@@ -64,7 +65,7 @@ class TestPhase11HardeningAndTrustClosure(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.companion_elf = "/tmp/expert_diagnostic_debug.elf"
+        cls.companion_elf, _ = ensure_expert_diagnostic_fixture(need_stripped=False)
         cls.proc = subprocess.Popen([cls.companion_elf, "healthy"], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         time.sleep(0.15)
         cls.pid = cls.proc.pid

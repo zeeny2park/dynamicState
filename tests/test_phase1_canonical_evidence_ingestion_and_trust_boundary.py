@@ -14,6 +14,7 @@ import subprocess
 import time
 import unittest
 
+from tests.fixture_builds import ensure_expert_diagnostic_fixture
 from extractor.capture_backend import (
     LiveCaptureReceipt,
     get_trusted_capture_authority_token,
@@ -101,7 +102,7 @@ class TestPhase1CanonicalEvidenceIngestion(unittest.TestCase):
         session = engine.start_investigation(
             problem_statement="0x7fff0038 주소에서 세그폴트 및 메모리 오염 의심",
             pid=self.target_pid,
-            companion_elf="/tmp/expert_diagnostic_debug.elf",
+            companion_elf=ensure_expert_diagnostic_fixture(need_stripped=False)[0],
         )
 
         # Check adapter is initialized on session
@@ -353,7 +354,7 @@ class TestPhase1CanonicalEvidenceIngestion(unittest.TestCase):
 
     def test_group_e_mcp_lifecycle_and_canonical_evidence_flow(self):
         """Verifies MCP tools invoke canonical evidence ingestion and reports reflect valid evidence."""
-        companion_elf = "/tmp/expert_diagnostic_debug.elf"
+        companion_elf, _ = ensure_expert_diagnostic_fixture(need_stripped=False)
         proc = subprocess.Popen([companion_elf, "healthy"], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         time.sleep(0.15)
         pid = proc.pid

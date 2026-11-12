@@ -11,6 +11,7 @@ Verifies:
 import os
 import unittest
 
+from tests.fixture_builds import ensure_expert_diagnostic_fixture
 from extractor.diagnostic_recipes import (
     CATEGORY_ABNORMAL_VARIABLE_CHANGES,
     CATEGORY_DATA_RACE_INDICATORS,
@@ -122,7 +123,8 @@ class TestPhase21ClassificationAndPlanning(unittest.TestCase):
     def test_target_assessment_with_live_proc_and_companion_elf(self):
         """Verifies assessment of local process and companion ELF with DWARF."""
         my_pid = os.getpid()
-        assessment = self.assessor.assess(pid=my_pid, companion_elf="/tmp/expert_diagnostic_debug.elf")
+        elf, _ = ensure_expert_diagnostic_fixture(need_stripped=False)
+        assessment = self.assessor.assess(pid=my_pid, companion_elf=elf)
         self.assertTrue(assessment.accessible)
         self.assertGreaterEqual(assessment.thread_count, 1)
         self.assertGreaterEqual(assessment.rss_kb, 0)
@@ -141,7 +143,8 @@ class TestPhase21ClassificationAndPlanning(unittest.TestCase):
     def test_investigation_planning_multi_factor_ranking(self):
         """Verifies multi-factor scoring and ranking of diagnostic steps."""
         classification = self.classifier.classify("Investigate memory corruption and wild pointer dereference")
-        assessment = self.assessor.assess(pid=os.getpid(), companion_elf="/tmp/expert_diagnostic_debug.elf")
+        elf, _ = ensure_expert_diagnostic_fixture(need_stripped=False)
+        assessment = self.assessor.assess(pid=os.getpid(), companion_elf=elf)
         plan = self.planner.create_plan(classification, assessment)
 
         self.assertGreater(plan.total_steps, 0)

@@ -19,6 +19,7 @@ from typing import Any, Dict, List, Optional, Set, Tuple, Union
 from .debug_artifacts import DebugArtifactProvider
 from .debug_image import BinaryIdentity, CompatibilityResult, DebugImageProvider, inspect_elf
 from .debug_info import DebugInfoProvider, GdbDebugInfoProvider
+from .gdb_env import gdb_subprocess_env
 from .memory_snapshot import CapturedRegion, RawMemorySnapshot
 from .modules import ModuleAddressResolver, RuntimeModule, discover_modules
 from .runtime_state import (
@@ -345,7 +346,7 @@ print('__DWARF_JSON_END__')
 """
 
     cmd = ["gdb", "-q", "-nx", "-batch", "-ex", f"file {debug_image_path}", "-ex", f"python\n{py_script}"]
-    proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
+    proc = subprocess.run(cmd, capture_output=True, text=True, check=False, env=gdb_subprocess_env())
     if proc.returncode != 0:
         raise RuntimeError(f"GDB offline symbol extraction failed: {proc.stderr}")
 

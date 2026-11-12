@@ -8,6 +8,7 @@ Source file/line -> Function candidates -> Hypothesis -> Verification.
 import os
 import unittest
 
+from tests.fixture_builds import ensure_expert_diagnostic_fixture
 from extractor.expert_diagnostic_engine import (
     EvidenceToSourceCorrelator,
     demangle_symbol,
@@ -18,7 +19,7 @@ class TestPhase21EvidenceSourceCorrelation(unittest.TestCase):
     """Test suite for evidence-to-source correlation pipeline."""
 
     def setUp(self):
-        self.companion_elf = "/tmp/expert_diagnostic_debug.elf"
+        self.companion_elf, _ = ensure_expert_diagnostic_fixture(need_stripped=False)
         self.correlator = EvidenceToSourceCorrelator(companion_elf=self.companion_elf)
 
     def test_cpp_symbol_demangling(self):

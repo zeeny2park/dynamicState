@@ -13,6 +13,7 @@ import subprocess
 import time
 import unittest
 
+from tests.fixture_builds import ensure_expert_diagnostic_fixture
 from extractor.diagnostic_recipes import (
     CATEGORY_DEADLOCK_INDICATORS,
     CATEGORY_MEMORY_CORRUPTION,
@@ -32,13 +33,7 @@ class TestPhase211EvidenceDrivenHypotheses(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.debug_elf = "/tmp/expert_diagnostic_debug.elf"
-        if not os.path.exists(cls.debug_elf):
-            cmd = (
-                "g++ -g -O0 -fno-inline -fno-omit-frame-pointer "
-                "tests/fixtures/real_runtime/expert_diagnostic_scenarios.cpp "
-                "-o /tmp/expert_diagnostic_debug.elf -lpthread"
-            )
-            subprocess.run(cmd, shell=True, check=True)
+        ensure_expert_diagnostic_fixture(need_stripped=False)
 
     def setUp(self):
         self.engine = ExpertDiagnosticEngine(corpus_dir="/tmp/phase2_1_1_hyp_corpus")

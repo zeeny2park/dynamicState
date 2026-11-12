@@ -18,6 +18,8 @@ import tempfile
 import time
 import unittest
 
+from tests.fixture_builds import ensure_real_runtime_app_debug
+
 
 class TestCliAdaptiveReportIntegration(unittest.TestCase):
     """End-to-end CLI regression tests for Adaptive Report integration."""
@@ -25,15 +27,7 @@ class TestCliAdaptiveReportIntegration(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.tmp_dir = tempfile.mkdtemp(prefix="ds_cli_test_")
-        cls.target_bin = "/tmp/real_runtime_app_debug.elf"
-
-        # Ensure debug target is compiled
-        if not os.path.isfile(cls.target_bin) and os.path.isfile("tests/fixtures/real_runtime/main.cpp"):
-            subprocess.run(
-                ["g++", "-fPIE", "-pie", "-g", "-O0", "-fno-inline", "-fno-omit-frame-pointer", "-Wl,--build-id=sha1",
-                 "tests/fixtures/real_runtime/main.cpp", "-o", cls.target_bin, "-lpthread"],
-                check=True,
-            )
+        cls.target_bin = ensure_real_runtime_app_debug()
 
         cls.proc = subprocess.Popen(
             [cls.target_bin],

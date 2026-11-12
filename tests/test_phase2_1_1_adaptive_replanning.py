@@ -14,6 +14,7 @@ import subprocess
 import time
 import unittest
 
+from tests.fixture_builds import ensure_expert_diagnostic_fixture
 from extractor.expert_diagnostic_engine import (
     STATE_COMPLETED,
     STATE_INCONCLUSIVE,
@@ -29,14 +30,7 @@ class TestPhase211AdaptiveReplanning(unittest.TestCase):
     def setUpClass(cls):
         cls.debug_elf = "/tmp/expert_diagnostic_debug.elf"
         cls.stripped_elf = "/tmp/expert_diagnostic_stripped.elf"
-        if not os.path.exists(cls.debug_elf):
-            cmd = (
-                "g++ -g -O0 -fno-inline -fno-omit-frame-pointer "
-                "tests/fixtures/real_runtime/expert_diagnostic_scenarios.cpp "
-                "-o /tmp/expert_diagnostic_debug.elf -lpthread && "
-                "strip -s -o /tmp/expert_diagnostic_stripped.elf /tmp/expert_diagnostic_debug.elf"
-            )
-            subprocess.run(cmd, shell=True, check=True)
+        ensure_expert_diagnostic_fixture()
 
     def setUp(self):
         self.corpus_dir = "/tmp/phase2_1_1_replan_corpus"
