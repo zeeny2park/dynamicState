@@ -684,7 +684,7 @@ def parse_cfi_table(artifact_path: str, arch: str = "x86_64") -> Dict[int, Dict[
             cie_re = re.compile(r"^\s*([0-9a-fA-F]+)\s+[0-9a-fA-F]+\s+[0-9a-fA-F]+\s+CIE\b")
             fde_re = re.compile(r"FDE\s+cie=([0-9a-fA-F]+)\s+pc=([0-9a-fA-F]+)\.\.([0-9a-fA-F]+)")
             adv_re = re.compile(r"(?:DW_CFA_advance_loc\w*:\s+\d+\s+to\s+|DW_CFA_set_loc:\s+)([0-9a-fA-F]+)")
-            def_cfa_re = re.compile(r"DW_CFA_def_cfa:\s+(\w+)\s+ofs\s+(\d+)")
+            def_cfa_re = re.compile(r"DW_CFA_def_cfa:\s+(\w+)(?:\s+\([^)]*\))?\s+ofs\s+(\d+)")
             def_cfa_reg_re = re.compile(r"DW_CFA_def_cfa_register:\s+(\w+)")
             def_cfa_off_re = re.compile(r"DW_CFA_def_cfa_offset:\s+(\d+)")
             offset_fp_re = re.compile(r"DW_CFA_offset:\s+(?:r29|x29|r6|rbp)\b.*at cfa(-?\d+)")
@@ -699,6 +699,7 @@ def parse_cfi_table(artifact_path: str, arch: str = "x86_64") -> Dict[int, Dict[
             fp_established: bool = False
             last_rule_pc: int = 0
             state_stack: List[Tuple[str, int, bool]] = []
+            fde_entry_cfa: Tuple[str, int] = ("sp", 0)
 
             assert proc.stdout is not None
             for raw_line in proc.stdout:
@@ -743,6 +744,7 @@ def parse_cfi_table(artifact_path: str, arch: str = "x86_64") -> Dict[int, Dict[
                         curr_cfa_reg = "sp"
                         curr_cfa_off = 0 if arch in ("aarch64", "arm64") else 8
                     fp_established = False
+                    fde_entry_cfa = (curr_cfa_reg, curr_cfa_off)
                     last_rule_pc = low_pc
                     state_stack.clear()
                     curr_cie_offset = None
@@ -809,8 +811,24 @@ def parse_cfi_table(artifact_path: str, arch: str = "x86_64") -> Dict[int, Dict[
                     curr_fde["fp_offset_from_cfa"] = int(m_off.group(1))
                     if curr_fde["frame_established_pc"] is None:
                         curr_fde["frame_established_pc"] = curr_pc
+                    # A frame set up again after an epilogue (code shared by several exit paths) is live again:
+                    # only a teardown that is not followed by a new frame marks the end of the function's frame.
+                    curr_fde["frame_destroyed_pc"] = None
 
-                if restore_fp_re.search(line):
+                if restore_fp_re.search(line) and not state_stack:
+                    fp_established = False
+                    if curr_fde["frame_destroyed_pc"] is None:
+                        curr_fde["frame_destroyed_pc"] = curr_pc
+                elif (
+                    (m_cfa or m_cfa_r or m_cfa_o)
+                    and curr_fde["frame_established_pc"] is not None
+                    and not state_stack
+                    and (curr_cfa_reg, curr_cfa_off) == fde_entry_cfa
+                ):
+                    # Epilogue without DW_CFA_restore (x86_64 `pop %rbp; ret` is only
+                    # `DW_CFA_def_cfa: r7 (rsp) ofs 8`): the CFA rule is back to the CIE entry state after the
+                    # frame had been set up, so the frame is gone from this PC on. Early-return epilogues inside
+                    # DW_CFA_remember_state/restore_state pairs are not the end of the function and are skipped.
                     fp_established = False
                     if curr_fde["frame_destroyed_pc"] is None:
                         curr_fde["frame_destroyed_pc"] = curr_pc
@@ -1069,6 +1087,10 @@ class DwarfIndexer:
 
     @classmethod
     def _parse_int(cls, val: str) -> int:
+        # binutils < 2.39 prints DW_FORM_addrx values as bare hex: "(addr_index: 0x0): 401000"
+        m_ax = re.match(r"^\s*\((?:addr_)?index: [^)]*\):\s*([0-9a-fA-F]+)\s*$", val)
+        if m_ax:
+            return int(m_ax.group(1), 16)
         if "): " in val:
             val = val.split("): ", 1)[1]
         m = re.search(r"DW_OP_plus_uconst\s*(\d+)", val)
@@ -1328,6 +1350,9 @@ class DwarfIndexer:
 
         # Second pass: parse variables and subprograms
         cfi_table = parse_cfi_table(path, index.architecture)
+        # Location lists read from the section bytes: binutils < 2.39 cannot decode DW_FORM_loclistx (clang 14+,
+        # DWARF 5) and prints an empty DW_AT_location, so DIEs without readable text fall back to this map.
+        binary_loclists: Optional[Dict[int, int]] = None
 
         for die_idx, d in enumerate(dies):
             if d["tag"] == "DW_TAG_variable":
@@ -1469,6 +1494,11 @@ class DwarfIndexer:
                             c_loc_raw = c_attrs.get("DW_AT_location", "")
                             c_loc_expr = None
                             c_loc_list = None
+                            if not c_loc_raw:
+                                if binary_loclists is None:
+                                    from .dwarf_loclists_binary import read_location_lists
+                                    binary_loclists = read_location_lists(path).by_die
+                                c_loc_list = binary_loclists.get(child["offset"])
                             if c_loc_raw:
                                 if "(location list)" in c_loc_raw:
                                     m_off = re.search(r"(?:^|:\s*|[\s(])(?:0x)?([0-9a-fA-F]+)\s+\(location list\)", c_loc_raw)

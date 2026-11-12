@@ -214,12 +214,12 @@ def parse_debug_loc_table(artifact_path: str) -> Dict[int, List[Tuple[int, int, 
     try:
         cmd = ["readelf", "--debug-dump=loc", cache_key[0]]
         res = subprocess.run(cmd, capture_output=True, text=True, check=False)
-        if res.returncode != 0:
+        readelf_failed = res.returncode != 0
+        if readelf_failed:
             with _LOC_LOCK:
                 _LOC_ERROR[cache_key] = res.stderr.strip() or f"readelf exited with code {res.returncode}"
-            return {}
 
-        lines = res.stdout.splitlines()
+        lines = [] if readelf_failed else res.stdout.splitlines()
         current_list_offset: Optional[int] = None
         current_view_offsets: List[int] = []
         current_entries: List[Tuple[int, int, str]] = []
@@ -338,6 +338,16 @@ def parse_debug_loc_table(artifact_path: str) -> Dict[int, List[Tuple[int, int, 
     except Exception as e:
         _LOC_ERROR[cache_key] = str(e)
         return {}
+
+    # Lists the readelf text did not yield (binutils < 2.39 cannot decode clang 14+ DWARF 5 loclistx/rnglistx
+    # forms and prints nothing usable) come from the section bytes; readelf's own text wins where it has a list.
+    from .dwarf_loclists_binary import read_location_lists
+    for off, entries in read_location_lists(cache_key[0]).table.items():
+        loc_table.setdefault(off, entries)
+    if not loc_table and readelf_failed:
+        return {}
+    with _LOC_LOCK:
+        _LOC_ERROR.pop(cache_key, None)
 
     _LOC_CACHE[cache_key] = loc_table
     return loc_table
