@@ -1,0 +1,382 @@
+{
+  "repository": "C:\\task\\dynamicState\\dynamicState",
+  "totals": {
+    "code_lines": 191868,
+    "test_code_lines": 100530,
+    "source_code_lines": 91338,
+    "test_to_source_ratio": 1.101,
+    "unreadable_or_binary_source_files": 0
+  },
+  "by_language": {
+    "Python": {
+      "files": 368,
+      "code": 178528,
+      "comment": 23711,
+      "blank": 26162
+    },
+    "JavaScript": {
+      "files": 1,
+      "code": 9161,
+      "comment": 359,
+      "blank": 1078
+    },
+    "C++": {
+      "files": 19,
+      "code": 2133,
+      "comment": 148,
+      "blank": 328
+    },
+    "Shell": {
+      "files": 19,
+      "code": 1455,
+      "comment": 360,
+      "blank": 385
+    },
+    "C": {
+      "files": 13,
+      "code": 579,
+      "comment": 91,
+      "blank": 128
+    },
+    "Dockerfile": {
+      "files": 1,
+      "code": 12,
+      "comment": 0,
+      "blank": 4
+    }
+  },
+  "by_top_level_module": {
+    "tests": {
+      "source_code_lines": 0,
+      "test_code_lines": 100523,
+      "files": 308
+    },
+    "extractor": {
+      "source_code_lines": 84267,
+      "test_code_lines": 0,
+      "files": 85
+    },
+    "scripts": {
+      "source_code_lines": 3281,
+      "test_code_lines": 0,
+      "files": 6
+    },
+    "benchmarks": {
+      "source_code_lines": 2503,
+      "test_code_lines": 0,
+      "files": 6
+    },
+    "examples": {
+      "source_code_lines": 803,
+      "test_code_lines": 0,
+      "files": 11
+    },
+    "gdb": {
+      "source_code_lines": 338,
+      "test_code_lines": 0,
+      "files": 2
+    },
+    "(root)": {
+      "source_code_lines": 134,
+      "test_code_lines": 0,
+      "files": 1
+    },
+    "docker": {
+      "source_code_lines": 12,
+      "test_code_lines": 7,
+      "files": 2
+    }
+  },
+  "largest_source_files": [
+    {
+      "path": "extractor/watch_session.py",
+      "code_lines": 10133
+    },
+    {
+      "path": "extractor/web/static/app.js",
+      "code_lines": 9161
+    },
+    {
+      "path": "extractor/capture_backend.py",
+      "code_lines": 4858
+    },
+    {
+      "path": "extractor/investigation.py",
+      "code_lines": 4479
+    },
+    {
+      "path": "extractor/web/server.py",
+      "code_lines": 4425
+    },
+    {
+      "path": "extractor/expert_diagnostic_engine.py",
+      "code_lines": 3074
+    },
+    {
+      "path": "extractor/hypothesis.py",
+      "code_lines": 2857
+    },
+    {
+      "path": "scripts/mcp_server.py",
+      "code_lines": 2249
+    },
+    {
+      "path": "extractor/adaptive_engine.py",
+      "code_lines": 2156
+    },
+    {
+      "path": "extractor/diagnostic_recipes.py",
+      "code_lines": 2091
+    },
+    {
+      "path": "extractor/ebpf_tracer.py",
+      "code_lines": 2062
+    },
+    {
+      "path": "extractor/evidence_ledger.py",
+      "code_lines": 2042
+    },
+    {
+      "path": "extractor/competing_hypotheses.py",
+      "code_lines": 2031
+    },
+    {
+      "path": "extractor/target_adapter.py",
+      "code_lines": 1908
+    },
+    {
+      "path": "extractor/agent_runtime.py",
+      "code_lines": 1796
+    },
+    {
+      "path": "extractor/cli.py",
+      "code_lines": 1544
+    },
+    {
+      "path": "extractor/cpp_decoder.py",
+      "code_lines": 1518
+    },
+    {
+      "path": "extractor/llm_provider.py",
+      "code_lines": 1417
+    },
+    {
+      "path": "extractor/dwarf_indexer.py",
+      "code_lines": 1321
+    },
+    {
+      "path": "extractor/workflow.py",
+      "code_lines": 1142
+    },
+    {
+      "path": "extractor/temporal_investigation.py",
+      "code_lines": 1141
+    },
+    {
+      "path": "extractor/runtime_evidence_provider.py",
+      "code_lines": 1104
+    },
+    {
+      "path": "extractor/evaluation.py",
+      "code_lines": 1084
+    },
+    {
+      "path": "extractor/dwarf_evaluator.py",
+      "code_lines": 1039
+    },
+    {
+      "path": "extractor/verdict_engine.py",
+      "code_lines": 1036
+    }
+  ],
+  "debt_marker_counts": {},
+  "debt_markers": [],
+  "stub_signals": [
+    {
+      "location": "extractor/debug_info.py:195",
+      "text": "raise NotImplementedError("
+    },
+    {
+      "location": "extractor/debug_info.py:200",
+      "text": "raise NotImplementedError()"
+    },
+    {
+      "location": "extractor/debug_info.py:203",
+      "text": "raise NotImplementedError()"
+    },
+    {
+      "location": "extractor/debug_info.py:206",
+      "text": "raise NotImplementedError()"
+    },
+    {
+      "location": "extractor/execution.py:12",
+      "text": "raise NotImplementedError"
+    },
+    {
+      "location": "extractor/inspection_module.py:94",
+      "text": "raise NotImplementedError"
+    },
+    {
+      "location": "extractor/runtime_controller.py:79",
+      "text": "raise NotImplementedError"
+    },
+    {
+      "location": "extractor/runtime_controller.py:82",
+      "text": "raise NotImplementedError"
+    },
+    {
+      "location": "extractor/runtime_controller.py:85",
+      "text": "raise NotImplementedError"
+    },
+    {
+      "location": "extractor/runtime_controller.py:88",
+      "text": "raise NotImplementedError"
+    },
+    {
+      "location": "extractor/runtime_controller.py:91",
+      "text": "raise NotImplementedError"
+    },
+    {
+      "location": "extractor/runtime_controller.py:94",
+      "text": "raise NotImplementedError"
+    },
+    {
+      "location": "extractor/runtime_controller.py:101",
+      "text": "raise NotImplementedError"
+    },
+    {
+      "location": "extractor/runtime_controller.py:182",
+      "text": "raise NotImplementedError"
+    },
+    {
+      "location": "extractor/state_diff.py:24",
+      "text": "raise NotImplementedError"
+    },
+    {
+      "location": "extractor/state_diff.py:27",
+      "text": "raise NotImplementedError"
+    },
+    {
+      "location": "extractor/state_restorer.py:57",
+      "text": "raise NotImplementedError"
+    },
+    {
+      "location": "extractor/state_restorer.py:60",
+      "text": "raise NotImplementedError"
+    }
+  ],
+  "skipped_or_focused_tests": [
+    {
+      "location": "tests/test_phase2_4_4_mcp_e2e.py:55",
+      "text": "@unittest.skipUnless(MCP_AVAILABLE, \"mcp package not available\")"
+    },
+    {
+      "location": "tests/test_phase51_real_workspace_web_service.py:104",
+      "text": "@unittest.skipUnless(shutil.which(\"g++\"), \"g++ compiler required\")"
+    }
+  ],
+  "test_files_without_detectable_assertions": [
+    {
+      "path": "docker/gdb92/run_test.sh",
+      "code_lines": 7
+    },
+    {
+      "path": "tests/fixtures/real_runtime/ebpf_stack_fixture.cpp",
+      "code_lines": 176
+    },
+    {
+      "path": "tests/fixtures/real_runtime/expert_diagnostic_scenarios.cpp",
+      "code_lines": 122
+    },
+    {
+      "path": "tests/fixtures/real_runtime/guard_pool_fixture.cpp",
+      "code_lines": 87
+    },
+    {
+      "path": "tests/fixtures/real_runtime/main.cpp",
+      "code_lines": 106
+    },
+    {
+      "path": "tests/fixtures/real_runtime/phase11_concurrency_fixture.cpp",
+      "code_lines": 93
+    },
+    {
+      "path": "tests/fixtures/real_runtime/phase14_embedded_telemetry_fixture.cpp",
+      "code_lines": 115
+    },
+    {
+      "path": "tests/fixtures/real_runtime/phase2_1_8_runtime_targets.cpp",
+      "code_lines": 358
+    },
+    {
+      "path": "tests/fixtures/real_runtime/proc_accidental_tid_memory.c",
+      "code_lines": 55
+    },
+    {
+      "path": "tests/fixtures/real_runtime/proc_mem_burst_and_drop.c",
+      "code_lines": 35
+    },
+    {
+      "path": "tests/fixtures/real_runtime/proc_mem_vsz_mapping_only.c",
+      "code_lines": 30
+    },
+    {
+      "path": "tests/fixtures/real_runtime/proc_raw_futex_no_mutex.c",
+      "code_lines": 39
+    },
+    {
+      "path": "tests/fixtures/real_runtime/proc_scenario_a_healthy.c",
+      "code_lines": 64
+    },
+    {
+      "path": "tests/fixtures/real_runtime/proc_scenario_b_growing_mem.c",
+      "code_lines": 53
+    },
+    {
+      "path": "tests/fixtures/real_runtime/proc_scenario_c_thread_contention.c",
+      "code_lines": 61
+    },
+    {
+      "path": "tests/fixtures/real_runtime/proc_scenario_d_stripped.c",
+      "code_lines": 33
+    },
+    {
+      "path": "tests/fixtures/real_runtime/proc_thread_3way_deadlock.c",
+      "code_lines": 58
+    },
+    {
+      "path": "tests/fixtures/real_runtime/proc_thread_circular_deadlock.c",
+      "code_lines": 46
+    },
+    {
+      "path": "tests/fixtures/real_runtime/proc_thread_normal_cv.c",
+      "code_lines": 47
+    },
+    {
+      "path": "tests/fixtures/real_runtime/proc_two_waiters_one_lock.c",
+      "code_lines": 55
+    },
+    {
+      "path": "tests/fixtures/real_runtime/product_general_scenarios.cpp",
+      "code_lines": 133
+    },
+    {
+      "path": "tests/fixtures/real_runtime/scenario_target.cpp",
+      "code_lines": 112
+    }
+  ],
+  "source_files_not_referenced_by_any_test": [
+    "examples/deadlock_demo.cpp",
+    "benchmarks/investigation_quality/fixture_target.cpp",
+    "examples/pool_demo.cpp",
+    "examples/real_multithread_example.py",
+    "run_all_tests.sh",
+    "scripts/target_capture.sh"
+  ],
+  "source_files_not_referenced_by_any_test_count": 6,
+  "notes": [
+    "Signals are heuristic leads. Read the code before reporting any of them as a finding.",
+    "'not referenced by any test' uses basename matching; indirect coverage is possible.",
+    "'without detectable assertions' may miss custom assertion helpers or snapshot tests."
+  ]
+}

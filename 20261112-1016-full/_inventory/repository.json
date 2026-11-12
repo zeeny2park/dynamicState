@@ -1,0 +1,534 @@
+{
+  "repository": "C:\\task\\dynamicState\\dynamicState",
+  "name": "dynamicState",
+  "total_files": 469,
+  "category_counts": {
+    "build": 1,
+    "ci": 4,
+    "config": 12,
+    "docs": 28,
+    "other": 3,
+    "source": 112,
+    "test": 309
+  },
+  "languages_by_file_count": {
+    "Python": 368,
+    "C++": 19,
+    "Shell": 19,
+    "C": 13,
+    "Dockerfile": 1,
+    "JavaScript": 1
+  },
+  "top_level_layout": {
+    ".gitignore": 1,
+    "README.md": 1,
+    "benchmarks/": 12,
+    "ci/": 4,
+    "docker/": 2,
+    "docs/": 26,
+    "examples/": 11,
+    "extractor/": 88,
+    "gdb/": 2,
+    "protocol/": 5,
+    "requirements.txt": 1,
+    "run_all_tests.sh": 1,
+    "scripts/": 6,
+    "snapshots/": 1,
+    "tests/": 308
+  },
+  "intent_sources": {
+    "readme": [
+      "README.md",
+      "ci/README.md",
+      "protocol/README.md"
+    ],
+    "architecture": [
+      "docs/EBPF_TRACING_ARCHITECTURE_PHASE1.md",
+      "docs/EMBEDDED_DEPLOYMENT_ARCHITECTURE.md",
+      "docs/PHASE_6_AGENT_API_DESIGN.md"
+    ],
+    "roadmap_plan": [
+      "docs/EBPF_TRACING_ARCHITECTURE_PHASE1.md",
+      "docs/FUNCTIONAL_GAP_ANALYSIS_AND_DEVELOPMENT_ROADMAP.md",
+      "docs/PHASE_0_IMPLEMENTATION_INVENTORY_AND_INTEGRATION_AUDIT.md",
+      "docs/PHASE_2_2_2_3_FINAL_REPORT.md",
+      "docs/PHASE_2_2_C_1_FINAL_REPORT.md",
+      "docs/PHASE_2_2_C_FINAL_REPORT.md",
+      "docs/PHASE_2_3_C_1_FINAL_REPORT.md",
+      "docs/PHASE_2_3_C_FINAL_REPORT.md",
+      "docs/PHASE_2_4_1_FINAL_REPORT.md",
+      "docs/PHASE_2_4_2_FINAL_REPORT.md",
+      "docs/PHASE_2_4_3_FINAL_REPORT.md",
+      "docs/PHASE_2_4_4_FINAL_REPORT.md",
+      "docs/PHASE_2_4_FINAL_REPORT.md",
+      "docs/PHASE_6_AGENT_API_DESIGN.md"
+    ],
+    "api_spec": [
+      "docs/PHASE_6_AGENT_API_DESIGN.md"
+    ]
+  },
+  "build_systems": [
+    "Python (pip) (requirements.txt)"
+  ],
+  "ci_pipelines": [
+    "custom ci/ directory: ci/README.md",
+    "custom ci/ directory: ci/ci.yml",
+    "custom ci/ directory: ci/workflows/gdb92.yml",
+    "custom ci/ directory: ci/workflows/test.yml"
+  ],
+  "deployment_descriptors": [
+    "Docker: docker/gdb92/Dockerfile"
+  ],
+  "entry_points_manifest": [],
+  "entry_points_heuristic": [
+    {
+      "kind": "Python __main__",
+      "location": "benchmarks/capture_benchmark.py:950"
+    },
+    {
+      "kind": "CLI parser",
+      "location": "benchmarks/capture_benchmark.py:930"
+    },
+    {
+      "kind": "C/C++ main",
+      "location": "benchmarks/investigation_quality/fixture_target.cpp:127"
+    },
+    {
+      "kind": "Python __main__",
+      "location": "benchmarks/investigation_quality/run_benchmark.py:1174"
+    },
+    {
+      "kind": "CLI parser",
+      "location": "benchmarks/investigation_quality/run_benchmark.py:1141"
+    },
+    {
+      "kind": "C/C++ main",
+      "location": "examples/deadlock_demo.cpp:60"
+    },
+    {
+      "kind": "C/C++ main",
+      "location": "examples/pool_demo.cpp:23"
+    },
+    {
+      "kind": "Python __main__",
+      "location": "examples/real_multithread_example.py:243"
+    },
+    {
+      "kind": "C/C++ main",
+      "location": "examples/sample.cpp:65"
+    },
+    {
+      "kind": "C/C++ main",
+      "location": "examples/sample_dwarf_target.cpp:17"
+    },
+    {
+      "kind": "C/C++ main",
+      "location": "examples/sample_low_impact.cpp:65"
+    },
+    {
+      "kind": "C/C++ main",
+      "location": "examples/sample_multithread.cpp:77"
+    },
+    {
+      "kind": "C/C++ main",
+      "location": "examples/sample_multithread_nondet.cpp:52"
+    },
+    {
+      "kind": "C/C++ main",
+      "location": "examples/sample_pointer_cycle_target.cpp:25"
+    },
+    {
+      "kind": "C/C++ main",
+      "location": "examples/sample_prod.cpp:108"
+    },
+    {
+      "kind": "Python __main__",
+      "location": "extractor/__main__.py:5"
+    },
+    {
+      "kind": "Python __main__",
+      "location": "extractor/cli.py:1712"
+    },
+    {
+      "kind": "CLI parser",
+      "location": "extractor/cli.py:23"
+    },
+    {
+      "kind": "Python __main__",
+      "location": "extractor/evaluation.py:1244"
+    },
+    {
+      "kind": "Python __main__",
+      "location": "extractor/state_diff.py:404"
+    },
+    {
+      "kind": "CLI parser",
+      "location": "extractor/state_diff.py:411"
+    },
+    {
+      "kind": "Python __main__",
+      "location": "extractor/web/__main__.py:61"
+    },
+    {
+      "kind": "CLI parser",
+      "location": "extractor/web/__main__.py:17"
+    },
+    {
+      "kind": "Python __main__",
+      "location": "extractor/web/workspace.py:134"
+    },
+    {
+      "kind": "CLI parser",
+      "location": "extractor/web/workspace.py:23"
+    },
+    {
+      "kind": "Python __main__",
+      "location": "scripts/mcp_server.py:2895"
+    },
+    {
+      "kind": "Python __main__",
+      "location": "scripts/run_e2e_operational_acceptance.py:350"
+    },
+    {
+      "kind": "CLI parser",
+      "location": "scripts/run_e2e_operational_acceptance.py:79"
+    },
+    {
+      "kind": "Python __main__",
+      "location": "scripts/run_production_pilot.py:134"
+    },
+    {
+      "kind": "CLI parser",
+      "location": "scripts/run_production_pilot.py:30"
+    },
+    {
+      "kind": "Python __main__",
+      "location": "scripts/validate_real_target.py:652"
+    },
+    {
+      "kind": "CLI parser",
+      "location": "scripts/validate_real_target.py:626"
+    }
+  ],
+  "test_files_sample": [
+    "docker/gdb92/run_test.sh",
+    "tests/fixtures/real_runtime/ebpf_stack_fixture.cpp",
+    "tests/fixtures/real_runtime/expert_diagnostic_scenarios.cpp",
+    "tests/fixtures/real_runtime/guard_pool_fixture.cpp",
+    "tests/fixtures/real_runtime/main.cpp",
+    "tests/fixtures/real_runtime/phase11_concurrency_fixture.cpp",
+    "tests/fixtures/real_runtime/phase14_embedded_telemetry_fixture.cpp",
+    "tests/fixtures/real_runtime/phase2_1_8_runtime_targets.cpp",
+    "tests/fixtures/real_runtime/proc_accidental_tid_memory.c",
+    "tests/fixtures/real_runtime/proc_mem_burst_and_drop.c",
+    "tests/fixtures/real_runtime/proc_mem_vsz_mapping_only.c",
+    "tests/fixtures/real_runtime/proc_raw_futex_no_mutex.c",
+    "tests/fixtures/real_runtime/proc_scenario_a_healthy.c",
+    "tests/fixtures/real_runtime/proc_scenario_b_growing_mem.c",
+    "tests/fixtures/real_runtime/proc_scenario_c_thread_contention.c",
+    "tests/fixtures/real_runtime/proc_scenario_d_stripped.c",
+    "tests/fixtures/real_runtime/proc_thread_3way_deadlock.c",
+    "tests/fixtures/real_runtime/proc_thread_circular_deadlock.c",
+    "tests/fixtures/real_runtime/proc_thread_normal_cv.c",
+    "tests/fixtures/real_runtime/proc_two_waiters_one_lock.c",
+    "tests/fixtures/real_runtime/product_general_scenarios.cpp",
+    "tests/fixtures/real_runtime/scenario_target.cpp",
+    "tests/integration_agent_runtime.sh",
+    "tests/integration_exploration.sh",
+    "tests/integration_exploration_branching.sh",
+    "tests/integration_explorer_failure_isolation.sh",
+    "tests/integration_explorer_real_gdb.sh",
+    "tests/integration_gdb.sh",
+    "tests/integration_gdb92.py",
+    "tests/integration_low_impact_snapshot.sh",
+    "tests/integration_mutation_validation.sh",
+    "tests/integration_phase3.sh",
+    "tests/integration_phase5_2_hardening.sh",
+    "tests/integration_state_transition.sh",
+    "tests/integration_stripped_debug_image.sh",
+    "tests/integration_stripped_transition.sh",
+    "tests/integration_transition_failure.sh",
+    "tests/manual_acceptance_web_ui.py",
+    "tests/manual_acceptance_web_ui.sh",
+    "tests/real_world_gdb_scenario.py"
+  ],
+  "sensitive_file_names": [],
+  "scm": {
+    "available": true,
+    "branch": "main",
+    "head": "f842448aec369545cdf5af1400d2879818fcedbc",
+    "commit_count": 236,
+    "first_commit": "b2dc8f2|2026-09-27|feat: complete Phase 3 Runtime State Transition Engine (Snapshot, Typed Mutation, Continue, Semantic Diff)",
+    "recent_commits": [
+      {
+        "hash": "f842448",
+        "date": "2026-11-10",
+        "author": "zeeny2park",
+        "subject": "feat(phase-2.4.4): end-to-end adaptive investigation, counter source continuity, and evidence provenance validation"
+      },
+      {
+        "hash": "12b0547",
+        "date": "2026-11-10",
+        "author": "zeeny2park",
+        "subject": "feat(phase-2.4.3): enforce temporal epoch integrity, missing metrics semantics, and production path validation"
+      },
+      {
+        "hash": "4c738c9",
+        "date": "2026-11-10",
+        "author": "zeeny2park",
+        "subject": "feat(phase-2.4.2): temporal evidence integrity and lifecycle diagnostics closure"
+      },
+      {
+        "hash": "b63c044",
+        "date": "2026-11-10",
+        "author": "zeeny2park",
+        "subject": "feat(phase-2.4.1): validation integrity, evidence closure, and mcp transport e2e"
+      },
+      {
+        "hash": "635765d",
+        "date": "2026-11-10",
+        "author": "zeeny2park",
+        "subject": "feat(phase-2.4): embedded linux and real-world diagnostic validation closure"
+      },
+      {
+        "hash": "3d4d47d",
+        "date": "2026-11-09",
+        "author": "zeeny2park",
+        "subject": "feat(phase-2.3-c.1): measurement semantics and all-22-recipe diagnostic accuracy closure"
+      },
+      {
+        "hash": "52d4754",
+        "date": "2026-11-09",
+        "author": "zeeny2park",
+        "subject": "feat(phase-2.3-c): production diagnostic pipeline closure and end-to-end audit verification"
+      },
+      {
+        "hash": "c0375a0",
+        "date": "2026-11-09",
+        "author": "zeeny2park",
+        "subject": "Phase 2.2-C.1: Runtime Interpretation Correctness & End-to-End Diagnostic Validation"
+      },
+      {
+        "hash": "0df718b",
+        "date": "2026-11-09",
+        "author": "zeeny2park",
+        "subject": "feat(phase-2.2-c): unified C++ type decoder, allocator-aware pointer integrity, and temporal identity"
+      },
+      {
+        "hash": "69bb100",
+        "date": "2026-11-09",
+        "author": "zeeny2park",
+        "subject": "feat(phase-2.2-2.3): functional correctness and diagnostic integration closure"
+      },
+      {
+        "hash": "9be2661",
+        "date": "2026-11-09",
+        "author": "zeeny2park",
+        "subject": "docs: add functional gap analysis and development roadmap report"
+      },
+      {
+        "hash": "9a3b684",
+        "date": "2026-11-09",
+        "author": "zeeny2park",
+        "subject": "feat(phase-1.2.4.1): final trust boundary and serialization closure"
+      },
+      {
+        "hash": "86b320a",
+        "date": "2026-11-09",
+        "author": "zeeny2park",
+        "subject": "feat(security): close Phase 1.2.4 cryptographic conformance and legacy migration"
+      },
+      {
+        "hash": "ddf73dd",
+        "date": "2026-11-09",
+        "author": "zeeny2park",
+        "subject": "feat(security): close Phase 1.2.3 canonicalization compliance and trust compatibility"
+      },
+      {
+        "hash": "e182796",
+        "date": "2026-11-09",
+        "author": "zeeny2park",
+        "subject": "feat(trust): Phase 1.2.2 Cryptographic Canonicalization & Attestation Authority Closure"
+      },
+      {
+        "hash": "62635ce",
+        "date": "2026-11-09",
+        "author": "zeeny2park",
+        "subject": "feat(diagnostics): Phase 1.2.1 - Strict Identity Binding & Canonical Causal Attestation Closure"
+      },
+      {
+        "hash": "4d02f56",
+        "date": "2026-11-09",
+        "author": "zeeny2park",
+        "subject": "feat(diagnostics): Phase 1.2 - Controlled Execution Trust Closure & Final Verification"
+      },
+      {
+        "hash": "6af2959",
+        "date": "2026-11-09",
+        "author": "zeeny2park",
+        "subject": "feat(diagnostics): Phase 1.1 - Canonical Evidence Ingestion Hardening & Trust Boundary Closure"
+      },
+      {
+        "hash": "aa1839c",
+        "date": "2026-11-08",
+        "author": "zeeny2park",
+        "subject": "feat(diagnostics): Phase 1 - Canonical Evidence Ingestion & Trust Boundary Integration"
+      },
+      {
+        "hash": "f234daa",
+        "date": "2026-11-08",
+        "author": "zeeny2park",
+        "subject": "docs(audit): complete Phase 0 implementation inventory and integration audit"
+      },
+      {
+        "hash": "9dea5d3",
+        "date": "2026-11-08",
+        "author": "DynamicState Engineering",
+        "subject": "Phase 2.1.8: Evidence Trust Closure, Real-World Diagnostic Validation & Investigation Quality"
+      },
+      {
+        "hash": "c190269",
+        "date": "2026-11-08",
+        "author": "zeeny2park",
+        "subject": "feat(investigation): enforce verdict authority, multi-parent DAG traversal, and primary evidence rules"
+      },
+      {
+        "hash": "cae5ffb",
+        "date": "2026-11-08",
+        "author": "zeeny2park",
+        "subject": "feat(diagnostics): complete Phase 2.1.6 diagnostic verdict integrity and report completeness closure"
+      },
+      {
+        "hash": "465542f",
+        "date": "2026-11-08",
+        "author": "zeeny2park",
+        "subject": "feat(diagnostics): complete Phase 2.1.5 diagnostic methodology, evidence integrity, and reporting"
+      },
+      {
+        "hash": "7c828d1",
+        "date": "2026-11-08",
+        "author": "zeeny2park",
+        "subject": "feat(diagnostics): complete Phase 2.1.4 diagnostic execution integration and semantic correctness"
+      },
+      {
+        "hash": "40dfdc5",
+        "date": "2026-11-08",
+        "author": "zeeny2park",
+        "subject": "feat(diagnostics): complete Phase 2.1.3 expert diagnostic semantics & intelligence"
+      },
+      {
+        "hash": "79d1b02",
+        "date": "2026-11-08",
+        "author": "zeeny2park",
+        "subject": "feat(investigation): complete Phase 2.1.2 diagnostic accuracy & product-general runtime investigation"
+      },
+      {
+        "hash": "049a7d5",
+        "date": "2026-11-08",
+        "author": "zeeny2park",
+        "subject": "feat(phase-2.1.1): implement live evidence acquisition and evidence-driven diagnosis"
+      },
+      {
+        "hash": "9c65000",
+        "date": "2026-11-07",
+        "author": "zeeny2park",
+        "subject": "feat(investigation): Phase 2.1 adaptive investigation & expert diagnostic workflow"
+      },
+      {
+        "hash": "637c0fa",
+        "date": "2026-11-07",
+        "author": "zeeny2park",
+        "subject": "feat(trust): Phase 2.0-A.3.19 durable commit outcome semantics & verifiable evidence derivation closure"
+      }
+    ],
+    "working_tree_dirty": false,
+    "uncommitted_paths": [],
+    "churn_hotspots_last_500_commits": [
+      {
+        "path": "extractor/target_adapter.py",
+        "commits": 49
+      },
+      {
+        "path": "extractor/investigation.py",
+        "commits": 44
+      },
+      {
+        "path": "README.md",
+        "commits": 44
+      },
+      {
+        "path": "extractor/evidence_ledger.py",
+        "commits": 41
+      },
+      {
+        "path": "extractor/web/server.py",
+        "commits": 37
+      },
+      {
+        "path": "extractor/web/static/app.js",
+        "commits": 36
+      },
+      {
+        "path": "extractor/observation_budget.py",
+        "commits": 34
+      },
+      {
+        "path": "ci/workflows/test.yml",
+        "commits": 31
+      },
+      {
+        "path": "extractor/web/static/index.html",
+        "commits": 30
+      },
+      {
+        "path": "extractor/agent_runtime.py",
+        "commits": 28
+      },
+      {
+        "path": "extractor/adaptive_engine.py",
+        "commits": 27
+      },
+      {
+        "path": "extractor/watch_session.py",
+        "commits": 27
+      },
+      {
+        "path": "extractor/capture_backend.py",
+        "commits": 27
+      },
+      {
+        "path": "tests/test_ebpf_tracer.py",
+        "commits": 26
+      },
+      {
+        "path": "docs/EBPF_TRACING_ARCHITECTURE_PHASE1.md",
+        "commits": 25
+      },
+      {
+        "path": "run_all_tests.sh",
+        "commits": 24
+      },
+      {
+        "path": "extractor/ebpf_tracer.py",
+        "commits": 22
+      },
+      {
+        "path": "scripts/mcp_server.py",
+        "commits": 20
+      },
+      {
+        "path": "extractor/cli.py",
+        "commits": 19
+      },
+      {
+        "path": "extractor/hypothesis.py",
+        "commits": 18
+      }
+    ],
+    "recent_tags": []
+  },
+  "notes": [
+    "Heuristic classification: confirm by reading files before citing as evidence.",
+    "sensitive_file_names lists names only; contents were not read."
+  ]
+}

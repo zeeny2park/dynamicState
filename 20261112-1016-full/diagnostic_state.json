@@ -1,0 +1,1168 @@
+{
+  "schema": "project-diagnostic/state@1",
+  "generated_at": "2026-11-12T01:41:26+00:00",
+  "mode": "full",
+  "repository": "C:\\task\\dynamicState\\dynamicState",
+  "baseline_commit": "f842448aec369545cdf5af1400d2879818fcedbc",
+  "previous_state": null,
+  "reports": [
+    "ARCHITECTURE_AUDIT.md",
+    "BLINDSPOT_AND_RISK_REPORT.md",
+    "EXECUTIVE_SUMMARY.md",
+    "FUNCTIONAL_GAP_ANALYSIS.md",
+    "IMPROVEMENT_ROADMAP.md",
+    "PROJECT_OVERVIEW.md",
+    "REQUIREMENT_TRACEABILITY.md"
+  ],
+  "findings": [
+    {
+      "id": "F-ARCH-001",
+      "title": "진단 엔진 4종, 판정 어휘 3종, 보고서 생성기 3종이 병렬로 존재함",
+      "report": "ARCHITECTURE_AUDIT.md",
+      "category": "ARCH",
+      "severity": "HIGH",
+      "confidence": "HIGH",
+      "evidence_type": "FACT",
+      "requirements": [
+        "REQ-001"
+      ],
+      "evidence": [
+        "extractor/expert_diagnostic_engine.py:1392-1444",
+        "extractor/adaptive_engine.py:1159",
+        "extractor/investigation.py:1243-1458",
+        "extractor/workflow.py:408",
+        "extractor/diagnostic_verdict_aggregator.py:53-59",
+        "extractor/verdict_engine.py:68-74",
+        "extractor/watch_session.py:6786-6787",
+        "extractor/diagnostic_report.py:539",
+        "extractor/watch_session.py:11378-11626",
+        "extractor/investigation.py:3421",
+        "docs/FUNCTIONAL_GAP_ANALYSIS_AND_DEVELOPMENT_ROADMAP.md:167-169"
+      ]
+    },
+    {
+      "id": "F-ARCH-002",
+      "title": "`watch_session.py` 한 파일에 수집·해석·진단·보고가 섞여 있음",
+      "report": "ARCHITECTURE_AUDIT.md",
+      "category": "ARCH",
+      "severity": "MEDIUM",
+      "confidence": "HIGH",
+      "evidence_type": "FACT",
+      "requirements": [
+        "REQ-009"
+      ],
+      "evidence": [
+        "extractor/watch_session.py:103-173",
+        "extractor/watch_session.py:2432-2437",
+        "extractor/watch_session.py:5303-5322",
+        "extractor/watch_session.py:5731-5737",
+        "extractor/watch_session.py:7023-7052",
+        "extractor/watch_session.py:11378-11626",
+        "cmd: wc -l extractor/watch_session.py",
+        "_inventory/repository.md"
+      ]
+    },
+    {
+      "id": "F-ARCH-003",
+      "title": "전문가 지식이 분기문과 변수 이름 키워드로 코드에 박혀 있고, 테스트용 대상 프로그램의 이름·값과 닮아 있음",
+      "report": "ARCHITECTURE_AUDIT.md",
+      "category": "ARCH",
+      "severity": "HIGH",
+      "confidence": "MEDIUM",
+      "evidence_type": "INFERENCE",
+      "requirements": [
+        "OBJ-001"
+      ],
+      "evidence": [
+        "extractor/diagnostic_recipes.py:1006",
+        "extractor/runtime_evidence_provider.py:592-617",
+        "extractor/runtime_evidence_provider.py:767-779",
+        "extractor/runtime_evidence_provider.py:1169-1174",
+        "extractor/watch_session.py:5397-5411",
+        "tests/fixtures/real_runtime/expert_diagnostic_scenarios.cpp:35",
+        "tests/fixtures/real_runtime/expert_diagnostic_scenarios.cpp:46",
+        "tests/fixtures/real_runtime/expert_diagnostic_scenarios.cpp:83",
+        "scripts/mcp_server.py:2645"
+      ]
+    },
+    {
+      "id": "F-ARCH-004",
+      "title": "개발 노력이 신뢰·출처 검증 장치에 치우쳐 있고 핵심 진단 능력은 얕음",
+      "report": "ARCHITECTURE_AUDIT.md",
+      "category": "ARCH",
+      "severity": "MEDIUM",
+      "confidence": "MEDIUM",
+      "evidence_type": "INFERENCE",
+      "requirements": [
+        "OBJ-005"
+      ],
+      "evidence": [
+        "extractor/evidence_ledger.py:87-815",
+        "extractor/evidence_ledger.py:1470-2068",
+        "extractor/expert_diagnostic_engine.py:1583-1713",
+        "target/collector/src/sha256.c",
+        "extractor/allocator_inspector.py:203-219"
+      ]
+    },
+    {
+      "id": "F-ARCH-005",
+      "title": "원격(임베디드) 읽기 경로가 읽기마다 프로세스를 새로 띄우고, 폴백은 바이트 단위 읽기임",
+      "report": "ARCHITECTURE_AUDIT.md",
+      "category": "ARCH",
+      "severity": "HIGH",
+      "confidence": "HIGH",
+      "evidence_type": "FACT",
+      "requirements": [
+        "NFR-001"
+      ],
+      "evidence": [
+        "extractor/target_adapter.py:1484-1586",
+        "extractor/target_adapter.py:1799",
+        "extractor/target_adapter.py:1871",
+        "target/collector/src/main.c:262-388",
+        "target/collector/README.md:110-124"
+      ]
+    },
+    {
+      "id": "F-RISK-001",
+      "title": "조사 기본 경로가 대상 프로세스를 정지시키고, 보고서는 정지 시간을 0으로 고정 출력함",
+      "report": "BLINDSPOT_AND_RISK_REPORT.md",
+      "category": "RISK",
+      "severity": "HIGH",
+      "confidence": "HIGH",
+      "evidence_type": "FACT",
+      "requirements": [
+        "NFR-001"
+      ],
+      "evidence": [
+        "extractor/capture_plan.py:26",
+        "extractor/capture_backend.py:3220",
+        "extractor/capture_backend.py:3312-3315",
+        "extractor/capture_backend.py:3518",
+        "extractor/capture_backend.py:3546-3561",
+        "extractor/investigation.py:1452",
+        "extractor/cli.py:867-880",
+        "extractor/watch_session.py:11474",
+        "extractor/expert_diagnostic_engine.py:2979",
+        "benchmarks/latest_results.json:107-110"
+      ]
+    },
+    {
+      "id": "F-RISK-002",
+      "title": "x86_64·glibc·64비트 리틀 엔디언 가정이 다른 타깃에서 거부되지 않고 그대로 적용됨",
+      "report": "BLINDSPOT_AND_RISK_REPORT.md",
+      "category": "RISK",
+      "severity": "HIGH",
+      "confidence": "MEDIUM",
+      "evidence_type": "INFERENCE",
+      "requirements": [
+        "NFR-004"
+      ],
+      "evidence": [
+        "extractor/watch_session.py:5459-5463",
+        "extractor/watch_session.py:5416-5421",
+        "extractor/watch_session.py:5587-5600",
+        "extractor/allocator_inspector.py:203-209",
+        "extractor/allocator_inspector.py:701-708",
+        "extractor/target_adapter.py:1338-1349",
+        "extractor/target_adapter.py:2156-2162"
+      ]
+    },
+    {
+      "id": "F-TEST-001",
+      "title": "CI가 가동된 적이 없고, 교착 검증 테스트 11개 파일이 삭제된 심볼을 참조함",
+      "report": "BLINDSPOT_AND_RISK_REPORT.md",
+      "category": "TEST",
+      "severity": "HIGH",
+      "confidence": "HIGH",
+      "evidence_type": "FACT",
+      "requirements": [
+        "REQ-007"
+      ],
+      "evidence": [
+        "ci/README.md:34",
+        "tests/test_ci_workflow_parity.py:37-41",
+        "tests/test_phase2_0_a_3_4_1_deadlock_evidence_and_budget.py:74-84",
+        "tests/test_phase2_0_a_3_4_deadlock_proof_and_budget_audit.py:306-335",
+        "commit:533a0bb",
+        "cmd: git ls-files .github"
+      ]
+    },
+    {
+      "id": "F-TEST-002",
+      "title": "정확도 테스트가 상수를 단언하거나 답을 직접 주입하며, 원인 이름을 확인하는 테스트가 없음",
+      "report": "BLINDSPOT_AND_RISK_REPORT.md",
+      "category": "TEST",
+      "severity": "HIGH",
+      "confidence": "HIGH",
+      "evidence_type": "FACT",
+      "requirements": [
+        "REQ-004"
+      ],
+      "evidence": [
+        "tests/test_phase2_4_1_recipe_accuracy_and_evidence_path.py:421-430",
+        "tests/test_phase2_4_1_recipe_accuracy_and_evidence_path.py:399",
+        "tests/test_phase2_1_8_complete_validation.py:889-896",
+        "tests/test_phase2_1_8_complete_validation.py:974-978",
+        "tests/test_phase2_4_2_real_process_temporal_growth_and_accuracy.py:229-235",
+        "tests/test_phase2_0_a_3_12_real_cpp_e2e.py:192-211",
+        "tests/test_phase2_4_4_adaptive_investigation.py:191-193"
+      ]
+    },
+    {
+      "id": "F-TEST-003",
+      "title": "임베디드 보드, 에뮬레이터, 비-glibc 환경에서의 실행 기록이 없음",
+      "report": "BLINDSPOT_AND_RISK_REPORT.md",
+      "category": "TEST",
+      "severity": "HIGH",
+      "confidence": "HIGH",
+      "evidence_type": "FACT",
+      "requirements": [
+        "NFR-003"
+      ],
+      "evidence": [
+        "benchmarks/latest_results.json:3-9",
+        "docs/PHASE_2_4_FINAL_REPORT.md:6",
+        "extractor/production_pilot.py:672-675",
+        "tests/test_phase2_4_real_world_targets.py:253-267",
+        "tests/test_phase2_4_real_world_targets.py:276-278",
+        "ci/workflows/test.yml:27-29"
+      ]
+    },
+    {
+      "id": "F-SEC-001",
+      "title": "웹 API에 인증이 없고 모든 출처를 허용하며, 기본 모드에서 변이 기능이 열려 있음",
+      "report": "BLINDSPOT_AND_RISK_REPORT.md",
+      "category": "SEC",
+      "severity": "HIGH",
+      "confidence": "MEDIUM",
+      "evidence_type": "INFERENCE",
+      "requirements": [
+        "NFR-005"
+      ],
+      "evidence": [
+        "extractor/web/server.py:4195",
+        "extractor/web/server.py:4217-4257",
+        "extractor/web/server.py:3721-3726",
+        "extractor/agent_runtime.py:75",
+        "extractor/agent_runtime.py:663-667",
+        "scripts/mcp_server.py:520",
+        "extractor/cli.py:1218"
+      ]
+    },
+    {
+      "id": "F-OPS-001",
+      "title": "수집기 배포가 호스트와 같은 아키텍처에서만 동작하고 교차 빌드 절차가 없음",
+      "report": "BLINDSPOT_AND_RISK_REPORT.md",
+      "category": "OPS",
+      "severity": "MEDIUM",
+      "confidence": "HIGH",
+      "evidence_type": "FACT",
+      "requirements": [
+        "NFR-003"
+      ],
+      "evidence": [
+        "extractor/target_adapter.py:2066-2079",
+        "extractor/target_adapter.py:2093-2114",
+        "extractor/target_adapter.py:2116-2123",
+        "target/collector/Makefile:1-13",
+        ".gitignore:17"
+      ]
+    },
+    {
+      "id": "F-BUILD-001",
+      "title": "의존성·패키징·라이선스가 없고, `mcp`가 없으면 MCP 서버가 조용히 종료함",
+      "report": "BLINDSPOT_AND_RISK_REPORT.md",
+      "category": "BUILD",
+      "severity": "MEDIUM",
+      "confidence": "HIGH",
+      "evidence_type": "FACT",
+      "requirements": [
+        "REQ-001"
+      ],
+      "evidence": [
+        "requirements.txt:1-2",
+        "scripts/mcp_server.py:17-36",
+        "README.md:89",
+        "README.md:264",
+        "docker/gdb92/Dockerfile:1-12"
+      ]
+    },
+    {
+      "id": "F-PERF-001",
+      "title": "수집이 대상과 타깃 보드에 준 부하를 측정하지 않음",
+      "report": "BLINDSPOT_AND_RISK_REPORT.md",
+      "category": "PERF",
+      "severity": "MEDIUM",
+      "confidence": "HIGH",
+      "evidence_type": "FACT",
+      "requirements": [
+        "NFR-006"
+      ],
+      "evidence": [
+        "extractor/observation_budget.py:34-43",
+        "benchmarks/capture_benchmark.py:296-330",
+        "tests/test_phase2_4_collection_reliability_and_overhead.py:203",
+        "tests/test_phase2_4_collection_reliability_and_overhead.py:216-217",
+        "target/collector/src/collector.c:819-825",
+        "extractor/capture_backend.py:2160-2167"
+      ]
+    },
+    {
+      "id": "F-QUAL-001",
+      "title": "개발 과정이 자기 선언적 완료 판정과 대규모 일괄 변경에 의존함",
+      "report": "BLINDSPOT_AND_RISK_REPORT.md",
+      "category": "QUAL",
+      "severity": "MEDIUM",
+      "confidence": "MEDIUM",
+      "evidence_type": "INFERENCE",
+      "requirements": [],
+      "evidence": [
+        "commit:533a0bb",
+        "docs/PHASE_2_4_FINAL_REPORT.md:7",
+        "docs/PHASE_2_4_4_FINAL_REPORT.md:6",
+        "docs/FUNCTIONAL_GAP_ANALYSIS_AND_DEVELOPMENT_ROADMAP.md:7",
+        "cmd: git rev-list --count HEAD"
+      ]
+    },
+    {
+      "id": "F-FUNC-001",
+      "title": "주소에서 소유 변수를 찾는 역추적과 힙 순회가 없음",
+      "report": "FUNCTIONAL_GAP_ANALYSIS.md",
+      "category": "FUNC",
+      "severity": "HIGH",
+      "confidence": "HIGH",
+      "evidence_type": "FACT",
+      "requirements": [
+        "REQ-006"
+      ],
+      "evidence": [
+        "extractor/watch_session.py:3588-3598",
+        "extractor/watch_session.py:4380-4404",
+        "extractor/watch_session.py:7023-7052",
+        "extractor/watch_session.py:7171-7178",
+        "extractor/allocator_inspector.py:203-219"
+      ]
+    },
+    {
+      "id": "F-FUNC-002",
+      "title": "누수 진단이 \"메모리가 늘어난다\"에서 멈추고, 확정 경로는 실제 수집으로 도달할 수 없음",
+      "report": "FUNCTIONAL_GAP_ANALYSIS.md",
+      "category": "FUNC",
+      "severity": "HIGH",
+      "confidence": "HIGH",
+      "evidence_type": "FACT",
+      "requirements": [
+        "REQ-004"
+      ],
+      "evidence": [
+        "extractor/temporal_observation_window.py:472-481",
+        "extractor/temporal_observation_window.py:501-506",
+        "extractor/temporal_observation_window.py:55-56",
+        "tests/test_phase2_1_4_diagnostic_execution_integration.py:353-355",
+        "extractor/runtime_evidence_provider.py:972-980",
+        "extractor/expert_diagnostic_engine.py:1191-1192"
+      ]
+    },
+    {
+      "id": "F-FUNC-003",
+      "title": "버퍼 오버플로우를 탐지할 수 없음",
+      "report": "FUNCTIONAL_GAP_ANALYSIS.md",
+      "category": "FUNC",
+      "severity": "HIGH",
+      "confidence": "HIGH",
+      "evidence_type": "FACT",
+      "requirements": [
+        "REQ-005"
+      ],
+      "evidence": [
+        "extractor/watch_session.py:5731-5737",
+        "extractor/watch_session.py:2432-2437",
+        "extractor/watch_session.py:2457-2460",
+        "extractor/runtime_evidence_provider.py:767-779",
+        "extractor/runtime_evidence_provider.py:604-605"
+      ]
+    },
+    {
+      "id": "F-FUNC-004",
+      "title": "수집이 실패하면 \"정상\"으로 판정하는 경로가 있음",
+      "report": "FUNCTIONAL_GAP_ANALYSIS.md",
+      "category": "FUNC",
+      "severity": "CRITICAL",
+      "confidence": "HIGH",
+      "evidence_type": "FACT",
+      "requirements": [
+        "REQ-009"
+      ],
+      "evidence": [
+        "extractor/watch_session.py:11431-11432",
+        "extractor/watch_session.py:11444-11445",
+        "extractor/watch_session.py:11463-11464",
+        "extractor/watch_session.py:11524-11537",
+        "extractor/watch_session.py:11547",
+        "extractor/watch_session.py:7896-7903",
+        "scripts/mcp_server.py:2852",
+        "extractor/cli.py:1690-1696"
+      ]
+    },
+    {
+      "id": "F-FUNC-005",
+      "title": "한 번 관측한 순환 대기를 \"연속 표본으로 검증된 교착\"으로 보고함",
+      "report": "FUNCTIONAL_GAP_ANALYSIS.md",
+      "category": "FUNC",
+      "severity": "HIGH",
+      "confidence": "MEDIUM",
+      "evidence_type": "INFERENCE",
+      "requirements": [
+        "REQ-007"
+      ],
+      "evidence": [
+        "extractor/diagnostic_recipes.py:1537",
+        "extractor/diagnostic_recipes.py:1570-1584",
+        "extractor/runtime_evidence_provider.py:1206-1271",
+        "extractor/concurrency_graph.py:278-355"
+      ]
+    },
+    {
+      "id": "F-FUNC-006",
+      "title": "스레드 오동작 규칙에 입력을 넣는 수집기가 없음",
+      "report": "FUNCTIONAL_GAP_ANALYSIS.md",
+      "category": "FUNC",
+      "severity": "HIGH",
+      "confidence": "HIGH",
+      "evidence_type": "FACT",
+      "requirements": [
+        "REQ-008"
+      ],
+      "evidence": [
+        "extractor/diagnostic_recipes.py:769-897",
+        "extractor/diagnostic_recipes.py:2106-2177",
+        "extractor/watch_session.py:8054-8084",
+        "extractor/watch_session.py:8268-8285",
+        "extractor/watch_session.py:9686-9694",
+        "tests/test_phase2_1_8_complete_validation.py:974-978"
+      ]
+    },
+    {
+      "id": "F-FUNC-007",
+      "title": "\"PID 진단\" 단일 진입점이 없고 인터페이스마다 다른 엔진·판정이 나옴",
+      "report": "FUNCTIONAL_GAP_ANALYSIS.md",
+      "category": "FUNC",
+      "severity": "HIGH",
+      "confidence": "HIGH",
+      "evidence_type": "FACT",
+      "requirements": [
+        "REQ-001"
+      ],
+      "evidence": [
+        "scripts/mcp_server.py:508-510",
+        "scripts/mcp_server.py:512-530",
+        "scripts/mcp_server.py:687-688",
+        "extractor/expert_diagnostic_engine.py:2915-2916",
+        "extractor/cli.py:867-880",
+        "extractor/web/server.py:3721-3737",
+        "extractor/diagnostic_verdict_aggregator.py:53-59",
+        "extractor/verdict_engine.py:68-74",
+        "extractor/watch_session.py:6786-6787"
+      ]
+    },
+    {
+      "id": "F-FUNC-008",
+      "title": "메모리 증가 후속 단계를 만들 때 필수 인자가 빠져 있음",
+      "report": "FUNCTIONAL_GAP_ANALYSIS.md",
+      "category": "FUNC",
+      "severity": "HIGH",
+      "confidence": "MEDIUM",
+      "evidence_type": "INFERENCE",
+      "requirements": [
+        "REQ-004"
+      ],
+      "evidence": [
+        "extractor/expert_diagnostic_engine.py:730-743",
+        "extractor/expert_diagnostic_engine.py:2100-2116"
+      ]
+    },
+    {
+      "id": "F-FUNC-009",
+      "title": "관측하지 않은 사실을 확정으로 올리는 휴리스틱",
+      "report": "FUNCTIONAL_GAP_ANALYSIS.md",
+      "category": "FUNC",
+      "severity": "HIGH",
+      "confidence": "MEDIUM",
+      "evidence_type": "INFERENCE",
+      "requirements": [
+        "REQ-009"
+      ],
+      "evidence": [
+        "extractor/runtime_evidence_provider.py:787-807",
+        "extractor/diagnostic_recipes.py:1059-1090",
+        "extractor/runtime_evidence_provider.py:1169-1174",
+        "extractor/expert_diagnostic_engine.py:2060",
+        "extractor/expert_diagnostic_engine.py:2277-2289",
+        "extractor/expert_diagnostic_engine.py:2639-2640"
+      ]
+    },
+    {
+      "id": "F-FUNC-010",
+      "title": "보고서가 엔지니어·기계 지향이며 원인 대상이 이름으로 나오지 않음",
+      "report": "FUNCTIONAL_GAP_ANALYSIS.md",
+      "category": "FUNC",
+      "severity": "HIGH",
+      "confidence": "HIGH",
+      "evidence_type": "FACT",
+      "requirements": [
+        "REQ-010"
+      ],
+      "evidence": [
+        "extractor/diagnostic_report.py:558-565",
+        "extractor/expert_diagnostic_engine.py:3049-3052",
+        "extractor/expert_diagnostic_engine.py:2623-2640",
+        "extractor/expert_diagnostic_engine.py:2972-2979",
+        "extractor/watch_session.py:11474",
+        "extractor/watch_session.py:11552"
+      ]
+    },
+    {
+      "id": "F-FUNC-011",
+      "title": "증상 범주에 빈 곳이 있고 실시간 트리아지가 스레드만 봄",
+      "report": "FUNCTIONAL_GAP_ANALYSIS.md",
+      "category": "FUNC",
+      "severity": "MEDIUM",
+      "confidence": "HIGH",
+      "evidence_type": "FACT",
+      "requirements": [
+        "REQ-003"
+      ],
+      "evidence": [
+        "extractor/diagnostic_recipes.py:204-930",
+        "extractor/expert_diagnostic_engine.py:287-290",
+        "extractor/expert_diagnostic_engine.py:815-817",
+        "extractor/adaptive_engine.py:1561-1586",
+        "extractor/adaptive_engine.py:1435-1461"
+      ]
+    },
+    {
+      "id": "F-FUNC-012",
+      "title": "구현되었으나 어떤 진입점에서도 도달하지 않는 코드",
+      "report": "FUNCTIONAL_GAP_ANALYSIS.md",
+      "category": "FUNC",
+      "severity": "MEDIUM",
+      "confidence": "HIGH",
+      "evidence_type": "FACT",
+      "requirements": [
+        "REQ-001"
+      ],
+      "evidence": [
+        "extractor/workflow.py:408",
+        "extractor/concurrency_graph.py:129-402",
+        "extractor/expert_diagnostic_engine.py:1228",
+        "extractor/capture_backend.py:5462-5540",
+        "extractor/debug_info.py:188-206",
+        "scripts/target_capture.sh:2-5"
+      ]
+    },
+    {
+      "id": "F-FUNC-013",
+      "title": "콜스택이 실제 되감기가 아닌 스택 스캔이고, 원격 경로에서는 스레드 정보가 크게 줄어듦",
+      "report": "FUNCTIONAL_GAP_ANALYSIS.md",
+      "category": "FUNC",
+      "severity": "HIGH",
+      "confidence": "HIGH",
+      "evidence_type": "FACT",
+      "requirements": [
+        "REQ-007"
+      ],
+      "evidence": [
+        "extractor/watch_session.py:5561-5606",
+        "extractor/watch_session.py:5587-5600",
+        "extractor/target_adapter.py:1246-1247",
+        "extractor/target_adapter.py:1781-1788",
+        "extractor/watch_session.py:5481",
+        "extractor/dwarf_indexer.py:653-654",
+        "scripts/mcp_server.py:1899-1901"
+      ]
+    },
+    {
+      "id": "F-INTENT-001",
+      "title": "단계 보고서의 \"정밀도·재현율 100%, 양산 준비 완료\" 주장이 후속 보고서와 코드에 의해 부정됨",
+      "report": "REQUIREMENT_TRACEABILITY.md",
+      "category": "INTENT",
+      "severity": "HIGH",
+      "confidence": "HIGH",
+      "evidence_type": "FACT",
+      "requirements": [
+        "OBJ-001"
+      ],
+      "evidence": [
+        "docs/PHASE_2_4_FINAL_REPORT.md:7",
+        "docs/PHASE_2_4_FINAL_REPORT.md:103-104",
+        "docs/PHASE_2_4_4_FINAL_REPORT.md:127-135",
+        "docs/PHASE_2_4_4_FINAL_REPORT.md:146-147",
+        "tests/test_phase2_4_1_recipe_accuracy_and_evidence_path.py:421-430"
+      ]
+    },
+    {
+      "id": "F-INTENT-002",
+      "title": "README가 말하는 제품 정체성(상태 탐색·변이)과 실제 목적(읽기 전용 진단)이 어긋남",
+      "report": "REQUIREMENT_TRACEABILITY.md",
+      "category": "INTENT",
+      "severity": "MEDIUM",
+      "confidence": "HIGH",
+      "evidence_type": "FACT",
+      "requirements": [
+        "OBJ-003"
+      ],
+      "evidence": [
+        "README.md:11",
+        "README.md:23-24",
+        "README.md:169-180",
+        "docs/PROCESS_HEALTH_INVESTIGATION_SKILL.md:37"
+      ]
+    },
+    {
+      "id": "F-TRACE-001",
+      "title": "어떤 요구사항도 실행 증거로 검증되지 않음",
+      "report": "REQUIREMENT_TRACEABILITY.md",
+      "category": "TRACE",
+      "severity": "HIGH",
+      "confidence": "HIGH",
+      "evidence_type": "FACT",
+      "requirements": [
+        "OBJ-003"
+      ],
+      "evidence": [
+        "ci/README.md:34",
+        "docs/PHASE_2_4_4_FINAL_REPORT.md:6",
+        "cmd: git ls-files .github"
+      ]
+    },
+    {
+      "id": "F-TRACE-002",
+      "title": "진단 워크플로우 명세가 문서로만 있고 에이전트가 쓸 수 있는 형태로 연결되지 않음",
+      "report": "REQUIREMENT_TRACEABILITY.md",
+      "category": "TRACE",
+      "severity": "MEDIUM",
+      "confidence": "HIGH",
+      "evidence_type": "FACT",
+      "requirements": [
+        "REQ-011"
+      ],
+      "evidence": [
+        "docs/PROCESS_HEALTH_INVESTIGATION_SKILL.md:19-21",
+        "scripts/mcp_server.py:2872-2894",
+        "cmd: git ls-files"
+      ]
+    },
+    {
+      "id": "F-DOC-001",
+      "title": "README의 명령·경로·수치가 실제와 다름",
+      "report": "REQUIREMENT_TRACEABILITY.md",
+      "category": "DOC",
+      "severity": "LOW",
+      "confidence": "HIGH",
+      "evidence_type": "FACT",
+      "requirements": [],
+      "evidence": [
+        "README.md:128",
+        "README.md:193",
+        "README.md:264",
+        "README.md:113",
+        "README.md:251",
+        "extractor/cli.py:45-47",
+        "extractor/web/workspace.py:29"
+      ]
+    }
+  ],
+  "requirements": [
+    {
+      "id": "REQ-001",
+      "status": "PARTIALLY_IMPLEMENTED",
+      "requirement": "",
+      "evidence": []
+    },
+    {
+      "id": "REQ-002",
+      "status": "PARTIALLY_IMPLEMENTED",
+      "requirement": "",
+      "evidence": []
+    },
+    {
+      "id": "REQ-003",
+      "status": "PARTIALLY_IMPLEMENTED",
+      "requirement": "",
+      "evidence": []
+    },
+    {
+      "id": "REQ-004",
+      "status": "PARTIALLY_IMPLEMENTED",
+      "requirement": "",
+      "evidence": []
+    },
+    {
+      "id": "REQ-005",
+      "status": "PARTIALLY_IMPLEMENTED",
+      "requirement": "",
+      "evidence": []
+    },
+    {
+      "id": "REQ-006",
+      "status": "NOT_IMPLEMENTED",
+      "requirement": "",
+      "evidence": []
+    },
+    {
+      "id": "REQ-007",
+      "status": "PARTIALLY_IMPLEMENTED",
+      "requirement": "",
+      "evidence": []
+    },
+    {
+      "id": "REQ-008",
+      "status": "PARTIALLY_IMPLEMENTED",
+      "requirement": "",
+      "evidence": []
+    },
+    {
+      "id": "REQ-009",
+      "status": "IMPLEMENTED_BUT_INCORRECT",
+      "requirement": "",
+      "evidence": []
+    },
+    {
+      "id": "REQ-010",
+      "status": "PARTIALLY_IMPLEMENTED",
+      "requirement": "",
+      "evidence": []
+    },
+    {
+      "id": "REQ-011",
+      "status": "PARTIALLY_IMPLEMENTED",
+      "requirement": "",
+      "evidence": []
+    },
+    {
+      "id": "NFR-001",
+      "status": "IMPLEMENTED_BUT_INCORRECT",
+      "requirement": "",
+      "evidence": []
+    },
+    {
+      "id": "NFR-002",
+      "status": "PARTIALLY_IMPLEMENTED",
+      "requirement": "",
+      "evidence": []
+    },
+    {
+      "id": "NFR-003",
+      "status": "IMPLEMENTED_BUT_UNVERIFIED",
+      "requirement": "",
+      "evidence": []
+    },
+    {
+      "id": "NFR-004",
+      "status": "PARTIALLY_IMPLEMENTED",
+      "requirement": "",
+      "evidence": []
+    },
+    {
+      "id": "NFR-005",
+      "status": "PARTIALLY_IMPLEMENTED",
+      "requirement": "",
+      "evidence": []
+    },
+    {
+      "id": "NFR-006",
+      "status": "NOT_IMPLEMENTED",
+      "requirement": "",
+      "evidence": []
+    }
+  ],
+  "improvements": [
+    {
+      "id": "IMP-001",
+      "priority": "P0",
+      "title": "수집 실패를 \"정상\"으로 바꾸는 경로 제거",
+      "work_type": "EXISTING_IMPLEMENTATION_FIX",
+      "group": "IMMEDIATE_CORRECTIONS",
+      "findings": [
+        "F-FUNC-004",
+        "F-FUNC-009"
+      ],
+      "dependencies": [],
+      "requirements": [
+        "REQ-009"
+      ]
+    },
+    {
+      "id": "IMP-002",
+      "priority": "P0",
+      "title": "기본 수집을 무정지로 바꾸고 정지 시간을 측정값으로 보고",
+      "work_type": "EXISTING_IMPLEMENTATION_FIX",
+      "group": "IMMEDIATE_CORRECTIONS",
+      "findings": [
+        "F-RISK-001"
+      ],
+      "dependencies": [],
+      "requirements": [
+        "NFR-001",
+        "NFR-006"
+      ]
+    },
+    {
+      "id": "IMP-003",
+      "priority": "P1",
+      "title": "교착 지속성 기본값 수정",
+      "work_type": "EXISTING_IMPLEMENTATION_FIX",
+      "group": "IMMEDIATE_CORRECTIONS",
+      "findings": [
+        "F-FUNC-005"
+      ],
+      "dependencies": [],
+      "requirements": [
+        "REQ-007"
+      ]
+    },
+    {
+      "id": "IMP-004",
+      "priority": "P1",
+      "title": "메모리 증가 후속 단계 생성 결함 수정",
+      "work_type": "EXISTING_IMPLEMENTATION_FIX",
+      "group": "IMMEDIATE_CORRECTIONS",
+      "findings": [
+        "F-FUNC-008"
+      ],
+      "dependencies": [],
+      "requirements": [
+        "REQ-004"
+      ]
+    },
+    {
+      "id": "IMP-005",
+      "priority": "P0",
+      "title": "테스트 기준선 확보와 CI 가동",
+      "work_type": "TEST_OR_VERIFICATION",
+      "group": "RELIABILITY_AND_VALIDATION",
+      "findings": [
+        "F-TEST-001",
+        "F-TRACE-001",
+        "F-QUAL-001"
+      ],
+      "dependencies": [],
+      "requirements": [
+        "NFR-003",
+        "REQ-007"
+      ]
+    },
+    {
+      "id": "IMP-006",
+      "priority": "P1",
+      "title": "단일 `diagnose` 진입점",
+      "work_type": "INTEGRATION_FIX",
+      "group": "CORE_FUNCTIONAL_COMPLETION",
+      "findings": [
+        "F-FUNC-007",
+        "F-ARCH-001"
+      ],
+      "dependencies": [
+        "IMP-001",
+        "IMP-005"
+      ],
+      "requirements": [
+        "REQ-001"
+      ]
+    },
+    {
+      "id": "IMP-007",
+      "priority": "P1",
+      "title": "힙 순회기와 역참조 맵(주소 → 변수)",
+      "work_type": "NEW_IMPLEMENTATION",
+      "group": "CORE_FUNCTIONAL_COMPLETION",
+      "findings": [
+        "F-FUNC-001"
+      ],
+      "dependencies": [
+        "IMP-005"
+      ],
+      "requirements": [
+        "REQ-006"
+      ]
+    },
+    {
+      "id": "IMP-008",
+      "priority": "P1",
+      "title": "누수 주체 특정",
+      "work_type": "EXISTING_IMPLEMENTATION_FIX",
+      "group": "CORE_FUNCTIONAL_COMPLETION",
+      "findings": [
+        "F-FUNC-002"
+      ],
+      "dependencies": [
+        "IMP-004",
+        "IMP-007"
+      ],
+      "requirements": [
+        "REQ-004"
+      ]
+    },
+    {
+      "id": "IMP-009",
+      "priority": "P1",
+      "title": "버퍼 오버플로우 탐지",
+      "work_type": "NEW_IMPLEMENTATION",
+      "group": "CORE_FUNCTIONAL_COMPLETION",
+      "findings": [
+        "F-FUNC-003"
+      ],
+      "dependencies": [
+        "IMP-007"
+      ],
+      "requirements": [
+        "REQ-005"
+      ]
+    },
+    {
+      "id": "IMP-010",
+      "priority": "P1",
+      "title": "스레드 시계열 표본 수집과 규칙 연결",
+      "work_type": "INTEGRATION_FIX",
+      "group": "CORE_FUNCTIONAL_COMPLETION",
+      "findings": [
+        "F-FUNC-006",
+        "F-FUNC-005",
+        "F-FUNC-012"
+      ],
+      "dependencies": [
+        "IMP-003",
+        "IMP-005"
+      ],
+      "requirements": [
+        "REQ-007",
+        "REQ-008"
+      ]
+    },
+    {
+      "id": "IMP-011",
+      "priority": "P1",
+      "title": "CFI 기반 콜스택과 원격 스레드 정보",
+      "work_type": "EXISTING_IMPLEMENTATION_FIX",
+      "group": "CORE_FUNCTIONAL_COMPLETION",
+      "findings": [
+        "F-FUNC-013"
+      ],
+      "dependencies": [
+        "IMP-021"
+      ],
+      "requirements": [
+        "NFR-004",
+        "REQ-007"
+      ]
+    },
+    {
+      "id": "IMP-012",
+      "priority": "P1",
+      "title": "사람이 읽는 보고서(평이한 결론, 이름과 위치, 한국어)",
+      "work_type": "EXISTING_IMPLEMENTATION_FIX",
+      "group": "CORE_FUNCTIONAL_COMPLETION",
+      "findings": [
+        "F-FUNC-010"
+      ],
+      "dependencies": [
+        "IMP-006",
+        "IMP-007"
+      ],
+      "requirements": [
+        "REQ-010"
+      ]
+    },
+    {
+      "id": "IMP-013",
+      "priority": "P1",
+      "title": "정답표가 있는 실제 프로세스 정확도 벤치마크",
+      "work_type": "TEST_OR_VERIFICATION",
+      "group": "RELIABILITY_AND_VALIDATION",
+      "findings": [
+        "F-TEST-002",
+        "F-INTENT-001",
+        "F-ARCH-003",
+        "F-QUAL-001"
+      ],
+      "dependencies": [
+        "IMP-005"
+      ],
+      "requirements": [
+        "REQ-004",
+        "REQ-005",
+        "REQ-007",
+        "REQ-008"
+      ]
+    },
+    {
+      "id": "IMP-014",
+      "priority": "P1",
+      "title": "임베디드 타깃 검증 행렬(에뮬레이터)",
+      "work_type": "TEST_OR_VERIFICATION",
+      "group": "RELIABILITY_AND_VALIDATION",
+      "findings": [
+        "F-TEST-003"
+      ],
+      "dependencies": [
+        "IMP-016"
+      ],
+      "requirements": [
+        "NFR-003",
+        "NFR-004"
+      ]
+    },
+    {
+      "id": "IMP-015",
+      "priority": "P1",
+      "title": "타깃 ABI 판별과 미지원 조합 거부",
+      "work_type": "EXISTING_IMPLEMENTATION_FIX",
+      "group": "CORE_FUNCTIONAL_COMPLETION",
+      "findings": [
+        "F-RISK-002"
+      ],
+      "dependencies": [],
+      "requirements": [
+        "NFR-004"
+      ]
+    },
+    {
+      "id": "IMP-016",
+      "priority": "P2",
+      "title": "수집기 교차 빌드와 배포 방식 개선",
+      "work_type": "EXISTING_IMPLEMENTATION_FIX",
+      "group": "RELIABILITY_AND_VALIDATION",
+      "findings": [
+        "F-OPS-001"
+      ],
+      "dependencies": [],
+      "requirements": [
+        "NFR-003"
+      ]
+    },
+    {
+      "id": "IMP-017",
+      "priority": "P2",
+      "title": "진단 엔진 통합과 도달 불가 코드 제거",
+      "work_type": "REFACTORING",
+      "group": "ARCHITECTURAL_IMPROVEMENTS",
+      "findings": [
+        "F-ARCH-001",
+        "F-ARCH-002",
+        "F-FUNC-012"
+      ],
+      "dependencies": [
+        "IMP-005",
+        "IMP-006",
+        "IMP-013"
+      ],
+      "requirements": [
+        "REQ-001",
+        "REQ-009"
+      ]
+    },
+    {
+      "id": "IMP-018",
+      "priority": "P2",
+      "title": "선언형 레시피, 구조 기반 후보 선정, 범주 확장",
+      "work_type": "REFACTORING",
+      "group": "ARCHITECTURAL_IMPROVEMENTS",
+      "findings": [
+        "F-ARCH-003",
+        "F-FUNC-009",
+        "F-FUNC-011"
+      ],
+      "dependencies": [
+        "IMP-013"
+      ],
+      "requirements": [
+        "OBJ-001",
+        "REQ-002",
+        "REQ-003"
+      ]
+    },
+    {
+      "id": "IMP-019",
+      "priority": "P1",
+      "title": "읽기 전용 기본값과 웹 API 인증",
+      "work_type": "EXISTING_IMPLEMENTATION_FIX",
+      "group": "IMMEDIATE_CORRECTIONS",
+      "findings": [
+        "F-SEC-001"
+      ],
+      "dependencies": [],
+      "requirements": [
+        "NFR-005"
+      ]
+    },
+    {
+      "id": "IMP-020",
+      "priority": "P2",
+      "title": "수집이 대상에 준 부하 측정",
+      "work_type": "NEW_IMPLEMENTATION",
+      "group": "PERFORMANCE_AND_OPTIMIZATION",
+      "findings": [
+        "F-PERF-001"
+      ],
+      "dependencies": [
+        "IMP-002"
+      ],
+      "requirements": [
+        "NFR-002",
+        "NFR-006"
+      ]
+    },
+    {
+      "id": "IMP-021",
+      "priority": "P2",
+      "title": "수집기 데몬 모드를 지속 SSH 세션으로 연결",
+      "work_type": "INTEGRATION_FIX",
+      "group": "PERFORMANCE_AND_OPTIMIZATION",
+      "findings": [
+        "F-ARCH-005"
+      ],
+      "dependencies": [
+        "IMP-016"
+      ],
+      "requirements": [
+        "NFR-001"
+      ]
+    },
+    {
+      "id": "IMP-022",
+      "priority": "P2",
+      "title": "의존성 선언, 패키징, README 정정",
+      "work_type": "DOCUMENTATION_UPDATE",
+      "group": "RELIABILITY_AND_VALIDATION",
+      "findings": [
+        "F-BUILD-001",
+        "F-DOC-001",
+        "F-INTENT-002"
+      ],
+      "dependencies": [
+        "IMP-006"
+      ],
+      "requirements": [
+        "REQ-001"
+      ]
+    },
+    {
+      "id": "IMP-023",
+      "priority": "P2",
+      "title": "진단 워크플로우를 에이전트 스킬로 패키징",
+      "work_type": "INTEGRATION_FIX",
+      "group": "CORE_FUNCTIONAL_COMPLETION",
+      "findings": [
+        "F-TRACE-002"
+      ],
+      "dependencies": [
+        "IMP-006"
+      ],
+      "requirements": [
+        "REQ-011"
+      ]
+    }
+  ],
+  "incremental": []
+}

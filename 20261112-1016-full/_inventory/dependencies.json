@@ -1,0 +1,192 @@
+{
+  "repository": "C:\\task\\dynamicState\\dynamicState",
+  "manifests": [
+    {
+      "manifest": "requirements.txt",
+      "dependency_count": 0,
+      "pinning": {},
+      "dependencies": []
+    }
+  ],
+  "lockfiles": [],
+  "manifests_without_lockfile_in_same_dir": [],
+  "internal_graph": {
+    "component_depth": 2,
+    "file_edge_count": 1172,
+    "lazy_python_import_edges": 153,
+    "lazy_python_import_examples": [
+      "extractor/adaptive_engine.py -> extractor/watch_session.py",
+      "extractor/agent_runtime.py -> extractor/memory_capture.py",
+      "extractor/agent_runtime.py -> extractor/memory_snapshot.py",
+      "extractor/agent_runtime.py -> extractor/memory_snapshot_summary.py",
+      "extractor/agent_runtime.py -> extractor/modules.py",
+      "extractor/agent_runtime.py -> extractor/offline_analyzer.py",
+      "extractor/capture_backend.py -> extractor/debug_image.py",
+      "extractor/causal_fixtures.py -> extractor/debug_image.py",
+      "extractor/cli.py -> extractor/agent_runtime.py",
+      "extractor/cli.py -> extractor/debug_image.py",
+      "extractor/cli.py -> extractor/dwarf_indexer.py",
+      "extractor/cli.py -> extractor/ebpf_tracer.py",
+      "extractor/cli.py -> extractor/memory_maps.py",
+      "extractor/cli.py -> extractor/memory_snapshot.py",
+      "extractor/cli.py -> extractor/modules.py"
+    ],
+    "component_edges": {
+      "benchmarks": {
+        "extractor": 3
+      },
+      "benchmarks/investigation_quality": {
+        "extractor": 7
+      },
+      "examples": {
+        "extractor": 3
+      },
+      "extractor/web": {
+        "extractor": 7
+      },
+      "gdb": {
+        "extractor": 4
+      },
+      "scripts": {
+        "extractor": 10
+      },
+      "tests": {
+        "extractor": 858,
+        "extractor/web": 44,
+        "benchmarks": 1,
+        "benchmarks/investigation_quality": 2,
+        "scripts": 25
+      }
+    },
+    "component_cycles": [],
+    "file_level_cycles": [],
+    "highest_fan_in_files": [
+      {
+        "path": "extractor/target_adapter.py",
+        "imported_by": 84
+      },
+      {
+        "path": "extractor/evidence_ledger.py",
+        "imported_by": 82
+      },
+      {
+        "path": "extractor/capture_backend.py",
+        "imported_by": 73
+      },
+      {
+        "path": "extractor/agent_runtime.py",
+        "imported_by": 61
+      },
+      {
+        "path": "extractor/observation_budget.py",
+        "imported_by": 60
+      },
+      {
+        "path": "extractor/debug_image.py",
+        "imported_by": 56
+      },
+      {
+        "path": "extractor/investigation.py",
+        "imported_by": 46
+      },
+      {
+        "path": "extractor/web/server.py",
+        "imported_by": 45
+      },
+      {
+        "path": "extractor/watch_session.py",
+        "imported_by": 40
+      },
+      {
+        "path": "extractor/hypothesis.py",
+        "imported_by": 31
+      },
+      {
+        "path": "extractor/expert_diagnostic_engine.py",
+        "imported_by": 30
+      },
+      {
+        "path": "extractor/diagnostic_recipes.py",
+        "imported_by": 26
+      },
+      {
+        "path": "extractor/dwarf_indexer.py",
+        "imported_by": 25
+      },
+      {
+        "path": "scripts/mcp_server.py",
+        "imported_by": 25
+      },
+      {
+        "path": "extractor/adaptive_engine.py",
+        "imported_by": 24
+      }
+    ],
+    "highest_fan_out_files": [
+      {
+        "path": "extractor/agent_runtime.py",
+        "imports": 19
+      },
+      {
+        "path": "extractor/expert_diagnostic_engine.py",
+        "imports": 19
+      },
+      {
+        "path": "extractor/investigation.py",
+        "imports": 18
+      },
+      {
+        "path": "extractor/__init__.py",
+        "imports": 12
+      },
+      {
+        "path": "tests/test_phase25_grounded_investigation.py",
+        "imports": 12
+      },
+      {
+        "path": "tests/test_phase26_real_execution_quality.py",
+        "imports": 12
+      },
+      {
+        "path": "tests/test_harness_scenarios.py",
+        "imports": 11
+      },
+      {
+        "path": "tests/test_causal_validation_hardening.py",
+        "imports": 10
+      },
+      {
+        "path": "tests/test_phase13_operational_acceptance.py",
+        "imports": 10
+      },
+      {
+        "path": "tests/test_phase24_temporal_investigation.py",
+        "imports": 10
+      },
+      {
+        "path": "tests/test_phase28_memory_explorer_ux.py",
+        "imports": 10
+      },
+      {
+        "path": "tests/test_phase2_1_5_diagnostic_methodology_and_reporting.py",
+        "imports": 10
+      },
+      {
+        "path": "tests/test_phase2_1_8_complete_validation.py",
+        "imports": 10
+      },
+      {
+        "path": "extractor/watch_session.py",
+        "imports": 9
+      },
+      {
+        "path": "tests/test_audit_hardening.py",
+        "imports": 9
+      }
+    ]
+  },
+  "notes": [
+    "Internal graph resolution is heuristic (static imports only; dynamic loading, DI and reflection are invisible).",
+    "A missing lockfile may be intentional for libraries; judge against the project's distribution model."
+  ]
+}
