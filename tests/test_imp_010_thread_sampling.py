@@ -142,14 +142,16 @@ class TestSpinAndLongWait(_RealProcessBase):
         self.assertEqual(names, ["spin_hang"], f"busy_worker must not be flagged; spin_hang row: {spin_row}")
         spin = obs["runaway_threads"][0]
         self.assertIn(spin["function"], SPIN_FUNCTIONS)
-        self.assertGreaterEqual(spin["cpu_share"], 0.5)
+        # CPU share depends on machine load; "always wanted the CPU" (schedstat) does not
+        self.assertGreaterEqual(spin["runnable_fraction"], 0.9)
+        self.assertGreater(spin["cpu_share"], 0.0)
         self.assertEqual(spin["verdict"], "CPU monopoly without observable progress")
         # the finding that reaches the engine's evidence names the thread
         findings = [e.get("finding", "") for e in session.collected_evidence]
         self.assertTrue(any("spin_hang" in f and "CPU monopoly without observable progress" in f for f in findings), findings)
         # the control: same CPU class, but progressing (read/write syscalls advance, different frames)
         worker = next(t for t in obs["thread_summary"] if t["name"] == "busy_worker")
-        self.assertGreaterEqual(worker["cpu_share"], 0.4)
+        self.assertGreater(worker["cpu_share"], 0.0)
         self.assertGreater(worker["io_syscalls_delta"], 0)
 
     def test_long_wait_is_reported_as_unknown_expectation_not_a_fault(self):

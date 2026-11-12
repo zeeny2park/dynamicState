@@ -42,6 +42,8 @@ except (ValueError, OSError, AttributeError):  # pragma: no cover
 MUTEX_SPAN = 40          # sizeof(pthread_mutex_t) on 64-bit glibc; upper bound used to match futex addresses
 FUTEX_CMD_WAIT = 0
 FUTEX_CMD_WAIT_BITSET = 9
+SCHEDSTAT_FALLBACK_NOTE = ("per-thread schedstat unavailable: fell back to the CPU-share rule; a contended machine "
+                           "can hide a spinner (it may receive less CPU than the threshold)")
 LONG_WAIT_VERDICT = "long wait observed, cannot determine whether expected"
 
 
@@ -52,6 +54,14 @@ LONG_WAIT_VERDICT = "long wait observed, cannot determine whether expected"
 class ThreadSamplingConfig:
     samples: int = 5
     interval_sec: float = 0.15
+    # Primary spin criterion: fraction of the window the thread was RUNNABLE (on CPU + waiting on a run queue, from
+    # /proc/<pid>/task/<tid>/schedstat).  An always-runnable thread scores ~1.0 however many competitors there are;
+    # a thread that sleeps or blocks scores far lower.  0.9 leaves room for sampling-time jitter (timestamps are
+    # taken around, not inside, the kernel read) while staying well above any thread that blocks for a real share.
+    runaway_runnable_fraction: float = 0.90
+    # A runnable thread that received (almost) no CPU is starved, not "monopolising": require a sliver of real CPU.
+    runaway_min_cpu_share_when_runnable: float = 0.02
+    # Fallback only (schedstat absent or all zero): the old absolute rule, which a contended machine can defeat.
     runaway_cpu_share: float = 0.50
     # A spinner can still take a stray voluntary switch (page-fault lock, start-up tail). Requiring exactly zero
     # made the verdict flip on a single event; tolerate a negligible rate instead.
@@ -68,6 +78,8 @@ class ThreadSamplingConfig:
                 cfg.samples = max(2, int(t["thread_sample_count"]))
             if t.get("thread_sample_interval_sec") is not None:
                 cfg.interval_sec = max(0.0, float(t["thread_sample_interval_sec"]))
+            if t.get("runaway_runnable_fraction") is not None:
+                cfg.runaway_runnable_fraction = float(t["runaway_runnable_fraction"])
             if t.get("runaway_cpu_share") is not None:
                 cfg.runaway_cpu_share = float(t["runaway_cpu_share"])
         except (TypeError, ValueError):
@@ -557,7 +569,7 @@ def _symbolize(data: _DwarfData, rt: Callable[[int], int], addr: int, idx: Any) 
 # Thread time series
 # --------------------------------------------------------------------------------------
 def read_thread_fields(pid: int, tid: int, counters: Dict[str, int]) -> Optional[Dict[str, Any]]:
-    """state, utime/stime, context switches, io syscall counters of one thread (4 small /proc reads)."""
+    """state, utime/stime, context switches, io syscall counters, schedstat of one thread (6 small /proc reads)."""
     base = f"/proc/{pid}/task/{tid}"
     stat = _read_proc_file(f"{base}/stat", counters)
     if stat is None:
@@ -597,6 +609,14 @@ def read_thread_fields(pid: int, tid: int, counters: Dict[str, int]) -> Optional
             syscw = int(line.split(":", 1)[1])
     rec["io_syscalls"] = (syscr + syscw) if (syscr is not None and syscw is not None) else None
     rec["syscall"] = read_syscall(pid, tid, counters)
+    # run ns / run-queue wait ns / timeslices; absent (no key) when unreadable (no CONFIG_SCHED_INFO)
+    ss = _read_proc_file(f"{base}/schedstat", counters)
+    parts = (ss or "").split()
+    if len(parts) >= 3:
+        try:
+            rec["schedstat"] = {"run_ns": int(parts[0]), "wait_ns": int(parts[1]), "timeslices": int(parts[2])}
+        except ValueError:
+            pass
     return rec
 
 
@@ -820,6 +840,22 @@ def derive(series: ThreadSeries) -> Dict[str, Any]:
         ticks = [r["utime_ticks"] + r["stime_ticks"] for r in recs]
         d["cpu_ticks_delta"] = ticks[-1] - ticks[0]
         d["cpu_share"] = round((ticks[-1] - ticks[0]) / CLK_TCK / window, 3) if len(pts) >= 2 else None
+        # runnable fraction from schedstat; never fabricated: None when absent / all-zero (kernel without SCHED_INFO)
+        ss_pts = [(t, r["schedstat"]) for t, r in zip(times, recs) if isinstance(r.get("schedstat"), dict)]
+        usable = (len(ss_pts) >= 2
+                  and any(v["run_ns"] or v["wait_ns"] or v.get("timeslices") for _, v in ss_pts))
+        d["schedstat_available"] = bool(usable)
+        d["runnable_fraction"] = None
+        d["runnable_cpu_received"] = None
+        if usable:
+            (ta, a), (tb, b) = ss_pts[0], ss_pts[-1]
+            span_ns = max(1.0, (tb - ta) * 1e9)
+            dr, dw = b["run_ns"] - a["run_ns"], b["wait_ns"] - a["wait_ns"]
+            if dr >= 0 and dw >= 0 and tb > ta:
+                d["runnable_fraction"] = round(min(1.0, (dr + dw) / span_ns), 3)
+                d["runnable_cpu_received"] = round(min(1.0, dr / span_ns), 3)
+            else:
+                d["schedstat_available"] = False
         vols = [r.get("voluntary_ctxt_switches") for r in recs]
         invs = [r.get("nonvoluntary_ctxt_switches") for r in recs]
         d["voluntary_switches_delta"] = (vols[-1] - vols[0]) if None not in (vols[0], vols[-1]) else None
@@ -904,6 +940,10 @@ def judge(series: ThreadSeries) -> Dict[str, Any]:
         return result
     result["thread_sampling"]["status"] = "OK"
     threads = dv["threads"]
+    ss_ok = any(t["schedstat_available"] for t in threads.values())
+    result["thread_sampling"]["schedstat_available"] = ss_ok
+    if not ss_ok:
+        result["thread_sampling"]["limitations"] = [SCHEDSTAT_FALLBACK_NOTE]
     window = result["thread_sampling"]["window_sec"]
     runaway: List[Dict[str, Any]] = []
     long_waits: List[Dict[str, Any]] = []
@@ -930,19 +970,36 @@ def judge(series: ThreadSeries) -> Dict[str, Any]:
             findings.append(f"Thread {label} stayed in uninterruptible sleep (D) for {window:.2f}s.")
         # --- CPU monopoly without observable progress -----------------------------------
         share = d["cpu_share"] or 0.0
-        if (share >= cfg.runaway_cpu_share and all(s == "R" for s in states)
+        rf = d["runnable_fraction"]
+        if rf is not None:
+            got = d["runnable_cpu_received"]
+            wanted = rf >= cfg.runaway_runnable_fraction and got >= cfg.runaway_min_cpu_share_when_runnable
+            basis = "schedstat_runnable_fraction"
+        else:
+            got = share
+            wanted = share >= cfg.runaway_cpu_share
+            basis = "cpu_share_fallback"
+        if (wanted and all(s == "R" for s in states)
                 and (d["voluntary_switches_delta"] or 0) <= cfg.runaway_max_voluntary_switches_per_sec * max(window, 1e-6)
                 and d["io_syscalls_delta"] in (0, None)
                 and (d["top_function_dominance"] is None or d["top_function_dominance"] >= 0.8)):
             fn = d["top_function"] or "unresolved"
             r = dict(public, verdict="CPU monopoly without observable progress", function=fn,
-                     cpu_share_pct=round(share * 100, 1))
+                     cpu_share_pct=round(share * 100, 1), judgement_basis=basis)
+            tail = (f"the same top frame `{fn}` in most samples ({_fmt_pct(d['top_function_dominance'])}): "
+                    f"CPU monopoly without observable progress")
+            if rf is not None:
+                contended = got < 0.8 * min(1.0, rf)
+                r["contended_machine"] = contended
+                msg = (f"Thread {label} was runnable {_fmt_pct(rf)} of the {window:.2f}s window and received "
+                       f"{_fmt_pct(got)} of a CPU{' (machine contended)' if contended else ''}, "
+                       f"with no voluntary context switch, no read/write syscall, and {tail}.")
+            else:
+                r["limitation"] = SCHEDSTAT_FALLBACK_NOTE
+                msg = (f"Thread {label} used {_fmt_pct(share)} CPU over {window:.2f}s with no voluntary context "
+                       f"switch, no read/write syscall, and {tail}. [{SCHEDSTAT_FALLBACK_NOTE}]")
             runaway.append(r)
-            findings.append(
-                f"Thread {label} used {_fmt_pct(share)} CPU over {window:.2f}s with no voluntary context switch, "
-                f"no read/write syscall, and the same top frame `{fn}` in most samples ({_fmt_pct(d['top_function_dominance'])}): "
-                f"CPU monopoly without observable progress."
-            )
+            findings.append(msg)
         # --- long wait in one syscall for the whole window -------------------------------
         keys = d["_sc_keys"]
         if (d["present_in_all_samples"] and keys[0] is not None and all(k == keys[0] for k in keys)

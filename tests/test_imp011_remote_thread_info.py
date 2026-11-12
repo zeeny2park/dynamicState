@@ -130,6 +130,17 @@ class RemoteThreadInfoTests(unittest.TestCase):
                     break
                 self.assertIsNone(proc.poll(), "fixture exited before READY")
                 self.assertLess(time.monotonic(), deadline, "fixture never printed READY")
+            # READY is printed just BEFORE the main thread enters pause(): under load the first samples could
+            # catch it mid-transition (a spurious local/remote difference). Wait until it sleeps.
+            while time.monotonic() < deadline:
+                try:
+                    with open(f"/proc/{proc.pid}/stat") as f:
+                        if f.read().rsplit(")", 1)[1].split()[0] == "S":
+                            time.sleep(0.1)
+                            break
+                except OSError:
+                    break
+                time.sleep(0.02)
         return proc
 
     def _script(self, name, body):
@@ -243,7 +254,7 @@ class RemoteThreadInfoTests(unittest.TestCase):
     # (b) thread sampler through the remote adapter
     # =========================================================================================
     def _collect_and_judge(self, adapter, pid, companion):
-        cfg = ThreadSamplingConfig(runaway_cpu_share=0.3)   # robust against a loaded CI box; same for both sides
+        cfg = ThreadSamplingConfig()   # default thresholds; the runnable-fraction criterion is load-independent
         series = ThreadSampler(adapter, self.mgr).collect(pid, companion, cfg)
         return series, judge(series)
 
