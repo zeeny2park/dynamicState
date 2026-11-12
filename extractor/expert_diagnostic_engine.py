@@ -176,6 +176,13 @@ from .diagnostic_verdict_aggregator import (
     VERDICT_INCONCLUSIVE,
     VERDICT_ABORTED,
 )
+from .healthy_verdict import (
+    HEALTHY_RULE_ID,
+    evaluate as evaluate_healthy,
+    long_wait_scope_items,
+    not_healthy_scope,
+    summary_sentence as healthy_summary_sentence,
+)
 from .modules import ModuleAddressResolver
 from .debug_image import inspect_elf
 
@@ -3800,6 +3807,11 @@ class ExpertDiagnosticEngine:
 #   state            str   final session lifecycle state (or "NOT_RUN")
 #   stop_reason      str|None
 #   duration_s       float wall time of the call
+#   healthy_scope    dict  the HEALTHY rule (extractor.healthy_verdict, docs/HEALTHY_VERDICT.md) applied to this run:
+#                          {rule, healthy (bool), checked [{recipe_id, what, what_ko, result}],
+#                           not_checked [{kind, item, label, label_ko, reason}] (scope limits of a HEALTHY verdict),
+#                           blocking [{kind, item, reason}] (why the run is NOT healthy; empty when HEALTHY)}.
+#                          verdict == HEALTHY  <=>  healthy_scope.healthy.
 DIAGNOSE_SCHEMA_VERSION = "1"
 DIAGNOSE_DEFAULT_SYMPTOM = "general health check"
 
@@ -3845,6 +3857,7 @@ class DiagnoseResult:
     stop_reason: Optional[str] = None
     duration_s: float = 0.0
     schema_version: str = DIAGNOSE_SCHEMA_VERSION
+    healthy_scope: Dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
         return json.loads(json.dumps(asdict(self), default=str))
@@ -4052,6 +4065,7 @@ def diagnose(
         r.not_covered.extend(pre_nc)
         r.not_covered.append({"kind": kind, "item": item, "reason": reason})
         r.summary = summary
+        r.healthy_scope = not_healthy_scope(r.not_covered, summary)
         r.duration_s = round(time.monotonic() - t0, 3)
         return r
 
@@ -4173,6 +4187,8 @@ def _diagnose_run(
 
     def _finish(summary: str) -> DiagnoseResult:
         res.summary = summary
+        if not res.healthy_scope:
+            res.healthy_scope = not_healthy_scope(nc, summary)
         res.duration_s = round(time.monotonic() - t0, 3)
         return res
 
@@ -4360,6 +4376,26 @@ def _diagnose_run(
         if exhausted:
             nc.append({"kind": "budget_exhausted", "item": "observation budget",
                        "reason": str(getattr(metrics, "exhaustion_reason", None) or res.stop_reason)})
+
+        # HEALTHY rule (extractor.healthy_verdict): every baseline check cleared, nothing blocking -> HEALTHY
+        # within the stated scope; otherwise never HEALTHY (an aggregator HEALTHY is re-checked by the same rule).
+        nc.extend(long_wait_scope_items(executed))
+        res.healthy_scope = evaluate_healthy(
+            verdict=res.verdict, findings=res.findings, checks=executed, not_covered=nc,
+            baseline_ids=BASELINE_RECIPE_IDS,
+            recipe_names={r.recipe_id: r.name for r in DiagnosticRecipeRegistry.list_recipes()})
+        if res.healthy_scope["healthy"]:
+            res.verdict = VERDICT_HEALTHY
+        elif res.verdict == VERDICT_HEALTHY:
+            res.verdict = "INCONCLUSIVE"
+        if res.verdict in (VERDICT_HEALTHY, "INCONCLUSIVE"):
+            sec_a["overall_result"] = res.verdict
+            if res.verdict == VERDICT_HEALTHY:
+                sec_a["decision_rule_id"] = HEALTHY_RULE_ID
+                sec_a["verdict_rationale"] = healthy_summary_sentence(res.healthy_scope, len(BASELINE_RECIPE_IDS))
+                sec_a["unresolved_questions"] = []
+        report["healthy_scope"] = res.healthy_scope
+
         stop_ms = float(sec_b.get("target_stop_duration_ms") or 0.0)
         res.collection_impact = {
             "capture_mode": sec_b.get("collection_mode"),
@@ -4389,6 +4425,9 @@ def _diagnose_run(
             res.report = json.loads(json.dumps(report, default=str))
 
         passed = sum(1 for r in res.checks_run if r["status"] == CheckStatus.PASS)
+        if res.verdict == VERDICT_HEALTHY:
+            return _finish(f"Verdict HEALTHY: {healthy_summary_sentence(res.healthy_scope, len(BASELINE_RECIPE_IDS))}"
+                           f" {passed} of {len(res.checks_run)} executed checks passed (see healthy_scope).")
         if res.findings:
             cats = ", ".join(dict.fromkeys(str(f["category"]) for f in res.findings))
             head = f"Verdict {res.verdict}: found {cats}."
@@ -4398,5 +4437,6 @@ def _diagnose_run(
                        f"{len(nc)} item(s) could not be examined (see not_covered).")
     except Exception as exc:  # noqa: BLE001 - diagnose must not raise for target-side problems
         res.verdict = "INCONCLUSIVE"
+        res.healthy_scope = {}  # recomputed by _finish: never healthy
         nc.append({"kind": "unexpected_error", "item": "diagnose", "reason": f"{type(exc).__name__}: {exc}"})
         return _finish(f"The diagnosis failed unexpectedly ({type(exc).__name__}). No conclusion was reached.")

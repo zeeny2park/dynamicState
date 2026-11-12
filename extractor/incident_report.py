@@ -25,6 +25,7 @@ from typing import Any, Callable, Dict, List, Optional
 from .collection_impact import impact_summary_lines
 from .diagnostic_verdict_aggregator import (
     FAULT_VERDICTS,
+    VERDICT_HEALTHY,
     VERDICT_INCONCLUSIVE,
     health_score_for,
 )
@@ -216,6 +217,12 @@ def export_incident_report(
             "Investigation inconclusive: the collection failed or parts of the target could not be examined "
             f"({'; '.join(limitations[:3])}). Verify target process accessibility and read permissions, then re-run."
         ] + [x for x in remediation_checklist if "within expected parameters" not in x]
+    elif verdict == VERDICT_HEALTHY:
+        # HEALTHY rule (extractor.healthy_verdict): the claim is limited to the baseline scope; say what was not checked
+        not_checked = [str(x.get("label") or x.get("item")) for x in (res.get("healthy_scope") or {}).get("not_checked") or []]
+        remediation_checklist = [
+            "No remediation needed within the checked scope: every baseline check ran to completion and found nothing."
+        ] + ([f"Not checked (outside the healthy scope): {'; '.join(not_checked)}."] if not_checked else [])
     elif not remediation_checklist:
         remediation_checklist.append("No fault was found by the checks that ran; see 'What could not be examined'.")
     health_score = health_score_for(verdict, findings)
@@ -263,6 +270,13 @@ def export_incident_report(
         md.append("- Diagnostic inspection inconclusive: collection failed or target memory was unreadable.")
         for lim in limitations[:12]:
             md.append(f"  - Limitation: `{lim}`")
+    elif verdict == VERDICT_HEALTHY:
+        scope = res.get("healthy_scope") or {}
+        md.append("- Healthy within the checked scope: every baseline check ran to completion and found nothing.")
+        for c in scope.get("checked") or []:
+            md.append(f"  - Checked: {c.get('what')} (`{c.get('recipe_id')}`)")
+        for x in scope.get("not_checked") or []:
+            md.append(f"  - Not checked: {x.get('label') or x.get('item')}")
     else:
         md.append("- No fault was found by the checks that ran.")
     if summary_md:
@@ -330,6 +344,7 @@ def export_incident_report(
         "verdict": verdict,
         "overall_status": verdict,
         "health_score": health_score,
+        "healthy_scope": res.get("healthy_scope") or {},
         "limitations": limitations,
         "not_covered": list(res.get("not_covered") or []),
         "findings_count": len(findings),

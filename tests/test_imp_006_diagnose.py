@@ -25,7 +25,7 @@ SETTLE_S = 0.5
 RESULT_KEYS = {
     "schema_version", "verdict", "confidence", "confidence_basis", "summary", "findings", "checks_run",
     "not_covered", "collection_impact", "report_path", "report", "investigation_id", "target", "state",
-    "stop_reason", "duration_s",
+    "stop_reason", "duration_s", "healthy_scope",
 }
 
 
@@ -250,6 +250,32 @@ class TestDiagnoseEntryPoint(unittest.TestCase):
         self.assertEqual(shape(cli_out), shape(web_out))
         self.assertIn(web_out["verdict"], ("CONFIRMED_FAULT", "PROBABLE_FAULT", "FAULT"))
         self.assertTrue(shape(web_out)[1], "deadlock fixture should yield at least one finding")
+
+    def test_mcp_cli_and_web_agree_on_healthy_target(self):
+        # HEALTHY rule (docs/HEALTHY_VERDICT.md): the healthy fixture is HEALTHY within scope on all three interfaces
+        proc = self._launch("proc_scenario_a_healthy")
+        image = self.bins["proc_scenario_a_healthy"]
+        post = self._start_web()
+        mcp_out = json.loads(mcp_srv.runtime_diagnose_process(pid=proc.pid, debug_image=image))
+        cli = subprocess.run(
+            [sys.executable, "-m", "extractor.cli", "diagnose", "--pid", str(proc.pid), "--debug-image", image,
+             "--corpus", self.corpus, "--json"],
+            capture_output=True, text=True, cwd=ROOT, timeout=120,
+        )
+        self.assertEqual(cli.returncode, 0, cli.stderr)
+        cli_out = json.loads(cli.stdout)
+        status, web = post("/api/diagnose", json.dumps({"pid": proc.pid, "debug_image": image}).encode())
+        self.assertEqual(status, 200)
+        web_out = web["result"]
+        for name, out in (("mcp", mcp_out), ("cli", cli_out), ("web", web_out)):
+            with self.subTest(interface=name):
+                self.assertEqual(set(out) - {"success"}, RESULT_KEYS | {"human_summary"})
+                self.assertEqual(out["verdict"], "HEALTHY", out["healthy_scope"].get("blocking"))
+                self.assertEqual(out["findings"], [])
+                self.assertTrue(out["healthy_scope"]["healthy"])
+                self.assertEqual(sorted(c["recipe_id"] for c in out["healthy_scope"]["checked"]),
+                                 sorted(c["recipe_id"] for c in web_out["healthy_scope"]["checked"]))
+                self.assertIn("healthy within the checked scope", out["human_summary"])
 
     def test_mcp_tool_registered_with_description(self):
         self.assertIn("runtime_diagnose_process", mcp_srv.runtime_diagnose_process.__name__)

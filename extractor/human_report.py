@@ -13,6 +13,8 @@ Rules the renderer keeps:
   (``limitation`` / ``reason`` strings) is quoted verbatim and marked as such in Korean.
 * An INCONCLUSIVE / ABORTED verdict is stated in the first sentence, with the reason, and never described as
   healthy.
+* A HEALTHY verdict (extractor.healthy_verdict) is stated as "healthy within the checked scope" and the same first
+  sentence names what was not checked (``healthy_scope.not_checked``).
 """
 
 from __future__ import annotations
@@ -40,10 +42,16 @@ T: Dict[str, Tuple[str, str]] = {
                        "{who}의 진단은 판단 불가입니다. 이유: {why}."),
     "c_aborted": ("The diagnosis of {who} was aborted before a conclusion: {why}.",
                   "{who}의 진단은 결론이 나기 전에 중단되었습니다. 이유: {why}."),
-    "c_healthy": ("The checks that ran found no problem in {who}; this does not prove the process is fine "
-                  "(see section 4 for what was not examined).",
-                  "{who}에서 실행된 검사로는 문제가 발견되지 않았습니다. 다만 이것이 문제가 없다는 증명은 아니며, "
-                  "확인하지 못한 항목은 4번 항목에 있습니다."),
+    "c_healthy": ("{who} is healthy within the checked scope: all {n} baseline checks ran to completion and found "
+                  "nothing. Not checked: {nc}.",
+                  "{who}은(는) 점검한 범위 안에서 정상입니다. 기본 검사 {n}개가 모두 끝까지 실행되었고 아무것도 "
+                  "발견하지 못했습니다. 점검하지 못한 것: {nc}."),
+    "c_healthy_more": ("; and {n} more (section 4)", " 외 {n}건 (4번 항목)"),
+    "c_healthy_noscope": ("The checks that ran found no problem in {who}; this does not prove the process is fine "
+                          "(see section 4 for what was not examined).",
+                          "{who}에서 실행된 검사로는 문제가 발견되지 않았습니다. 다만 이것이 문제가 없다는 증명은 아니며, "
+                          "확인하지 못한 항목은 4번 항목에 있습니다."),
+    "k_checked": ("Checked and found nothing (baseline):", "검사했고 아무것도 발견하지 못한 것 (기본 검사):"),
     "c_degraded": ("{who} is degraded: {what}.", "{who}은(는) 성능이 저하된 상태입니다: {what}."),
     "c_fault_conf": ("{who} has a confirmed problem: {what}.", "{who}에서 확인된 문제가 있습니다: {what}."),
     "c_fault_prob": ("{who} probably has a problem: {what}.", "{who}에 문제가 있을 가능성이 높습니다: {what}."),
@@ -155,8 +163,9 @@ T: Dict[str, Tuple[str, str]] = {
     "k_conf": ("confirmed: the evidence in hand establishes the problem", "확정: 확보한 증거가 문제를 입증함"),
     "k_prob": ("probable: likely, but not fully proven", "추정: 가능성이 높으나 완전히 입증되지는 않음"),
     "k_degraded": ("degraded: something is off but a cause is not established", "성능 저하: 이상은 있으나 원인은 확정되지 않음"),
-    "k_healthy": ("nothing found by the checks that ran; this is not proof of health",
-                  "실행된 검사에서는 발견 없음 (건강하다는 증명은 아님)"),
+    "k_healthy": ("healthy within the checked scope: every baseline check ran and found nothing; outside that "
+                  "scope nothing is claimed",
+                  "정상(점검한 범위 안에서): 모든 기본 검사가 실행되었고 아무것도 발견하지 못함. 범위 밖은 판단하지 않음"),
     "k_incon": ("could not decide", "판단 불가"),
     "k_abort": ("aborted", "중단됨"),
     "k_fstatus_c": ("confirmed root cause", "확정된 근본 원인"),
@@ -202,6 +211,11 @@ T: Dict[str, Tuple[str, str]] = {
                                 "대상의 CPU/libc 종류를 알아내지 못했습니다."),
     "nc_report_not_saved": ("The full report could not be saved to disk.", "전체 보고서를 디스크에 저장하지 못했습니다."),
     "nc_limitation": ("Limitations reported by the engine:", "엔진이 보고한 제한 사항:"),
+    "nc_long_wait_not_judged": ("Threads that waited for the whole window outside a lock; whether that wait is "
+                                "expected was not judged (an idle wait and a stall look the same from outside): "
+                                "{items}.",
+                                "구간 내내 락이 아닌 곳에서 대기한 스레드. 이 대기가 정상인지는 판단하지 않았습니다 "
+                                "(밖에서는 유휴 대기와 멈춤이 같아 보임): {items}."),
     "nc_other": ("Other: {kind}:", "그 밖의 항목 {kind}:"),
     "nc_orig": (" (engine text: {raw})", " (엔진 원문: {raw})"),
     # --- next steps
@@ -328,6 +342,14 @@ GLOSSARY: Dict[str, Tuple[str, str, str, str]] = {
                 "not proven, could not decide = the checks gave no answer (this is not 'healthy').",
                 "확정 / 추정 / 판단 불가", "확정 = 증거로 입증됨, 추정 = 가능성 높으나 미입증, 판단 불가 = 검사가 답을 "
                 "주지 못함(건강하다는 뜻이 아님)."),
+    # the same line for a HEALTHY result (the healthy term is only defined where the verdict is HEALTHY)
+    "verdict_healthy": ("confirmed / probable / healthy / could not decide", "confirmed = proven by evidence, "
+                        "probable = likely but not proven, healthy = every baseline check ran to completion and found "
+                        "nothing (only within the checked scope; what was not checked is listed), could not decide = "
+                        "the checks gave no answer.",
+                        "확정 / 추정 / 정상 / 판단 불가", "확정 = 증거로 입증됨, 추정 = 가능성 높으나 미입증, 정상 = 모든 "
+                        "기본 검사가 끝까지 실행되어 아무것도 발견하지 못함(점검한 범위 안에서만이며, 점검하지 못한 "
+                        "것은 따로 적음), 판단 불가 = 검사가 답을 주지 못함."),
 }
 
 _STATUS_WORD = {"inconclusive": ("inconclusive", "판단 불가"), "error": ("error", "오류"),
@@ -690,6 +712,17 @@ def _incon_reason(ctx: _Ctx, res: Dict[str, Any]) -> str:
     return ctx.t("r_unspecified")
 
 
+def _healthy_sentence(ctx: _Ctx, who: str, res: Dict[str, Any]) -> str:
+    scope = res.get("healthy_scope") if isinstance(res.get("healthy_scope"), dict) else {}
+    if not scope.get("healthy"):
+        return ctx.t("c_healthy_noscope", who=who)
+    labels = [str(x.get("label_ko" if ctx.i else "label") or x.get("item")) for x in scope.get("not_checked") or []]
+    shown = "; ".join(labels[:3]) or "-"
+    if len(labels) > 3:
+        shown += ctx.t("c_healthy_more", n=len(labels) - 3)
+    return ctx.t("c_healthy", who=who, n=len(scope.get("checked") or []), nc=shown)
+
+
 def _conclusion(ctx: _Ctx, res: Dict[str, Any], renders: List[Dict[str, Any]]) -> str:
     who = _who(ctx, res.get("target") or {})
     v = res.get("verdict")
@@ -700,7 +733,7 @@ def _conclusion(ctx: _Ctx, res: Dict[str, Any], renders: List[Dict[str, Any]]) -
     findings = res.get("findings") or []
     if v == "HEALTHY" or not findings:
         if v in ("HEALTHY",):
-            return ctx.t("c_healthy", who=who)
+            return _healthy_sentence(ctx, who, res)
         # fault-like verdict without a named finding: do not claim health
         return ctx.t("c_inconclusive", who=who, why=_incon_reason(ctx, res))
     f, r = findings[0], renders[0]
@@ -842,9 +875,13 @@ def _section4(ctx: _Ctx, res: Dict[str, Any]) -> List[str]:
     v = str(res.get("verdict"))
     conf = round(float(res.get("confidence") or 0) * 100)
     out = [ctx.t("k_verdict", v=f"{v} - {ctx.t(VERDICT_WORD.get(v, 'k_incon'))}", conf=conf)]
-    ctx.term("verdict")
+    ctx.term("verdict_healthy" if v == "HEALTHY" else "verdict")
     for f in res.get("findings") or []:
         out.append(f"- {_cat_label(ctx, str(f.get('category')))}: {_status_word(ctx, str(f.get('status')))}")
+    scope = res.get("healthy_scope") if isinstance(res.get("healthy_scope"), dict) else {}
+    if v == "HEALTHY" and scope.get("healthy") and scope.get("checked"):
+        out += ["", ctx.t("k_checked")]
+        out += [f"- {x.get('what_ko' if ctx.i else 'what')} ({_c(x.get('recipe_id'))})" for x in scope["checked"]]
     nc = res.get("not_covered") or []
     if not nc:
         out.append(ctx.t("k_none"))
@@ -874,6 +911,8 @@ def _section4(ctx: _Ctx, res: Dict[str, Any]) -> List[str]:
         elif kind == "recipes_not_planned":
             ids = [x for n in items for x in str(n.get("item")).split(",") if x]
             line = ctx.t("nc_recipes_not_planned", n=len(ids), items=_join([_c(x) for x in ids]))
+        elif kind == "long_wait_not_judged":
+            line = ctx.t("nc_long_wait_not_judged", items=_join(names))
         elif kind == "baseline_check_not_run":
             line = ctx.t("nc_baseline_check_not_run", items=_join(names))
         elif kind in ("unattributed_finding", "stage_failed", "unexpected_error"):

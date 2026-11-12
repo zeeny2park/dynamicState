@@ -21,6 +21,7 @@ from extractor.diagnostic_recipes import (
     RECIPE_LONG_RUNNING_BLOCKED_THREADS,
     RECIPE_POTENTIAL_DEADLOCK_PATTERNS,
     RECIPE_THREAD_STATE_ANOMALIES,
+    RECIPE_STATUS_CONTRADICTED,
     RECIPE_STATUS_INSUFFICIENT_EVIDENCE,
 )
 from extractor.expert_diagnostic_engine import ExpertDiagnosticEngine
@@ -179,8 +180,14 @@ class TestSpinAndLongWait(_RealProcessBase):
         recipe = DiagnosticRecipeRegistry.get_recipe(RECIPE_LONG_RUNNING_BLOCKED_THREADS)
         obs, _ = prov.collect_for_recipe(recipe, proc.pid, self._binary("proc_thread_spin_work_block"))
         res = DiagnosticRecipeRegistry.evaluate_recipe(RECIPE_LONG_RUNNING_BLOCKED_THREADS, obs)
-        self.assertEqual(res.status, RECIPE_STATUS_INSUFFICIENT_EVIDENCE)
+        # HEALTHY rule (docs/HEALTHY_VERDICT.md): with a complete lock observation the recipe answers its own question
+        # (no lock wait without owner progress -> CONTRADICTED) but still does not judge the long wait: it is carried
+        # as "cannot determine whether expected", expectation UNKNOWN, never as a supporting fact.
+        self.assertEqual(res.status, RECIPE_STATUS_CONTRADICTED, res.confidence_basis)
         self.assertIn("cannot determine whether expected", res.confidence_basis.lower())
+        self.assertEqual(res.details["expectation"], "UNKNOWN")
+        self.assertIn("blocked_reader", [t["name"] for t in res.details["long_waits_not_judged"]])
+        self.assertFalse(res.supporting_facts)
 
     def test_normal_condition_variable_worker_is_not_reported(self):
         proc = self._spawn("proc_thread_normal_cv", ready=False, min_threads=2)

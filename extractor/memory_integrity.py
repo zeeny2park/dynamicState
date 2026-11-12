@@ -137,12 +137,16 @@ def run_integrity(adapter: Any, pid: int, companion_elf: Optional[str], cfg: Int
         walk = walker = None
     if walk is None and mode == "baseline" and est > cfg.baseline_heap_cap_bytes:
         heap["status"] = "NOT_CHECKED"
+        # structured reason (the HEALTHY rule reads it): a declared cost limit of the baseline, not a failure
+        heap["not_checked_reason"] = "above_baseline_cap"
+        heap["baseline_cap_bytes"] = int(cfg.baseline_heap_cap_bytes)
         rec["limitations"].append(
             "heap integrity not checked: heap larger than baseline cap (%.1f MiB > %.1f MiB); a memory-corruption or "
             "crash symptom, or targeting RECIPE_HEAP_METADATA_CORRUPTION, runs the full walk"
             % (est / 1048576.0, cfg.baseline_heap_cap_bytes / 1048576.0) + remote_cost_note(adapter))
     elif walk is None and bytes_allow < est + 65536:
         heap["status"] = "NOT_CHECKED"
+        heap["not_checked_reason"] = "byte_budget"
         rec["limitations"].append("heap integrity not checked: the observation byte budget left (%d bytes) is below "
                                   "the heap size (%d bytes)" % (bytes_allow, est) + remote_cost_note(adapter))
     else:

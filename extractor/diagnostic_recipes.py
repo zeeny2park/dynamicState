@@ -2567,6 +2567,19 @@ def _rule_inconsistent_related_variables(recipe: DiagnosticRecipe, data: Dict[st
     return None
 
 
+def _lock_waits_fully_observed(data: Dict[str, Any]) -> bool:
+    """The lock-wait question of RECIPE_LONG_RUNNING_BLOCKED_THREADS can be answered "no": a usable thread-sampling
+    window, mutex owners decodable on this target, a complete lock graph, no stalled lock wait, no wait cycle and no
+    thread-state anomaly in the window (``threads_healthy``)."""
+    return ((data.get("thread_sampling") or {}).get("status") == "OK"
+            and data.get("threads_healthy") is True
+            and not data.get("stalled_lock_waits")
+            and not data.get("persistent_block")
+            and not data.get("deadlock_detected")
+            and not data.get("lock_owner_unsupported")
+            and not data.get("incomplete_lock_graph"))
+
+
 def _rule_long_running_blocked_threads(recipe: DiagnosticRecipe, data: Dict[str, Any]) -> Optional[RecipeEvaluationResult]:
     """Verdict rule of RECIPE_LONG_RUNNING_BLOCKED_THREADS (None: no rule matched; the generic rule decides)."""
     rid = recipe.recipe_id
@@ -2584,6 +2597,31 @@ def _rule_long_running_blocked_threads(recipe: DiagnosticRecipe, data: Dict[str,
             supporting_facts=[f"Blocked threads: {len(blocked)}"] + list(data.get("long_wait_findings") or []),
             recommended_action="Inspect lock holder critical section duration or futex wake signaling.",
             details={"blocked_thread_count": len(blocked), "blocked_duration_sec": stall_sec, "deadlock_detected": deadlock_det},
+        )
+    elif data.get("long_wait_threads") and _lock_waits_fully_observed(data):
+        # HEALTHY rule (docs/HEALTHY_VERDICT.md): what this recipe CAN decide is whether a thread is blocked on a
+        # lock whose owner makes no progress.  With a usable sampling window, decodable lock owners, a complete lock
+        # graph, no stalled lock wait and no wait cycle, that question is answered "no" -> CONTRADICTED.  Whether a
+        # long wait in a syscall (poll / read / condition variable) is expected is NOT decided: from outside an idle
+        # wait and a stall look identical.  It is carried as a declared scope limit (long_waits_not_judged), never
+        # as a supporting fact and never as evidence of health.
+        lw = [t for t in data["long_wait_threads"] if isinstance(t, dict)]
+        win = (data.get("thread_sampling") or {}).get("window_sec")
+        not_judged = [{"tid": t.get("tid"), "name": t.get("name"), "syscall": t.get("syscall"),
+                       "wait_kind": t.get("wait_kind"), "waited_at_least_sec": t.get("waited_at_least_sec")}
+                      for t in lw]
+        txt = ("no thread was blocked on a lock whose owner made no progress over the %ss sampling window; "
+               "%d long wait(s) outside lock waits observed, cannot determine whether expected (not judged): %s"
+               % (win, len(lw), "; ".join(f"'{t.get('name')}' in {t.get('syscall')}" for t in lw[:5])))
+        return RecipeEvaluationResult(
+            recipe_id=rid,
+            status=RECIPE_STATUS_CONTRADICTED,
+            confidence=0.80,
+            confidence_basis=txt,
+            contradicting_facts=["no lock wait without owner progress in the sampling window"],
+            limitations=list(data.get("long_wait_findings") or []),
+            details={"blocked_thread_count": 0, "long_wait_threads": [t.get("name") for t in lw],
+                     "expectation": "UNKNOWN", "long_waits_not_judged": not_judged},
         )
     elif data.get("long_wait_threads"):
         # IMP-010: a thread sat in one syscall for the whole sampling window. From outside, a blocked-forever

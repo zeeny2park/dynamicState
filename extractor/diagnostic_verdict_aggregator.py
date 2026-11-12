@@ -32,6 +32,14 @@ Documented Verdict Decision Table (Phase 2.1.8 Part B3):
 |                                    | explicit clean-state evidence or all fault hyps REFUTED,   |                    |
 |                                    | and zero blocking collection/integrity limitations.        |                    |
 +------------------------------------+------------------------------------------------------------+--------------------+
+| RULE_5B_HEALTHY_WITHIN_BASELINE_   | Applied by ``diagnose`` after this table (one rule, one    | HEALTHY            |
+| SCOPE (extractor.healthy_verdict)  | vocabulary): every baseline check executed and cleared     |                    |
+|                                    | (PASS; heap above the baseline walk cap is a listed scope  |                    |
+|                                    | limit), no finding, no FAIL, no blocking not_covered kind  |                    |
+|                                    | (collection failure, budget exhausted, ...).  Scope limits |                    |
+|                                    | are listed in healthy_scope.not_checked.  A RULE_5 HEALTHY |                    |
+|                                    | that fails RULE_5B is reported INCONCLUSIVE.               |                    |
++------------------------------------+------------------------------------------------------------+--------------------+
 | RULE_6_INCONCLUSIVE_FALLBACK       | Any remaining state (empty checks, missing required_scope, | INCONCLUSIVE       |
 |                                    | unexecuted/inconclusive/errored/skipped checks, missing    |                    |
 |                                    | explicit clean evidence, unjustified NOT_APPLICABLE,       |                    |
@@ -107,6 +115,17 @@ VERDICT_DECISION_TABLE: List[Dict[str, Any]] = [
             "lifecycle_state == COMPLETED, 100% required checks and required_scope passed, zero FAIL/ERROR/INCONCLUSIVE/"
             "NOT_EXECUTED/SKIPPED/UNSUPPORTED checks, zero unjustified NOT_APPLICABLE checks, explicit clean-state evidence, "
             "and zero blocking limitations."
+        ),
+    },
+    {
+        "priority": 5,
+        "rule_id": "RULE_5B_HEALTHY_WITHIN_BASELINE_SCOPE",
+        "verdict": VERDICT_HEALTHY,
+        "criteria": (
+            "Applied by diagnose() (extractor.healthy_verdict): every baseline recipe executed and every check of it "
+            "PASSed (a heap above the baseline walk cap is a listed scope limit), no finding of any severity, no FAIL "
+            "check, no blocking not_covered kind (collection failure, stage failure, budget exhausted, baseline check "
+            "not run, engine limitation, unknown kind). Scope limits are listed in healthy_scope.not_checked."
         ),
     },
     {
