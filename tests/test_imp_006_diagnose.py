@@ -167,6 +167,90 @@ class TestDiagnoseEntryPoint(unittest.TestCase):
         self.assertEqual(plain.returncode, 0)
         self.assertIn(cli_out["verdict"], plain.stdout)
 
+    # ---- web endpoint (POST /api/diagnose) ----
+    def _start_web(self):
+        import http.client
+        import threading
+        from extractor.agent_runtime import AgentRuntime
+        from extractor.web.server import run_server
+        server = run_server(AgentRuntime(corpus_dir=self.corpus), host="127.0.0.1", port=0)
+        thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True)
+        thread.start()
+
+        def _stop():
+            server.shutdown()
+            server.server_close()
+
+        self.addCleanup(_stop)
+        port = server.server_address[1]
+
+        def post(path, raw, headers=None, token=True):
+            conn = http.client.HTTPConnection("127.0.0.1", port, timeout=120)
+            hdrs = {"Content-Type": "application/json"}
+            if token:
+                hdrs["X-Session-Token"] = server.session_token
+            hdrs.update(headers or {})
+            conn.request("POST", path, body=raw, headers=hdrs)
+            resp = conn.getresponse()
+            data = resp.read().decode("utf-8", errors="replace")
+            conn.close()
+            return resp.status, (json.loads(data) if data else {})
+
+        return post
+
+    def test_web_endpoint_rejects_bad_requests(self):
+        post = self._start_web()
+        body = json.dumps({"pid": os.getpid()}).encode()
+        self.assertEqual(post("/api/diagnose", body, token=False)[0], 401)
+        self.assertEqual(post("/api/diagnose", body, headers={"X-Session-Token": "wrong"})[0], 401)
+        self.assertEqual(post("/api/diagnose", body, headers={"Origin": "http://evil.example"})[0], 403)
+        self.assertEqual(post("/api/diagnose", body, headers={"Content-Type": "text/plain"})[0], 415)
+        self.assertEqual(post("/api/diagnose", b"not json")[0], 400)
+        self.assertEqual(post("/api/diagnose", b"[1]")[0], 400)
+        for bad in ({}, {"pid": 1}, {"pid": True}, {"pid": "abc"}, {"pid": -5},
+                    {"pid": os.getpid(), "time_limit_s": "x"}):
+            status, out = post("/api/diagnose", json.dumps(bad).encode())
+            self.assertFalse(out["success"], bad)
+            self.assertEqual(out["error"]["code"], "INVALID_PARAM", bad)
+
+    def test_web_nonexistent_pid_is_inconclusive_not_http_error(self):
+        post = self._start_web()
+        status, out = post("/api/diagnose", json.dumps({"pid": 4194000}).encode())
+        self.assertEqual(status, 200)
+        self.assertTrue(out["success"])
+        self.assertEqual(out["result"]["verdict"], "INCONCLUSIVE")
+        self.assertTrue(out["result"]["not_covered"])
+        self.assertEqual(set(out["result"]), RESULT_KEYS)
+
+    def test_mcp_cli_and_web_agree_on_same_live_target(self):
+        proc = self._launch("proc_thread_circular_deadlock")
+        image = self.bins["proc_thread_circular_deadlock"]
+        post = self._start_web()
+        mcp_out = json.loads(mcp_srv.runtime_diagnose_process(pid=proc.pid, debug_image=image))
+        cli = subprocess.run(
+            [sys.executable, "-m", "extractor.cli", "diagnose", "--pid", str(proc.pid), "--debug-image", image,
+             "--corpus", self.corpus, "--json"],
+            capture_output=True, text=True, cwd=ROOT, timeout=120,
+        )
+        self.assertEqual(cli.returncode, 0, cli.stderr)
+        cli_out = json.loads(cli.stdout)
+        status, web = post("/api/diagnose", json.dumps({"pid": proc.pid, "debug_image": image}).encode())
+        self.assertEqual(status, 200)
+        self.assertTrue(web["success"], web)
+        web_out = web["result"]
+
+        def shape(d):
+            return d["verdict"], sorted((f["category"], tuple(sorted(f["subjects"]))) for f in d["findings"])
+
+        print(f"\n[3-interface] verdict={web_out['verdict']} findings={shape(web_out)[1]}")
+        self.assertEqual(set(web_out), RESULT_KEYS)
+        self.assertEqual(set(mcp_out) - {"success"}, set(web_out))
+        self.assertEqual(set(cli_out), set(web_out))
+        self.assertEqual(shape(mcp_out), shape(web_out))
+        self.assertEqual(shape(cli_out), shape(web_out))
+        self.assertIn(web_out["verdict"], ("CONFIRMED_FAULT", "PROBABLE_FAULT", "FAULT"))
+        self.assertTrue(shape(web_out)[1], "deadlock fixture should yield at least one finding")
+
     def test_mcp_tool_registered_with_description(self):
         self.assertIn("runtime_diagnose_process", mcp_srv.runtime_diagnose_process.__name__)
         self.assertIn("ONE call", mcp_srv.runtime_diagnose_process.__doc__)

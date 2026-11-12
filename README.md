@@ -28,7 +28,7 @@ dynamic-state diagnose -p $PID --json
 kill $PID
 ```
 
-From an AI agent, the same thing is one MCP call, `runtime_diagnose_process(pid, debug_image?, symptom?)`.
+From an AI agent, the same thing is one MCP call, `runtime_diagnose_process(pid, debug_image?, symptom?)`. The web UI/API has the same one-call entry: the "Diagnose" button on `/workspace`, or `POST /api/diagnose` with `{"pid", "debug_image"?, "symptom"?, "time_limit_s"?}` (session token required; returns `{"success": true, "result": {...}}`).
 Configure your agent (Claude Desktop, Cursor, ...) with:
 
 ```json

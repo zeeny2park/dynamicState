@@ -3729,7 +3729,48 @@ class WebApiAdapter:
         except Exception as e:
             return {"success": False, "error": {"code": "COMPARE_ERROR", "message": str(e)}}
 
+    DIAGNOSE_MAX_TIME_LIMIT_S = 60.0
+
+    def diagnose_api(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        """POST /api/diagnose: the one-call entry point (IMP-006). Calls the same diagnose() as MCP and CLI.
+
+        Read-only: a PID in the request does not authorise any mutation. Runs synchronously; the request's
+        time_limit_s is capped at DIAGNOSE_MAX_TIME_LIMIT_S. An unreadable/nonexistent PID is an INCONCLUSIVE
+        result (cause in not_covered), not an HTTP error; a malformed request is INVALID_PARAM.
+        """
+        raw_pid = params.get("pid")
+        if isinstance(raw_pid, bool) or raw_pid is None or not str(raw_pid).strip().isdigit() or int(str(raw_pid).strip()) <= 1:
+            return {"success": False, "error": {"code": "INVALID_PARAM", "message": "pid must be an integer > 1"}}
+        pid = int(str(raw_pid).strip())
+        debug_image = params.get("debug_image") or None
+        symptom = params.get("symptom") or None
+        if (debug_image is not None and not isinstance(debug_image, str)) or (symptom is not None and not isinstance(symptom, str)):
+            return {"success": False, "error": {"code": "INVALID_PARAM", "message": "debug_image and symptom must be strings"}}
+        time_limit_s = params.get("time_limit_s")
+        if time_limit_s is not None:
+            try:
+                if isinstance(time_limit_s, bool):
+                    raise ValueError
+                time_limit_s = float(time_limit_s)
+                if not (time_limit_s > 0):
+                    raise ValueError
+            except (TypeError, ValueError):
+                return {"success": False, "error": {"code": "INVALID_PARAM", "message": "time_limit_s must be a positive number"}}
+            time_limit_s = min(time_limit_s, self.DIAGNOSE_MAX_TIME_LIMIT_S)
+        try:
+            from extractor.expert_diagnostic_engine import diagnose
+            result = diagnose(
+                pid, debug_image=debug_image, symptom=symptom, time_limit_s=time_limit_s,
+                engine=self.runtime.expert_diagnostic_engine,
+            )
+            return {"success": True, "result": _to_json_serializable(result.to_dict())}
+        except Exception as e:
+            return {"success": False, "error": {"code": "DIAGNOSE_ERROR", "message": str(e)}}
+
     def start_investigation(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        """Multi-step investigation start (runtime investigation manager). Kept for its step-by-step
+        contract (investigation_id + evidence/hypothesis endpoints); it is a SUB-STEP of the one-call
+        `diagnose` (POST /api/diagnose), which should be preferred when only a verdict is wanted."""
         goal = params.get("goal") or "General state investigation"
         auth_target = bool(params.get("authorize_target", False))
 
@@ -5007,6 +5048,11 @@ class DynamicStateRequestHandler(http.server.BaseHTTPRequestHandler):
             # POST /api/watch/xray-blueprint
             if path == "/api/watch/xray-blueprint":
                 self._send_json(adapter.get_xray_blueprint_api(body))
+                return
+
+            # POST /api/diagnose (one-call diagnosis, IMP-006)
+            if path == "/api/diagnose":
+                self._send_json(adapter.diagnose_api(body))
                 return
 
             # POST /api/workspace/chat

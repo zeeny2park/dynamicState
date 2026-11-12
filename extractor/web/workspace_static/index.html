@@ -111,11 +111,18 @@
           🩺 원클릭 종합 진단
         </button>
 
+        <input id="diag-symptom" type="text" placeholder="Symptom (optional)" class="bg-slate-50 border border-slate-200 text-xs rounded-lg px-2.5 py-1.5 w-40 text-slate-800 placeholder-slate-400 focus:outline-none focus:border-blue-500" />
+        <button id="btn-diagnose" type="button" title="One-call diagnose (POST /api/diagnose): verdict, findings, not covered" class="px-2.5 py-1.5 text-xs font-semibold rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white shadow-xs transition">
+          Diagnose
+        </button>
+
         <button id="btn-sync-context" type="button" title="백엔드 활성 세션 컨텍스트(ActiveTargetContext) 동기화" class="px-2.5 py-1.5 text-xs font-medium rounded-lg bg-white hover:bg-slate-50 text-slate-700 border border-slate-200 transition">
           🔄 세션 동기화
         </button>
       </div>
     </div>
+
+    <div id="diagnose-result" class="hidden mt-2 pt-2 border-t border-slate-100 text-xs text-slate-800"></div>
 
     <!-- Process Discovery Dropdown Drawer -->
     <div id="proc-discovery-drawer" class="hidden mt-2 pt-2 border-t border-slate-100 text-xs">
@@ -366,6 +373,51 @@
         .replace(/"/g, '&quot;')
         .replace(/'/g, '&#39;');
     }
+
+    async function runDiagnose() {
+      const out = document.getElementById('diagnose-result');
+      const btn = document.getElementById('btn-diagnose');
+      const pidEl = document.getElementById('input-target-pid');
+      const pid = parseInt(pidEl ? pidEl.value : '', 10);
+      out.classList.remove('hidden');
+      if (!pid) { out.textContent = 'Enter a PID first.'; return; }
+      const symptom = document.getElementById('diag-symptom').value.trim();
+      const elfEl = document.getElementById('input-companion-elf');
+      const body = { pid: pid };
+      if (symptom) body.symptom = symptom;
+      if (elfEl && elfEl.value.trim()) body.debug_image = elfEl.value.trim();
+      btn.disabled = true;
+      out.textContent = 'Diagnosing (up to a few seconds)...';
+      const controller = new AbortController();
+      const timerId = setTimeout(() => controller.abort(), 90000);
+      try {
+        const headers = { 'Content-Type': 'application/json' };
+        if (window.__DYNAMICSTATE_SESSION_TOKEN__) headers['X-Session-Token'] = window.__DYNAMICSTATE_SESSION_TOKEN__;
+        const res = await fetch(getApiUrl('/api/diagnose'), { method: 'POST', headers: headers, body: JSON.stringify(body), signal: controller.signal });
+        const json = await res.json();
+        if (!json || !json.success) {
+          out.textContent = 'Diagnose failed: ' + ((json && json.error && json.error.message) || ('HTTP ' + res.status));
+          return;
+        }
+        const r = json.result;
+        const li = (items, f) => (items && items.length) ? '<ul class="list-disc ml-5">' + items.map(f).join('') + '</ul>' : '<div class="text-slate-500">none</div>';
+        out.innerHTML =
+          '<div><strong>Verdict: ' + escapeHtml(r.verdict) + '</strong> (confidence ' + escapeHtml(r.confidence) + ')</div>' +
+          '<div class="mt-1">' + escapeHtml(r.summary) + '</div>' +
+          '<div class="mt-1 font-semibold">Findings</div>' +
+          li(r.findings, f => '<li>' + escapeHtml(f.category) + ' [' + escapeHtml(f.severity) + '] subjects: ' + escapeHtml((f.subjects || []).join(', ')) + '</li>') +
+          '<div class="mt-1 font-semibold">Not covered</div>' +
+          li(r.not_covered, n => '<li>' + escapeHtml(n.what || n.item || n.check || '') + ': ' + escapeHtml(n.reason || '') + '</li>') +
+          '<div class="mt-1 font-semibold">Collection impact</div>' +
+          '<pre class="mono whitespace-pre-wrap">' + escapeHtml(JSON.stringify(r.collection_impact, null, 2)) + '</pre>';
+      } catch (err) {
+        out.textContent = 'Diagnose request failed: ' + err;
+      } finally {
+        clearTimeout(timerId);
+        btn.disabled = false;
+      }
+    }
+    document.getElementById('btn-diagnose').addEventListener('click', runDiagnose);
 
     function readTargetInputsIntoState() {
       const rawPidOrName = (document.getElementById('input-target-pid').value || '').trim();
