@@ -33,6 +33,19 @@ from .dwarf_indexer import DwarfIndex, DwarfIndexer, DwarfVariable
 from .cpp_decoder import CppContainerDecoder
 from .allocator_inspector import detect_allocator, classify_pointer_integrity, PointerClassification, AllocatorType
 from .target_adapter import TargetExecutionAdapter, LocalTargetAdapter, RemoteSshTargetAdapter
+from .target_abi import (
+    FEATURE_ALLOCATOR_CHUNKS,
+    FEATURE_FRAME_LAYOUT,
+    FEATURE_MUTEX_OWNER,
+    FEATURE_SYSCALL_NAMES,
+    FEATURE_TCB_SCAN,
+    SUPPORT_SUPPORTED,
+    TargetABI,
+    abi_support_summary,
+    check_support,
+    detect_target_abi,
+    syscall_name as abi_syscall_name,
+)
 from .verdict_engine import (
     VerdictEngine,
     ZeroCdnReporter,
@@ -454,6 +467,8 @@ class ObservationSession:
     allocation_events: List[AllocationEvent] = field(default_factory=list)
     capabilities: Dict[str, Any] = field(default_factory=dict)
     total_observations: int = 0
+    # IMP-015: ABI detected from the target at attach time (architecture, word size, endianness, libc)
+    target_abi: Dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self, include_observations: bool = True) -> Dict[str, Any]:
         d = {
@@ -474,6 +489,7 @@ class ObservationSession:
             "allocation_events": [a.to_dict() for a in self.allocation_events],
             "capabilities": self.capabilities,
             "total_observations": self.total_observations or len(self.observations),
+            "target_abi": self.target_abi,
         }
         if include_observations:
             d["observations"] = [o.to_dict() for o in self.observations]
@@ -492,6 +508,10 @@ class ObservationSession:
             "total_observations": self.total_observations or len(self.observations),
             "watch_items_count": len(self.watch_items),
             "gaps_count": len(self.gaps),
+            "architecture": self.target_abi.get("architecture"),
+            "libc": self.target_abi.get("libc"),
+            "word_size": self.target_abi.get("word_size"),
+            "abi_detection_status": self.target_abi.get("status"),
         }
 
     @classmethod
@@ -518,6 +538,7 @@ class ObservationSession:
             gaps=[CaptureGap.from_dict(g) for g in d.get("gaps", [])],
             allocation_events=[AllocationEvent.from_dict(a) for a in d.get("allocation_events", [])],
             capabilities=d.get("capabilities", {}),
+            target_abi=d.get("target_abi") or {},
             total_observations=tot,
         )
 
@@ -1374,6 +1395,12 @@ class WatchSessionManager:
                         expression=item_data.get("expression"),
                     ))
 
+            # 5b. Detect the target ABI from the target itself (ELF header, PT_INTERP, mapped libc)
+            try:
+                target_abi_rec = detect_target_abi(target_adapter, pid).to_dict()
+            except Exception as abi_exc:  # noqa: BLE001 - detection failure must not break attach
+                target_abi_rec = TargetABI(error=f"ABI detection raised: {abi_exc}").to_dict()
+
             # 6. Construct ObservationSession
             session_id = f"watch_{pid}_{int(time.time())}_{uuid.uuid4().hex[:6]}"
             target_ident = {
@@ -1381,6 +1408,8 @@ class WatchSessionManager:
                 "executable": runtime_ident.get("executable", ""),
                 "architecture": runtime_ident.get("architecture", "unknown"),
                 "elf_type": runtime_ident.get("elf_type", "unknown"),
+                "word_size": target_abi_rec.get("word_size"),
+                "libc": target_abi_rec.get("libc"),
             }
             backend_name = "remote_proc_mem" if target_adapter.is_remote() else "process_vm_readv"
             transport_name = "ssh_proxy" if target_adapter.is_remote() else "local"
@@ -1430,6 +1459,7 @@ class WatchSessionManager:
                 allocation_events=[],
                 capabilities=capabilities,
                 total_observations=0,
+                target_abi=target_abi_rec,
             )
 
             self._persist_session(session)
@@ -5341,8 +5371,13 @@ class WatchSessionManager:
         )
         load_bias = map_data.get("base_address_int", 0)
         primary_idx = DwarfIndexer.get_index(primary_elf)
-        ptr_size = primary_idx.pointer_size or 8
-        endian = primary_idx.endianness or "little"
+        # IMP-015: target ABI from the target itself (never the host); gates every layout assumption below.
+        target_abi = detect_target_abi(target_adapter, pid)
+        owner_support = check_support(target_abi, FEATURE_MUTEX_OWNER)
+        syscall_support = check_support(target_abi, FEATURE_SYSCALL_NAMES)
+        frame_support = check_support(target_abi, FEATURE_FRAME_LAYOUT)
+        ptr_size = primary_idx.pointer_size or ((target_abi.word_size or 64) // 8)
+        endian = primary_idx.endianness or target_abi.endianness or "little"
         ptr_fmt = ("<" if endian == "little" else ">") + ("Q" if ptr_size == 8 else "I")
 
         # Build module code ranges for return-address stack unwinding
@@ -5414,6 +5449,26 @@ class WatchSessionManager:
         locks_by_addr: Dict[int, Dict[str, Any]] = {}
 
         for l_name, l_addr, l_size, l_toff, l_idx in candidate_locks:
+            if not owner_support.supported:
+                # IMP-015: the glibc pthread_mutex_t owner layout is not valid (or not verifiable) for this
+                # target -> report the lock without any owner / locked-state interpretation.
+                l_info = {
+                    "name": l_name,
+                    "runtime_address": f"0x{l_addr:x}",
+                    "runtime_address_int": l_addr,
+                    "type_name": l_idx.get_type_name(l_toff),
+                    "is_locked": None,
+                    "lock_state_word": None,
+                    "recursion_count": None,
+                    "owner_tid": None,
+                    "owner_thread_name": None,
+                    "owner_status": owner_support.status,
+                    "owner_status_reason": owner_support.message,
+                    "waiting_tids": [],
+                }
+                locks_report.append(l_info)
+                locks_by_addr[l_addr] = l_info
+                continue
             raw_lock, lst, _ = target_adapter.read_memory(pid, l_addr, l_size)
             if lst != "OBSERVED" or not raw_lock or len(raw_lock) < 12:
                 continue
@@ -5448,6 +5503,7 @@ class WatchSessionManager:
                 "recursion_count": count_word,
                 "owner_tid": owner_tid if owner_tid > 0 else None,
                 "owner_thread_name": owner_thread_name,
+                "owner_status": owner_support.status,
                 "waiting_tids": [],
             }
             locks_report.append(l_info)
@@ -5456,11 +5512,6 @@ class WatchSessionManager:
         # ---------------------------------------------------------------------
         # Part B: Thread Syscall / Futex Wait & Zero-Stop Stack Unwinding
         # ---------------------------------------------------------------------
-        syscall_names_x86_64 = {
-            0: "read", 1: "write", 3: "close", 7: "poll", 9: "mmap",
-            24: "sched_yield", 35: "nanosleep", 44: "sendto", 45: "recvfrom",
-            202: "futex", 230: "clock_nanosleep", 232: "epoll_wait", 281: "epoll_pwait",
-        }
         thread_reports: List[Dict[str, Any]] = []
         wait_for_edges: List[Dict[str, Any]] = []  # waiter_tid -> owner_tid
 
@@ -5485,7 +5536,8 @@ class WatchSessionManager:
                     if sc_raw and not sc_raw.startswith("running"):
                         sc_parts = sc_raw.split()
                         syscall_nr = int(sc_parts[0])
-                        syscall_name = syscall_names_x86_64.get(syscall_nr, f"syscall_{syscall_nr}")
+                        # IMP-015: number -> name via the table of the TARGET architecture; None when unsupported/undetected
+                        syscall_name = abi_syscall_name(target_abi, syscall_nr)
                         if len(sc_parts) >= 2:
                             syscall_arg0 = int(sc_parts[1], 16)
                         if len(sc_parts) >= 9:
@@ -5584,7 +5636,7 @@ class WatchSessionManager:
                                 slot_addr = scan_from + w_i * ptr_size
                                 # If this is the innermost return address on a running user-space thread (pc_int == 0),
                                 # inspect the 5-byte CALL rel32 instruction at (cand_pc - 5) to recover a pure leaf poll-mode function!
-                                if not frames and pc_int == 0 and (t_state == "R" or t.get("is_running_user_space")):
+                                if not frames and pc_int == 0 and (t_state == "R" or t.get("is_running_user_space")) and frame_support.supported:
                                     call_bytes, cb_st, _ = target_adapter.read_memory(pid, cand_pc - 5, 5)
                                     if cb_st == "OBSERVED" and call_bytes and len(call_bytes) == 5 and call_bytes[0] == 0xe8:
                                         rel32 = struct.unpack("<i" if endian == "little" else ">i", call_bytes[1:5])[0]
@@ -5653,6 +5705,8 @@ class WatchSessionManager:
                 "name": t_name,
                 "state": t_state,
                 "syscall": syscall_name,
+                "syscall_nr": syscall_nr,
+                "syscall_status": syscall_support.status,
                 "syscall_arg0": f"0x{syscall_arg0:x}" if syscall_arg0 is not None else None,
                 "waiting_on_lock": waiting_on_lock,
                 "frames_count": len(frames),
@@ -5695,6 +5749,12 @@ class WatchSessionManager:
             "is_remote": target_adapter.is_remote(),
             "stop_duration_ms": 0.0,
             "evaluation_latency_us": latency_us,
+            "target_abi": target_abi.to_dict(),
+            "abi_support": abi_support_summary(
+                target_abi, [FEATURE_MUTEX_OWNER, FEATURE_SYSCALL_NAMES, FEATURE_FRAME_LAYOUT]
+            ),
+            "lock_owner_status": owner_support.status,
+            "lock_owner_status_reason": owner_support.message,
             "threads_inspected": len(thread_reports),
             "threads": thread_reports,
             "locks_inspected": len(locks_report),
@@ -5763,7 +5823,10 @@ class WatchSessionManager:
         ptr_fmt = ("<" if endian == "little" else ">") + ("Q" if ptr_size == 8 else "I")
 
         mappings = map_data.get("mappings", [])
-        alloc_detection = detect_allocator(maps=mappings)
+        # IMP-015: ptmalloc chunk interpretation only on supported (arch, libc) targets
+        alloc_detection = detect_allocator(
+            maps=mappings, target_abi=detect_target_abi(target_adapter, pid, probe_version=False)
+        )
         alloc_inspector = alloc_detection.inspector
 
         readable_vmas: List[Tuple[int, int]] = []
@@ -6014,6 +6077,8 @@ class WatchSessionManager:
             "health_status": "ANOMALIES_DETECTED" if anomalies else "HEALTHY",
             "allocator": alloc_detection.allocator_type.value,
             "allocator_confidence": alloc_detection.confidence,
+            "allocator_support_status": alloc_detection.support_status,
+            "allocator_basis": alloc_detection.basis,
             "checked_symbols_count": checked_count,
             "anomalies_count": len(anomalies),
             "anomalies": anomalies,
@@ -6407,8 +6472,11 @@ class WatchSessionManager:
         load_bias = map_data.get("base_address_int", 0)
         idx = DwarfIndexer.get_index(primary_elf)
         is_dyn = (idx.elf_type == "ET_DYN")
-        ptr_size = idx.pointer_size or 8
-        endian = idx.endianness or "little"
+        # IMP-015: frame-pointer / CFA / call-rel32 conventions below are x86_64 only.
+        target_abi = detect_target_abi(target_adapter, pid)
+        frame_support = check_support(target_abi, FEATURE_FRAME_LAYOUT)
+        ptr_size = idx.pointer_size or ((target_abi.word_size or 64) // 8)
+        endian = idx.endianness or target_abi.endianness or "little"
         ptr_fmt = ("<" if endian == "little" else ">") + ("Q" if ptr_size == 8 else "I")
 
         exec_vmas: List[Tuple[int, int]] = []
@@ -6501,7 +6569,7 @@ class WatchSessionManager:
                         subp = _find_dwarf_subprogram(cand_pc - 1)
                         if subp is not None and subp.name not in ("_start", "__libc_start_main_impl", "clone", "clone3", "start_thread"):
                             slot_addr = scan_from + w_i * ptr_size
-                            if not raw_hits and (t.get("state") == "R" or t.get("is_running_user_space")):
+                            if not raw_hits and (t.get("state") == "R" or t.get("is_running_user_space")) and frame_support.supported:
                                 call_bytes, cb_st, _ = target_adapter.read_memory(pid, cand_pc - 5, 5)
                                 if cb_st == "OBSERVED" and call_bytes and len(call_bytes) == 5 and call_bytes[0] == 0xe8:
                                     rel32 = struct.unpack("<i" if endian == "little" else ">i", call_bytes[1:5])[0]
@@ -6514,6 +6582,21 @@ class WatchSessionManager:
 
                     # Second pass: for each frame hit, determine its CFA / FP and decode its parameters & local variables
                     for h_idx, (w_i, slot_addr, cand_pc, subp) in enumerate(raw_hits[:max_frames]):
+                        if not frame_support.supported:
+                            # IMP-015: CFA / frame-pointer-chain variable addressing is the x86_64 convention.
+                            # Function identity (return-address scan + DWARF) is kept; no parameter/local values.
+                            frames_out.append({
+                                "frame_index": h_idx,
+                                "function_name": subp.name,
+                                "source_location": f"{subp.decl_file}:{subp.decl_line}" if subp.decl_file else None,
+                                "runtime_pc": f"0x{cand_pc:x}",
+                                "cfa_address": None,
+                                "fp_address": None,
+                                "parameters": [],
+                                "locals": [],
+                                "variables_status": frame_support.status,
+                            })
+                            continue
                         # Determine CFA for `subp`:
                         # Strategy A: check if the callee saved `subp`'s frame pointer `rbp` at `slot_addr - ptr_size`
                         cfa_addr = 0
@@ -6609,6 +6692,7 @@ class WatchSessionManager:
                 "state": t.get("state", "S"),
                 "frames_count": len(frames_out),
                 "frames": frames_out,
+                "frame_decode_status": frame_support.status,
             })
 
         latency_us = round((time.monotonic_ns() - t_start_ns) / 1000.0, 2)
@@ -6618,9 +6702,16 @@ class WatchSessionManager:
             "is_remote": target_adapter.is_remote(),
             "stop_duration_ms": 0.0,
             "evaluation_latency_us": latency_us,
+            "target_abi": target_abi.to_dict(),
+            "frame_decode_status": frame_support.status,
+            "frame_decode_status_reason": frame_support.message,
             "threads_count": len(thread_results),
             "threads": thread_results,
-            "llm_next_step_hint": f"Decoded stack frame parameters and local variables across {len(thread_results)} thread(s) with 0.00ms stop.",
+            "llm_next_step_hint": (
+                f"Stack frame decoding {frame_support.message}; frames are identified but no parameter/local values were produced."
+                if not frame_support.supported else
+                f"Decoded stack frame parameters and local variables across {len(thread_results)} thread(s) with 0.00ms stop."
+            ),
         }
 
     def auto_triage_incident(
@@ -8886,6 +8977,7 @@ class WatchSessionManager:
         threads: List[Dict[str, Any]],
         ptr_size: int = 8,
         endian: str = "<",
+        target_abi: Optional[TargetABI] = None,
     ) -> Dict[int, int]:
         """Discovers each thread's glibc TCB (`struct pthread *` / `fs_base`) in 0.00ms zero-stop mode.
         
@@ -8895,6 +8987,12 @@ class WatchSessionManager:
         combined with the embedded `pid_t tid` (`int32_t`) field inside `struct pthread` (`[tcb_addr + 0x40, tcb_addr + 0x600)`).
         """
         tcb_by_tid: Dict[int, int] = {}
+        # IMP-015: tcbhead_t self-pointer + struct pthread tid offsets are the glibc x86_64 layout.
+        # On any other target return nothing (callers report the support decision) instead of garbage.
+        if target_abi is None:
+            target_abi = detect_target_abi(target_adapter, pid, probe_version=False)
+        if not check_support(target_abi, FEATURE_TCB_SCAN).supported:
+            return tcb_by_tid
         target_tids = {int(t["tid"]) for t in threads if "tid" in t}
         if not target_tids:
             return tcb_by_tid
@@ -9005,6 +9103,8 @@ class WatchSessionManager:
         t_start_ns = time.monotonic_ns()
         primary_elf, _ = self._split_companion_elf_paths(companion_elf_path)
         idx = DwarfIndexer.get_index(primary_elf)
+        target_abi = detect_target_abi(target_adapter, pid)
+        tcb_support = check_support(target_abi, FEATURE_TCB_SCAN)
         ptr_size = idx.pointer_size
         endian = "<" if idx.endianness == "little" else ">"
 
@@ -9063,6 +9163,7 @@ class WatchSessionManager:
             threads=threads,
             ptr_size=ptr_size,
             endian=endian,
+            target_abi=target_abi,
         )
 
         thread_reports: List[Dict[str, Any]] = []
@@ -9136,12 +9237,17 @@ class WatchSessionManager:
                 "tls_align": tls_align,
                 "aligned_tls_memsz": aligned_tls_memsz,
             },
+            "target_abi": target_abi.to_dict(),
+            "tcb_scan_status": tcb_support.status,
+            "tcb_scan_status_reason": tcb_support.message,
             "tls_variables_discovered": len(tls_vars),
             "variable_summaries": variable_summaries,
             "threads_count": len(thread_reports),
             "tcb_resolved_count": len(tcb_by_tid),
             "threads": thread_reports,
             "llm_next_step_hint": (
+                f"TLS decoding {tcb_support.message}; no per-thread TLS values were produced."
+                if not tcb_support.supported else
                 f"Decoded {len(tls_vars)} TLS (`__thread` / `thread_local`) variable(s) across "
                 f"{len(tcb_by_tid)}/{len(thread_reports)} thread TCB(s) in 0.00ms zero-stop mode."
             ),

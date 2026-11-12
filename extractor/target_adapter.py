@@ -31,6 +31,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 import uuid
 
 from .debug_image import BinaryIdentity, inspect_elf
+from .target_abi import FEATURE_TCB_SCAN, check_support, detect_target_abi
 
 
 
@@ -905,6 +906,14 @@ class TargetExecutionAdapter(ABC):
         """
         pass
 
+    def read_target_file(self, pid: int, path: str, max_bytes: int) -> Optional[bytes]:
+        """Reads up to ``max_bytes`` of a file as seen on the TARGET host (e.g. /proc/PID/exe).
+
+        Used for ABI detection (IMP-015). Adapters that cannot do this return None, which makes
+        ABI detection fail closed (dependent checks become inconclusive).
+        """
+        return None
+
     def read_memory_batch(
         self,
         pid: int,
@@ -1034,6 +1043,13 @@ class LocalTargetAdapter(TargetExecutionAdapter):
             "is_remote": False,
             "host": self.target_host(),
         }
+
+    def read_target_file(self, pid: int, path: str, max_bytes: int) -> Optional[bytes]:
+        try:
+            with open(path, "rb") as fh:
+                return fh.read(max(0, int(max_bytes)))
+        except OSError:
+            return None
 
     def get_proc_maps(self, pid: int) -> List[Dict[str, Any]]:
         maps_path = f"/proc/{pid}/maps"
@@ -1318,7 +1334,10 @@ class LocalTargetAdapter(TargetExecutionAdapter):
 
             # Resolve stack_info and TCB address for pure user-space poll-mode threads (e.g. DPDK lcores where sp_int == 0)
             unresolved_threads = [t for t in threads if t["stack_info"].get("status") != "AVAILABLE" or t["stack_info"].get("tcb_address") is None]
-            if unresolved_threads and self._memory_reader is None:
+            # IMP-015: the tcbhead_t self-pointer scan below is an x86_64/glibc layout; only run it there.
+            if unresolved_threads and self._memory_reader is None and check_support(
+                detect_target_abi(self, pid, probe_version=False, maps=maps), FEATURE_TCB_SCAN
+            ).supported:
                 target_tids = {t["tid"]: t for t in threads}
                 for m in maps:
                     if not m.get("is_readable") or not m.get("is_writable"):
@@ -1676,6 +1695,16 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
             "is_remote": True,
             "host": self.target_host(),
         }
+
+    def read_target_file(self, pid: int, path: str, max_bytes: int) -> Optional[bytes]:
+        cmd = f"head -c {int(max_bytes)} {shlex.quote(str(path))} 2>/dev/null | base64"
+        rc, out, _ = self.run_ssh(cmd, timeout=self.timeout_sec * 1.5)
+        if rc != 0 or not out.strip():
+            return None
+        try:
+            return base64.b64decode(out.strip())
+        except Exception:  # noqa: BLE001
+            return None
 
     def get_proc_maps(self, pid: int) -> List[Dict[str, Any]]:
         cmd = f"cat /proc/{int(pid)}/maps 2>/dev/null"
