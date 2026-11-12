@@ -10,6 +10,7 @@ Verifies:
 
 import json
 import os
+import select
 import subprocess
 import time
 import unittest
@@ -40,6 +41,11 @@ class TestPhase211AdaptiveReplanning(unittest.TestCase):
     def tearDown(self):
         for p in self.procs:
             try:
+                if p.stdout:
+                    p.stdout.close()
+            except Exception:
+                pass
+            try:
                 p.terminate()
                 p.wait(timeout=1.0)
             except Exception:
@@ -49,9 +55,15 @@ class TestPhase211AdaptiveReplanning(unittest.TestCase):
                     pass
 
     def _spawn_target(self, mode: str) -> subprocess.Popen:
-        p = subprocess.Popen([self.debug_elf, mode], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        p = subprocess.Popen([self.debug_elf, mode], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
         self.procs.append(p)
-        time.sleep(0.12)
+        # The fixture prints its banner (flushed) immediately before applying the scenario state
+        # (e.g. the "corrupt" mode mutates globals right after it). Wait for the banner instead of a
+        # fixed sleep so a loaded CI VM cannot observe the target before the scenario is in place.
+        ready, _, _ = select.select([p.stdout], [], [], 10.0)
+        self.assertTrue(ready, "fixture did not print its banner within 10s")
+        self.assertIn("Mode: " + mode, p.stdout.readline())
+        time.sleep(0.1)
         return p
 
     def test_adaptive_early_stop_on_definitive_fault(self):
