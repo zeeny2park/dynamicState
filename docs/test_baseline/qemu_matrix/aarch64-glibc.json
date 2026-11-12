@@ -2,8 +2,8 @@
  "schema": "dynamicstate.qemu_matrix.v1",
  "entry": "aarch64-glibc",
  "title": "aarch64 + glibc (Debian trixie userland, BusyBox applets)",
- "started_utc": "2026-11-12T11:55:04Z",
- "duration_s": 330.3,
+ "started_utc": "2026-11-12T19:48:13Z",
+ "duration_s": 183.1,
  "overall": "PASS",
  "infrastructure_error": null,
  "guest": {
@@ -11,7 +11,7 @@
    "Linux 6.12.107+deb13-arm64 aarch64",
    "BusyBox v1.37.0 (Debian 1:1.37.0-6+b9) multi-call binary."
   ],
-  "boot_to_ssh_s": 9.3,
+  "boot_to_ssh_s": 17.2,
   "vcpus": 1,
   "mem_mb": 128,
   "cpu_model": "cortex-a72",
@@ -47,16 +47,16 @@
    "-monitor",
    "none",
    "-serial",
-   "file:/home/ubuntu/.cache/dynamicstate-qemu/dsqemu_aarch64-glibc_ftgiksix/console.log",
+   "file:/home/ubuntu/.cache/dynamicstate-qemu/dsqemu_aarch64-glibc_eyzub_uy/console.log",
    "-no-reboot",
    "-kernel",
    "/home/ubuntu/.cache/dynamicstate-qemu/aarch64-glibc/vmlinuz",
    "-initrd",
-   "/home/ubuntu/.cache/dynamicstate-qemu/dsqemu_aarch64-glibc_ftgiksix/initrd.cpio.gz",
+   "/home/ubuntu/.cache/dynamicstate-qemu/dsqemu_aarch64-glibc_eyzub_uy/initrd.cpio.gz",
    "-append",
    "console=ttyAMA0 panic=-1 quiet loglevel=3",
    "-netdev",
-   "user,id=n0,hostfwd=tcp:127.0.0.1:34241-:22",
+   "user,id=n0,hostfwd=tcp:127.0.0.1:45251-:22",
    "-device",
    "virtio-net-pci,netdev=n0,romfile="
   ]
@@ -66,19 +66,19 @@
    "id": "C1_collector_deploy_and_slice",
    "name": "Collector deploys (arch, static, version) + slice read returns expected bytes",
    "status": "PASS",
-   "summary": "DEPLOYED_BINARY aarch64 collector v1.2.0, 857848 bytes; slice of 48 bytes at 0xaaaaca570010 matches",
+   "summary": "DEPLOYED_BINARY aarch64 collector v1.3.0, 923648 bytes; slice of 48 bytes at 0xaaaad2ec0010 matches",
    "details": {
     "deploy": {
      "deployed": true,
      "status": "DEPLOYED_BINARY",
      "collector_path": "/tmp/dynamicstate-collector",
-     "bytes_transferred": 857848,
+     "bytes_transferred": 923648,
      "architecture": "aarch64",
-     "collector_version": "1.2.0",
-     "local_binary": "/home/ubuntu/workspace/ut/.claude/worktrees/agent-ab09a9b07a1b30c85/target/collector/dist/aarch64/dynamicstate-collector",
+     "collector_version": "1.3.0",
+     "local_binary": "/home/ubuntu/workspace/ut/.claude/worktrees/agent-a1a5419e943472266/target/collector/dist/aarch64/dynamicstate-collector",
      "transfer": "ssh_stdin"
     },
-    "deploy_reason": "Successfully deployed dynamicstate-collector (857848 bytes) to /tmp/dynamicstate-collector",
+    "deploy_reason": "Successfully deployed dynamicstate-collector (923648 bytes) to /tmp/dynamicstate-collector",
     "guest_uname_m": "aarch64",
     "local_binary": "target/collector/dist/aarch64/dynamicstate-collector",
     "local_binary_elf": {
@@ -87,10 +87,10 @@
      "endianness": "little",
      "interpreter": null
     },
-    "remote_version_output": "dynamicstate-collector 1.2.0",
-    "expected_version": "1.2.0",
+    "remote_version_output": "dynamicstate-collector 1.3.0",
+    "expected_version": "1.3.0",
     "slice_read": {
-     "address": "0xaaaaca570010",
+     "address": "0xaaaad2ec0010",
      "size": 48,
      "status": "OBSERVED",
      "error": null,
@@ -98,14 +98,14 @@
     },
     "daemon_stats_after_slice": {
      "opens": 1,
-     "requests": 1,
+     "requests": 3,
      "reopens": 0,
      "fallbacks": 0
     },
-    "remote_commands": 14
+    "remote_commands": 6
    },
-   "remote_commands": 14,
-   "duration_s": 4.27
+   "remote_commands": 6,
+   "duration_s": 5.47
   },
   {
    "id": "C1b_noexec_fallback_location",
@@ -118,17 +118,17 @@
      "deployed": true,
      "status": "DEPLOYED_BINARY",
      "collector_path": "/tmp/dsmx_fallback/dynamicstate-collector",
-     "bytes_transferred": 857848,
+     "bytes_transferred": 923648,
      "architecture": "aarch64",
-     "collector_version": "1.2.0",
-     "local_binary": "/home/ubuntu/workspace/ut/.claude/worktrees/agent-ab09a9b07a1b30c85/target/collector/dist/aarch64/dynamicstate-collector",
+     "collector_version": "1.3.0",
+     "local_binary": "/home/ubuntu/workspace/ut/.claude/worktrees/agent-a1a5419e943472266/target/collector/dist/aarch64/dynamicstate-collector",
      "transfer": "ssh_stdin"
     },
-    "reason": "Successfully deployed dynamicstate-collector (857848 bytes) to /tmp/dsmx_fallback/dynamicstate-collector",
+    "reason": "Successfully deployed dynamicstate-collector (923648 bytes) to /tmp/dsmx_fallback/dynamicstate-collector",
     "read_via_fallback_copy": "OBSERVED"
    },
    "remote_commands": 6,
-   "duration_s": 2.53
+   "duration_s": 5.49
   },
   {
    "id": "C2a_daemon_channel",
@@ -138,7 +138,7 @@
    "details": {
     "reads": 30,
     "bad_reads": [],
-    "wall_s": 0.34,
+    "wall_s": 0.63,
     "daemon_stats": {
      "opens": 1,
      "requests": 30,
@@ -154,7 +154,7 @@
     }
    },
    "remote_commands": 1,
-   "duration_s": 2.48
+   "duration_s": 3.73
   },
   {
    "id": "C2b_no_collector_fallback",
@@ -234,7 +234,7 @@
     }
    },
    "remote_commands": 10,
-   "duration_s": 3.59
+   "duration_s": 6.19
   },
   {
    "id": "C3_abi_detection",
@@ -282,8 +282,8 @@
      "cfi_unwind": "SUPPORTED"
     }
    },
-   "remote_commands": 2,
-   "duration_s": 0.55
+   "remote_commands": 3,
+   "duration_s": 1.61
   },
   {
    "id": "C4a_deadlock_diagnosis",
@@ -310,13 +310,13 @@
      "recipe_status": "SUPPORTED",
      "lock_owner_status": "SUPPORTED",
      "collections": 1,
-     "wall_s": 21.08,
-     "ssh_commands": 76
+     "wall_s": 4.18,
+     "ssh_commands": 2
     },
     "limitations": []
    },
-   "duration_s": 21.08,
-   "remote_commands": 76
+   "duration_s": 4.18,
+   "remote_commands": 2
   },
   {
    "id": "C4b_glibc_only_gating",
@@ -328,30 +328,30 @@
     "heap_walk_message": "",
     "chunks": 3,
     "arenas": 1,
-    "wall_s": 2.58,
-    "ssh_commands": 6
+    "wall_s": 2.54,
+    "ssh_commands": 1
    },
-   "duration_s": 2.6
+   "duration_s": 2.57
   },
   {
    "id": "C4c_futex_syscall_names",
    "name": "futex waiters carry the right syscall name",
    "status": "PASS",
-   "summary": "threads [849, 850] reported as futex (blocked, with sp/pc)",
+   "summary": "threads [860, 861] reported as futex (blocked, with sp/pc)",
    "details": {
     "guest_raw_syscalls": {
-     "847": 73,
-     "849": 98,
-     "850": 98
+     "858": 73,
+     "860": 98,
+     "861": 98
     },
     "futex_waiters_by_abi_table": [
-     849,
-     850
+     860,
+     861
     ],
     "table_names": {
-     "847": "ppoll",
-     "849": "futex",
-     "850": "futex"
+     "858": "ppoll",
+     "860": "futex",
+     "861": "futex"
     },
     "remote_get_threads_fields": [
      "cpu_id",
@@ -376,43 +376,43 @@
      "voluntary_ctxt_switches"
     ],
     "reported_syscalls": {
-     "849": {
+     "860": {
       "state": "blocked",
       "nr": 98,
       "args": [
-       187650805596240,
+       187650418802768,
        128,
        2,
        0,
        0,
        0
       ],
-      "sp": 281473733814400,
-      "pc": 281473734356848
+      "sp": 281473738926208,
+      "pc": 281473739468656
      },
-     "850": {
+     "861": {
       "state": "blocked",
       "nr": 98,
       "args": [
-       187650805596192,
+       187650418802720,
        128,
        2,
        0,
        0,
        0
       ],
-      "sp": 281473725360256,
-      "pc": 281473734356848
+      "sp": 281473730472064,
+      "pc": 281473739468656
      }
     }
    },
-   "duration_s": 0.83
+   "duration_s": 0.91
   },
   {
    "id": "C4d_diagnose_entry_point",
    "name": "diagnose() over SSH on the guest's deadlock fixture vs. host result",
    "status": "PASS",
-   "summary": "diagnose() over SSH: verdict CONFIRMED_FAULT, ['DEADLOCK_INDICATORS'], locks ['g_mutex_a', 'g_mutex_b'] = host; 8 item(s) recorded in not_covered",
+   "summary": "diagnose() over SSH: verdict CONFIRMED_FAULT, ['DEADLOCK_INDICATORS'], locks ['g_mutex_a', 'g_mutex_b'] = host; 10 item(s) recorded in not_covered",
    "details": {
     "remote": {
      "verdict": "CONFIRMED_FAULT",
@@ -436,10 +436,10 @@
      ],
      "host_arch": "aarch64"
     },
-    "wall_s": 190.6,
-    "ssh_commands": 709,
+    "wall_s": 20.9,
+    "ssh_commands": 8,
     "target": {
-     "pid": 847,
+     "pid": 858,
      "process_name": "deadlock",
      "abi": {
       "status": "DETECTED",
@@ -462,16 +462,131 @@
      "transport": "ssh",
      "host": "127.0.0.1",
      "user": "root",
-     "port": 34241,
+     "port": 45251,
      "proxy_jump": null,
      "auto_deploy_collector": true,
      "collector": {
       "status": "ALREADY_PRESENT",
       "collector_path": "/tmp/dynamicstate-collector",
-      "collector_version": "1.2.0"
+      "collector_version": "1.3.0"
      }
     },
-    "bytes_read": 488358,
+    "bytes_read": 503068,
+    "remote_command_breakdown": {
+     "ssh_invocations": 8,
+     "daemon_exchanges": 429,
+     "seconds_in_remote_calls": 10.392,
+     "bytes": 2041130,
+     "by_purpose": {
+      "daemon:ident": {
+       "count": 164,
+       "seconds": 1.84,
+       "bytes": 337938
+      },
+      "daemon:procfile": {
+       "count": 118,
+       "seconds": 0.789,
+       "bytes": 142908
+      },
+      "daemon:read": {
+       "count": 99,
+       "seconds": 3.241,
+       "bytes": 1503317
+      },
+      "daemon:threads": {
+       "count": 46,
+       "seconds": 1.076,
+       "bytes": 54878
+      },
+      "ssh:other": {
+       "count": 5,
+       "seconds": 2.135,
+       "bytes": 690
+      },
+      "daemon:impact": {
+       "count": 2,
+       "seconds": 0.051,
+       "bytes": 1330
+      },
+      "ssh:uname": {
+       "count": 1,
+       "seconds": 0.409,
+       "bytes": 8
+      },
+      "ssh:deploy": {
+       "count": 1,
+       "seconds": 0.354,
+       "bytes": 29
+      },
+      "daemon_open:daemon_open": {
+       "count": 1,
+       "seconds": 0.497,
+       "bytes": 32
+      }
+     },
+     "top_callers": {
+      "watch_session.py:inspect_thread_callstacks_and_locks": {
+       "count": 104,
+       "seconds": 1.203,
+       "bytes": 180839
+      },
+      "watch_session.py:_read": {
+       "count": 104,
+       "seconds": 1.684,
+       "bytes": 459208
+      },
+      "expert_diagnostic_engine.py:_step_collect_next": {
+       "count": 72,
+       "seconds": 0.519,
+       "bytes": 34092
+      },
+      "target_abi.py:detect_target_abi": {
+       "count": 32,
+       "seconds": 0.534,
+       "bytes": 166239
+      },
+      "runtime_evidence_provider.py:collect_process_info": {
+       "count": 20,
+       "seconds": 0.188,
+       "bytes": 19408
+      },
+      "thread_sampler.py:augment_lock_info": {
+       "count": 18,
+       "seconds": 0.422,
+       "bytes": 21474
+      },
+      "heap_walker.py:read_ranges": {
+       "count": 14,
+       "seconds": 1.443,
+       "bytes": 947512
+      },
+      "leak_attribution.py:proc_memory_sample": {
+       "count": 12,
+       "seconds": 0.085,
+       "bytes": 18714
+      },
+      "watch_session.py:_get_process_maps_and_load_bias": {
+       "count": 9,
+       "seconds": 0.061,
+       "bytes": 7080
+      },
+      "runtime_evidence_provider.py:_obs_threads_and_locks": {
+       "count": 8,
+       "seconds": 0.107,
+       "bytes": 12052
+      },
+      "expert_diagnostic_engine.py:assess": {
+       "count": 7,
+       "seconds": 0.338,
+       "bytes": 137960
+      },
+      "runtime_evidence_provider.py:collect_memory_maps": {
+       "count": 7,
+       "seconds": 0.044,
+       "bytes": 12740
+      }
+     }
+    },
     "zero_stop": true,
     "capture_mode": "ZERO_STOP_LIVE_RUNTIME",
     "not_covered": [
@@ -511,59 +626,69 @@
       "reason": "Check executed"
      },
      {
+      "kind": "check_inconclusive",
+      "item": "RECIPE_DOUBLE_FREE",
+      "reason": "Check executed"
+     },
+     {
+      "kind": "check_inconclusive",
+      "item": "RECIPE_USE_AFTER_FREE",
+      "reason": "Check executed"
+     },
+     {
       "kind": "recipes_not_planned",
-      "item": "RECIPE_DOUBLE_FREE,RECIPE_INVALID_FREE,RECIPE_USE_AFTER_FREE,RECIPE_SUSPICIOUS_A",
+      "item": "RECIPE_INVALID_FREE,RECIPE_SUSPICIOUS_ALLOCATION_PATTERNS,RECIPE_OBJECT_LIFETIME",
       "reason": "not selected by the planner for this symptom classification"
      }
     ],
-    "summary": "Verdict CONFIRMED_FAULT: found DEADLOCK_INDICATORS. 2 of 8 executed checks passed; 8 item(s) could not be examined (see not_covered)."
+    "summary": "Verdict CONFIRMED_FAULT: found DEADLOCK_INDICATORS. 4 of 12 executed checks passed; 10 item(s) could not be examined (see not_covered)."
    },
-   "duration_s": 190.57,
-   "remote_commands": 709
+   "duration_s": 20.89,
+   "remote_commands": 8
   },
   {
    "id": "C5_collection_cost",
    "name": "Collection cost (wall time, remote commands)",
    "status": "PASS",
-   "summary": "deadlock 21.08s/76 cmds; 100 reads: daemon channel 0.54s/1 cmds, one collector process per call 24.99s/100 cmds, no collector 28.5s/100 cmds",
+   "summary": "deadlock 4.18s/2 cmds; 100 reads: daemon channel 0.77s/1 cmds, one collector process per call 44.06s/100 cmds, no collector 42.21s/100 cmds",
    "details": {
     "read_modes": [
      {
       "mode": "daemon channel (collector)",
       "reads": 100,
-      "wall_s": 0.54,
+      "wall_s": 0.77,
       "ssh_commands": 1,
-      "per_read_ms": 5.4,
+      "per_read_ms": 7.7,
       "wrong_reads": 0
      },
      {
       "mode": "one collector process per call",
       "reads": 100,
-      "wall_s": 24.99,
+      "wall_s": 44.06,
       "ssh_commands": 100,
-      "per_read_ms": 249.9,
+      "per_read_ms": 440.6,
       "wrong_reads": 0
      },
      {
       "mode": "no collector (busybox dd block pipeline)",
       "reads": 100,
-      "wall_s": 28.5,
+      "wall_s": 42.21,
       "ssh_commands": 100,
-      "per_read_ms": 285.0,
+      "per_read_ms": 422.1,
       "wrong_reads": 0
      },
      {
       "mode": "daemon channel + pinned identity",
       "reads": 20,
-      "wall_s": 21.6,
-      "ssh_commands": 81,
-      "per_read_ms": 1080.2,
+      "wall_s": 0.14,
+      "ssh_commands": 0,
+      "per_read_ms": 6.9,
       "wrong_reads": 0
      }
     ],
     "deadlock_diagnosis": {
-     "wall_s": 21.08,
-     "ssh_commands": 76,
+     "wall_s": 4.18,
+     "ssh_commands": 2,
      "collections": 1
     },
     "guest": {
@@ -572,17 +697,17 @@
      "accel": "tcg (software emulation; absolute times are pessimistic)"
     }
    },
-   "duration_s": 96.71
+   "duration_s": 91.36
   },
   {
    "id": "C6_process_discovery_and_identity",
    "name": "Process discovery / identity / maps via BusyBox shell tools",
    "status": "PASS",
-   "summary": "found pid 166, build-id c13227c551f6, 17 maps entries, rw region located",
+   "summary": "found pid 170, build-id d01e474a64fa, 17 maps entries, rw region located",
    "details": {
     "find_processes": [
      {
-      "pid": 166,
+      "pid": 170,
       "name": "memtarget",
       "executable": "/tmp/memtarget"
      }
@@ -590,8 +715,8 @@
     "identity": {
      "architecture": "aarch64",
      "elf_type": "ET_DYN",
-     "build_id": "c13227c551f650bd41dc56458e0fdae24aa5b3c6",
-     "start_time": "941",
+     "build_id": "d01e474a64fab1e2919cf3cfa668c7389106bdb9",
+     "start_time": "1666",
      "executable": "/tmp/memtarget"
     },
     "maps": {
@@ -607,8 +732,8 @@
      "CoreDumping"
     ]
    },
-   "remote_commands": 8,
-   "duration_s": 6.53
+   "remote_commands": 5,
+   "duration_s": 12.38
   }
  ],
  "teardown": {

@@ -90,6 +90,8 @@ class CollectionImpact:
     #: cost of the diagnosis itself
     diagnosis_attributable: Dict[str, Any] = field(default_factory=dict)
     notes: List[str] = field(default_factory=list)
+    #: remote targets: what the window cost in ssh invocations / daemon exchanges, by purpose and call site
+    remote_commands: Dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -194,6 +196,12 @@ class CollectionImpactMeter:
             rec.measured = True
             self._fill_deltas(rec, a, b)
         self._fill_attributable(rec, a, b, end_host_cpu)
+        summarize = getattr(self.adapter, "remote_command_summary", None)
+        if self.remote and callable(summarize):
+            try:   # whole adapter session (preflight, deploy and identity included), not only this window
+                rec.remote_commands = summarize()
+            except Exception as exc:  # noqa: BLE001
+                notes.append(f"remote command summary failed: {type(exc).__name__}: {exc}")
         notes.append(
             "target.* is the target's own activity during the window (delta); it is not caused by the diagnosis, "
             "which never stops the target in zero-stop mode. Cost of the diagnosis is under diagnosis_attributable."
@@ -331,6 +339,8 @@ def impact_summary_for_report(
         "collector_max_rss_kb": attr.get("collector_max_rss_kb"),
         "impact_notes": list(d.get("notes") or []),
     })
+    if d.get("remote_commands"):
+        out["remote_commands"] = d["remote_commands"]
     return out
 
 

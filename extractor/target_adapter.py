@@ -26,6 +26,7 @@ import atexit
 import re
 import select
 import shlex
+import shutil
 import subprocess
 import tempfile
 import threading
@@ -972,6 +973,8 @@ class TargetExecutionAdapter(ABC):
                 return False, f"IDENTITY_UNAVAILABLE: Missing mandatory identity field '{req_field}' on PID {pid} during verification (pinned={p_val!r}, cur={c_val!r})"
             if str(p_val) != str(c_val):
                 return False, f"PID_REUSED: Target identity changed for '{req_field}' on PID {pid}: {p_val} -> {c_val}"
+        if pinned.get("exe_fingerprint") and cur.get("exe_fingerprint") and pinned["exe_fingerprint"] != cur["exe_fingerprint"]:
+            return False, f"PID_REUSED: Executable file changed on PID {pid}: {pinned['exe_fingerprint']} -> {cur['exe_fingerprint']}"
         if pinned.get("exe_inode") and cur.get("exe_inode") and int(pinned["exe_inode"]) != int(cur["exe_inode"]):
             return False, f"PID_REUSED: Executable inode changed on PID {pid}: {pinned['exe_inode']} -> {cur['exe_inode']}"
         if pinned.get("build_id") and cur.get("build_id") and str(pinned["build_id"]).strip().lower() != str(cur["build_id"]).strip().lower():
@@ -1856,6 +1859,109 @@ DAEMON_MAX_REQUEST_CHARS = 7000
 _LIVE_DAEMON_CHANNELS: "weakref.WeakSet" = weakref.WeakSet()
 
 
+def _classify_ssh_purpose(cmd: str) -> str:
+    """Coarse purpose of a one-shot remote command, from its text (instrumentation only)."""
+    c = cmd or ""
+    if "--daemon" in c:
+        return "daemon_open"
+    if "/maps" in c and "cat " in c:
+        return "maps"
+    if "readlink" in c and "/exe" in c and "boot_id" in c:
+        return "identity_probe"
+    if "readlink" in c and "/exe" in c:
+        return "identity_exe_link"
+    if "head -c 65536 /proc/" in c and "/exe" in c:
+        return "identity_elf_header"
+    if "/stat " in c + " " and "/proc/" in c and "cat /proc/" in c and "task" not in c:
+        return "identity_stat"
+    if "boot_id" in c:
+        return "identity_boot_id"
+    if c.startswith("uname"):
+        return "uname"
+    if "kill -0" in c:
+        return "liveness"
+    if "/status" in c and "task" not in c and c.startswith("cat "):
+        return "process_status"
+    if "/task/" in c and "@@T" in c:
+        return "threads_shell"
+    if "--threads" in c:
+        return "threads_collector_oneshot"
+    if "cpu_line" in c or "/proc/loadavg" in c:
+        return "load_snapshot_shell"
+    if "--read-slices" in c or "--read" in c:
+        return "read_collector_oneshot"
+    if "dd if=/proc/" in c:
+        return "read_shell_dd"
+    if "stat -c" in c:
+        return "stat_file"
+    if c.startswith("head -c") and "base64" in c:
+        return "read_file"
+    if "for p in /proc/" in c:
+        return "find_processes"
+    if "cat >" in c or "chmod" in c or "--version" in c or "mkdir" in c or "mv " in c:
+        return "deploy"
+    return "other"
+
+
+class RemoteCommandLog:
+    """Per-session record of every remote ssh invocation: purpose, call site, duration, bytes."""
+
+    MAX_RECORDS = 20000
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self.records: List[Dict[str, Any]] = []
+
+    def add(self, kind: str, purpose: str, site: str, caller: str, dur_s: float, nbytes: int = 0) -> None:
+        with self._lock:
+            if len(self.records) < self.MAX_RECORDS:
+                self.records.append({"kind": kind, "purpose": purpose, "site": site, "caller": caller,
+                                     "dur_s": dur_s, "bytes": nbytes})
+
+    def mark(self) -> int:
+        with self._lock:
+            return len(self.records)
+
+    def summary(self, since: int = 0, top_callers: int = 12) -> Dict[str, Any]:
+        with self._lock:
+            recs = list(self.records[since:])
+        by_purpose: Dict[str, Dict[str, Any]] = {}
+        by_caller: Dict[str, Dict[str, Any]] = {}
+        for r in recs:
+            for table, key in ((by_purpose, f"{r['kind']}:{r['purpose']}"), (by_caller, r["caller"])):
+                e = table.setdefault(key, {"count": 0, "seconds": 0.0, "bytes": 0})
+                e["count"] += 1
+                e["seconds"] += r["dur_s"]
+                e["bytes"] += r["bytes"]
+        for table in (by_purpose, by_caller):
+            for e in table.values():
+                e["seconds"] = round(e["seconds"], 3)
+        callers = dict(sorted(by_caller.items(), key=lambda kv: -kv[1]["count"])[:top_callers])
+        ssh_total = sum(1 for r in recs if r["kind"] in ("ssh", "daemon_open"))
+        return {
+            "ssh_invocations": ssh_total,
+            "daemon_exchanges": sum(1 for r in recs if r["kind"] == "daemon"),
+            "seconds_in_remote_calls": round(sum(r["dur_s"] for r in recs), 3),
+            "bytes": sum(r["bytes"] for r in recs),
+            "by_purpose": dict(sorted(by_purpose.items(), key=lambda kv: -kv[1]["count"])),
+            "top_callers": callers,
+        }
+
+
+def _call_sites() -> Tuple[str, str]:
+    """(adapter method, first caller outside this module) of the running remote call, for the command log."""
+    import sys
+    f = sys._getframe(2)
+    site = ""
+    while f is not None:
+        if f.f_globals.get("__name__") != __name__:
+            return site, f"{os.path.basename(f.f_code.co_filename)}:{f.f_code.co_name}"
+        if f.f_code.co_name not in ("run_ssh", "_with_daemon", "run", "_call_sites", "exchange", "_exchange", "<lambda>", "_daemon_json"):
+            site = site or f.f_code.co_name
+        f = f.f_back
+    return site, ""
+
+
 class DaemonChannelError(Exception):
     """The daemon channel is dead, timed out or produced garbage (caller reopens / falls back)."""
 
@@ -1869,7 +1975,20 @@ class _DaemonChannel:
         self._fd = proc.stdout.fileno()
         _LIVE_DAEMON_CHANNELS.add(self)
 
+    log: Optional["RemoteCommandLog"] = None
+
     def exchange(self, line: str, timeout: float) -> str:
+        t0 = time.monotonic()
+        reply = self._exchange(line, timeout)
+        if self.log is not None and line != "PING":
+            try:
+                site, caller = _call_sites()
+                self.log.add("daemon", line.split(" ", 1)[0].lower(), site, caller, time.monotonic() - t0, len(reply))
+            except Exception:  # noqa: BLE001
+                pass
+        return reply
+
+    def _exchange(self, line: str, timeout: float) -> str:
         proc = self.proc
         if proc.poll() is not None:
             raise DaemonChannelError("channel process exited")
@@ -1938,6 +2057,8 @@ def _close_live_daemon_channels() -> None:
             pass
 
 
+IDENT_HEADER_BYTES = 65536
+
 # The native collector reads at most this many bytes per slice (collector.c); larger requests are split host-side.
 COLLECTOR_MAX_SLICE = 65536
 COLLECTOR_REQUEST_PIECES = 64
@@ -1961,7 +2082,7 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
         timeout_sec: float = 5.0,
         ssh_bin: str = "ssh",
         command_runner: Optional[Callable[[List[str], float], Tuple[int, str, str]]] = None,
-        use_control_master: bool = False,
+        use_control_master: Optional[bool] = None,
         collector_path: Optional[str] = None,
         stream_opener: Optional[Callable[[List[str]], "subprocess.Popen"]] = None,
         use_daemon: bool = True,
@@ -1984,7 +2105,18 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
         self.timeout_sec = float(timeout_sec)
         self.ssh_bin = ssh_bin
         self._command_runner = command_runner or self._default_command_runner
+        # OpenSSH connection sharing: None = auto (on for the real ssh binary on POSIX, off when a custom command
+        # runner is injected or DYNAMICSTATE_SSH_CONTROLMASTER=0), True/False = forced.  If ssh rejects the options
+        # the adapter silently falls back to plain connections.
+        if use_control_master is None:
+            use_control_master = bool(
+                command_runner is None and os.name == "posix"
+                and os.environ.get("DYNAMICSTATE_SSH_CONTROLMASTER", "1") != "0"
+                and shutil.which(ssh_bin) is not None
+            )
         self.use_control_master = bool(use_control_master)
+        self._cm_disabled = False
+        self._cm_used = False
         self.collector_path = (collector_path or "").strip() or None
         # IMP-021: persistent daemon channel state.  ``stream_opener(args)`` returns a Popen with
         # stdin/stdout pipes; injectable so tests can run the "remote" side locally.
@@ -1997,6 +2129,13 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
         self.daemon_stats: Dict[str, int] = {"opens": 0, "requests": 0, "reopens": 0, "fallbacks": 0}
         self._threads_unsupported_for: Optional[str] = None  # collector path without the THREADS command
         self.last_threads_transport: Optional[str] = None
+        self.command_log = RemoteCommandLog()
+        self._proc_cmds_unsupported_for: Optional[str] = None   # collector without IDENT / PROCFILE
+        self._exe_cache: Dict[Tuple[str, str], Dict[str, Any]] = {}   # (exe path, file fingerprint) -> header + parsed ELF
+        self._ident_seen: set = set()
+
+    def remote_command_summary(self, since: int = 0) -> Dict[str, Any]:
+        return self.command_log.summary(since)
 
     def is_remote(self) -> bool:
         return True
@@ -2047,20 +2186,47 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
         """
         t = timeout or self.timeout_sec
         args = self._ssh_args(remote_shell_cmd)
+        t0 = time.monotonic()
+        res: Tuple[int, str, str]
         try:
             if input_bytes is not None:
-                return self._command_runner(args, t, input_bytes=input_bytes)
-            return self._command_runner(args, t)
+                res = self._command_runner(args, t, input_bytes=input_bytes)
+            else:
+                res = self._command_runner(args, t)
         except subprocess.TimeoutExpired:
-            return -1, "", f"SSH command timed out after {t:.1f}s"
+            res = (-1, "", f"SSH command timed out after {t:.1f}s")
         except Exception as e:
-            return -1, "", f"SSH execution error: {e}"
+            res = (-1, "", f"SSH execution error: {e}")
+        if (self._cm_used and not self._cm_disabled and res[0] == 255
+                and re.search(r"control|mux|bad configuration option|unknown percent|unsupported option", res[2] or "", re.I)):
+            self._cm_disabled = True   # this ssh cannot do connection sharing: plain connections from now on
+            try:
+                res = self._command_runner(self._ssh_args(remote_shell_cmd), t, **({"input_bytes": input_bytes} if input_bytes is not None else {}))
+            except Exception as e:  # noqa: BLE001
+                res = (-1, "", f"SSH execution error: {e}")
+        try:
+            site, caller = _call_sites()
+            self.command_log.add("ssh", _classify_ssh_purpose(remote_shell_cmd), site, caller,
+                                 time.monotonic() - t0, len(res[1] or "") + len(input_bytes or b""))
+        except Exception:  # noqa: BLE001 - instrumentation must never break a read
+            pass
+        return res
 
     @staticmethod
     def _default_stream_opener(args: List[str]) -> "subprocess.Popen":
         return subprocess.Popen(
             args, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, close_fds=True,
         )
+
+    def _control_master_opts(self) -> List[str]:
+        ctrl_dir = os.path.join(tempfile.gettempdir(), f"dynstate_ssh_{os.getuid() if hasattr(os, 'getuid') else 0}")
+        try:
+            os.makedirs(ctrl_dir, mode=0o700, exist_ok=True)
+            os.chmod(ctrl_dir, 0o700)
+        except Exception:  # noqa: BLE001
+            pass
+        # %C = hash of (local host, remote host, port, user): short enough for the 104-byte unix socket limit
+        return ["-o", "ControlMaster=auto", "-o", f"ControlPath={ctrl_dir}/%C", "-o", "ControlPersist=30s"]
 
     def _ssh_args(self, remote_shell_cmd: str) -> List[str]:
         args = [
@@ -2076,18 +2242,9 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
             args.extend(["-J", self.proxy_jump])
         if self.proxy_command:
             args.extend(["-o", f"ProxyCommand={self.proxy_command}"])
-        if self.use_control_master:
-            ctrl_dir = os.path.join(tempfile.gettempdir(), f"dynstate_ssh_{os.getuid() if hasattr(os, 'getuid') else 0}")
-            try:
-                os.makedirs(ctrl_dir, mode=0o700, exist_ok=True)
-                os.chmod(ctrl_dir, 0o700)
-            except Exception:
-                pass
-            args.extend([
-                "-o", "ControlMaster=auto",
-                "-o", f"ControlPath={ctrl_dir}/ssh_%r@%h:%p",
-                "-o", "ControlPersist=60s",
-            ])
+        if self.use_control_master and not self._cm_disabled:
+            args.extend(self._control_master_opts())
+            self._cm_used = True
 
         target_spec = f"{self.user}@{self.host}" if self.user else self.host
         args.append("--")
@@ -2095,16 +2252,154 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
         args.append(remote_shell_cmd)
         return args
 
+    # ---- IMP-022: identity / liveness / proc text files in ONE exchange --------------------------
+    @staticmethod
+    def _ident_shell_script(pid: int, with_header: bool) -> str:
+        p = f"/proc/{int(pid)}"
+        parts = [
+            "echo @@EXE", f"readlink -f {p}/exe 2>/dev/null || readlink {p}/exe 2>/dev/null",
+            "echo @@STAT", f"cat {p}/stat 2>/dev/null",
+            "echo @@BOOT", "cat /proc/sys/kernel/random/boot_id 2>/dev/null",
+            "echo @@FP", f"stat -L -c %i:%s:%Y {p}/exe 2>/dev/null",
+            "echo @@MACH", "uname -m 2>/dev/null",
+        ]
+        if with_header:
+            parts += ["echo @@HDR", f"head -c {IDENT_HEADER_BYTES} {p}/exe 2>/dev/null | base64"]
+        parts.append("echo @@END")
+        return "; ".join(parts)
+
+    @staticmethod
+    def _parse_ident_shell_output(out: str) -> Optional[Dict[str, Any]]:
+        if "@@END" not in out:
+            return None
+        sec: Dict[str, List[str]] = {}
+        cur: Optional[str] = None
+        for line in out.splitlines():
+            if line.startswith("@@"):
+                cur = line[2:].strip()
+                sec[cur] = []
+            elif cur is not None:
+                sec[cur].append(line)
+        j = lambda k: "\n".join(sec.get(k, [])).strip()  # noqa: E731
+        res: Dict[str, Any] = {"exe": j("EXE"), "stat": j("STAT"), "boot_id": j("BOOT"),
+                               "exe_fp": j("FP"), "machine": j("MACH"), "hdr": None}
+        if "HDR" in sec:
+            try:
+                res["hdr"] = base64.b64decode(j("HDR")) or None
+            except Exception:  # noqa: BLE001
+                res["hdr"] = None
+        return res
+
+    def _identity_probe(self, pid: int, with_header: bool = False) -> Optional[Dict[str, Any]]:
+        """exe link, /proc/PID/stat, boot_id, exe fingerprint, uname -m (+ ELF header) in ONE exchange:
+        a daemon request when the collector has IDENT, else ONE shell command.  None = transport failure."""
+        if self.collector_path and self._proc_cmds_unsupported_for != self.collector_path:
+            payload = self._daemon_json(f"IDENT {int(pid)}" + (" HDR" if with_header else ""))
+            if payload is not None:
+                if payload.get("success"):
+                    hdr = None
+                    if with_header and payload.get("hdr_hex"):
+                        try:
+                            hdr = bytes.fromhex(payload["hdr_hex"])
+                        except ValueError:
+                            hdr = None
+                    return {"exe": str(payload.get("exe") or ""), "stat": str(payload.get("stat") or "").strip(),
+                            "boot_id": str(payload.get("boot_id") or "").strip(), "exe_fp": str(payload.get("exe_fp") or ""),
+                            "machine": str(payload.get("machine") or ""), "hdr": hdr}
+                err = payload.get("error")
+                if err == "UNKNOWN_COMMAND":
+                    self._proc_cmds_unsupported_for = self.collector_path
+                elif err == "TARGET_TERMINATED":
+                    return {"exe": "", "stat": "", "boot_id": "", "exe_fp": "", "machine": "", "hdr": None}
+        rc, out, _ = self.run_ssh(f"sh -c {shlex.quote(self._ident_shell_script(pid, with_header))}",
+                                  timeout=self.timeout_sec * (1.5 if with_header else 1.0))
+        if rc != 0 and not out:
+            return None
+        return self._parse_ident_shell_output(out)
+
+    def _procfile_text(self, pid: int, name: str) -> Optional[str]:
+        """Text of /proc/PID/<name> through the daemon (None = use the shell path).  "" = process gone."""
+        if not self.collector_path or self._proc_cmds_unsupported_for == self.collector_path:
+            return None
+        payload = self._daemon_json(f"PROCFILE {int(pid)} {name}")
+        if payload is None:
+            return None
+        if payload.get("success") and isinstance(payload.get("text"), str):
+            return payload["text"]
+        err = payload.get("error")
+        if err == "UNKNOWN_COMMAND":
+            self._proc_cmds_unsupported_for = self.collector_path
+            return None
+        if err == "TARGET_TERMINATED":
+            return ""
+        return None
+
+    @staticmethod
+    def _start_time_from_stat(raw_stat: str) -> str:
+        raw_stat = (raw_stat or "").strip()
+        rparen = raw_stat.rfind(")")
+        if rparen != -1:
+            after_comm = raw_stat[rparen + 1:].strip().split()
+            if len(after_comm) >= 20:
+                return after_comm[19]
+        return ""
+
+    def _exe_entry(self, exe: str, fp: str, hdr: Optional[bytes]) -> Optional[Dict[str, Any]]:
+        """Cached ELF facts of one executable file image (key: path + ino:size:mtime fingerprint)."""
+        key = (exe, fp)
+        ent = self._exe_cache.get(key) if fp else None
+        if ent is not None or hdr is None:
+            return ent
+        ent = {"hdr": hdr, "arch": "unknown", "elf_type": "unknown", "build_id": None, "pt_loads": []}
+        if len(hdr) >= 64:
+            try:
+                with tempfile.NamedTemporaryFile(prefix="rem_elf_", suffix=".tmp", delete=False) as tf:
+                    tf.write(hdr)
+                    tf.flush()
+                    tmp_name = tf.name
+                try:
+                    ident = inspect_elf(tmp_name)
+                    ent.update(arch=ident.architecture, elf_type=ident.elf_type, build_id=ident.build_id,
+                               pt_loads=ident.pt_loads)
+                finally:
+                    if os.path.exists(tmp_name):
+                        os.remove(tmp_name)
+            except Exception:  # noqa: BLE001
+                pass
+        if fp:
+            self._exe_cache[key] = ent
+        return ent
+
+    def _exe_header(self, pid: int) -> Optional[bytes]:
+        """First 64 KiB of the target executable: cached per executable image, re-validated by its fingerprint."""
+        pr = self._identity_probe(pid, with_header=False)
+        if pr is None or not pr.get("exe_fp"):
+            pr = self._identity_probe(pid, with_header=True)
+            return pr.get("hdr") if pr else None
+        ent = self._exe_cache.get((pr["exe"], pr["exe_fp"]))
+        if ent is not None:
+            return ent["hdr"]
+        pr = self._identity_probe(pid, with_header=True)
+        if pr is None or not pr.get("hdr"):
+            return None
+        self._exe_entry(pr["exe"], pr["exe_fp"], pr["hdr"])
+        return pr["hdr"]
+
     def check_liveness(self, pid: int) -> Tuple[bool, Optional[str]]:
         if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 1:
             return False, f"Invalid PID {pid} (must be integer > 1)"
-        
+
+        text = self._procfile_text(int(pid), "comm")   # one daemon exchange when the channel is up
+        if text is not None:
+            if text:
+                return True, None
+            return False, f"Target PID {pid} is not running on {self.target_host()}"
         # Test liveness strictly on remote target host
         cmd = f"kill -0 {int(pid)} 2>/dev/null && echo ALIVE || echo DEAD"
         rc, stdout, stderr = self.run_ssh(cmd)
         if rc != 0:
             return False, f"SSH transport failure to {self.target_host()}: {stderr.strip() or 'Exit ' + str(rc)}"
-        
+
         out = stdout.strip()
         if "ALIVE" in out:
             return True, None
@@ -2112,82 +2407,62 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
 
     def get_process_identity(self, pid: int) -> Dict[str, Any]:
         """Discovers remote process executable, architecture, and Build ID.
-        
-        Reads the first 64KB of remote /proc/<pid>/exe and parses ELF header host-side.
+
+        ONE exchange (daemon IDENT, else one shell command); the ELF header of the executable is transferred and
+        parsed once per executable image (cache key: path + inode:size:mtime), so later calls are header-free.
         """
-        # 1. Resolve remote executable path
-        cmd_exe = f"readlink -f /proc/{int(pid)}/exe 2>/dev/null || readlink /proc/{int(pid)}/exe 2>/dev/null"
-        rc, stdout, _ = self.run_ssh(cmd_exe)
-        remote_exe = stdout.strip() if rc == 0 else ""
-
-        # 2. Extract first 64KB of executable via base64 to inspect ELF header on host
-        cmd_hdr = f"head -c 65536 /proc/{int(pid)}/exe 2>/dev/null | base64"
-        rc, stdout_b64, stderr = self.run_ssh(cmd_hdr, timeout=self.timeout_sec * 1.5)
-
-        arch = "unknown"
-        elf_type = "unknown"
-        build_id = None
-        pt_loads: List[Dict[str, Any]] = []
-
-        if rc == 0 and stdout_b64.strip():
-            try:
-                raw_elf = base64.b64decode(stdout_b64.strip())
-                if len(raw_elf) >= 64:
-                    with tempfile.NamedTemporaryFile(prefix="rem_elf_", suffix=".tmp", delete=False) as tf:
-                        tf.write(raw_elf)
-                        tf.flush()
-                        tmp_name = tf.name
-                    try:
-                        ident = inspect_elf(tmp_name)
-                        arch = ident.architecture
-                        elf_type = ident.elf_type
-                        build_id = ident.build_id
-                        pt_loads = ident.pt_loads
-                    finally:
-                        if os.path.exists(tmp_name):
-                            os.remove(tmp_name)
-            except Exception:
-                pass
-
-        # Fallback for architecture via remote uname -m if ELF parse didn't yield arch
-        if arch == "unknown":
-            rc, stdout_uname, _ = self.run_ssh("uname -m 2>/dev/null")
-            if rc == 0 and stdout_uname.strip():
-                arch = stdout_uname.strip()
-
-        # 3. Read remote start_time and boot_id to support pin_target_identity and PID reuse detection
-        start_time = ""
-        rc_stat, stdout_stat, _ = self.run_ssh(f"cat /proc/{int(pid)}/stat 2>/dev/null")
-        if rc_stat == 0 and stdout_stat.strip():
-            raw_stat = stdout_stat.strip()
-            rparen = raw_stat.rfind(")")
-            if rparen != -1:
-                after_comm = raw_stat[rparen + 1 :].strip().split()
-                if len(after_comm) >= 20:
-                    start_time = after_comm[19]
-
-        boot_id = ""
-        rc_boot, stdout_boot, _ = self.run_ssh("cat /proc/sys/kernel/random/boot_id 2>/dev/null")
-        if rc_boot == 0 and stdout_boot.strip():
-            boot_id = stdout_boot.strip()
+        first = int(pid) not in self._ident_seen
+        pr = self._identity_probe(pid, with_header=first) or {}
+        exe, fp = pr.get("exe", ""), pr.get("exe_fp", "")
+        ent = self._exe_entry(exe, fp, pr.get("hdr"))
+        if ent is None and exe and pr.get("hdr") is None:
+            pr2 = self._identity_probe(pid, with_header=True)   # cache miss (new executable image)
+            if pr2:
+                pr = {**pr, **{k: pr2[k] for k in ("hdr", "exe_fp", "exe") if pr2.get(k)}}
+                exe, fp = pr.get("exe", ""), pr.get("exe_fp", "")
+                ent = self._exe_entry(exe, fp, pr.get("hdr"))
+        if pr:
+            self._ident_seen.add(int(pid))
+        if ent is None and pr.get("hdr"):
+            ent = self._exe_entry(exe, "", pr["hdr"])   # no fingerprint: parse, do not cache
+        arch = (ent or {}).get("arch", "unknown")
+        elf_type = (ent or {}).get("elf_type", "unknown")
+        build_id = (ent or {}).get("build_id")
+        pt_loads = (ent or {}).get("pt_loads", [])
+        if arch == "unknown" and pr.get("machine"):
+            arch = pr["machine"].strip()
+        start_time = self._start_time_from_stat(pr.get("stat", ""))
+        boot_id = pr.get("boot_id", "")
 
         return {
             "pid": pid,
-            "executable": remote_exe,
-            "executable_identity": f"{remote_exe}:remote",
+            "executable": exe,
+            "executable_identity": f"{exe}:remote",
+            "exe_fingerprint": fp,
             "start_time": start_time,
             "boot_id": boot_id,
             "process_identity": f"{pid}:{start_time}:{boot_id}" if start_time else f"{pid}::{boot_id}",
             "architecture": arch,
             "elf_type": elf_type,
             "build_id": build_id,
-            "pt_loads": pt_loads,
+            "pt_loads": [dict(x) for x in pt_loads],
             "page_size": 4096,
             "is_remote": True,
             "host": self.target_host(),
         }
 
     def read_target_file(self, pid: int, path: str, max_bytes: int) -> Optional[bytes]:
+        m = re.fullmatch(r"/proc/(\d+)/(maps|status|stat|limits|comm|exe)", str(path))
+        if m:
+            if m.group(2) == "exe":
+                if int(max_bytes) <= IDENT_HEADER_BYTES:
+                    hdr = self._exe_header(int(m.group(1)))
+                    if hdr is not None:
+                        return hdr[:max(0, int(max_bytes))]
+            else:
+                text = self._procfile_text(int(m.group(1)), m.group(2))
+                if text is not None:
+                    return text.encode("utf-8", "replace")[:max(0, int(max_bytes))]
         cmd = f"head -c {int(max_bytes)} {shlex.quote(str(path))} 2>/dev/null | base64"
         rc, out, _ = self.run_ssh(cmd, timeout=self.timeout_sec * 1.5)
         if rc != 0 or not out.strip():
@@ -2211,10 +2486,14 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
         return None
 
     def get_proc_maps(self, pid: int) -> List[Dict[str, Any]]:
-        cmd = f"cat /proc/{int(pid)}/maps 2>/dev/null"
-        rc, stdout, _ = self.run_ssh(cmd)
         mappings: List[Dict[str, Any]] = []
-        if rc != 0 or not stdout:
+        stdout = self._procfile_text(int(pid), "maps")   # one daemon exchange when the channel is up
+        if stdout is None:
+            cmd = f"cat /proc/{int(pid)}/maps 2>/dev/null"
+            rc, stdout, _ = self.run_ssh(cmd)
+            if rc != 0:
+                return mappings
+        if not stdout:
             return mappings
 
         for line in stdout.splitlines():
@@ -2267,8 +2546,11 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
         status: Dict[str, Any] = {}
         if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 1:
             return status
-        cmd = f"cat /proc/{int(pid)}/status 2>/dev/null"
-        rc, stdout, _ = self.run_ssh(cmd)
+        stdout = self._procfile_text(int(pid), "status")
+        rc = 0
+        if stdout is None:
+            cmd = f"cat /proc/{int(pid)}/status 2>/dev/null"
+            rc, stdout, _ = self.run_ssh(cmd)
         if rc == 0 and stdout:
             for line in stdout.splitlines():
                 parts = line.split(":", 1)
@@ -2522,10 +2804,14 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
         return f"exec {shlex.quote(self.collector_path)} --daemon 2>/dev/null"
 
     def _open_daemon_locked(self) -> _DaemonChannel:
+        t0 = time.monotonic()
         proc = self._stream_opener(self._ssh_args(self._daemon_command()))
         ch = _DaemonChannel(proc)
+        ch.log = self.command_log
         try:
             reply = ch.exchange("PING", max(self.timeout_sec, 1.0))
+            self.command_log.add("daemon_open", "daemon_open", "_open_daemon_locked", _call_sites()[1],
+                                 time.monotonic() - t0, len(reply))
             if "PONG" not in reply:
                 raise DaemonChannelError(f"unexpected PING reply: {reply[:80]!r}")
         except BaseException:
@@ -2694,6 +2980,13 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
             return
         with lock:
             self._close_daemon_locked()
+        if self._cm_used and not self._cm_disabled and self._command_runner == self._default_command_runner:
+            try:   # tear down the shared master connection (best effort)
+                target_spec = f"{self.user}@{self.host}" if self.user else self.host
+                subprocess.run([self.ssh_bin, "-p", str(self.port), *self._control_master_opts(), "-O", "exit", "--", target_spec],
+                               capture_output=True, timeout=5)
+            except Exception:  # noqa: BLE001
+                pass
 
     @staticmethod
     def _dd_block_pipeline(pid: int, address: int, size: int) -> str:

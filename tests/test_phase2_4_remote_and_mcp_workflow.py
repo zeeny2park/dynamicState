@@ -25,6 +25,8 @@ import time
 import unittest
 from typing import List, Tuple
 
+from tests.remote_ident_compat import is_ident_probe, legacy_probe_reply
+
 from extractor.target_adapter import (
     PIDReusedError,
     RemoteSshTargetAdapter,
@@ -85,6 +87,12 @@ class TestPhase24RemoteAndMcpWorkflow(unittest.TestCase):
         should_fail_network = False
 
         def mock_command_runner(cmd_args: List[str], timeout: float) -> Tuple[int, str, str]:
+            cmd_str = " ".join(cmd_args)
+            if is_ident_probe(cmd_str):
+                return legacy_probe_reply(cmd_str, lambda q: _legacy_runner(['ssh', q], timeout))
+            return _legacy_runner(cmd_args, timeout)
+
+        def _legacy_runner(cmd_args: List[str], timeout: float) -> Tuple[int, str, str]:
             nonlocal call_count, should_fail_network
             call_count += 1
             cmd_str = " ".join(cmd_args)
@@ -150,6 +158,8 @@ class TestPhase24RemoteAndMcpWorkflow(unittest.TestCase):
 
         def mock_command_runner(cmd_args: List[str], timeout: float) -> Tuple[int, str, str]:
             cmd_str = " ".join(cmd_args)
+            if is_ident_probe(cmd_str):
+                return legacy_probe_reply(cmd_str, lambda q: mock_command_runner(['ssh', q], timeout))
             if "boot_id" in cmd_str:
                 return 0, f"{current_boot_id}\n", ""
             if "/stat" in cmd_str:

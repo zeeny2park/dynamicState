@@ -507,9 +507,18 @@ def c4d_diagnose_entry_point(ctx: Ctx) -> Dict[str, Any]:
                    corpus_dir=tempfile.mkdtemp(prefix="dsqemu_diag_")).to_dict()
     wall = time.monotonic() - t0
     host = host_diagnose_reference()
+    rc_sum = res["collection_impact"].get("remote_commands") or {}
+    print(f"[diagnose] {wall:.1f}s wall; ssh commands (harness count) {tr.snapshot()['commands']}; adapter log: "
+          f"{rc_sum.get('ssh_invocations')} ssh + {rc_sum.get('daemon_exchanges')} daemon exchanges, "
+          f"{rc_sum.get('seconds_in_remote_calls')}s in remote calls", flush=True)
+    for k, v in (rc_sum.get("by_purpose") or {}).items():
+        print(f"[diagnose]   {k:42s} {v['count']:5d}  {v['seconds']:8.2f}s  {v['bytes']:8d}B", flush=True)
+    for k, v in (rc_sum.get("top_callers") or {}).items():
+        print(f"[diagnose]   caller {k:40s} {v['count']:5d}  {v['seconds']:8.2f}s", flush=True)
     got = _diag_shape(res)
     d = {"remote": got, "host": host, "wall_s": round(wall, 1), "ssh_commands": tr.snapshot()["commands"],
          "target": res["target"], "bytes_read": res["collection_impact"].get("bytes_read"),
+         "remote_command_breakdown": res["collection_impact"].get("remote_commands"),
          "zero_stop": res["collection_impact"].get("zero_stop"), "capture_mode": res["collection_impact"].get("capture_mode"),
          "not_covered": [{"kind": n["kind"], "item": n["item"][:80], "reason": str(n.get("reason"))[:300]}
                          for n in res["not_covered"]],

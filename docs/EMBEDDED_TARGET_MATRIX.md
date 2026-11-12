@@ -74,7 +74,7 @@ on the way); C5 cost; C6 process discovery / identity / maps.
 
 | check | aarch64-glibc |
 |---|---|
-| C1 collector deploy + slice read | PASS (aarch64, 857 848 B, collector v1.2.0) |
+| C1 collector deploy + slice read | PASS (aarch64, 923 648 B, collector v1.3.0) |
 | C1b noexec fallback location | PASS |
 | C2a daemon channel | PASS |
 | C2b no-collector BusyBox fallback | PASS |
@@ -82,20 +82,20 @@ on the way); C5 cost; C6 process discovery / identity / maps.
 | C4a deadlock | PASS: SUPPORTED, locks g_mutex_a/g_mutex_b = host |
 | C4b remote heap walk | PASS: OK, 3 chunks in 1 arena (was BLOCKED: glibc version not identified remotely) |
 | C4c futex syscall name | PASS (threads reported as futex, blocked, with sp/pc) |
-| C4d `diagnose()` over SSH vs. host | PASS: CONFIRMED_FAULT, DEADLOCK_INDICATORS, locks g_mutex_a/g_mutex_b = host; 190.6 s, 709 ssh commands, 488 KB read, zero-stop |
+| C4d `diagnose()` over SSH vs. host | PASS: CONFIRMED_FAULT, DEADLOCK_INDICATORS, locks g_mutex_a/g_mutex_b = host; 20.9 s, 8 ssh commands + 429 daemon exchanges, 491 KB read, zero-stop (before IMP-022: 215.8 s, 797 ssh commands, 16.7 MB on the wire) |
 | C5 cost | PASS |
 | C6 discovery / identity / maps | PASS |
 | overall | PASS |
-| entry wall time | 330 s |
+| entry wall time | 183 s (was 356 s before IMP-022) |
 
 Cost on the constrained TCG guest (absolute times are pessimistic; the ratios matter):
 
 | | deadlock diagnosis | 100 reads: daemon | 100 reads: collector per call | 100 reads: BusyBox dd | 20 reads, identity pinned (daemon) |
 |---|---|---|---|---|---|
-| aarch64-glibc | 19.9 s / 70 ssh cmds | 0.55 s / 1 | 25.3 s / 100 | 28.6 s / 100 | 21.5 s / 81 |
+| aarch64-glibc | 4.2 s / 2 ssh cmds | 0.77 s / 1 | 44.1 s / 100 | 42.2 s / 100 | 0.14 s / 0 (was 20.8 s / 81) |
 
-A matrix run takes about 5.5 minutes after the image is cached (boot to SSH about 9 s); C4d alone is about 3 minutes
-because a remote diagnosis issues a few hundred SSH commands at about 0.25 s each on the TCG guest.
+A matrix run takes about 3 minutes after the image is cached (boot to SSH about 9 s); C4d is about 21 s.  (The
+per-call rows vary with host load: the same run measured 25 s / 24 s before; the ratios matter.)
 
 ## Open items and findings
 
@@ -107,17 +107,29 @@ because a remote diagnosis issues a few hundred SSH commands at about 0.25 s eac
 * **Fixed** - the remote deadlock result was INCONCLUSIVE for struct-member mutexes: the lock-candidate widening
   (`variable.member`, futex addresses) skipped remote targets; it now takes the per-thread syscalls from the collector's
   thread sample.
-* **Finding** - a remote diagnosis is chatty: about 700 SSH commands for one deadlock diagnosis on the guest (most are
-  not the daemon channel: maps, identity, thread info).  The default remote budget is therefore 120 s (local 5 s) and the
-  baseline heap-integrity walk gets a 10x wall cap remotely (byte caps unchanged).  `ControlMaster` reuse for the
-  one-call path is not enabled and not measured here; real boards on a LAN are expected to be faster than TCG.
+* **Fixed (IMP-022)** - a remote diagnosis was chatty: 797 ssh commands / 216 s for one deadlock diagnosis on the guest.
+  The adapter's per-session command log (`collection_impact["remote_commands"]`, printed by C4d) attributed them to:
+  identity re-verification 628 (79 %: per read `readlink` + 64 KiB ELF header + `/proc/PID/stat` + `boot_id`, 169 of
+  them carrying the 64 KiB header = 15 MB), `/proc/PID/maps` 76, liveness 51, `/proc/PID/status` 23, file reads/stat 11,
+  other 8; the daemon channel itself served 134 exchanges in 3 s.  Now: the collector (1.3.0) has `IDENT <pid> [HDR]`
+  (stat, exe link, exe fingerprint ino:size:mtime, boot_id, machine, optional ELF header) and `PROCFILE <pid> <maps|status|
+  stat|limits|comm>`; identity, verification, maps, status, liveness and those file reads are one daemon exchange each,
+  the ELF header is transferred and parsed once per executable image (cache key path + fingerprint), and without the
+  new commands (old collector / no collector) identity is ONE shell command instead of four.  Verification still
+  compares start time, executable, boot_id and now the executable's inode/size/mtime on every read (strict, no TTL).
+  Result: 8 ssh commands + 429 daemon exchanges, 20.9 s, 2.0 MB on the wire.  Remaining ssh: deploy probes (uname,
+  version, copy), the daemon open, `ls -l /proc/PID/fd` and library-image reads (5 `other`).  OpenSSH
+  `ControlMaster` reuse is now auto-enabled for the real `ssh` binary (off when a command runner is injected or
+  `DYNAMICSTATE_SSH_CONTROLMASTER=0`, silent fallback when ssh rejects the options); the matrix harness injects its own
+  counting runner, so its numbers do not include it, and it was not measured on a real network.  The default remote
+  budget (120 s) and the 10x remote heap-walk wall cap are unchanged.
 * Remote gaps that stay (reported in `not_covered` as `remote_limitation`, never guessed): TLS/TCB discovery, stacks of
   threads that were running, symbols of libraries that cannot be fetched.
 * **Fixed** - `RemoteSshTargetAdapter.find_processes` could never work: the remote script contained a raw NUL
   (`'\000'`) and a raw newline in `tr` arguments, so every call failed on every target.  Fixed in
   `extractor/target_adapter.py`; regression `tests/test_imp014_find_processes_regression.py`.
-* Cost finding: with a pinned identity every `read_memory` re-reads the identity (about 4 ssh commands, about 1 s per
-  read on the guest); the unpinned daemon read costs about 5 ms.
+* Cost finding (fixed by IMP-022): with a pinned identity every `read_memory` re-read the identity (about 4 ssh commands,
+  about 1 s per read on the guest); it is now one daemon exchange, about 7 ms per read with the pin.
 * Not verified: real silicon (see `docs/EMBEDDED_BOARD_RUN.md`), KVM, GNU-coreutils userland, big-endian, x86 host
   running the QEMU workflow (the GitHub runner is x86_64 with QEMU 6.2; the workflow is untested there), the
   Release/GPG signature of the Debian indexes (integrity relies on HTTPS + SHA256 chains).
