@@ -650,6 +650,9 @@ def investigate(adapter: Any, pid: int, companion_elf: Optional[str], cfg: Memor
         else:
             inv[k] = v
     an = series.get("last_analysis")
+    # IMP-009: the last walk (object, not plain data) is handed to the session state by attach_memory_observation
+    # so the integrity check can re-use it instead of walking again; never part of the recorded investigation
+    inv["_analysis"] = an
     dt = float(j.get("window_s") or 0.0)
     if an is not None and (j.get("unreachable_growth") or j.get("growth_owners")):
         before = int(an.reader.bytes_read)
@@ -772,6 +775,9 @@ def attach_memory_observation(provider: Any, recipe: Any, pid: int, companion_el
         if reason:
             inv = investigate(provider.adapter, pid, companion_elf, cfg, getattr(provider, "budget_tracker", None),
                               reason=reason)
+            an_obj = inv.pop("_analysis", None)
+            if an_obj is not None:
+                st.setdefault("analyses", {})[key] = an_obj
         else:
             inv = {"status": INV_NOT_RUN, "verdict": V_NO_TREND if trend["established"] else V_INSUFFICIENT,
                    "walks": 0, "limitations": [] if trend["established"] else

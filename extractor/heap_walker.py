@@ -54,7 +54,13 @@ walked again (``max_retries`` times), then the rest of the segment is reported a
 ``inconsistent`` region.  Metadata checks (``prev_size`` of the next chunk equal to the size of a
 free chunk, NON_MAIN_ARENA consistent with the arena for in-use chunks) are *soft*: the size chain
 is intact, the walk continues and the chunks are counted in ``soft_inconsistency_count``.  Any
-inconsistency makes the status PARTIAL.  Never a crash or an unbounded loop: iteration is capped
+inconsistency makes the status PARTIAL.  Every hard inconsistency records where each read attempt hit
+it (``attempt_sites``) and the chunk before it (``previous_chunk``): :mod:`extractor.heap_integrity` decides
+whether it is a torn read or stable damage (IMP-009).  After the retries the walk is *resynchronised*
+(:meth:`HeapWalker._resync`): the first position after the bad header from which a valid header chain reaches
+``top`` (or the end of an old thread heap) is found by a bounded forward scan, the bytes in between become one
+damaged region entry (``damaged_regions``) and the chunks after it are listed, so one damaged header does not
+hide the rest of the heap.  Never a crash or an unbounded loop: iteration is capped
 by ``segment_size / MINSIZE`` and every list (arenas, heaps, fastbins, tcache) is bounded and
 cycle-checked.  The arena ``top`` is re-read after the walk; a move is reported as a warning.
 """
@@ -537,6 +543,8 @@ class HeapWalkResult:
     inconsistencies: List[Dict[str, Any]] = field(default_factory=list)
     soft_inconsistencies: List[Dict[str, Any]] = field(default_factory=list)   # first examples
     soft_inconsistency_count: int = 0
+    # IMP-009: regions between a damaged header and the point where the walk resynchronised
+    damaged_regions: List[Dict[str, Any]] = field(default_factory=list)
     warnings: List[str] = field(default_factory=list)
     mappings: List[Dict[str, Any]] = field(default_factory=list)
     heap_ranges: List[Tuple[int, int]] = field(default_factory=list)   # arena segments + mmapped chunks
@@ -570,6 +578,7 @@ class HeapWalkResult:
             "inconsistencies": self.inconsistencies,
             "soft_inconsistency_count": self.soft_inconsistency_count,
             "soft_inconsistencies": self.soft_inconsistencies,
+            "damaged_regions": self.damaged_regions,
             "warnings": self.warnings,
             "stats": self.stats,
         }
@@ -609,6 +618,7 @@ class HeapWalker:
         max_arenas: int = 1024,
         max_heaps_per_arena: int = 4096,
         reader: Optional[BudgetedReader] = None,
+        resync: bool = True,
     ) -> None:
         self.adapter = adapter
         self.pid = int(pid)
@@ -631,6 +641,10 @@ class HeapWalker:
         self._layout: Optional[GlibcMallocLayout] = None
         self._arena_addrs: List[int] = []
         self.top_extensions = 0
+        # IMP-009: resynchronise the walk after a damaged header (see _resync)
+        self.resync = bool(resync)
+        self.resync_scan_bytes = 256 * 1024
+        self.resync_max_chains = 256
 
     # ---------------------------------------------------------------- gating
     def _gate(self) -> Optional[HeapWalkResult]:
@@ -969,7 +983,8 @@ class HeapWalker:
         if res.status == STATUS_OK and (res.inconsistencies or res.soft_inconsistency_count):
             res.status = STATUS_PARTIAL
             res.message = (f"{len(res.inconsistencies)} region(s) unwalkable and {res.soft_inconsistency_count} chunk(s) "
-                           f"with inconsistent metadata (target modified the heap while it was read)")
+                           f"with inconsistent metadata (target modified the heap while it was read, or the "
+                           f"metadata is damaged: see heap_integrity for the stable/transient decision)")
         return self._finish(res, t0)
 
     def _finish(self, res: HeapWalkResult, t0: float) -> HeapWalkResult:
@@ -1057,6 +1072,7 @@ class HeapWalker:
         res = self.result
         top_slot = arena + layout.ms["top"]
         attempt = 0
+        sites: List[str] = []          # IMP-009: where each read attempt hit its hard inconsistency
         while True:
             if attempt == 0:
                 buf = self.reader.read(seg_start, end - seg_start)
@@ -1068,6 +1084,8 @@ class HeapWalker:
                 res.inconsistencies.append({"arena": ai, "segment": "0x%x" % seg_start, "reason": "segment unreadable"})
                 return
             pending, hard, soft, reached_top = self._walk_buffer(buf, layout, first, seg_start, top, is_main)
+            if hard is not None:
+                sites.append(hard["at"])
             if hard is None or attempt >= self.max_retries:
                 break
             attempt += 1
@@ -1077,8 +1095,24 @@ class HeapWalker:
         info["segments"].append(seg_info)
         res.heap_ranges.append((seg_start, seg_end))
         if hard is not None:
-            hard.update({"arena": ai, "segment": "0x%x" % seg_start, "retries": attempt})
+            hard.update({"arena": ai, "segment": "0x%x" % seg_start, "retries": attempt, "attempt_sites": sites,
+                         "previous_chunk": "0x%x" % pending[-1][0] if pending else None})
             res.inconsistencies.append(hard)
+            if self.resync:
+                more, soft2, rs = self._resync(buf, layout, int(hard["at"], 16), seg_start, top, is_main)
+                if rs is not None:
+                    # IMP-009: one damaged header must not hide the rest of the segment
+                    hard.update(rs)
+                    hard["unwalked_bytes"] = rs["resynchronised_at_int"] - int(hard["at"], 16)
+                    del hard["resynchronised_at_int"]
+                    pending.extend(more)
+                    soft.extend(soft2)
+                    seg_info["chunks"] = len(pending)
+                    seg_info["reached_top"] = rs["resync_reached_top"]
+                    res.damaged_regions.append({"arena": ai, "at": hard["at"], "reason": hard["reason"],
+                                                "inferred_size": hard["unwalked_bytes"],
+                                                "resynchronised_at": hard["resynchronised_at"],
+                                                "previous_chunk": hard.get("previous_chunk")})
         if soft:
             seg_info["chunks_with_inconsistent_metadata"] = len(soft)
             res.soft_inconsistencies.extend({"arena": ai, "at": "0x%x" % p, "reason": r} for p, r in soft[:16])
@@ -1134,6 +1168,45 @@ class HeapWalker:
             pos += size
             n += 1
         return pending, None, soft, False
+
+    def _resync(self, buf: bytes, layout: GlibcMallocLayout, bad: int, seg_start: int, top: int, is_main: bool):
+        """IMP-009: after a hard inconsistency at ``bad`` the size chain is broken.  Scan forward (16-byte
+        steps, at most :attr:`resync_scan_bytes`) for the first position ``Y`` from which a sequential walk is
+        consistent to the end of the segment: it must reach the arena's ``top`` exactly (or, in an old thread
+        heap, the fencepost), with every header valid.  ``[bad, Y)`` becomes one *damaged region* entry of
+        inferred size ``Y - bad`` (its real chunk boundaries are unknown: it may cover several chunks), followed
+        by the chunks from ``Y``.  Limits: a damaged region longer than the scan window, or a chain from ``Y`` that
+        breaks again, leaves the rest unwalked (no resynchronisation is reported).  Returns
+        (chunks, soft, info) or ([], [], None)."""
+        end = seg_start + len(buf)
+        align, min_chunk = layout.malloc_alignment, layout.min_chunk
+        y = bad + align
+        limit = min(end - 16, bad + self.resync_scan_bytes)
+        need_top = seg_start <= top < end
+        tries = 0
+        while y <= limit and tries < self.resync_max_chains:
+            off = y - seg_start
+            if y == top:
+                cand_ok = True
+            else:
+                sf = _u64(buf, off + 8)
+                size = sf & ~SIZE_BITS
+                cand_ok = (size >= min_chunk and size % align == 0 and y + size <= end and not sf & IS_MMAPPED
+                           and not (is_main and sf & NON_MAIN_ARENA))
+            if cand_ok:
+                tries += 1
+                pending, hard, soft, reached = self._walk_buffer(buf, layout, y, seg_start, top, is_main)
+                if hard is None and (reached or not need_top) and pending:
+                    # state of the damaged region from the PREV_INUSE bit of the header found at y
+                    in_use = bool(_u64(buf, off + 8) & PREV_INUSE)
+                    out = [(bad, y - bad, ST_IN_USE if in_use else ST_FREE)] + pending
+                    return out, soft, {"resynchronised_at": "0x%x" % y, "resynchronised_at_int": y,
+                                       "resync_method": "forward scan for a header chain that reaches %s"
+                                                        % ("top" if reached else "the segment end"),
+                                       "resync_candidates_tried": tries, "resync_reached_top": bool(reached),
+                                       "resync_recovered_chunks": len(pending)}
+            y += align
+        return [], [], None
 
     # ---------------------------------------------------------------- top catch-up (IMP-008)
     def extend_arena_top(self, ai: int) -> int:

@@ -2184,6 +2184,10 @@ class AdaptiveInvestigationSession:
                                     for s in remaining_steps)
                         and not any(s.status == "PENDING" and s.recipe_id in BASELINE_RECIPE_IDS
                                     for s in remaining_steps)):
+                    if self.budget_tracker and obs_data.get("bytes_read"):
+                        # IMP-009: the bytes this step measured count even when it ends the investigation early
+                        self.budget_tracker.record_read(bytes_read=int(obs_data["bytes_read"]), stop_ms=0.0,
+                                                        profile_id=step.recipe_id)
                     self.state = STATE_ANALYZING
                     self.plan.current_step_index += 1
                     return {"action": "COLLECT_STEP", "step_id": step.step_id, "eval_result": asdict(eval_result), "adaptive_action": "EARLY_ANOMALY_CONFIRMED"}
@@ -2415,6 +2419,11 @@ class AdaptiveInvestigationSession:
         has_pass = False
 
         criteria_list = hyp.verification_criteria if isinstance(hyp.verification_criteria, list) else []
+        # IMP-009: stable heap metadata damage attributed to a named block (uncapped) is the memory-integrity proof;
+        # the pointer / poison-word criteria (written for a single probed pointer) do not apply to it.
+        heap_proof = next((e for e in hyp.supporting_evidence if e.get("status") == "SUPPORTED"
+                           and e.get("details", {}).get("corruption_confirmed")
+                           and e.get("details", {}).get("certainty_cap") != "PROBABLE"), None)
         for crit in criteria_list:
             cid = crit.get("criterion_id", "")
             outcome = "INCONCLUSIVE"
@@ -2422,8 +2431,15 @@ class AdaptiveInvestigationSession:
             consumed_ids: List[str] = []
             missing_ev: List[str] = []
 
+            if heap_proof is not None and cid in ("CRIT_POINTER_VALID_VMA", "CRIT_NO_POISON_PATTERN"):
+                if cid == "CRIT_NO_POISON_PATTERN":
+                    outcome = "FAIL"
+                    consumed_ids.append(heap_proof.get("evidence_id", ""))
+                    rationale = f"Stable heap metadata damage observed: {heap_proof.get('finding')}"
+                else:
+                    rationale = "Not applicable: the damage is proven by heap metadata, not by one probed pointer."
             # 1. Pointer & VMA check
-            if cid == "CRIT_POINTER_VALID_VMA":
+            elif cid == "CRIT_POINTER_VALID_VMA":
                 fault_ev = next((e for e in hyp.supporting_evidence if "NULL" in str(e) or "unmapped" in str(e).lower() or e.get("details", {}).get("violation_type") in ("NULL_POINTER_DEREFERENCE", "UNMAPPED_OR_GUARD_PAGE")), None)
                 contra_ev = next((e for e in hyp.contradicting_evidence if "validly mapped" in str(e) or e.get("details", {}).get("is_healthy") or e.get("details", {}).get("violation_type") == "NONE_IDLE_NULL_POINTER"), None)
                 if fault_ev:
@@ -2578,7 +2594,8 @@ class AdaptiveInvestigationSession:
             capped = [e for e in hyp.supporting_evidence if e.get("details", {}).get("certainty_cap") == "PROBABLE"]
             uncapped = [e for e in hyp.supporting_evidence if e.get("status") == "SUPPORTED"
                         and e.get("details", {}).get("certainty_cap") != "PROBABLE"
-                        and e.get("details", {}).get("leak_confirmed")]
+                        and (e.get("details", {}).get("leak_confirmed")
+                             or e.get("details", {}).get("corruption_confirmed"))]
             if has_fail and has_primary_supp and not has_pass and capped and not uncapped:
                 hyp.status = "LIKELY"
                 hyp.confidence = min(max(hyp.confidence, 0.70), 0.85)
@@ -3164,9 +3181,12 @@ class AdaptiveInvestigationSession:
                     epistemic_level="confirmed_root_cause",
                 ))
             elif h.status in ("LIKELY", "PROPOSED", "SUPPORTED") and h.category not in ("HEALTHY", "HEALTHY_PROCESS"):
+                # IMP-009: a rule may mark its observation as a warning (e.g. stack nearly exhausted)
+                sev = [e.get("details", {}).get("finding_severity") for e in h.supporting_evidence
+                       if e.get("status") == "SUPPORTED"]
                 findings_sec.probable_causes.append(FindingRecord(
                     finding_id=f_id,
-                    severity="MEDIUM",
+                    severity="WARNING" if sev and all(x == "WARNING" for x in sev) else "MEDIUM",
                     classification=CLASSIFICATION_PROBABLE_CAUSE,
                     problem_description=h.problem_statement,
                     affected_entity=h.category,
@@ -4023,6 +4043,20 @@ def diagnose(
                                "item": "leak_owner_attribution",
                                "reason": ("not supported on this target: " if li["status"] == "UNSUPPORTED" else "")
                                + why})
+        # IMP-009: what the memory-integrity check could not examine (heap above the baseline cap, unsupported
+        # allocator, no DWARF for the global check, ...)
+        mi_seen = set()
+        for c in session.checks:
+            mi = (c.actual_observations or {}).get("memory_integrity") if isinstance(c.actual_observations, dict) else None
+            if not isinstance(mi, dict):
+                continue
+            for why in mi.get("limitations") or []:
+                if why in mi_seen:
+                    continue
+                mi_seen.add(why)
+                kind = "unsupported_on_target" if "not supported on this target" in why else (
+                    "integrity_not_checked" if "not checked" in why else "integrity_limited")
+                nc.append({"kind": kind, "item": "memory_integrity", "reason": str(why)})
         for c in session.checks:
             if c.status in (CheckStatus.PASS, CheckStatus.FAIL):
                 continue
