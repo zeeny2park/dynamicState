@@ -157,7 +157,11 @@ class TestHealthyVerdictRealProcesses(unittest.TestCase):
             self.assertNotIn("could not decide" if lang == "en" else "판단 불가입니다", first)
 
     def test_lock_owner_unsupported_is_not_healthy(self):
-        with mock.patch.object(ws, "check_support", _owner_unsupported):
+        # The lock-owner support check runs in extractor.inspection.threads since the IMP-017 cleanup; patch it
+        # there (and keep the watch_session re-export patched for any remaining caller).
+        from extractor.inspection import threads as _threads
+        with mock.patch.object(_threads, "check_support", _owner_unsupported), \
+                mock.patch.object(ws, "check_support", _owner_unsupported):
             d = self._diag("idle")
         hs = d["healthy_scope"]
         self.assertEqual(d["verdict"], "INCONCLUSIVE", hs)
