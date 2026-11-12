@@ -393,7 +393,9 @@ jobs:
       - name: Record per-file test baseline
         if: always()
         run: |
-          scripts/run_test_baseline.sh test-baseline
+          # 2 parallel files on the 4-vCPU runner: real-process tests (leak growth windows, thread sampling,
+          # GDB restore) are load-sensitive and failed intermittently at the default of 3.
+          BASELINE_JOBS=2 scripts/run_test_baseline.sh test-baseline
 
       - name: Upload test baseline
         if: always()
