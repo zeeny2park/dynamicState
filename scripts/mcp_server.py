@@ -738,6 +738,10 @@ def runtime_get_investigation_report(investigation_id: str, format: str = "json"
     try:
         session = runtime.expert_diagnostic_engine.get_session(investigation_id)
         if session:
+            why = session.report_blocked_reason()
+            if why:
+                return _format_watch_result({"success": False, "investigation_id": investigation_id,
+                                             "error": why, "error_code": "NO_EXECUTED_CHECKS"})
             return _format_watch_result({
                 "success": True,
                 "investigation_id": investigation_id,
@@ -760,6 +764,13 @@ def runtime_diagnose_process(
     symptom: Optional[str] = None,
     time_limit_s: Optional[float] = None,
     language: str = "en",
+    remote_host: Optional[str] = None,
+    ssh_user: Optional[str] = None,
+    ssh_port: int = 22,
+    ssh_key: Optional[str] = None,
+    ssh_proxy_jump: Optional[str] = None,
+    auto_deploy_collector: bool = False,
+    collector_path: Optional[str] = None,
 ) -> str:
     """Diagnose a live Linux process end to end in ONE call and return the final verdict.
 
@@ -782,13 +793,34 @@ def runtime_diagnose_process(
             Defaults to a general health check.
         time_limit_s: Optional wall-clock observation budget in seconds.
         language: Language of human_summary: 'en' (default) or 'ko'. Pass the user's language.
+        remote_host: Set this (SSH host name or IP) when the process runs on a REMOTE embedded Linux target
+            (ARM64 / x86-64, glibc) instead of on this machine; then 'pid' is the PID on that target and the
+            analysis still runs here (nothing is stopped on the target). ASK THE USER for host, user and key if
+            they are not known; never invent them. Leave empty for a process on this machine.
+        ssh_user: SSH user name on the target (remote only).
+        ssh_port: SSH port (default 22).
+        ssh_key: Path on THIS machine to the SSH private key (a path only; never pass key contents or a password).
+        ssh_proxy_jump: Optional SSH jump host ('user@bastion').
+        auto_deploy_collector: True to copy the small native collector (matching the target CPU) to the
+            target's /tmp (or a fallback directory) first; it makes memory reads much faster. Default False.
+        collector_path: Path of an already installed collector on the target (remote only).
+        For a remote target 'debug_image' is REQUIRED: the matching UNSTRIPPED ELF (with DWARF) of the target
+        program, on this machine. Without it the result is INCONCLUSIVE with 'missing_debug_image' in
+        not_covered; ask the user for it. An unreachable host gives INCONCLUSIVE with 'target_unreachable'.
+        Remote runs read every byte over SSH, so memory-heap checks are capped and slower; what could not be
+        examined remotely (thread-local storage, running-thread stacks, library symbols) is listed in not_covered.
     """
     try:
         from extractor.human_report import diagnose_with_summary
         lang = "ko" if str(language or "en").strip().lower().startswith("ko") else "en"
+        remote_target = None
+        if remote_host and str(remote_host).strip():
+            remote_target = {"remote_host": remote_host, "ssh_user": ssh_user, "ssh_port": ssh_port,
+                             "ssh_key": ssh_key, "ssh_proxy_jump": ssh_proxy_jump,
+                             "auto_deploy_collector": bool(auto_deploy_collector), "collector_path": collector_path}
         out, summary = diagnose_with_summary(
             pid, debug_image=debug_image, symptom=symptom, time_limit_s=time_limit_s,
-            engine=runtime.expert_diagnostic_engine, lang=lang,
+            engine=runtime.expert_diagnostic_engine, lang=lang, target=remote_target,
         )
         out["human_summary"] = summary
         return _format_watch_result(out)

@@ -1938,6 +1938,11 @@ def _close_live_daemon_channels() -> None:
             pass
 
 
+# The native collector reads at most this many bytes per slice (collector.c); larger requests are split host-side.
+COLLECTOR_MAX_SLICE = 65536
+COLLECTOR_REQUEST_PIECES = 64
+
+
 class RemoteSshTargetAdapter(TargetExecutionAdapter):
     """Execution adapter for remote Linux targets accessed via SSH / SSH Proxy.
     
@@ -2622,7 +2627,61 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
         pid: int,
         slices: List[Tuple[int, int]],
     ) -> Optional[List[Tuple[Optional[bytes], str, Optional[str]]]]:
-        """Collector-backed batch read: persistent daemon channel first, per-call execution as fallback."""
+        """Collector-backed batch read: persistent daemon channel first, per-call execution as fallback.
+
+        The collector truncates every slice to COLLECTOR_MAX_SLICE bytes, so larger requests are split here
+        into collector-sized pieces (at most COLLECTOR_REQUEST_PIECES per exchange) and reassembled: a caller
+        asking for 4 MiB gets 4 MiB (or an honest PARTIAL), not a silent 64 KiB."""
+        big = any(int(sz) > COLLECTOR_MAX_SLICE for _a, sz in slices)
+        if not big:
+            return self._read_slices_via_collector_once(pid, slices)
+        flat: List[Tuple[int, int]] = []
+        owner: List[int] = []
+        for i, (addr, sz) in enumerate(slices):
+            addr, sz = int(addr), int(sz)
+            if sz <= COLLECTOR_MAX_SLICE:
+                flat.append((addr, sz))
+                owner.append(i)
+                continue
+            for off in range(0, sz, COLLECTOR_MAX_SLICE):
+                flat.append((addr + off, min(COLLECTOR_MAX_SLICE, sz - off)))
+                owner.append(i)
+        flat_res: List[Tuple[Optional[bytes], str, Optional[str]]] = []
+        for b in range(0, len(flat), COLLECTOR_REQUEST_PIECES):
+            part = self._read_slices_via_collector_once(pid, flat[b:b + COLLECTOR_REQUEST_PIECES])
+            if part is None:
+                return None
+            flat_res.extend(part)
+        out: List[Tuple[Optional[bytes], str, Optional[str]]] = []
+        for i, (addr, sz) in enumerate(slices):
+            sz = int(sz)
+            idxs = [k for k, o in enumerate(owner) if o == i]
+            if len(idxs) == 1:
+                out.append(flat_res[idxs[0]])
+                continue
+            buf = bytearray()
+            first_err: Optional[Tuple[str, Optional[str]]] = None
+            for k in idxs:
+                data, st, msg = flat_res[k]
+                if data:
+                    buf += data
+                if st != "OBSERVED" or data is None or len(data) != flat[k][1]:
+                    first_err = (st, msg)
+                    break
+            if first_err is None and len(buf) == sz:
+                out.append((bytes(buf), "OBSERVED", None))
+            elif buf:
+                out.append((bytes(buf), "PARTIAL", f"Partial read: {len(buf)}/{sz} bytes"))
+            else:
+                st, msg = first_err or ("UNAVAILABLE", None)
+                out.append((None, st, msg))
+        return out
+
+    def _read_slices_via_collector_once(
+        self,
+        pid: int,
+        slices: List[Tuple[int, int]],
+    ) -> Optional[List[Tuple[Optional[bytes], str, Optional[str]]]]:
         res = self._read_slices_via_daemon(pid, slices)
         if res is not None:
             return res

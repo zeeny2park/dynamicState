@@ -34,6 +34,9 @@ _WALK_UNSUPPORTED = ("UNSUPPORTED_ALLOCATOR", "UNSUPPORTED_GLIBC_VERSION", "INCO
                      "ARENA_NOT_FOUND")
 
 
+REMOTE_BASELINE_WALL_FACTOR = 10.0   # remote baseline walk: same byte caps, wall cap x10 (SSH round trips)
+
+
 @dataclass
 class IntegrityConfig:
     baseline_heap_cap_bytes: int = 8 * 1024 * 1024
@@ -89,7 +92,7 @@ def _full_reason(classification: Any, target_recipe: Optional[str]) -> Optional[
 def run_integrity(adapter: Any, pid: int, companion_elf: Optional[str], cfg: IntegrityConfig, budget: Any = None,
                   full_reason: Optional[str] = None, shared: Any = None) -> Dict[str, Any]:
     """One integrity investigation; returns plain data (see module docstring)."""
-    from .heap_walker import BudgetedReader, HeapWalker
+    from .heap_walker import BudgetedReader, HeapWalker, remote_cost_note
     from .heap_integrity import HeapIntegrityChecker, undersized_allocations
     from .observation_budget import ObservationBudgetLimits, ObservationBudgetTracker
     from .reachability import ReachabilityLimits, build_reachability, _module_contexts
@@ -107,7 +110,12 @@ def run_integrity(adapter: Any, pid: int, companion_elf: Optional[str], cfg: Int
     bytes_allow = int(rem_bytes * cfg.bytes_fraction)
     wall_allow = rem_wall * cfg.wall_fraction
     if mode == "baseline":
-        wall_allow = min(wall_allow, cfg.baseline_wall_cap_s)
+        cap = cfg.baseline_wall_cap_s
+        if remote_cost_note(adapter):
+            # same byte caps, but a remote walk pays an SSH round trip per batch (about 0.25 s on the QEMU guest):
+            # the 1.5 s local wall cap would end it before the libc banner was read
+            cap *= REMOTE_BASELINE_WALL_FACTOR
+        wall_allow = min(wall_allow, cap)
     heap = rec["heap"]
     est = heap_size_estimate(maps)
     heap["estimated_heap_bytes"] = est
@@ -132,11 +140,11 @@ def run_integrity(adapter: Any, pid: int, companion_elf: Optional[str], cfg: Int
         rec["limitations"].append(
             "heap integrity not checked: heap larger than baseline cap (%.1f MiB > %.1f MiB); a memory-corruption or "
             "crash symptom, or targeting RECIPE_HEAP_METADATA_CORRUPTION, runs the full walk"
-            % (est / 1048576.0, cfg.baseline_heap_cap_bytes / 1048576.0))
+            % (est / 1048576.0, cfg.baseline_heap_cap_bytes / 1048576.0) + remote_cost_note(adapter))
     elif walk is None and bytes_allow < est + 65536:
         heap["status"] = "NOT_CHECKED"
         rec["limitations"].append("heap integrity not checked: the observation byte budget left (%d bytes) is below "
-                                  "the heap size (%d bytes)" % (bytes_allow, est))
+                                  "the heap size (%d bytes)" % (bytes_allow, est) + remote_cost_note(adapter))
     else:
         if walk is None:
             hb = ObservationBudgetTracker(ObservationBudgetLimits(

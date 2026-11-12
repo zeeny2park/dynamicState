@@ -543,6 +543,7 @@ def run_walk_series(adapter: Any, pid: int, companion_elf: Optional[str], cfg: M
                     budget: Any = None, sleep: Callable[[float], None] = time.sleep) -> Dict[str, Any]:
     """``cfg.walks`` heap walks + reachability spaced over the observation window, within a share of the
     session's remaining budget.  Returns {status, walks: [census...], cost, limitations, last_analysis}."""
+    from .heap_walker import remote_cost_note
     from .reachability import analyze_heap_ownership
     t0 = time.monotonic()
     rem_wall, rem_bytes = _remaining(budget)
@@ -568,7 +569,7 @@ def run_walk_series(adapter: Any, pid: int, companion_elf: Optional[str], cfg: M
                     sp = (deadline - now - est * left) / left
                     if sp < cfg.min_walk_spacing_s:
                         out["limitations"].append("observation budget left room for only %d heap walk(s)"
-                                                  % len(out["walks"]))
+                                                  % len(out["walks"]) + remote_cost_note(adapter))
                         break
                     target = now + sp
                 else:
@@ -578,7 +579,7 @@ def run_walk_series(adapter: Any, pid: int, companion_elf: Optional[str], cfg: M
         used = out["bytes_read"]
         if bytes_allow - used <= 0:
             out["limitations"].append("observation byte budget for heap walks exhausted after %d walk(s)"
-                                      % len(out["walks"]))
+                                      % len(out["walks"]) + remote_cost_note(adapter))
             break
         ws = time.monotonic()
         try:

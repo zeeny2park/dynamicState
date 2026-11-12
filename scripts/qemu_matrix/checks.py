@@ -15,6 +15,7 @@ from .results import BLOCKED, FAIL, PASS, SKIPPED, check
 
 KNOWN = b"DYNAMICSTATE-MATRIX-KNOWN-BUFFER-0123456789abcd\x00"
 EXPECTED_LOCKS = {"g_mutex_a", "g_mutex_b"}
+DIAGNOSE_TIME_LIMIT_S = 300.0
 REPO = build_targets.REPO
 
 
@@ -451,12 +452,83 @@ def c4b_gating(ctx: Ctx) -> Dict[str, Any]:
             return check(cid, name, PASS, f"heap walk {w.status}: {n_chunks} chunks in {len(w.arenas)} arena(s)", d)
         if w.status == "INCONCLUSIVE_ABI_UNDETECTED" and "glibc version" in w.message:
             return check(cid, name, BLOCKED,
-                         "heap walking is declared supported here but HeapWalker cannot identify the glibc version of a REMOTE target "
-                         "(version probe is local-only / banner read from target memory failed) and answers INCONCLUSIVE - honest, "
-                         "but the remote heap walk cannot run: " + w.message, d)
+                         "heap walking is declared supported here but HeapWalker could not identify the glibc version of the "
+                         "REMOTE target (banner read from the mapped libc through the collector failed) and answers "
+                         "INCONCLUSIVE - honest, but the remote heap walk cannot run: " + w.message, d)
         return check(cid, name, FAIL, f"heap walk on a supported target returned {w.status}: {w.message}", d)
     finally:
         ad.close()
+
+
+def _diag_shape(d: Dict[str, Any]) -> Dict[str, Any]:
+    return {"verdict": d["verdict"],
+            "categories": sorted({str(f["category"]) for f in d["findings"]}),
+            "locks": sorted({x for f in d["findings"] for x in f["subjects"] if x in EXPECTED_LOCKS})}
+
+
+def host_diagnose_reference() -> Dict[str, Any]:
+    """The one-call ``diagnose()`` on the same deadlock fixture running natively on the host."""
+    cc = shutil.which("gcc") or shutil.which("cc")
+    if not cc:
+        return {"available": False, "reason": "no host compiler"}
+    from extractor.expert_diagnostic_engine import diagnose
+    tmp = tempfile.mkdtemp(prefix="dsqemu_hostdiag_")
+    proc = None
+    try:
+        out = os.path.join(tmp, "deadlock")
+        subprocess.run(build_targets.cc_cmd(cc, build_targets.TARGET_SRC["deadlock"], out), check=True,
+                       capture_output=True)
+        proc = subprocess.Popen([out], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        time.sleep(1.0)
+        res = diagnose(proc.pid, out, corpus_dir=os.path.join(tmp, "corpus")).to_dict()
+        return {"available": True, **_diag_shape(res), "host_arch": os.uname().machine}
+    finally:
+        if proc is not None:
+            proc.kill()
+            proc.wait()
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def c4d_diagnose_entry_point(ctx: Ctx) -> Dict[str, Any]:
+    """IMP-006: ``diagnose(target=...)`` (the one-call entry point) against the guest over SSH, compared with
+    the same fixture diagnosed on the host.  Exercises: SSH reachability pre-flight, collector deploy decision
+    (auto_deploy_collector), remote ABI / glibc identification, the remote deadlock path and the recorded gaps."""
+    cid, name = "C4d_diagnose_entry_point", "diagnose() on the guest's deadlock fixture over SSH vs. host result"
+    from extractor.expert_diagnostic_engine import TargetSpec, diagnose
+    from .guest import CountingTransport
+    g = ctx.guest
+    tr = CountingTransport()
+    spec = TargetSpec(remote_host="127.0.0.1", ssh_user="root", ssh_port=g.port, ssh_key=g.key, timeout_s=30.0,
+                      auto_deploy_collector=True, command_runner=tr.runner, stream_opener=tr.opener)
+    t0 = time.monotonic()
+    # The TCG guest costs about 0.25 s per SSH command and a remote diagnosis issues a few hundred: the budget is
+    # raised explicitly (a real board on a LAN is faster; the measured wall time and command count are reported).
+    res = diagnose(ctx.dl_pid, ctx.targets["deadlock"]["debug"], target=spec, time_limit_s=DIAGNOSE_TIME_LIMIT_S,
+                   corpus_dir=tempfile.mkdtemp(prefix="dsqemu_diag_")).to_dict()
+    wall = time.monotonic() - t0
+    host = host_diagnose_reference()
+    got = _diag_shape(res)
+    d = {"remote": got, "host": host, "wall_s": round(wall, 1), "ssh_commands": tr.snapshot()["commands"],
+         "target": res["target"], "bytes_read": res["collection_impact"].get("bytes_read"),
+         "zero_stop": res["collection_impact"].get("zero_stop"), "capture_mode": res["collection_impact"].get("capture_mode"),
+         "not_covered": [{"kind": n["kind"], "item": n["item"][:80], "reason": str(n.get("reason"))[:300]}
+                         for n in res["not_covered"]],
+         "summary": res["summary"]}
+    rkinds = {n["kind"] for n in res["not_covered"]}
+    if res["verdict"] == "INCONCLUSIVE" and ({"target_unreachable", "missing_debug_image"} & rkinds):
+        return check(cid, name, FAIL, "diagnose() could not even start: " + res["summary"], d, duration_s=wall)
+    if not host.get("available"):
+        ok = res["verdict"] in ("CONFIRMED_FAULT", "PROBABLE_FAULT", "FAULT") and set(got["locks"]) == EXPECTED_LOCKS
+        return check(cid, name, PASS if ok else FAIL,
+                     "no host compiler for the reference; checked against the known fixture truth only", d, duration_s=wall)
+    if got == {k: host[k] for k in ("verdict", "categories", "locks")} and set(got["locks"]) == EXPECTED_LOCKS \
+            and res["target"].get("transport") == "ssh" and res["collection_impact"].get("zero_stop"):
+        return check(cid, name, PASS,
+                     f"diagnose() over SSH: verdict {got['verdict']}, {got['categories']}, locks {got['locks']} = host; "
+                     f"{len(res['not_covered'])} item(s) recorded in not_covered", d, duration_s=wall,
+                     remote_commands=d["ssh_commands"])
+    return check(cid, name, FAIL, f"remote {got} differs from host { {k: host.get(k) for k in ('verdict', 'categories', 'locks')} }",
+                 d, duration_s=wall, remote_commands=d["ssh_commands"])
 
 
 def c4c_syscall_names(ctx: Ctx) -> Dict[str, Any]:

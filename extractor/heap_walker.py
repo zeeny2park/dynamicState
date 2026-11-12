@@ -87,6 +87,8 @@ from .target_abi import (
 )
 
 _MAX_BANNER_SCAN = 4 * 1024 * 1024
+_BANNER_CHUNK = 128 * 1024
+_BANNER_OVERLAP = 256
 
 # --------------------------------------------------------------------------------------
 # Status values
@@ -317,6 +319,18 @@ def elf_symbols(path: str, wanted: Optional[Iterable[bytes]] = None, sections: S
 # --------------------------------------------------------------------------------------
 # Budgeted zero-stop reader + snapshot
 # --------------------------------------------------------------------------------------
+
+def remote_cost_note(adapter: Any) -> str:
+    """Suffix for byte/time-budget limitations: a remote walk pays for every heap byte over the link."""
+    try:
+        if adapter is not None and adapter.is_remote():
+            return (" [remote target: every heap byte is read over the SSH link in 64 KiB collector slices, so the "
+                    "caps are deliberately small; the walk was not enlarged to fit]")
+    except Exception:  # noqa: BLE001
+        pass
+    return ""
+
+
 class BudgetedReader:
     """All target reads of the heap analysis go through here: the adapter's zero-stop batch
     read path, split into slices of at most ``max_slice`` bytes, and charged to the budget."""
@@ -671,7 +685,9 @@ class HeapWalker:
         if ver is None:
             return HeapWalkResult(status=STATUS_INCONCLUSIVE,
                                   message="inconclusive: glibc version of the target could not be identified "
-                                          "(the ptmalloc layout depends on it)", **base)
+                                          "(the ptmalloc layout depends on it)"
+                                          + ("; " + self._version_scan_note if getattr(self, "_version_scan_note", None) else ""),
+                                  **base)
         if ver < SUPPORTED_GLIBC_MIN or ver > SUPPORTED_GLIBC_MAX:
             return HeapWalkResult(
                 status=STATUS_UNSUPPORTED_GLIBC_VERSION,
@@ -686,25 +702,62 @@ class HeapWalker:
 
     def _glibc_version_from_memory(self, abi: TargetABI) -> Optional[Tuple[int, int]]:
         """The ``GNU C Library ... version X.Y`` banner lives in libc's read-only data, which is
-        mapped in the target: read it through the zero-stop path (works for remote targets too)."""
+        mapped in the target: read it through the zero-stop path (works for remote targets too).
+
+        Bounded: at most ``_MAX_BANNER_SCAN`` bytes in total, non-executable read-only segments first and
+        one segment at a time (stops at the first hit, so a remote target usually costs a few KiB over the
+        link).  Cached on the adapter per (pid, libc mapping) so repeated walks of one session do not
+        repeat the read; a failed identification is not cached (the next walk may succeed)."""
         if not abi.libc_path:
             return None
-        ranges = []
+        segs = []
         for m in self._maps:
-            if (m.get("pathname") or "") != abi.libc_path or "w" in (m.get("permissions") or ""):
+            if (m.get("pathname") or "") != abi.libc_path or "w" in (m.get("permissions") or "") \
+                    or "r" not in (m.get("permissions") or "-"):
                 continue
-            s, e = _map_bounds(m)
-            ranges.append((s, min(e - s, _MAX_BANNER_SCAN - sum(n for _, n in ranges))))
-            if sum(n for _, n in ranges) >= _MAX_BANNER_SCAN:
-                break
-        if not ranges:
+            s_, e_ = _map_bounds(m)
+            segs.append((1 if "x" in (m.get("permissions") or "") else 0, s_, e_ - s_))
+        if not segs:
             return None
+        segs.sort()
+        key = (int(self.pid), abi.libc_path, segs[0][1])
+        cache = getattr(self.adapter, "_glibc_version_cache", None)
+        if isinstance(cache, dict) and key in cache:
+            return cache[key]
+        left = _MAX_BANNER_SCAN
+        self._version_scan_note = None
         try:
-            for data in self.reader.read_ranges(ranges):
-                mm = _GLIBC_BANNER_RE.search(data or b"")
-                if mm:
-                    return parse_glibc_version(mm.group(1).decode("ascii", "replace"))
-        except HeapWalkBudgetExhausted:
+            for _x, start, size in segs:
+                # backwards in 128 KiB chunks (the banner sits in .rodata, behind the code): a remote target
+                # usually costs a few hundred KiB over the link instead of the whole segment
+                end = start + size
+                bad = 0
+                while left > 0 and end > start and bad < 2:
+                    n = min(_BANNER_CHUNK, end - start, left)
+                    frm = end - n
+                    left -= n
+                    data = self.reader.read(frm, n)
+                    if not data:
+                        bad += 1
+                    else:
+                        bad = 0
+                        mm = _GLIBC_BANNER_RE.search(data)
+                        if mm:
+                            ver = parse_glibc_version(mm.group(1).decode("ascii", "replace"))
+                            if ver is not None:
+                                try:
+                                    if not isinstance(cache, dict):
+                                        cache = {}
+                                        setattr(self.adapter, "_glibc_version_cache", cache)
+                                    cache[key] = ver
+                                except Exception:  # noqa: BLE001
+                                    pass
+                            return ver
+                    if frm <= start or n <= _BANNER_OVERLAP:
+                        break
+                    end = frm + _BANNER_OVERLAP       # overlap: a banner cut at a chunk boundary is still found
+        except HeapWalkBudgetExhausted as exc:
+            self._version_scan_note = "the observation budget ended the libc banner read (%s)" % exc
             return None
         return None
 

@@ -530,6 +530,16 @@ def main():
     dx_p.add_argument("--json", action="store_true", default=False,
                       help="Print the full result as JSON (the readable summary is under 'human_summary')")
     dx_p.add_argument("--lang", choices=("en", "ko"), default="en", help="Language of the human-readable summary")
+    dx_p.add_argument("--remote-host", "--host", dest="remote_host", type=str, default=None,
+                      help="SSH host/IP of a REMOTE target (the process runs there; --debug-image is then required)")
+    dx_p.add_argument("--ssh-user", "--user", dest="ssh_user", type=str, default=None, help="SSH username")
+    dx_p.add_argument("--ssh-port", "--port", dest="ssh_port", type=int, default=22, help="SSH port (default: 22)")
+    dx_p.add_argument("--ssh-key", "--identity", dest="ssh_key", type=str, default=None, help="SSH private key path")
+    dx_p.add_argument("--ssh-proxy-jump", dest="ssh_proxy_jump", type=str, default=None, help="Optional SSH ProxyJump")
+    dx_p.add_argument("--auto-deploy-collector", action="store_true", default=False,
+                      help="Auto-deploy the native collector to the remote target first (faster reads)")
+    dx_p.add_argument("--collector-path", dest="collector_path", type=str, default=None,
+                      help="Path of an already installed collector on the remote target")
 
     args = parser.parse_args()
 
@@ -1725,9 +1735,15 @@ def main():
     elif args.command == "diagnose":
         from .expert_diagnostic_engine import ExpertDiagnosticEngine
         from .human_report import diagnose_with_summary
+        remote_target = None
+        if args.remote_host:
+            remote_target = {"remote_host": args.remote_host, "ssh_user": args.ssh_user, "ssh_port": args.ssh_port,
+                             "ssh_key": args.ssh_key, "ssh_proxy_jump": args.ssh_proxy_jump,
+                             "auto_deploy_collector": args.auto_deploy_collector, "collector_path": args.collector_path}
         result, summary = diagnose_with_summary(
             args.pid, debug_image=args.debug_image, symptom=args.symptom, time_limit_s=args.time_limit_s,
             engine=ExpertDiagnosticEngine(corpus_dir=os.path.abspath(args.corpus)), lang=args.lang,
+            target=remote_target,
         )
         if args.json:
             result["human_summary"] = summary

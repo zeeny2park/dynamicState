@@ -344,16 +344,30 @@ def augment_lock_info(
 ) -> Any:
     """Return ``info`` extended with struct-member mutexes and futex-address locks.
 
-    Never raises: any failure leaves ``info`` unchanged and adds a limitation.  Remote targets are returned
-    unchanged (thread syscall data is not available remotely; roadmap IMP-011/021).
+    Never raises: any failure leaves ``info`` unchanged and adds a limitation.  On a remote target the
+    futex syscall of each thread comes from the adapter's one-exchange thread sample (collector THREADS /
+    shell fallback) instead of a local /proc read; the DWARF walk is the same.  An adapter that cannot
+    deliver thread syscalls leaves ``info`` unchanged (the futex-address part is then not done).
     """
     if not isinstance(info, dict) or info.get("error") or not info.get("threads"):
         return info
     try:
-        if adapter.is_remote():
-            return info
+        remote = bool(adapter.is_remote())
     except Exception:  # noqa: BLE001
         return info
+    remote_syscalls: Dict[int, Optional[Dict[str, Any]]] = {}
+    if remote:
+        try:
+            recs = adapter.read_thread_samples(pid, counters) if getattr(type(adapter), "thread_samples_supported", False) else None
+        except Exception:  # noqa: BLE001
+            recs = None
+        if not recs:
+            return info
+        remote_syscalls = {int(r["tid"]): r.get("syscall") for r in recs if r.get("tid") is not None}
+
+    def syscall_of(tid: int) -> Optional[Dict[str, Any]]:
+        return remote_syscalls.get(tid) if remote else read_syscall(pid, tid, counters)
+
     out = dict(info)
     notes: List[str] = list(info.get("limitations") or [])
     try:
@@ -444,7 +458,7 @@ def augment_lock_info(
         thread_sys: Dict[int, Dict[str, Any]] = {}
         for t in info["threads"]:
             tid = int(t["tid"])
-            sc = read_syscall(pid, tid, counters)
+            sc = syscall_of(tid)
             if sc and not sc.get("running"):
                 thread_sys[tid] = sc
         for tid, sc in thread_sys.items():
