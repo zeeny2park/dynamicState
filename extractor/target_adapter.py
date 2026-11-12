@@ -22,11 +22,15 @@ import errno
 import hashlib
 import json
 import os
+import atexit
 import re
+import select
 import shlex
 import subprocess
 import tempfile
+import threading
 import time
+import weakref
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 import uuid
 
@@ -1539,6 +1543,96 @@ class LocalTargetAdapter(TargetExecutionAdapter):
         return results[:max(1, limit)]
 
 
+# --- IMP-021: persistent collector daemon channel -------------------------------------------
+# Wire protocol (target/collector/README.md, "daemon"): one request per stdin line, one JSON
+# reply per stdout line (hex payloads, so a reply never contains a raw newline).  The collector's
+# line buffer is 8192 bytes, so requests are kept well below that; the collector exits on stdin EOF.
+DAEMON_MAX_REQUEST_CHARS = 7000
+_LIVE_DAEMON_CHANNELS: "weakref.WeakSet" = weakref.WeakSet()
+
+
+class DaemonChannelError(Exception):
+    """The daemon channel is dead, timed out or produced garbage (caller reopens / falls back)."""
+
+
+class _DaemonChannel:
+    """One long-lived child (ssh -> collector --daemon) speaking line-oriented PING/READ/QUIT."""
+
+    def __init__(self, proc: "subprocess.Popen"):
+        self.proc = proc
+        self._buf = b""
+        self._fd = proc.stdout.fileno()
+        _LIVE_DAEMON_CHANNELS.add(self)
+
+    def exchange(self, line: str, timeout: float) -> str:
+        proc = self.proc
+        if proc.poll() is not None:
+            raise DaemonChannelError("channel process exited")
+        self._buf = b""  # any unsolicited bytes are stale
+        try:
+            proc.stdin.write(line.encode("ascii") + b"\n")
+            proc.stdin.flush()
+        except (OSError, ValueError) as e:
+            raise DaemonChannelError(f"write failed: {e}")
+        deadline = time.monotonic() + timeout
+        while True:
+            nl = self._buf.find(b"\n")
+            if nl >= 0:
+                reply = self._buf[:nl]
+                self._buf = self._buf[nl + 1:]
+                return reply.decode("utf-8", "replace")
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise DaemonChannelError("timeout waiting for daemon reply")
+            ready, _, _ = select.select([self._fd], [], [], remaining)
+            if not ready:
+                continue
+            try:
+                chunk = os.read(self._fd, 65536)
+            except OSError as e:
+                raise DaemonChannelError(f"read failed: {e}")
+            if not chunk:
+                raise DaemonChannelError("EOF from daemon channel")
+            self._buf += chunk
+
+    def close(self, graceful: bool = True) -> None:
+        proc = self.proc
+        try:
+            if graceful and proc.poll() is None:
+                try:
+                    proc.stdin.write(b"QUIT\n")
+                    proc.stdin.flush()
+                except (OSError, ValueError):
+                    pass
+            try:
+                proc.stdin.close()
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                proc.wait(timeout=1.5 if graceful else 0.05)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                try:
+                    proc.wait(timeout=2.0)
+                except subprocess.TimeoutExpired:
+                    pass
+            try:
+                proc.stdout.close()
+            except Exception:  # noqa: BLE001
+                pass
+        finally:
+            _LIVE_DAEMON_CHANNELS.discard(self)
+
+
+@atexit.register
+def _close_live_daemon_channels() -> None:
+    for ch in list(_LIVE_DAEMON_CHANNELS):
+        try:
+            ch.close()
+        except Exception:  # noqa: BLE001
+            pass
+
+
 class RemoteSshTargetAdapter(TargetExecutionAdapter):
     """Execution adapter for remote Linux targets accessed via SSH / SSH Proxy.
     
@@ -1559,6 +1653,8 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
         command_runner: Optional[Callable[[List[str], float], Tuple[int, str, str]]] = None,
         use_control_master: bool = False,
         collector_path: Optional[str] = None,
+        stream_opener: Optional[Callable[[List[str]], "subprocess.Popen"]] = None,
+        use_daemon: bool = True,
     ):
         self._ensure_tracking_state()
         if not host or not isinstance(host, str) or not host.strip():
@@ -1580,6 +1676,15 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
         self._command_runner = command_runner or self._default_command_runner
         self.use_control_master = bool(use_control_master)
         self.collector_path = (collector_path or "").strip() or None
+        # IMP-021: persistent daemon channel state.  ``stream_opener(args)`` returns a Popen with
+        # stdin/stdout pipes; injectable so tests can run the "remote" side locally.
+        self._stream_opener = stream_opener or self._default_stream_opener
+        self._use_daemon = bool(use_daemon)
+        self._daemon_lock = threading.RLock()
+        self._daemon: Optional[_DaemonChannel] = None
+        self._daemon_path: Optional[str] = None
+        self._daemon_unsupported_for: Optional[str] = None  # collector path decided "no daemon"
+        self.daemon_stats: Dict[str, int] = {"opens": 0, "requests": 0, "reopens": 0, "fallbacks": 0}
 
     def is_remote(self) -> bool:
         return True
@@ -1629,6 +1734,23 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
         runners then receive it as the ``input_bytes`` keyword argument.
         """
         t = timeout or self.timeout_sec
+        args = self._ssh_args(remote_shell_cmd)
+        try:
+            if input_bytes is not None:
+                return self._command_runner(args, t, input_bytes=input_bytes)
+            return self._command_runner(args, t)
+        except subprocess.TimeoutExpired:
+            return -1, "", f"SSH command timed out after {t:.1f}s"
+        except Exception as e:
+            return -1, "", f"SSH execution error: {e}"
+
+    @staticmethod
+    def _default_stream_opener(args: List[str]) -> "subprocess.Popen":
+        return subprocess.Popen(
+            args, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, close_fds=True,
+        )
+
+    def _ssh_args(self, remote_shell_cmd: str) -> List[str]:
         args = [
             self.ssh_bin,
             "-p", str(self.port),
@@ -1659,14 +1781,7 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
         args.append("--")
         args.append(target_spec)
         args.append(remote_shell_cmd)
-        try:
-            if input_bytes is not None:
-                return self._command_runner(args, t, input_bytes=input_bytes)
-            return self._command_runner(args, t)
-        except subprocess.TimeoutExpired:
-            return -1, "", f"SSH command timed out after {t:.1f}s"
-        except Exception as e:
-            return -1, "", f"SSH execution error: {e}"
+        return args
 
     def check_liveness(self, pid: int) -> Tuple[bool, Optional[str]]:
         if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 1:
@@ -1884,45 +1999,186 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
         threads.sort(key=lambda t: t["tid"])
         return threads
 
-    def _read_slices_via_collector(
+    def _read_slices_via_collector_oneshot(
         self,
         pid: int,
         slices: List[Tuple[int, int]],
     ) -> Optional[List[Tuple[Optional[bytes], str, Optional[str]]]]:
-        """Uses C99 dynamicstate-collector --read-slices on the remote target for zero-stop process_vm_readv batch reads."""
+        """Per-call fallback: one ssh + one collector process per read (--read-slices)."""
         if not self.collector_path or not slices:
             return None
-        import json as _json
         spec = ",".join(f"0x{int(addr):x}:{max(0, int(sz))}" for addr, sz in slices)
         cmd = f"{shlex.quote(self.collector_path)} -p {int(pid)} --read-slices {shlex.quote(spec)} 2>/dev/null"
         rc, stdout, _ = self.run_ssh(cmd)
         if rc != 0 or not stdout.strip():
             return None
         try:
-            payload = _json.loads(stdout.strip().splitlines()[-1])
-            if not payload.get("success") or "slices" not in payload:
-                if payload.get("error") == "TARGET_TERMINATED":
-                    return [(None, "TARGET_TERMINATED", "Remote process terminated") for _ in slices]
-                return None
-            out_list: List[Tuple[Optional[bytes], str, Optional[str]]] = []
-            raw_slices = payload.get("slices", [])
-            for idx, (req_addr, req_sz) in enumerate(slices):
-                if req_sz <= 0:
-                    out_list.append((b"", "OBSERVED", None))
-                    continue
-                s_item = raw_slices[idx] if idx < len(raw_slices) else {}
-                st = s_item.get("status", "UNAVAILABLE")
-                hex_str = s_item.get("hex", "")
-                raw_b = bytes.fromhex(hex_str) if hex_str else b""
-                if st == "OBSERVED" and len(raw_b) == req_sz:
-                    out_list.append((raw_b, "OBSERVED", None))
-                elif len(raw_b) > 0:
-                    out_list.append((raw_b, "PARTIAL", f"Partial read: {len(raw_b)}/{req_sz} bytes"))
-                else:
-                    out_list.append((None, st if st in ("UNAVAILABLE", "PERMISSION_DENIED", "TARGET_TERMINATED") else "UNAVAILABLE", f"Collector read status: {st} at 0x{req_addr:x}"))
-            return out_list
+            payload = json.loads(stdout.strip().splitlines()[-1])
+            return self._decode_slices_payload(payload, slices)
         except Exception:
             return None
+
+    @staticmethod
+    def _decode_slices_payload(
+        payload: Dict[str, Any], slices: List[Tuple[int, int]],
+    ) -> Optional[List[Tuple[Optional[bytes], str, Optional[str]]]]:
+        """Maps a collector JSON reply (one-shot or daemon) to per-slice results; None = unusable."""
+        if not payload.get("success") or "slices" not in payload:
+            if payload.get("error") == "TARGET_TERMINATED":
+                return [(None, "TARGET_TERMINATED", "Remote process terminated") for _ in slices]
+            return None
+        out_list: List[Tuple[Optional[bytes], str, Optional[str]]] = []
+        raw_slices = payload.get("slices", [])
+        for idx, (req_addr, req_sz) in enumerate(slices):
+            if req_sz <= 0:
+                out_list.append((b"", "OBSERVED", None))
+                continue
+            s_item = raw_slices[idx] if idx < len(raw_slices) else {}
+            st = s_item.get("status", "UNAVAILABLE")
+            hex_str = s_item.get("hex", "")
+            raw_b = bytes.fromhex(hex_str) if hex_str else b""
+            if st == "OBSERVED" and len(raw_b) == req_sz:
+                out_list.append((raw_b, "OBSERVED", None))
+            elif len(raw_b) > 0:
+                out_list.append((raw_b, "PARTIAL", f"Partial read: {len(raw_b)}/{req_sz} bytes"))
+            else:
+                out_list.append((None, st if st in ("UNAVAILABLE", "PERMISSION_DENIED", "TARGET_TERMINATED") else "UNAVAILABLE", f"Collector read status: {st} at 0x{req_addr:x}"))
+        return out_list
+
+
+    # ---- IMP-021 daemon channel -------------------------------------------------------------
+    def _daemon_command(self) -> str:
+        return f"exec {shlex.quote(self.collector_path)} --daemon 2>/dev/null"
+
+    def _open_daemon_locked(self) -> _DaemonChannel:
+        proc = self._stream_opener(self._ssh_args(self._daemon_command()))
+        ch = _DaemonChannel(proc)
+        try:
+            reply = ch.exchange("PING", max(self.timeout_sec, 1.0))
+            if "PONG" not in reply:
+                raise DaemonChannelError(f"unexpected PING reply: {reply[:80]!r}")
+        except BaseException:
+            ch.close(graceful=False)
+            raise
+        self._daemon, self._daemon_path = ch, self.collector_path
+        self.daemon_stats["opens"] += 1
+        return ch
+
+    def _close_daemon_locked(self, graceful: bool = True) -> None:
+        ch, self._daemon = self._daemon, None
+        if ch is not None:
+            ch.close(graceful=graceful)
+
+    def _daemon_exchange_slices(
+        self, ch: _DaemonChannel, pid: int, slices: List[Tuple[int, int]],
+    ) -> Optional[List[Tuple[Optional[bytes], str, Optional[str]]]]:
+        """Sends slices in request lines below the collector's line buffer; raises on channel faults."""
+        chunks: List[List[Tuple[int, int]]] = []
+        cur: List[Tuple[int, int]] = []
+        cur_len = 0
+        for addr, sz in slices:
+            item = f"0x{int(addr):x}:{max(0, int(sz))}"
+            if cur and cur_len + len(item) + 1 > DAEMON_MAX_REQUEST_CHARS:
+                chunks.append(cur)
+                cur, cur_len = [], 0
+            cur.append((addr, sz))
+            cur_len += len(item) + 1
+        if cur:
+            chunks.append(cur)
+        out: List[Tuple[Optional[bytes], str, Optional[str]]] = []
+        for chunk in chunks:
+            spec = ",".join(f"0x{int(a):x}:{max(0, int(z))}" for a, z in chunk)
+            reply = ch.exchange(f"READ {int(pid)} {spec}", max(self.timeout_sec, 1.0))
+            try:
+                payload = json.loads(reply)
+            except ValueError:
+                raise DaemonChannelError(f"garbage reply: {reply[:80]!r}")
+            if not isinstance(payload, dict):
+                raise DaemonChannelError("non-object reply")
+            if payload.get("success") and len(payload.get("slices", [])) != len(chunk):
+                raise DaemonChannelError("slice count mismatch")
+            try:
+                res = self._decode_slices_payload(payload, chunk)
+            except Exception as e:  # noqa: BLE001 - malformed slice items
+                raise DaemonChannelError(f"undecodable reply: {e}")
+            if res is None:
+                return None  # well-formed error reply (e.g. INVALID_ARGS): channel stays usable
+            out.extend(res)
+        return out
+
+    def _read_slices_via_daemon(
+        self, pid: int, slices: List[Tuple[int, int]],
+    ) -> Optional[List[Tuple[Optional[bytes], str, Optional[str]]]]:
+        """Reads through the persistent channel; None means "use the per-call path".
+
+        Decision logic: if the daemon can never be established (old collector without --daemon,
+        exec denied, ...) the decision is remembered per collector path.  If a channel that worked
+        dies (EOF / timeout / garbage) it is closed, reopened once and the read retried; a second
+        failure falls back to per-call execution for this read only.
+        """
+        if not self._use_daemon or not self.collector_path or not slices:
+            return None
+        with self._daemon_lock:
+            path = self.collector_path
+            if self._daemon_unsupported_for == path:
+                return None
+            if self._daemon is not None and self._daemon_path != path:
+                self._close_daemon_locked()
+            for attempt in (0, 1):
+                try:
+                    if self._daemon is None or self._daemon.proc.poll() is not None:
+                        if self._daemon is not None:
+                            self._close_daemon_locked(graceful=False)
+                        if attempt:
+                            self.daemon_stats["reopens"] += 1
+                        self._open_daemon_locked()
+                    self.daemon_stats["requests"] += 1
+                    return self._daemon_exchange_slices(self._daemon, pid, slices)
+                except (DaemonChannelError, OSError, ValueError):
+                    self._close_daemon_locked(graceful=False)
+                    if self.daemon_stats["opens"] == 0:
+                        self._daemon_unsupported_for = path  # never worked: remember for the session
+                        self.daemon_stats["fallbacks"] += 1
+                        return None
+                    if attempt == 1:
+                        self.daemon_stats["fallbacks"] += 1
+                        return None
+            return None
+
+    def _read_slices_via_collector(
+        self,
+        pid: int,
+        slices: List[Tuple[int, int]],
+    ) -> Optional[List[Tuple[Optional[bytes], str, Optional[str]]]]:
+        """Collector-backed batch read: persistent daemon channel first, per-call execution as fallback."""
+        res = self._read_slices_via_daemon(pid, slices)
+        if res is not None:
+            return res
+        return self._read_slices_via_collector_oneshot(pid, slices)
+
+    def close(self) -> None:
+        """Clean shutdown of the daemon channel (QUIT + reap the ssh child)."""
+        lock = getattr(self, "_daemon_lock", None)
+        if lock is None:
+            return
+        with lock:
+            self._close_daemon_locked()
+
+    @staticmethod
+    def _dd_block_pipeline(pid: int, address: int, size: int) -> str:
+        """Block-wise raw read of [address, address+size): O(1) processes, no byte-sized dd.
+
+        Reads whole 4 KiB blocks (``skip`` counts blocks, so 64-bit offsets are fine on BusyBox dd)
+        and trims the unaligned head/tail with tail/head (POSIX, BusyBox-safe).
+        """
+        page = 4096
+        n = max(0, int(size))
+        page_num, page_off = divmod(int(address), page)
+        pages = (page_off + n + page - 1) // page
+        return (
+            f"dd if=/proc/{int(pid)}/mem bs={page} skip={page_num} count={pages} 2>/dev/null"
+            f" | tail -c +{page_off + 1} | head -c {n}"
+        )
 
     def read_memory_batch(
         self,
@@ -1956,18 +2212,8 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
             if s_int == 0:
                 cmds.append(f"echo '{idx}|'")
                 continue
-            page_sz = 4096
-            page_num = a_int // page_sz
-            page_off = a_int % page_sz
-            pages_needed = ((page_off + s_int + page_sz - 1) // page_sz)
-            cmds.append(
-                f"b=$(dd if=/proc/{int(pid)}/mem bs=1 skip={a_int} count={s_int} 2>/dev/null | base64 | tr -d '\\n'); "
-                f"if [ -z \"$b\" ]; then "
-                f"b=$(dd if=/proc/{int(pid)}/mem bs={page_sz} skip={page_num} count={pages_needed} 2>/dev/null | "
-                f"dd bs=1 skip={page_off} count={s_int} 2>/dev/null | base64 | tr -d '\\n'); "
-                f"fi; "
-                f"echo \"{idx}|$b\""
-            )
+            pipeline = self._dd_block_pipeline(pid, a_int, s_int)
+            cmds.append(f"b=$({pipeline} | base64 | tr -d '\\n'); echo \"{idx}|$b\"")
         remote_script = "; ".join(cmds)
         rc, stdout, stderr = self.run_ssh(f"sh -c {shlex.quote(remote_script)}")
         if rc != 0:
@@ -2023,7 +2269,7 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
 
         # Remote memory read via dd and base64
         # dd skip requires decimal integer
-        cmd = f"dd if=/proc/{int(pid)}/mem bs=1 skip={int(address)} count={int(size)} 2>/dev/null | base64"
+        cmd = f"{self._dd_block_pipeline(pid, address, size)} | base64"
         rc, stdout, stderr = self.run_ssh(cmd)
         if rc != 0:
             if rc == -1 or "timed out" in stderr.lower() or "connection" in stderr.lower():

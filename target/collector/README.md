@@ -123,6 +123,21 @@ For high-frequency remote watch sessions and deep pointer-chain traversal withou
 #   QUIT
 ```
 
+**Daemon wire protocol** (used by `RemoteSshTargetAdapter` over one persistent SSH session, IMP-021):
+
+- Framing: one request per stdin line, exactly one reply per stdout line (JSON). Payload bytes are
+  hex-encoded, so a reply never contains a raw newline and needs no length prefix.
+- `PING` -> `{"success":true,"status":"PONG"}`; `QUIT`/`EXIT` -> `{"success":true,"status":"BYE"}` and exit;
+  `READ <pid> <addr:size[,addr:size...]>` -> the same JSON object as `--read-slices`
+  (`{"success":true,"pid":..,"backend":..,"slices":[{"address","size","bytes_read","status","hex"}],"duration_us":..}`),
+  one entry per requested slice, in order. Errors are single-line `{"success":false,"error":"..."}`
+  (`MISSING_SLICES_SPEC`, `INVALID_PID`, `UNKNOWN_COMMAND`, `INVALID_ARGS`, `TARGET_TERMINATED`, `PERMISSION_DENIED`).
+- Limits: the request line buffer is 8192 bytes (a longer line would be split and desynchronise the stream), so
+  the host keeps each `READ` below ~7000 characters and splits larger batches; each slice is capped at 65536 bytes.
+- Lifetime: the daemon exits on `QUIT` and on stdin EOF (also when the SSH session or the host process dies), so
+  no collector is orphaned on the target. The host starts it as `exec <collector> --daemon` and falls back to
+  per-call `--read-slices` when the daemon cannot be established (old collector, exec denied).
+
 ### Multi-architecture static builds (`make dist`)
 ```bash
 make dist   # dist/{arm,aarch64,x86_64}/dynamicstate-collector, static; prints which arches were skipped
