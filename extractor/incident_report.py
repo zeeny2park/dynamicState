@@ -31,6 +31,40 @@ from .diagnostic_verdict_aggregator import (
 from .verdict_engine import sanitize_report_output_path
 
 DEFAULT_TITLE = "dynamicState Zero-Stop Runtime Incident Report"
+DEFAULT_TITLE_KO = "dynamicState 무정지 런타임 인시던트 보고서"
+
+_LABELS = {
+    "en": {"summary": "Plain-language summary", "detail": "Detailed report (sections A-I)",
+           "verdict": "Verdict", "diag_summary": "Diagnosis summary", "no_summary": "No summary was produced."},
+    "ko": {"summary": "쉬운 말 요약", "detail": "상세 보고서 (A-I 항목)",
+           "verdict": "판정", "diag_summary": "진단 요약", "no_summary": "요약이 만들어지지 않았습니다."},
+}
+
+_HTML_CSS = """
+.ds-summary { max-width: 860px; margin: 24px auto; padding: 16px 24px; border: 1px solid #cbd5e1; border-radius: 8px;
+  background: #ffffff; color: #0f172a; font: 15px/1.6 -apple-system, "Segoe UI", "Noto Sans KR", sans-serif; }
+.ds-summary h1, .ds-summary h2, .ds-summary h3 { line-height: 1.3; }
+.ds-summary code, .ds-summary pre { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 13px; }
+.ds-summary code { background: #f1f5f9; padding: 1px 4px; border-radius: 3px; }
+.ds-summary pre { background: #f1f5f9; padding: 12px; border-radius: 6px; overflow-x: auto; }
+.ds-summary pre code { background: none; padding: 0; }
+.ds-verdict { font-weight: 600; }
+.ds-detail-title { max-width: 860px; margin: 16px auto; }
+@media (prefers-color-scheme: dark) {
+  .ds-summary { background: #0f172a; color: #e2e8f0; border-color: #334155; }
+  .ds-summary code, .ds-summary pre { background: #1e293b; }
+}
+"""
+
+
+def _summary_section(lang: str, verdict: str, summary_md: str) -> str:
+    from .human_report import markdown_to_html
+    lb = _LABELS[lang]
+    body = markdown_to_html(summary_md, heading_offset=1) if summary_md else f"<p>{html.escape(lb['no_summary'])}</p>"
+    return (f'<style>{_HTML_CSS}</style>\n<section class="ds-summary" lang="{lang}" id="human-summary">\n'
+            f'<h2>{html.escape(lb["summary"])}</h2>\n'
+            f'<p class="ds-verdict">{html.escape(lb["verdict"])}: <code>{html.escape(verdict)}</code></p>\n'
+            f'{body}\n</section>\n<h2 class="ds-detail-title">{html.escape(lb["detail"])}</h2>\n')
 
 
 def _limitation_text(nc: Dict[str, Any]) -> str:
@@ -69,10 +103,11 @@ def _demote_headings(md: str) -> List[str]:
     return out
 
 
-def _html_fallback(title: str, verdict: str, summary_md: str) -> str:
+def _html_fallback(title: str, verdict: str, summary_md: str, lang: str = "en", human_md: str = "") -> str:
     return (
-        "<!DOCTYPE html>\n<html><head><meta charset=\"utf-8\"><title>" + html.escape(title) + "</title></head><body>"
-        f"<h1>{html.escape(title)}</h1><p>Verdict: <b>{html.escape(verdict)}</b></p>"
+        f"<!DOCTYPE html>\n<html lang=\"{lang}\"><head><meta charset=\"utf-8\"><title>" + html.escape(title)
+        + "</title></head><body>"
+        f"<h1>{html.escape(title)}</h1>\n{_summary_section(lang, verdict, human_md)}"
         f"<pre>{html.escape(summary_md)}</pre></body></html>\n"
     )
 
@@ -121,9 +156,14 @@ def export_incident_report(
     time_limit_s: Optional[float] = None,
     hypothesis_verifier: Optional[Callable[..., Dict[str, Any]]] = None,
     pre_limitations: Optional[List[str]] = None,
+    language: str = "en",
 ) -> Dict[str, Any]:
     """Diagnose ``pid`` once with ``diagnose()`` and render the incident report (Markdown, HTML, JSON)."""
     t0 = time.monotonic_ns()
+    if language not in ("en", "ko"):
+        raise ValueError(f"language must be 'en' or 'ko', got {language!r}")
+    if title == DEFAULT_TITLE and language == "ko":
+        title = DEFAULT_TITLE_KO
     if pid is not None and (isinstance(pid, bool) or int(pid) <= 0):
         return {
             "success": False, "pid": pid, "overall_status": VERDICT_INCONCLUSIVE, "verdict": VERDICT_INCONCLUSIVE,
@@ -150,7 +190,7 @@ def export_incident_report(
             r = diagnose(int(pid), debug_image=companion_elf_path or None, symptom=symptom,
                          time_limit_s=time_limit_s, include_report=True, **kw)
             res = r.to_dict()
-            summary_md = render_human_report(res, res.get("report"))
+            summary_md = render_human_report(res, res.get("report"), lang=language)
         except Exception as exc:  # noqa: BLE001 - a crash in the diagnosis is a collection failure, not a report
             res = _inconclusive_result(pid, companion_elf_path, "unexpected_error", "diagnose",
                                        f"{type(exc).__name__}: {exc}")
@@ -226,7 +266,7 @@ def export_incident_report(
     else:
         md.append("- No fault was found by the checks that ran.")
     if summary_md:
-        md += ["", "### Diagnosis summary", ""] + _demote_headings(summary_md)
+        md += ["", f"### {_LABELS[language]['diag_summary']}", ""] + _demote_headings(summary_md)
     if hyp_res is not None:
         md += ["", f"## 3. Hypothesis Verification (`{hyp_res.get('verdict')}` · Confidence "
                    f"`{round(float(hyp_res.get('confidence_score') or 0.0) * 100, 1)}%`)",
@@ -252,11 +292,13 @@ def export_incident_report(
         try:
             from .diagnostic_report import DiagnosticReport
             report_html = DiagnosticReport.from_dict(report).to_html().replace(
-                "<body>", f"<body>\n<h1>{html.escape(title)}</h1>", 1)
+                "<body>", f"<body>\n<h1>{html.escape(title)}</h1>\n"
+                          f"{_summary_section(language, verdict, summary_md)}", 1)
+            report_html = report_html.replace("<html>", f'<html lang="{language}">', 1)
         except Exception:  # noqa: BLE001 - fall back to the plain rendering below
             report_html = None
     if report_html is None:
-        report_html = _html_fallback(title, verdict, report_markdown)
+        report_html = _html_fallback(title, verdict, report_markdown, language, summary_md)
     report_json = json.dumps(res, default=str)
 
     saved_path, save_error = _write(output_path, report_markdown, "incident report")
@@ -266,8 +308,9 @@ def export_incident_report(
         hint = (f"Incident report for PID {eff_pid} is INCONCLUSIVE ({len(limitations)} limitation(s): "
                 f"{'; '.join(limitations[:2])})")
     else:
-        hint = (f"Incident report for PID {eff_pid}: verdict {verdict} (Health Score: "
-                f"{(str(health_score) + '/100') if health_score is not None else 'N/A'}, {len(findings)} finding(s))")
+        from .human_report import conclusion_sentence
+        hint = f"Incident report for PID {eff_pid}: verdict {verdict}. {conclusion_sentence(summary_md)}".rstrip()
+        hint = hint.rstrip(".")
     hint += f" and saved to {saved_path}." if saved_path else "."
     out_res = {k: v for k, v in res.items() if k != "report"}
     return {
@@ -283,6 +326,7 @@ def export_incident_report(
         "report_latency_us": latency_us,
         "observation_latency_us": latency_us,
         "title": title,
+        "language": language,
         "verdict": verdict,
         "overall_status": verdict,
         "health_score": health_score,

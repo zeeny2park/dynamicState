@@ -1019,3 +1019,90 @@ def diagnose_with_summary(pid: int, debug_image: Optional[str] = None, symptom: 
     summary = render_human_report(d, d.get("report"), lang=lang)
     d["report"] = None
     return d, summary
+
+
+# ------------------------------------------------------------------------------------- Markdown -> HTML
+_INLINE_RE = re.compile(r"`([^`]+)`|\*\*([^*]+)\*\*")
+
+
+def _inline_html(text: str) -> str:
+    import html as _h
+    out, pos = [], 0
+    for m in _INLINE_RE.finditer(text):
+        out.append(_h.escape(text[pos:m.start()]))
+        out.append(f"<code>{_h.escape(m.group(1))}</code>" if m.group(1) is not None
+                   else f"<strong>{_h.escape(m.group(2))}</strong>")
+        pos = m.end()
+    out.append(_h.escape(text[pos:]))
+    return "".join(out)
+
+
+def markdown_to_html(md: str, heading_offset: int = 0) -> str:
+    """Dependency-free converter for the subset the human summary uses: ``#`` headings, paragraphs, ``-`` bullet
+    lists, ``1.`` numbered lists, inline code, bold and fenced code blocks.  Everything is HTML-escaped."""
+    import html as _h
+    out: List[str] = []
+    para: List[str] = []
+    lst: Optional[str] = None
+    fence: Optional[List[str]] = None
+
+    def flush_para():
+        if para:
+            out.append("<p>" + "<br>".join(_inline_html(x) for x in para) + "</p>")
+            para.clear()
+
+    def close_list():
+        nonlocal lst
+        if lst:
+            out.append(f"</{lst}>")
+            lst = None
+
+    for raw in (md or "").splitlines():
+        line = raw.rstrip()
+        if fence is not None:
+            if line.strip().startswith("```"):
+                out.append("<pre><code>" + _h.escape("\n".join(fence)) + "</code></pre>")
+                fence = None
+            else:
+                fence.append(line)
+            continue
+        if line.strip().startswith("```"):
+            flush_para()
+            close_list()
+            fence = []
+            continue
+        if not line.strip():
+            flush_para()
+            close_list()
+            continue
+        m = re.match(r"^(#{1,6})\s+(.*)$", line)
+        if m:
+            flush_para()
+            close_list()
+            lvl = min(6, len(m.group(1)) + heading_offset)
+            out.append(f"<h{lvl}>{_inline_html(m.group(2))}</h{lvl}>")
+            continue
+        m = re.match(r"^\s*[-*]\s+(.*)$", line)
+        n = re.match(r"^\s*\d+\.\s+(.*)$", line)
+        if m or n:
+            flush_para()
+            kind = "ul" if m else "ol"
+            if lst != kind:
+                close_list()
+                out.append(f"<{kind}>")
+                lst = kind
+            out.append("<li>" + _inline_html((m or n).group(1)) + "</li>")
+            continue
+        close_list()
+        para.append(line.strip())
+    if fence is not None:
+        out.append("<pre><code>" + _h.escape("\n".join(fence)) + "</code></pre>")
+    flush_para()
+    close_list()
+    return "\n".join(out)
+
+
+def conclusion_sentence(summary_md: str) -> str:
+    """The text of section 1 (the conclusion) of a human summary, on one line; "" when absent."""
+    m = re.search(r"^## 1\.[^\n]*\n+(.*?)(?:\n+## |\Z)", summary_md or "", re.S | re.M)
+    return " ".join(m.group(1).split()) if m else ""

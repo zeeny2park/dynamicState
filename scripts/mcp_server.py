@@ -3027,11 +3027,13 @@ def runtime_export_incident_report(
     ssh_port: int = 22,
     ssh_key: Optional[str] = None,
     ssh_proxy_jump: Optional[str] = None,
+    language: str = "en",
 ) -> str:
     """1-Call Comprehensive Incident Report & Remediation Exporter (zero-stop read; the target is not suspended).
     Exports either an active expert investigation (`investigation_id`) as Markdown/JSON, or
     combines Target Identity, Auto-Triage Scorecard, Thread Callstacks & Locks, and Hypothesis
     Verification into a structured Markdown + JSON report (`report_markdown`, `remediation_checklist`).
+    `language` ("en" or "ko") sets the language of the plain-language summary and labels.
     """
     try:
         if investigation_id:
@@ -3092,6 +3094,7 @@ def runtime_export_incident_report(
             ssh_port=ssh_port,
             ssh_key=ssh_key,
             ssh_proxy_jump=ssh_proxy_jump,
+            language=language,
         )
         return _format_watch_result({"success": True, **res})
     except Exception as e:

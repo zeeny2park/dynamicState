@@ -11987,6 +11987,7 @@ class WatchSessionManager:
         ssh_key: Optional[str] = None,
         ssh_proxy_jump: Optional[str] = None,
         adapter: Optional[TargetExecutionAdapter] = None,
+        language: str = "en",
     ) -> Dict[str, Any]:
         """1-Call Incident Report exporter (`runtime_export_incident_report`, CLI `export-report`, web).
 
@@ -11998,7 +11999,7 @@ class WatchSessionManager:
         pre: List[str] = []
         build_id = None
         if pid is not None and (isinstance(pid, bool) or pid <= 0):
-            return _export(title=title, pid=pid)
+            return _export(title=title, pid=pid, language=language)
         try:
             ctx_info = self.resolve_target_context(
                 pid=pid, companion_elf_path=companion_elf_path, process_name=process_name,
@@ -12019,5 +12020,5 @@ class WatchSessionManager:
             remote_host=ctx_info.get("remote_host"), ssh_user=ctx_info.get("ssh_user"),
             ssh_port=ctx_info.get("ssh_port") or 22, ssh_key=ctx_info.get("ssh_key"),
             ssh_proxy_jump=ctx_info.get("ssh_proxy_jump"), adapter=adapter, corpus_dir=self.corpus_dir,
-            hypothesis_verifier=self.verify_runtime_hypothesis, pre_limitations=pre,
+            hypothesis_verifier=self.verify_runtime_hypothesis, pre_limitations=pre, language=language,
         )

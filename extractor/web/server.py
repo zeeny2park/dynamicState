@@ -3432,7 +3432,11 @@ class WebApiAdapter:
             assertions = params.get("assertions")
             if isinstance(assertions, str):
                 assertions = [x.strip() for x in assertions.split(",") if x.strip()]
+            language = params.get("language") or params.get("lang") or "en"
+            if language not in ("en", "ko"):
+                return {"success": False, "error": {"code": "INVALID_PARAM", "message": "language must be 'en' or 'ko'"}}
             res = self.watch_manager.export_incident_report(
+                language=language,
                 title=str(params.get("title") or "dynamicState Zero-Stop Runtime Incident Report"),
                 hypothesis=params.get("hypothesis"),
                 assertions=assertions,

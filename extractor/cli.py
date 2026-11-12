@@ -518,6 +518,7 @@ def main():
     er_p.add_argument("--template", dest="template_path", type=str, default=None, help="Optional custom HTML template path")
     er_p.add_argument("-p", "--pid", type=int, default=None)
     er_p.add_argument("-d", "--debug-image", "--companion-elf", dest="debug_image", type=str, default=None)
+    er_p.add_argument("--lang", dest="lang", choices=("en", "ko"), default="en", help="Language of the plain-language summary and labels (default en)")
     er_p.add_argument("--corpus", type=str, default="corpus")
 
     dx_p = subparsers.add_parser("diagnose", help="Diagnose a live process end to end in one call and print the verdict (zero-stop)")
@@ -1782,6 +1783,7 @@ def main():
             template_path=getattr(args, "template_path", None),
             pid=args.pid,
             companion_elf_path=args.debug_image,
+            language=getattr(args, "lang", "en") or "en",
         )
         if res.get("save_error"):
             print(f"WARNING: {res['save_error']}", file=sys.stderr)
