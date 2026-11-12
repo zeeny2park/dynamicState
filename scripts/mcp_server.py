@@ -759,6 +759,7 @@ def runtime_diagnose_process(
     debug_image: Optional[str] = None,
     symptom: Optional[str] = None,
     time_limit_s: Optional[float] = None,
+    language: str = "en",
 ) -> str:
     """Diagnose a live Linux process end to end in ONE call and return the final verdict.
 
@@ -769,7 +770,9 @@ def runtime_diagnose_process(
     Returns JSON with: verdict (CONFIRMED_FAULT, PROBABLE_FAULT, FAULT, DEGRADED, HEALTHY, INCONCLUSIVE,
     ABORTED), confidence, summary, findings (category, severity, subjects = concrete lock/thread/function/
     variable names), checks_run, not_covered (what could not be examined and why), collection_impact,
-    report_path, investigation_id and target. An unreadable PID or missing debug image gives INCONCLUSIVE
+    report_path, investigation_id and target, plus human_summary: a plain-language Markdown report (conclusion,
+    names and source locations, reasoning, certainty and what was not examined, next steps, measured impact) in
+    the requested language. Relay human_summary to the user. An unreadable PID or missing debug image gives INCONCLUSIVE
     with the cause in not_covered; it is never reported as healthy.
 
     Args:
@@ -778,14 +781,17 @@ def runtime_diagnose_process(
         symptom: Optional natural-language symptom (e.g. 'process hangs', 'memory keeps growing').
             Defaults to a general health check.
         time_limit_s: Optional wall-clock observation budget in seconds.
+        language: Language of human_summary: 'en' (default) or 'ko'. Pass the user's language.
     """
     try:
-        from extractor.expert_diagnostic_engine import diagnose
-        result = diagnose(
+        from extractor.human_report import diagnose_with_summary
+        lang = "ko" if str(language or "en").strip().lower().startswith("ko") else "en"
+        out, summary = diagnose_with_summary(
             pid, debug_image=debug_image, symptom=symptom, time_limit_s=time_limit_s,
-            engine=runtime.expert_diagnostic_engine,
+            engine=runtime.expert_diagnostic_engine, lang=lang,
         )
-        return _format_watch_result(result.to_dict())
+        out["human_summary"] = summary
+        return _format_watch_result(out)
     except Exception as e:
         return _format_watch_result({"success": False, "error": str(e), "error_code": type(e).__name__})
 
