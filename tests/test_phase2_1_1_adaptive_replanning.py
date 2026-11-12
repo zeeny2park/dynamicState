@@ -15,6 +15,7 @@ import subprocess
 import time
 import unittest
 
+from extractor.diagnostic_recipes import BASELINE_RECIPE_IDS
 from tests.fixture_builds import ensure_expert_diagnostic_fixture
 from extractor.expert_diagnostic_engine import (
     STATE_COMPLETED,
@@ -82,13 +83,24 @@ class TestPhase211AdaptiveReplanning(unittest.TestCase):
         # Execute first collection step (RECIPE_INVALID_MEMORY_ACCESS confirms fault 0.98)
         res = session.step()
         self.assertEqual(res["action"], "COLLECT_STEP")
-        self.assertEqual(res.get("adaptive_action"), "EARLY_ANOMALY_CONFIRMED")
-        # Remaining steps should be marked SKIPPED
+        # Remaining NON-baseline steps are marked SKIPPED (early stop intent kept for them) ...
         skipped_steps = [s for s in session.plan.steps if s.status == "SKIPPED"]
         self.assertGreater(len(skipped_steps), 0)
+        self.assertFalse([s for s in skipped_steps if s.recipe_id in BASELINE_RECIPE_IDS])
+        # ... but the baseline checks that have not run yet keep the investigation going (a second problem
+        # must not be missed), so the early stop returns only once they are done.
+        self.assertNotEqual(res.get("adaptive_action"), "EARLY_ANOMALY_CONFIRMED")
+        self.assertEqual(session.state, "COLLECTING")
+        guard = 0
+        while session.state == "COLLECTING" and guard < 20:
+            session.step()
+            guard += 1
 
-        # Transition should proceed to ANALYZING without executing redundant steps
+        # Transition proceeds to ANALYZING without executing the redundant (non-baseline) steps
         self.assertEqual(session.state, "ANALYZING")
+        executed = {c.recipe_id for c in session.checks}
+        self.assertTrue(set(BASELINE_RECIPE_IDS) <= executed)
+        self.assertFalse([s for s in session.plan.steps if s.status == "SKIPPED" and s.recipe_id in executed])
 
     def test_session_persistence_and_resume_from_disk(self):
         """Verifies that an investigation session persists to disk and can be restored by ID."""

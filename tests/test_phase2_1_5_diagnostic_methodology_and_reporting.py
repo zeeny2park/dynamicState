@@ -587,8 +587,9 @@ class TestRealisticCppScenarios(unittest.TestCase):
                 companion_elf=debug_elf,
             )
 
-            # Step until completed or step budget
-            for _ in range(15):
+            # Step until completed or step budget (30 = run_to_completion's default; the plan now also holds
+            # the always-run baseline checks, so 15 single steps no longer reach the end)
+            for _ in range(30):
                 if session.state in (STATE_COMPLETED, STATE_INCONCLUSIVE):
                     break
                 session.step()

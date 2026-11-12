@@ -126,6 +126,8 @@ class RuntimeEvidenceProvider:
         self._historical_samples: Dict[str, Dict[str, Any]] = {}
         # IMP-010: overrides for ThreadSamplingConfig (thread_sample_count, thread_sample_interval_sec, ...)
         self.thread_sampling_overrides: Dict[str, Any] = {}
+        # When a dict, a usable thread series is shared by all thread recipes of the run (None = never share)
+        self.thread_series_cache: Optional[Dict[Any, Any]] = None
 
     def _inspect_locks(self, pid: int, companion_elf: Optional[str]) -> Any:
         """One lock inspection (existing callstack/lock interface) widened with member / futex mutexes (IMP-010)."""
@@ -149,10 +151,20 @@ class RuntimeEvidenceProvider:
         """IMP-010: N samples per thread -> existing thread-recipe input keys (runaway_threads, zombie_threads,
         thread_state_anomaly, threads_healthy, blocked_duration_sec, persistent_block) + long_wait_threads."""
         cfg = ThreadSamplingConfig.from_thresholds({**getattr(recipe, "thresholds_and_conditions", {}), **self.thread_sampling_overrides})
+        cache_key = (pid, repr(cfg))
         try:
-            sampler = ThreadSampler(self.adapter, self.watch_manager, self.budget_tracker)
-            series = sampler.collect(pid, companion_elf or "", cfg, inspect_fn=lambda: self._inspect_locks(pid, companion_elf))
-            derived = judge_thread_series(series)
+            if self.thread_series_cache is not None and cache_key in self.thread_series_cache:
+                # Same sample series as an earlier recipe of this run: reuse the verdict keys, but do not store the
+                # bulky per-thread summary a second time (every step re-persists the whole session).
+                derived = {k: v for k, v in self.thread_series_cache[cache_key].items()
+                           if k not in ("thread_summary", "thread_count_series")}
+                derived["thread_series_shared"] = True
+            else:
+                sampler = ThreadSampler(self.adapter, self.watch_manager, self.budget_tracker)
+                series = sampler.collect(pid, companion_elf or "", cfg, inspect_fn=lambda: self._inspect_locks(pid, companion_elf))
+                derived = judge_thread_series(series)
+                if self.thread_series_cache is not None and derived.get("thread_sampling", {}).get("status") == "OK":
+                    self.thread_series_cache[cache_key] = derived
         except Exception as exc:  # noqa: BLE001
             all_records.append(RuntimeEvidenceRecord(
                 evidence_id=f"ev_{uuid.uuid4().hex[:12]}",
