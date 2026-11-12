@@ -105,44 +105,6 @@ def _parse_gdb_xmm_registers(stdout: str) -> Dict[str, int]:
     return out
 
 
-def _x86_64_known_defect():
-    """expectedFailure for a whole test, active on x86_64 hosts only (see the `CI x86_64: real defect` notes)."""
-    if platform.machine() == "x86_64":
-        return unittest.expectedFailure
-    return lambda f: f
-
-
-@contextlib.contextmanager
-def _x86_64_known_defect_block(reason: str):
-    """Block-scoped equivalent of unittest.expectedFailure on x86_64: the block must fail there, and an
-    unexpected pass is reported so the marker gets removed. On other hosts the block runs normally."""
-    if platform.machine() != "x86_64":
-        yield
-        return
-    try:
-        yield
-    except (AssertionError, KeyError):
-        return
-    raise AssertionError(f"unexpected success: x86_64 known defect no longer reproduces ({reason})")
-
-
-def _clang_o2_loclist_defect(label: str):
-    """Context for the clang -O2 location-list checks.
-
-    # CI x86_64: real defect — parse_debug_loc_table()/DwarfIndexer yield no location lists for the clang -O2
-    # fixture. Observed on the ubuntu-22.04 runner (x86_64, runner-image clang, binutils 2.38): empty table
-    # (len 0) and DwarfVariable.location_list_offset is None for 'val'. Expected (and observed on aarch64 with
-    # clang 18 / binutils 2.42, and for x86_64 clang 18 objects linked here): non-empty table with a list for
-    # 'val'. The parser scrapes `readelf --debug-dump=loc|info` text, so this is most likely readelf/clang
-    # version specific output the regexes do not recognise (unconfirmed without the runner). The gcc_o2
-    # assertions stay strict; the clang_o2 assertions are kept and must still fail there (unexpected pass is
-    # reported so this marker gets removed).
-    """
-    if label == "clang_o2":
-        return _x86_64_known_defect_block("clang -O2 location lists")
-    return contextlib.nullcontext()
-
-
 class TestDwarfEvaluatorCorrectness(unittest.TestCase):
     """Deep verification of DWARF location evaluation, frame-base rules, and GDB parity."""
 
@@ -314,20 +276,19 @@ class TestDwarfEvaluatorCorrectness(unittest.TestCase):
         for label in ("gcc_o2", "clang_o2"):
             if label not in self.binaries:
                 continue
-            with _clang_o2_loclist_defect(label):
-                bin_path = self.binaries[label]
-                t = parse_debug_loc_table(bin_path)
-                self.assertGreater(len(t), 0, f"Location table for {label} must not be empty")
+            bin_path = self.binaries[label]
+            t = parse_debug_loc_table(bin_path)
+            self.assertGreater(len(t), 0, f"Location table for {label} must not be empty")
 
-                idx = DwarfIndexer.get_index(bin_path)
-                subp = idx.subprograms_by_name["test_clobbered_param"][0]
-                val_var = subp.get_variable("val")
-                self.assertIsNotNone(val_var)
-                self.assertIsNotNone(val_var.location_list_offset)
-                self.assertIn(val_var.location_list_offset, t, f"loc_offset for 'val' must exist in table for {label}")
+            idx = DwarfIndexer.get_index(bin_path)
+            subp = idx.subprograms_by_name["test_clobbered_param"][0]
+            val_var = subp.get_variable("val")
+            self.assertIsNotNone(val_var)
+            self.assertIsNotNone(val_var.location_list_offset)
+            self.assertIn(val_var.location_list_offset, t, f"loc_offset for 'val' must exist in table for {label}")
 
-                entries = t[val_var.location_list_offset]
-                self.assertGreaterEqual(len(entries), 2, f"'val' in {label} must have multiple range entries")
+            entries = t[val_var.location_list_offset]
+            self.assertGreaterEqual(len(entries), 2, f"'val' in {label} must have multiple range entries")
 
     def test_05_missing_or_corrupt_location_list_returns_error(self):
         """Malformed or missing location list must return ERROR, not OPTIMIZED_OUT."""
@@ -436,59 +397,58 @@ class TestDwarfEvaluatorCorrectness(unittest.TestCase):
         if not target_label:
             raise unittest.SkipTest("Neither Clang nor GCC -O2 binary available")
 
-        with _clang_o2_loclist_defect(target_label):
-            bin_path = self.binaries[target_label]
-            idx = DwarfIndexer.get_index(bin_path)
-            subp = idx.subprograms_by_name["test_clobbered_param"][0]
-            ident = inspect_elf(bin_path)
-            t = parse_debug_loc_table(bin_path)
+        bin_path = self.binaries[target_label]
+        idx = DwarfIndexer.get_index(bin_path)
+        subp = idx.subprograms_by_name["test_clobbered_param"][0]
+        ident = inspect_elf(bin_path)
+        t = parse_debug_loc_table(bin_path)
 
-            val_var = subp.get_variable("val")
-            loc_entries = t[val_var.location_list_offset]
+        val_var = subp.get_variable("val")
+        loc_entries = t[val_var.location_list_offset]
 
-            # 1. Entry range (parameter register live)
-            start_entry, end_entry, expr_entry = loc_entries[0]
-            self.assertIn("reg", expr_entry.lower())
-            ctx_entry = DwarfEvaluationContext(
+        # 1. Entry range (parameter register live)
+        start_entry, end_entry, expr_entry = loc_entries[0]
+        self.assertIn("reg", expr_entry.lower())
+        ctx_entry = DwarfEvaluationContext(
+            binary_identity=ident,
+            subprogram=subp,
+            link_time_address=start_entry,
+            registers={"x0": 100, "rdi": 100},
+            variable_name="val",
+            architecture=ident.architecture,
+        )
+        res_entry = DwarfEvaluator.evaluate(ctx_entry)
+        self.assertEqual(res_entry.status, EVAL_STATUS_OBSERVED)
+        self.assertEqual(res_entry.value, 100)
+
+        # 2. Entry value range (register clobbered by nested call)
+        ev_entry = next((e for e in loc_entries if "entry_value" in e[2]), None)
+        if ev_entry:
+            start_ev, end_ev, _ = ev_entry
+            ctx_ev = DwarfEvaluationContext(
                 binary_identity=ident,
                 subprogram=subp,
-                link_time_address=start_entry,
-                registers={"x0": 100, "rdi": 100},
+                link_time_address=start_ev,
+                registers={"x0": 999, "x19": 999, "rdi": 999, "rbx": 999},
                 variable_name="val",
                 architecture=ident.architecture,
             )
-            res_entry = DwarfEvaluator.evaluate(ctx_entry)
-            self.assertEqual(res_entry.status, EVAL_STATUS_OBSERVED)
-            self.assertEqual(res_entry.value, 100)
+            res_ev = DwarfEvaluator.evaluate(ctx_ev)
+            self.assertEqual(res_ev.status, EVAL_STATUS_OPTIMIZED_OUT)
+            self.assertIn("entry_value", res_ev.reason)
 
-            # 2. Entry value range (register clobbered by nested call)
-            ev_entry = next((e for e in loc_entries if "entry_value" in e[2]), None)
-            if ev_entry:
-                start_ev, end_ev, _ = ev_entry
-                ctx_ev = DwarfEvaluationContext(
-                    binary_identity=ident,
-                    subprogram=subp,
-                    link_time_address=start_ev,
-                    registers={"x0": 999, "x19": 999, "rdi": 999, "rbx": 999},
-                    variable_name="val",
-                    architecture=ident.architecture,
-                )
-                res_ev = DwarfEvaluator.evaluate(ctx_ev)
-                self.assertEqual(res_ev.status, EVAL_STATUS_OPTIMIZED_OUT)
-                self.assertIn("entry_value", res_ev.reason)
-
-            # 3. Beyond function boundary
-            ctx_out = DwarfEvaluationContext(
-                binary_identity=ident,
-                subprogram=subp,
-                link_time_address=subp.high_pc + 0x100,
-                registers={"x0": 100},
-                variable_name="val",
-                architecture=ident.architecture,
-            )
-            res_out = DwarfEvaluator.evaluate(ctx_out)
-            self.assertEqual(res_out.status, EVAL_STATUS_UNAVAILABLE)
-            self.assertIn("outside", res_out.reason)
+        # 3. Beyond function boundary
+        ctx_out = DwarfEvaluationContext(
+            binary_identity=ident,
+            subprogram=subp,
+            link_time_address=subp.high_pc + 0x100,
+            registers={"x0": 100},
+            variable_name="val",
+            architecture=ident.architecture,
+        )
+        res_out = DwarfEvaluator.evaluate(ctx_out)
+        self.assertEqual(res_out.status, EVAL_STATUS_UNAVAILABLE)
+        self.assertIn("outside", res_out.reason)
 
     # =========================================================================
     # 5. Non-PIE Binary Evaluation
@@ -735,12 +695,6 @@ class TestDwarfEvaluatorCorrectness(unittest.TestCase):
         self.assertIn("0xbadf00d", res.reason)
         self.assertIn("not found in debug data", res.reason)
 
-    # CI x86_64: real defect — DwarfSubprogram.frame_destroyed_pc is None for gcc -O0 `trace_target_function` on
-    # x86_64 (observed on the runner: "Function with frame teardown must have frame_destroyed_pc detected in
-    # CFI"); expected: the epilogue PC of the CFI rule change. parse_cfi_table() only treats DW_CFA_restore of the
-    # frame pointer as frame destruction (AArch64 `ldp x29, x30`), but x86_64 `leave/pop %rbp; ret` is encoded as
-    # `DW_CFA_def_cfa: r7 (rsp) ofs 8` with no DW_CFA_restore (verified on x86_64 gcc/clang objects).
-    @_x86_64_known_defect()
     def test_16_epilogue_frame_destruction_is_truthfully_unavailable(self):
         """Evaluating stack variables in function epilogue after frame destruction must return UNAVAILABLE."""
         target_label = "gcc_o0" if "gcc_o0" in self.binaries else None
@@ -909,39 +863,36 @@ class TestDwarfEvaluatorCorrectness(unittest.TestCase):
                     except ValueError:
                         pass
 
-            # On x86_64 the clang -O2 binary hits the location-list defect noted at _clang_o2_loclist_defect:
-            # GDB prints a value where the evaluator finds no location description. gcc stays strict.
-            with _clang_o2_loclist_defect(label):
-                for vname in ("i32", "u32", "i64", "u64"):
-                    self.assertIn(vname, gdb_prints, f"GDB did not print {vname}")
-                    ctx = DwarfEvaluationContext(
-                        binary_identity=ident,
-                        subprogram=subp,
-                        link_time_address=subp.low_pc,
-                        registers=regs,
-                        variable_name=vname,
-                        architecture=ident.architecture,
-                    )
-                    res = DwarfEvaluator.evaluate(ctx)
-                    if not _arg_in_register_at_entry(ident.architecture, vname):
-                        # x86_64 SysV passes u32/u64 (7th/8th integer args) on the stack: truthfully UNAVAILABLE at entry.
-                        self.assertEqual(res.status, EVAL_STATUS_UNAVAILABLE, f"{label} {vname}: {res.reason}")
-                        self.assertIn("prologue frame establishment", res.reason)
-                        self.assertIsNone(res.value)
-                        continue
-                    if gdb_prints[vname] == "<optimized out>":
-                        # GDB itself has no value for this variable at this PC (e.g. clang -O2 emits no location
-                        # for an argument it proved dead): the evaluator must agree and must not invent a value.
-                        self.assertIn(res.status, (EVAL_STATUS_OPTIMIZED_OUT, EVAL_STATUS_UNAVAILABLE),
-                                      f"{label} {vname}: GDB says <optimized out> but evaluator gave {res.status}")
-                        self.assertIsNone(res.value)
-                        continue
-                    self.assertEqual(res.status, EVAL_STATUS_OBSERVED, f"{label} {vname} failed: {res.reason}")
-                    self.assertEqual(
-                        res.value,
-                        gdb_prints[vname],
-                        f"{label} {vname} value mismatch: DynamicState={res.value} vs GDB={gdb_prints[vname]}",
-                    )
+            for vname in ("i32", "u32", "i64", "u64"):
+                self.assertIn(vname, gdb_prints, f"GDB did not print {vname}")
+                ctx = DwarfEvaluationContext(
+                    binary_identity=ident,
+                    subprogram=subp,
+                    link_time_address=subp.low_pc,
+                    registers=regs,
+                    variable_name=vname,
+                    architecture=ident.architecture,
+                )
+                res = DwarfEvaluator.evaluate(ctx)
+                if not _arg_in_register_at_entry(ident.architecture, vname):
+                    # x86_64 SysV passes u32/u64 (7th/8th integer args) on the stack: truthfully UNAVAILABLE at entry.
+                    self.assertEqual(res.status, EVAL_STATUS_UNAVAILABLE, f"{label} {vname}: {res.reason}")
+                    self.assertIn("prologue frame establishment", res.reason)
+                    self.assertIsNone(res.value)
+                    continue
+                if gdb_prints[vname] == "<optimized out>":
+                    # GDB itself has no value for this variable at this PC (e.g. clang -O2 emits no location
+                    # for an argument it proved dead): the evaluator must agree and must not invent a value.
+                    self.assertIn(res.status, (EVAL_STATUS_OPTIMIZED_OUT, EVAL_STATUS_UNAVAILABLE),
+                                  f"{label} {vname}: GDB says <optimized out> but evaluator gave {res.status}")
+                    self.assertIsNone(res.value)
+                    continue
+                self.assertEqual(res.status, EVAL_STATUS_OBSERVED, f"{label} {vname} failed: {res.reason}")
+                self.assertEqual(
+                    res.value,
+                    gdb_prints[vname],
+                    f"{label} {vname} value mismatch: DynamicState={res.value} vs GDB={gdb_prints[vname]}",
+                )
 
             if "flag" in gdb_prints:
                 ctx_flag = DwarfEvaluationContext(
@@ -1226,22 +1177,21 @@ class TestDwarfEvaluatorCorrectness(unittest.TestCase):
         for label in ("gcc_o2", "clang_o2"):
             if label not in self.binaries:
                 continue
-            with _clang_o2_loclist_defect(label):
-                bin_path = self.binaries[label]
-                loc_table = parse_debug_loc_table(bin_path)
-                self.assertIsInstance(loc_table, dict)
-                self.assertGreater(len(loc_table), 0, f"Location table for {label} must not be empty")
+            bin_path = self.binaries[label]
+            loc_table = parse_debug_loc_table(bin_path)
+            self.assertIsInstance(loc_table, dict)
+            self.assertGreater(len(loc_table), 0, f"Location table for {label} must not be empty")
 
-                for off, entries in loc_table.items():
-                    self.assertIsInstance(off, int)
-                    self.assertIsInstance(entries, list)
-                    for entry in entries:
-                        self.assertEqual(len(entry), 3)
-                        start_pc, end_pc, expr = entry
-                        self.assertIsInstance(start_pc, int)
-                        self.assertIsInstance(end_pc, int)
-                        self.assertIsInstance(expr, str)
-                        self.assertLessEqual(start_pc, end_pc)
+            for off, entries in loc_table.items():
+                self.assertIsInstance(off, int)
+                self.assertIsInstance(entries, list)
+                for entry in entries:
+                    self.assertEqual(len(entry), 3)
+                    start_pc, end_pc, expr = entry
+                    self.assertIsInstance(start_pc, int)
+                    self.assertIsInstance(end_pc, int)
+                    self.assertIsInstance(expr, str)
+                    self.assertLessEqual(start_pc, end_pc)
             tested_formats += 1
 
         self.assertGreater(tested_formats, 0, "At least one compiler output must be verified for location list parsing")

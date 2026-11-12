@@ -64,9 +64,13 @@ SUPPORT_TABLE: Dict[str, List[Tuple[Optional[str], Optional[str], Optional[int],
         ("aarch64", _ANY, 64, _ANY),
         ("arm", _ANY, 32, _ANY),
     ],
-    # glibc tcbhead_t self-pointer invariant + struct pthread tid offsets (x86-64 layout).
+    # x86_64: glibc tcbhead_t self-pointer invariant + struct pthread tid offsets.
+    # aarch64: TLS variant I; thread pointer found from the thread's TID + dtv consistency at the top of its
+    # stack / initial-TLS mapping (no hard-coded struct pthread layout; see
+    # tests/test_aarch64_tcb_discovery.py).
     FEATURE_TCB_SCAN: [
         ("x86_64", LIBC_GLIBC, 64, "little"),
+        ("aarch64", LIBC_GLIBC, 64, "little"),
     ],
     # IMP-011: frame parameter/local decoding.  The CFA of each frame comes from the CFI unwinder
     # (extractor/cfi_unwinder.py: .eh_frame/.debug_frame CFA programs, per-architecture DWARF register

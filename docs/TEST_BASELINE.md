@@ -35,10 +35,10 @@
 | 테스트 파일 | 245 | 246 |
 | 실행된 테스트 | 2,350 | 2,324 |
 | 실패한 파일 (파일별 실행) | 1 (로컬 LLM 시간 초과, 아래 참고) | 0 |
-| 단일 프로세스 실행 | OK (expected failures=3, skipped=1) | OK |
+| 단일 프로세스 실행 | OK (skipped=1) | OK |
 | 벤치마크 (`benchmarks/diagnosis_accuracy`) | 채점 대상 11개 중 9개 탐지, 원인 이름 완전 일치 6, 오탐 0/8 | 같음 |
 
-남아 있는 실제 결함 표시(`expectedFailure`): x86_64 전용 3건(`tests/test_dwarf_evaluator_correctness.py`: clang -O2 위치 목록 파싱, CFI 에필로그 규칙), TLS/TCB 탐색의 x86_64 가정 3건(`tests/test_phase46_*`, `tests/test_phase47_*` test_03).
+남아 있는 실제 결함 표시(`expectedFailure`): 없음. 이전 6건은 수정 후 표시를 제거했다: clang 14 / binutils 2.38의 위치 목록(`extractor/dwarf_loclists_binary.py`가 섹션 바이트를 직접 읽음), x86_64 CFI 에필로그(`parse_cfi_table`), aarch64 TLS/TCB 탐색(`_discover_thread_pointers_aarch64`). x86_64 CI 러너에서의 실행은 아직 확인되지 않았다(오브젝트 파일 분석과 ubuntu:22.04 컨테이너 재현으로만 확인).
 
 부하에 민감한 파일: `tests/test_phase15_conversational_llm.py`(이 호스트의 8000번 포트에 다른 서비스가 있어 실시간 LLM 검사가 시간 초과), `tests/test_imp_010_runnable_fraction.py`와 `tests/test_multithread_exploration.py`(`BASELINE_SERIAL` 표시, 기준선 스크립트가 단독 실행), `tests/test_phase2_0_a_3_12_real_cpp_e2e.py`, `tests/test_imp006_remote_diagnose.py`와 `tests/test_imp_012_human_report.py`의 누수 테스트(병렬 부하에서 간헐 실패, 단독 실행 시 통과). CI의 파일별 실행은 이 때문에 병렬도 2로 돈다.
 

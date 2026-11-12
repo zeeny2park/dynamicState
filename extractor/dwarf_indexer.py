@@ -549,7 +549,7 @@ class DwarfIndex:
     def to_cache_dict(self) -> Dict[str, Any]:
         """Serialize DwarfIndex to a JSON-compatible dictionary for persistent disk caching."""
         return {
-            "schema_version": "1.1.0",
+            "schema_version": "1.1.1",
             "artifact_path": self.artifact_path,
             "build_id": self.build_id,
             "pointer_size": self.pointer_size,
@@ -720,7 +720,7 @@ def parse_cfi_table(artifact_path: str, arch: str = "x86_64") -> Dict[int, Dict[
             cie_re = re.compile(r"^\s*([0-9a-fA-F]+)\s+[0-9a-fA-F]+\s+[0-9a-fA-F]+\s+CIE\b")
             fde_re = re.compile(r"FDE\s+cie=([0-9a-fA-F]+)\s+pc=([0-9a-fA-F]+)\.\.([0-9a-fA-F]+)")
             adv_re = re.compile(r"(?:DW_CFA_advance_loc\w*:\s+\d+\s+to\s+|DW_CFA_set_loc:\s+)([0-9a-fA-F]+)")
-            def_cfa_re = re.compile(r"DW_CFA_def_cfa:\s+(\w+)\s+ofs\s+(\d+)")
+            def_cfa_re = re.compile(r"DW_CFA_def_cfa:\s+(\w+)(?:\s+\([^)]*\))?\s+ofs\s+(\d+)")
             def_cfa_reg_re = re.compile(r"DW_CFA_def_cfa_register:\s+(\w+)")
             def_cfa_off_re = re.compile(r"DW_CFA_def_cfa_offset:\s+(\d+)")
             offset_fp_re = re.compile(r"DW_CFA_offset:\s+(?:r29|x29|r6|rbp)\b.*at cfa(-?\d+)")
@@ -735,6 +735,7 @@ def parse_cfi_table(artifact_path: str, arch: str = "x86_64") -> Dict[int, Dict[
             fp_established: bool = False
             last_rule_pc: int = 0
             state_stack: List[Tuple[str, int, bool]] = []
+            fde_entry_cfa: Tuple[str, int] = ("sp", 0)
 
             assert proc.stdout is not None
             for raw_line in proc.stdout:
@@ -779,6 +780,7 @@ def parse_cfi_table(artifact_path: str, arch: str = "x86_64") -> Dict[int, Dict[
                         curr_cfa_reg = "sp"
                         curr_cfa_off = 0 if arch in ("aarch64", "arm64") else 8
                     fp_established = False
+                    fde_entry_cfa = (curr_cfa_reg, curr_cfa_off)
                     last_rule_pc = low_pc
                     state_stack.clear()
                     curr_cie_offset = None
@@ -845,8 +847,24 @@ def parse_cfi_table(artifact_path: str, arch: str = "x86_64") -> Dict[int, Dict[
                     curr_fde["fp_offset_from_cfa"] = int(m_off.group(1))
                     if curr_fde["frame_established_pc"] is None:
                         curr_fde["frame_established_pc"] = curr_pc
+                    # A frame set up again after an epilogue (code shared by several exit paths) is live again:
+                    # only a teardown that is not followed by a new frame marks the end of the function's frame.
+                    curr_fde["frame_destroyed_pc"] = None
 
-                if restore_fp_re.search(line):
+                if restore_fp_re.search(line) and not state_stack:
+                    fp_established = False
+                    if curr_fde["frame_destroyed_pc"] is None:
+                        curr_fde["frame_destroyed_pc"] = curr_pc
+                elif (
+                    (m_cfa or m_cfa_r or m_cfa_o)
+                    and curr_fde["frame_established_pc"] is not None
+                    and not state_stack
+                    and (curr_cfa_reg, curr_cfa_off) == fde_entry_cfa
+                ):
+                    # Epilogue without DW_CFA_restore (x86_64 `pop %rbp; ret` is only
+                    # `DW_CFA_def_cfa: r7 (rsp) ofs 8`): the CFA rule is back to the CIE entry state after the
+                    # frame had been set up, so the frame is gone from this PC on. Early-return epilogues inside
+                    # DW_CFA_remember_state/restore_state pairs are not the end of the function and are skipped.
                     fp_established = False
                     if curr_fde["frame_destroyed_pc"] is None:
                         curr_fde["frame_destroyed_pc"] = curr_pc
@@ -936,7 +954,7 @@ class DwarfIndexer:
                 try:
                     with open(disk_cache_file, "r", encoding="utf-8") as cf:
                         cached_data = json.load(cf)
-                    if cached_data.get("schema_version") == "1.1.0":
+                    if cached_data.get("schema_version") == "1.1.1":
                         index = DwarfIndex.from_cache_dict(cached_data)
                         with cls._lock:
                             cls._cache[cache_key] = index
@@ -1088,6 +1106,22 @@ class DwarfIndexer:
         return None
 
     @classmethod
+    def _read_tls_symbols(cls, path: str) -> Dict[str, int]:
+        """{symbol name: st_value} of the STT_TLS symbols (offsets inside the PT_TLS segment)."""
+        out: Dict[str, int] = {}
+        try:
+            res = subprocess.run(["readelf", "-s", "-W", path], capture_output=True, text=True,
+                                 errors="replace", check=False, timeout=30)
+        except Exception:
+            return out
+        sym_re = re.compile(r"^\s*\d+:\s+([0-9a-fA-F]+)\s+\S+\s+TLS\s+\S+\s+\S+\s+(\S+)\s+(\S+)")
+        for line in res.stdout.splitlines():
+            m = sym_re.match(line)
+            if m and m.group(2) != "UND":
+                out.setdefault(m.group(3).split("@")[0], int(m.group(1), 16))
+        return out
+
+    @classmethod
     def _parse_tls_offset(cls, val: str) -> Optional[int]:
         if "DW_OP_form_tls_address" not in val and "DW_OP_gnu_push_tls_address" not in val:
             return None
@@ -1105,6 +1139,10 @@ class DwarfIndexer:
 
     @classmethod
     def _parse_int(cls, val: str) -> int:
+        # binutils < 2.39 prints DW_FORM_addrx values as bare hex: "(addr_index: 0x0): 401000"
+        m_ax = re.match(r"^\s*\((?:addr_)?index: [^)]*\):\s*([0-9a-fA-F]+)\s*$", val)
+        if m_ax:
+            return int(m_ax.group(1), 16)
         if "): " in val:
             val = val.split("): ", 1)[1]
         m = re.search(r"DW_OP_plus_uconst\s*(\d+)", val)
@@ -1364,6 +1402,12 @@ class DwarfIndexer:
 
         # Second pass: parse variables and subprograms
         cfi_table = parse_cfi_table(path, index.architecture)
+        # Location lists read from the section bytes: binutils < 2.39 cannot decode DW_FORM_loclistx (clang 14+,
+        # DWARF 5) and prints an empty DW_AT_location, so DIEs without readable text fall back to this map.
+        binary_loclists: Optional[Dict[int, int]] = None
+        # aarch64 gcc/clang emit no DW_AT_location for __thread variables (no DTPREL relocation in .debug_info);
+        # their offset inside the PT_TLS segment is the st_value of the STT_TLS symbol of the same name.
+        tls_symbols: Optional[Dict[str, int]] = None
 
         for die_idx, d in enumerate(dies):
             if d["tag"] == "DW_TAG_variable":
@@ -1398,6 +1442,15 @@ class DwarfIndexer:
                         v_file = file_table.get(sf_idx) or (cls._clean_str(spec_die["attrs"].get("DW_AT_decl_file", "")) if spec_die["attrs"].get("DW_AT_decl_file") else None)
                     if not v_line:
                         v_line = cls._parse_int(spec_die["attrs"].get("DW_AT_decl_line", "0")) or None
+
+                if not loc_raw and not is_decl and not is_tls_var and (name or linkage_name):
+                    if tls_symbols is None:
+                        tls_symbols = cls._read_tls_symbols(path)
+                    sym_off = tls_symbols.get(linkage_name) if linkage_name else None
+                    if sym_off is None and name:
+                        sym_off = tls_symbols.get(name)
+                    if sym_off is not None:
+                        tls_off, is_tls_var = sym_off, True
 
                 var = DwarfVariable(
                     die_offset=d["offset"],
@@ -1505,6 +1558,11 @@ class DwarfIndexer:
                             c_loc_raw = c_attrs.get("DW_AT_location", "")
                             c_loc_expr = None
                             c_loc_list = None
+                            if not c_loc_raw:
+                                if binary_loclists is None:
+                                    from .dwarf_loclists_binary import read_location_lists
+                                    binary_loclists = read_location_lists(path).by_die
+                                c_loc_list = binary_loclists.get(child["offset"])
                             if c_loc_raw:
                                 if "(location list)" in c_loc_raw:
                                     m_off = re.search(r"(?:^|:\s*|[\s(])(?:0x)?([0-9a-fA-F]+)\s+\(location list\)", c_loc_raw)
