@@ -20,9 +20,9 @@ Fail if: the agent asks for symbols it does not need, or calls many tools before
 
 ## 2. Healthy fixture
 Start a `healthy` target. Prompt: "Is PID <pid> healthy?"
-Pass if: `diagnose` is called once; if the verdict is HEALTHY the message says "no problem found in the checks that ran"
-and lists `not_covered`; if the verdict is INCONCLUSIVE (the benchmark currently returns INCONCLUSIVE for healthy
-controls) the agent does NOT say "no problem" / "healthy" and says it could not tell and why.
+Pass if: `diagnose` is called once; if the verdict is HEALTHY the message says "healthy within the checked scope"
+and names what was not checked (`healthy_scope.not_checked`); if the verdict is INCONCLUSIVE the agent does NOT say
+"no problem" / "healthy" and says it could not tell and why.
 
 ## 3. Missing debug ELF
 Strip a copy of a target (`strip -s -o /tmp/app.stripped <elf>`), run it, prompt: "Diagnose PID <pid>."

@@ -261,8 +261,9 @@ class TestHumanReportReal(unittest.TestCase):
                 self.assertNotIn("정상", text)
                 self.assertTrue("inconclusive" in first or "aborted" in first or "판단 불가" in first or "중단" in first, first)
             elif res["verdict"] == "HEALTHY":
-                # a clean result is reported as "nothing found by these checks", with the caveat attached
-                self.assertTrue("not prove" in first or "증명은 아니" in first, first)
+                # HEALTHY rule: "healthy within the checked scope", and the same sentence names what was not checked
+                self.assertTrue("healthy within the checked scope" in first or "점검한 범위 안에서 정상" in first, first)
+                self.assertTrue("Not checked:" in first or "점검하지 못한 것:" in first, first)
             else:
                 self.assertTrue(res["findings"], "a fault verdict needs a named finding")
             pos = [text.index("## " + h) for h in (HEADERS_EN if lang == "en" else HEADERS_KO)[:6]]

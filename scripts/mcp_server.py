@@ -780,7 +780,9 @@ def runtime_diagnose_process(
     report_path, investigation_id and target, plus human_summary: a plain-language Markdown report (conclusion,
     names and source locations, reasoning, certainty and what was not examined, next steps, measured impact) in
     the requested language. Relay human_summary to the user. An unreadable PID or missing debug image gives INCONCLUSIVE
-    with the cause in not_covered; it is never reported as healthy.
+    with the cause in not_covered; it is never reported as healthy. HEALTHY means every baseline check ran to
+    completion and found nothing, within a stated scope: healthy_scope lists what was checked and what was not
+    (not_checked); always relay the not-checked items with a HEALTHY verdict.
 
     Args:
         pid: PID of the target process (required).

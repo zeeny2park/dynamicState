@@ -147,7 +147,8 @@ Then open `http://127.0.0.1:8765/workspace`.
   - Works today: **deadlocks** are confirmed with the lock names and thread names (and the lock call's source line, within a few lines).
   - Not yet: leaks, heap overflow, use-after-free, busy-wait and long stalls are usually `INCONCLUSIVE` from `diagnose`.
     For leaks and buffer ownership use `runtime_heap_leak_candidates` and `runtime_heap_owner_lookup` directly.
-  - Healthy processes are not yet cleared: they come back `INCONCLUSIVE`, never `HEALTHY` and never a false fault.
+  - Healthy processes are cleared as `HEALTHY` only when every baseline check ran to completion and found nothing;
+    `healthy_scope` lists what was checked and what was not ([docs/HEALTHY_VERDICT.md](docs/HEALTHY_VERDICT.md)).
     Treat `INCONCLUSIVE` as "could not tell".
   - The result depends on the symptom wording ("the service stopped responding" is `INCONCLUSIVE` on a real deadlock; the default general check finds it).
 - Remote one-call diagnosis has the gaps listed above (`remote_limitation` in `not_covered`).

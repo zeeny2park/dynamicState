@@ -1,0 +1,272 @@
+"""The HEALTHY verdict of ``diagnose`` (rule RULE_5B_HEALTHY_WITHIN_BASELINE_SCOPE; docs/HEALTHY_VERDICT.md).
+
+HEALTHY means: every baseline check ran to completion with the evidence it needs and found nothing, within its
+stated scope.  It is a positive statement about what was checked, never "nothing was found because nothing could
+be looked at" (that stays INCONCLUSIVE, IMP-001).
+
+A diagnosis is HEALTHY only if ALL of the following hold:
+
+1. Collection succeeded: none of the blocking ``not_covered`` kinds (``BLOCKING_KINDS``: target unreadable /
+   unreachable, missing debug image, ABI detection failed, a stage failed, nothing executed, a baseline check not
+   run, observation budget exhausted, engine limitation, unattributed finding, unexpected error) and no kind this
+   rule does not know (an unknown kind blocks).
+2. No finding of any severity and no FAIL check (baseline or symptom-specific); the aggregator verdict is
+   INCONCLUSIVE or HEALTHY (never a fault, DEGRADED or ABORTED).
+3. Every baseline recipe (``diagnostic_recipes.BASELINE_RECIPE_IDS``) has at least one executed check and every
+   check of it cleared:
+   * status PASS (the recipe looked and found nothing: CONTRADICTED), or
+   * RECIPE_HEAP_METADATA_CORRUPTION INCONCLUSIVE only because the heap was above the baseline walk cap (a declared
+     cost limit: ``memory_integrity.heap.not_checked_reason == "above_baseline_cap"``) while the global-adjacency
+     and stack-margin parts completed and found nothing.  Listed in ``not_checked``.
+   Anything else (INCONCLUSIVE, ERROR, NOT_APPLICABLE, UNSUPPORTED, NOT_EXECUTED) blocks.  In particular a baseline
+   check that could not run for a target-support reason (e.g. mutex owners not decodable -> the deadlock / lock
+   checks are INCONCLUSIVE) blocks: the question it owns was not answered.
+4. Scope limits do not block but are listed in ``healthy_scope.not_checked`` and named in the summary:
+   features unsupported on the target ABI that no baseline check needed (``unsupported_on_target``), the heap cap
+   above, long waits in syscalls whose expectedness cannot be judged from outside (``long_wait_not_judged``),
+   leak-owner attribution limits when the leak check itself cleared, remote-target limits, symptom-specific
+   (non-baseline) checks that reached no result, and recipes not planned for the symptom.
+
+Symptom-specific checks never gate HEALTHY (a FAIL still does, through rule 2): their scope is the symptom, the
+HEALTHY scope is the baseline.  Defect classes no baseline check looks for (use-after-free, double free, data
+races, logic errors) are always listed as not checked (``outside_baseline``).
+"""
+
+from __future__ import annotations
+
+from typing import Any, Dict, Iterable, List, Optional, Tuple
+
+from .diagnostic_methodology import CheckStatus
+
+HEALTHY_RULE_ID = "RULE_5B_HEALTHY_WITHIN_BASELINE_SCOPE"
+
+# not_covered kinds that mean the diagnosis could not look (never a scope limit)
+BLOCKING_KINDS = frozenset({
+    "target_unreadable", "target_unreachable", "invalid_target", "missing_debug_image", "abi_detection_failed",
+    "stage_failed", "not_executed", "baseline_check_not_run", "budget_exhausted", "limitation",
+    "unattributed_finding", "unexpected_error",
+})
+# not_covered kinds that are declared scope limits (listed, not blocking).  check_* kinds are decided per check.
+SCOPE_KINDS = frozenset({
+    "unsupported_on_target", "recipes_not_planned", "remote_limitation", "collector_not_deployed",
+    "integrity_not_checked", "integrity_limited", "leak_owner_limited", "report_not_saved", "long_wait_not_judged",
+})
+
+# What each built-in baseline check clears, in plain words (en, ko).  A plugin baseline recipe uses its name.
+BASELINE_SCOPE_LABELS: Dict[str, Tuple[str, str]] = {
+    "RECIPE_THREAD_STATE_ANOMALIES": ("threads spinning without progress, zombie or stuck threads",
+                                      "진전 없이 도는 스레드, 좀비·멈춘 스레드"),
+    "RECIPE_LONG_RUNNING_BLOCKED_THREADS": ("threads blocked on a lock whose owner makes no progress",
+                                            "락 소유자가 진행하지 않는데 그 락을 기다리는 스레드"),
+    "RECIPE_SUSPICIOUS_LOCK_OWNERSHIP": ("locks held by a dead or invalid owner", "죽었거나 잘못된 소유자가 잡은 락"),
+    "RECIPE_POTENTIAL_DEADLOCK_PATTERNS": ("deadlock (lock wait-for cycles)", "교착 상태(락 대기 고리)"),
+    "RECIPE_PROCESS_MEMORY_GROWTH": ("memory growth / leak in the observation window", "관측 구간의 메모리 증가·누수"),
+    "RECIPE_HEAP_METADATA_CORRUPTION": ("heap metadata damage, global array overruns, stack exhaustion",
+                                        "힙 메타데이터 손상, 전역 배열 넘침, 스택 고갈"),
+    "RECIPE_FD_LEAK": ("file-descriptor leak", "파일 디스크립터 누수"),
+}
+
+OUTSIDE_BASELINE = ("use-after-free, double free, data races and program-logic errors (no baseline check looks "
+                    "for them)",
+                    "해제 후 사용, 이중 해제, 데이터 레이스, 프로그램 논리 오류 (기본 검사가 찾지 않는 종류)")
+
+
+_NOT_CHECKED_ORDER = {k: i for i, k in enumerate((
+    "integrity_not_checked", "long_wait_not_judged", "leak_owner_limited", "integrity_limited",
+    "unsupported_on_target", "remote_limitation", "symptom_checks_without_result", "outside_baseline"))}
+
+
+def _st(c: Any) -> str:
+    return str(getattr(c, "status", ""))
+
+
+def _obs(c: Any) -> Dict[str, Any]:
+    ob = getattr(c, "actual_observations", None)
+    return ob if isinstance(ob, dict) else {}
+
+
+def _plain(recipe_id: str) -> str:
+    return str(recipe_id).replace("RECIPE_", "").replace("_", " ").lower()
+
+
+def _heap_cap_scope_limit(c: Any) -> Optional[Dict[str, Any]]:
+    """RECIPE_HEAP_METADATA_CORRUPTION that is INCONCLUSIVE only because of the baseline heap cap -> scope item."""
+    mi = _obs(c).get("memory_integrity")
+    if not isinstance(mi, dict):
+        return None
+    heap = mi.get("heap") or {}
+    if heap.get("status") != "NOT_CHECKED" or heap.get("not_checked_reason") != "above_baseline_cap":
+        return None
+    if (mi.get("globals") or {}).get("status") != "COMPLETED" or (mi.get("stacks") or {}).get("status") != "COMPLETED":
+        return None
+    if heap.get("defects") or (mi.get("globals") or {}).get("candidates") or (mi.get("stacks") or {}).get("warnings"):
+        return None
+    mb = float(heap.get("estimated_heap_bytes") or 0) / 1048576.0
+    cap = float(heap.get("baseline_cap_bytes") or 0) / 1048576.0
+    return {"kind": "integrity_not_checked", "item": "heap_integrity",
+            "label": (f"heap integrity (heap {mb:.1f} MiB is above the {cap:.1f} MiB baseline walk cap; global "
+                      "arrays and stack margins were checked)",
+                      f"힙 무결성 (힙 {mb:.1f} MiB가 기본 검사 상한 {cap:.1f} MiB보다 큼; 전역 배열과 스택 여유는 검사함)"),
+            "reason": "heap integrity not checked: heap larger than the baseline cap; a memory-corruption symptom "
+                      "runs the full walk"}
+
+
+def long_wait_scope_items(checks: Iterable[Any]) -> List[Dict[str, Any]]:
+    """not_covered rows for long waits a PASSed RECIPE_LONG_RUNNING_BLOCKED_THREADS could not judge."""
+    out: List[Dict[str, Any]] = []
+    seen = set()
+    for c in checks:
+        if getattr(c, "recipe_id", None) != "RECIPE_LONG_RUNNING_BLOCKED_THREADS" or _st(c) != CheckStatus.PASS:
+            continue
+        for t in _obs(c).get("long_wait_threads") or []:
+            if not isinstance(t, dict) or t.get("tid") in seen:
+                continue
+            seen.add(t.get("tid"))
+            out.append({"kind": "long_wait_not_judged", "item": f"{t.get('name')} (tid {t.get('tid')})",
+                        "thread": t.get("name"), "tid": t.get("tid"), "syscall": t.get("syscall"),
+                        "reason": f"waited in {t.get('syscall')}"
+                                  f"{' (' + str(t.get('wait_kind')) + ')' if t.get('wait_kind') else ''} for the whole "
+                                  f"{t.get('waited_at_least_sec')} s window: an idle wait and a stall look the same "
+                                  "from outside, so whether this wait is expected was not judged"})
+    return out
+
+
+def evaluate(*, verdict: str, findings: List[Dict[str, Any]], checks: List[Any], not_covered: List[Dict[str, Any]],
+             baseline_ids: Iterable[str], recipe_names: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
+    """Apply the HEALTHY rule.  ``checks`` are the session's executed DiagnosticCheck objects.
+
+    Returns ``healthy_scope``: {rule, healthy (bool), checked [{recipe_id, what, what_ko, result}],
+    not_checked [{kind, item, label, label_ko, reason}], blocking [{kind, item, reason}]}."""
+    names = recipe_names or {}
+    baseline = list(dict.fromkeys(baseline_ids))
+    blocking: List[Dict[str, Any]] = []
+    not_checked: List[Dict[str, Any]] = []
+    checked: List[Dict[str, Any]] = []
+
+    def block(kind: str, item: str, reason: str) -> None:
+        blocking.append({"kind": kind, "item": item, "reason": reason})
+
+    if verdict not in ("INCONCLUSIVE", "HEALTHY"):
+        block("verdict", verdict, f"the aggregated verdict is {verdict}")
+    if findings:
+        block("finding", ",".join(dict.fromkeys(str(f.get("category")) for f in findings)),
+              f"{len(findings)} finding(s) were produced")
+    for c in checks:
+        if _st(c) == CheckStatus.FAIL:
+            block("check_fail", str(getattr(c, "recipe_id", "")), "a check found the anomaly it looks for")
+
+    # 3. baseline checks
+    by_recipe: Dict[str, List[Any]] = {}
+    for c in checks:
+        by_recipe.setdefault(str(getattr(c, "recipe_id", "")), []).append(c)
+    for rid in baseline:
+        cs = by_recipe.get(rid) or []
+        if not cs:
+            block("baseline_check_missing", rid, "baseline check was not executed")
+            continue
+        ok = True
+        partial: List[str] = []
+        for c in cs:
+            st = _st(c)
+            if st == CheckStatus.PASS:
+                continue
+            lim = _heap_cap_scope_limit(c) if rid == "RECIPE_HEAP_METADATA_CORRUPTION" and \
+                st == CheckStatus.INCONCLUSIVE else None
+            if lim is not None:
+                partial.append("global arrays and stack margins checked, heap not walked (above the baseline cap)")
+                not_checked.append({"kind": lim["kind"], "item": lim["item"], "label": lim["label"][0],
+                                    "label_ko": lim["label"][1], "reason": lim["reason"]})
+                continue
+            ok = False
+            why = "; ".join(list(getattr(c, "limitations", None) or []) + list(getattr(c, "missing_evidence", None) or [])) \
+                or str(getattr(c, "technical_interpretation", "") or "")
+            block(f"baseline_check_{st.lower()}", rid, f"baseline check ended {st}" + (f": {why}" if why else ""))
+        if ok:
+            en, ko = BASELINE_SCOPE_LABELS.get(rid, (names.get(rid) or _plain(rid),) * 2)
+            res = "; ".join([str(getattr(c, "technical_interpretation", "") or "") for c in cs
+                             if _st(c) == CheckStatus.PASS] + partial)
+            checked.append({"recipe_id": rid, "what": en, "what_ko": ko, "result": res})
+
+    # 4. not_covered: blocking kinds vs scope limits
+    sym_open: List[str] = []
+    long_waits: List[Dict[str, Any]] = []
+    for n in not_covered:
+        kind = str(n.get("kind") or "")
+        item = str(n.get("item") or "")
+        if kind.startswith("check_"):
+            if item in baseline:
+                continue  # decided per check above
+            if item not in sym_open:
+                sym_open.append(item)
+            continue
+        if kind == "unsupported_on_target" and item in baseline:
+            continue  # the check itself is INCONCLUSIVE and blocks above
+        if kind in BLOCKING_KINDS or kind not in SCOPE_KINDS:
+            block(kind, item, str(n.get("reason") or kind))
+            continue
+        if kind == "integrity_not_checked" and any(x["kind"] == "integrity_not_checked" for x in not_checked):
+            continue  # already listed from the heap-cap decision
+        if kind == "recipes_not_planned":
+            continue  # summarised below with the symptom-specific checks
+        if kind == "long_wait_not_judged":
+            long_waits.append(n)
+            continue  # one item for all long waits, below
+        label = {
+            "unsupported_on_target": (f"{item} (not supported on this target)", f"{item} (이 대상에서 지원되지 않음)"),
+            "leak_owner_limited": ("which variable owns heap memory (leak-owner attribution was limited)",
+                                   "힙 메모리를 쥔 변수 추적 (누수 소유자 추적이 제한됨)"),
+            "integrity_limited": (f"part of the memory-integrity check ({n.get('reason')})",
+                                  f"메모리 무결성 검사의 일부 (엔진 원문: {n.get('reason')})"),
+            "integrity_not_checked": (f"part of the memory-integrity check ({n.get('reason')})",
+                                      f"메모리 무결성 검사의 일부 (엔진 원문: {n.get('reason')})"),
+            "remote_limitation": (f"{item} on the remote target", f"원격 대상의 {item}"),
+            "collector_not_deployed": ("native collector (slower shell reads were used)", "네이티브 수집기 (느린 셸 읽기 사용)"),
+            "report_not_saved": ("saving the full report", "전체 보고서 저장"),
+        }.get(kind, (item, item))
+        not_checked.append({"kind": kind, "item": item, "label": label[0], "label_ko": label[1],
+                            "reason": str(n.get("reason") or "")})
+    if long_waits:
+        who = ", ".join(str(n.get("item")) for n in long_waits[:4]) + (
+            f" and {len(long_waits) - 4} more" if len(long_waits) > 4 else "")
+        who_ko = ", ".join(str(n.get("item")) for n in long_waits[:4]) + (
+            f" 외 {len(long_waits) - 4}개" if len(long_waits) > 4 else "")
+        not_checked.append({"kind": "long_wait_not_judged", "item": ",".join(str(n.get("item")) for n in long_waits),
+                            "label": f"whether the long wait of {who} is expected (an idle wait and a stall look "
+                                     "the same from outside)",
+                            "label_ko": f"{who_ko}의 긴 대기가 정상인지 (밖에서는 유휴 대기와 멈춤이 같아 보임)",
+                            "reason": "; ".join(f"{n.get('item')}: {n.get('reason')}" for n in long_waits)})
+    if sym_open:
+        plain = ", ".join(_plain(x) for x in sym_open)
+        not_checked.append({"kind": "symptom_checks_without_result", "item": ",".join(sym_open),
+                            "label": f"symptom-specific checks that reached no result ({plain})",
+                            "label_ko": f"결론을 내지 못한 증상별 추가 검사 ({plain})",
+                            "reason": "these checks are not part of the baseline; they ran but could not decide"})
+    not_checked.append({"kind": "outside_baseline", "item": "outside_baseline", "label": OUTSIDE_BASELINE[0],
+                        "label_ko": OUTSIDE_BASELINE[1], "reason": "not covered by any baseline check"})
+    # most consequential first (the summary names the first few)
+    not_checked.sort(key=lambda x: _NOT_CHECKED_ORDER.get(x["kind"], len(_NOT_CHECKED_ORDER)))
+    return {"rule": HEALTHY_RULE_ID, "healthy": not blocking, "checked": checked, "not_checked": not_checked,
+            "blocking": blocking}
+
+
+def not_healthy_scope(not_covered: List[Dict[str, Any]], why: str) -> Dict[str, Any]:
+    """healthy_scope of a diagnosis that stopped before the checks (pre-flight / stage failure)."""
+    blocking = [{"kind": str(n.get("kind")), "item": str(n.get("item")), "reason": str(n.get("reason") or "")}
+                for n in not_covered if n.get("kind") not in SCOPE_KINDS] or [{"kind": "not_run", "item": "diagnosis",
+                                                                                 "reason": why}]
+    return {"rule": HEALTHY_RULE_ID, "healthy": False, "checked": [], "not_checked": [], "blocking": blocking}
+
+
+def summary_sentence(scope: Dict[str, Any], n_baseline: int, lang: str = "en", max_items: int = 3) -> str:
+    """First sentence of a HEALTHY summary: healthy within scope + what was not checked."""
+    ko = lang == "ko"
+    items = [x.get("label_ko" if ko else "label") or x.get("item") for x in scope.get("not_checked") or []]
+    shown = items[:max_items]
+    more = len(items) - len(shown)
+    if ko:
+        s = (f"점검한 범위 안에서 정상입니다: 기본 검사 {n_baseline}개가 모두 끝까지 실행되었고 아무것도 발견하지 "
+             f"못했습니다. 점검하지 못한 것: {'; '.join(shown)}")
+        return s + (f" 외 {more}건." if more > 0 else ".")
+    s = (f"healthy within the checked scope: all {n_baseline} baseline checks ran to completion and found nothing. "
+         f"Not checked: {'; '.join(shown)}")
+    return s + (f"; and {more} more." if more > 0 else ".")

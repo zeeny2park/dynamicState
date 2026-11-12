@@ -39,7 +39,10 @@ report the result honestly.
 
 ## Reading the result
 - `verdict`: CONFIRMED_FAULT (a named problem, evidence in hand), PROBABLE_FAULT / FAULT (likely, not fully proven),
-  DEGRADED, HEALTHY (nothing found within the checks that ran), INCONCLUSIVE (could not decide), ABORTED.
+  DEGRADED, HEALTHY (every baseline check ran to completion and found nothing, within the scope in `healthy_scope`),
+  INCONCLUSIVE (could not decide), ABORTED.
+- `healthy_scope`: `checked` (what the baseline checks cleared), `not_checked` (scope limits of a HEALTHY verdict),
+  `blocking` (why the run is not HEALTHY).
 - `findings[]`: `category` (kind of problem, e.g. deadlock), `severity`, `status`, `description`, `subjects` (the concrete
   lock, thread, function, variable or `file:line` names), `evidence_ids`. A finding without subjects is not a diagnosis.
 - `checks_run[]`: what was actually executed and its status.
@@ -65,7 +68,7 @@ report the result honestly.
   - remote_limitation: things a remote diagnosis cannot examine (thread-local storage, stacks of threads that were running, symbols of libraries that could not be fetched). State them as not examined.
   - unsupported_on_target: say the feature is not supported there; do not substitute a guess.
   - no findings: if you passed a symptom, re-run `diagnose` once without `symptom` (general health check); then offer the narrower tools above for the user's symptom.
-- HEALTHY: say "no problem was found in the checks that ran", then list `not_covered`. It does not prove the process is fine.
+- HEALTHY: say it is healthy within the checked scope, then name `healthy_scope.not_checked` (e.g. long waits whose expectedness was not judged, heap integrity above the walk cap, use-after-free). Nothing outside that scope is claimed.
 - ABORTED: report why (`not_covered`, `summary`) and ask how to proceed.
 
 ## Explaining the result to the user
