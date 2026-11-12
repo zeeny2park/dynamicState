@@ -12,4 +12,4 @@
 | Collection cost (wall time, remote commands) | PASS |
 | Process discovery / identity / maps via BusyBox shell tools | PASS |
 | overall | PASS |
-| run time (s) | 330.3 |
+| run time (s) | 183.1 |

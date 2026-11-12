@@ -10,6 +10,7 @@ import threading
 import time
 import unittest
 from unittest.mock import patch
+from tests.remote_ident_compat import is_ident_probe, legacy_probe_reply
 
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if PROJECT_ROOT not in sys.path:
@@ -92,6 +93,8 @@ class TestPhase32RemoteAndMcpImprovements(unittest.TestCase):
 
         def mock_ssh_runner(cmd_args, timeout):
             remote_cmd = cmd_args[-1]
+            if is_ident_probe(remote_cmd):
+                return legacy_probe_reply(remote_cmd, lambda q: mock_ssh_runner(["ssh", q], timeout))
             if "for p in /proc/[0-9]*" in remote_cmd:
                 return 0, "8842|app_prod|/opt/bin/app_prod.stripped|/opt/bin/app_prod.stripped --daemon\n", ""
             if "kill -0 8842" in remote_cmd:

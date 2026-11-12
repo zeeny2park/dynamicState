@@ -150,6 +150,19 @@ Daemon commands that let the host measure what a diagnosis costs the target (one
 Older collectors answer `UNKNOWN_COMMAND`; the host then falls back to one batched `sh` command (no collector
 CPU/memory figures in that case, and the report says so).
 
+### Identity and /proc text files (`IDENT`, `PROCFILE`; collector >= 1.3.0, IMP-022)
+
+Daemon commands that replace several ssh commands each (identity re-verification used to cost four per memory read):
+
+- `IDENT <pid> [HDR]` -> `stat` (raw `/proc/PID/stat`), `exe` (readlink of `/proc/PID/exe`), `exe_fp` (`inode:size:mtime`
+  of the executable file), `boot_id`, `machine` (`uname -m`) and, with `HDR`, `hdr_hex` (first 64 KiB of the executable).
+  `TARGET_TERMINATED` when the process is gone.
+- `PROCFILE <pid> <name>` with `name` one of `maps`, `status`, `stat`, `limits`, `comm` -> `{"success":true,"text":...}`
+  (JSON-escaped, at most 16 MiB, `truncated` flag); other names are `INVALID_ARGS`.
+
+Older collectors answer `UNKNOWN_COMMAND`; the host then uses one batched `sh` command for the identity probe and
+single `cat` commands for the files.
+
 ### Thread information (`THREADS`, `--threads`; collector >= 1.1.0, IMP-011)
 
 One reply carries every thread of a process, so a thread sample costs one exchange regardless of the thread count:

@@ -1810,6 +1810,129 @@ int collector_report_impact(pid_t pid, void *out_file) {
     return 0;
 }
 
+
+/* ---- IMP-022: identity probe and whitelisted /proc text files in ONE exchange ------------------
+ * IDENT <pid> [HDR]: what the host needs to pin / re-verify a target's identity: raw /proc/PID/stat,
+ * the exe link, a fingerprint of the exe file (ino:size:mtime), boot_id, uname machine and (HDR) the
+ * first 64 KiB of the executable as hex.  PROCFILE <pid> <name>: the text of /proc/PID/<name> for a
+ * fixed whitelist (maps, status, stat, limits, comm), JSON-escaped, at most PROCFILE_MAX bytes. */
+#define PROCFILE_MAX (16u * 1024u * 1024u)
+#define IDENT_HDR_BYTES 65536
+
+static void put_json_escaped(FILE *out, const char *buf, size_t n) {
+    for (size_t i = 0; i < n; i++) {
+        unsigned char c = (unsigned char)buf[i];
+        if (c == '"' || c == '\\') { fputc('\\', out); fputc(c, out); }
+        else if (c == '\n') fputs("\\n", out);
+        else if (c == '\t') fputs("\\t", out);
+        else if (c < 0x20) fprintf(out, "\\u%04x", c);
+        else fputc(c, out);
+    }
+}
+
+int collector_report_ident(pid_t pid, int with_header, void *out_file) {
+    FILE *out = out_file ? (FILE *)out_file : stdout;
+    char path[96], raw[4096], link[4096];
+    snprintf(path, sizeof(path), "/proc/%ld/stat", (long)pid);
+    if (slurp_small(path, raw, sizeof(raw)) == 0) {
+        fprintf(out, "{\"success\":false,\"error\":\"TARGET_TERMINATED\"}\n");
+        fflush(out);
+        return -1;
+    }
+    fprintf(out, "{\"success\":true,\"pid\":%ld,\"stat\":\"", (long)pid);
+    put_json_escaped(out, raw, strlen(raw));
+    fputc('"', out);
+    snprintf(path, sizeof(path), "/proc/%ld/exe", (long)pid);
+    ssize_t ln = readlink(path, link, sizeof(link) - 1);
+    if (ln < 0) ln = 0;
+    link[ln] = '\0';
+    fputs(",\"exe\":\"", out);
+    put_json_escaped(out, link, (size_t)ln);
+    fputc('"', out);
+    struct stat st;
+    if (stat(path, &st) == 0) {
+        fprintf(out, ",\"exe_fp\":\"%llu:%llu:%lld\"", (unsigned long long)st.st_ino,
+                (unsigned long long)st.st_size, (long long)st.st_mtime);
+    }
+    if (slurp_small("/proc/sys/kernel/random/boot_id", raw, sizeof(raw)) > 0) {
+        size_t n = strlen(raw);
+        while (n > 0 && (raw[n - 1] == '\n' || raw[n - 1] == '\r')) raw[--n] = '\0';
+        fputs(",\"boot_id\":\"", out);
+        put_json_escaped(out, raw, n);
+        fputc('"', out);
+    }
+    struct utsname un;
+    if (uname(&un) == 0) {
+        fputs(",\"machine\":\"", out);
+        put_json_escaped(out, un.machine, strlen(un.machine));
+        fputc('"', out);
+    }
+    if (with_header) {
+        int fd = open(path, O_RDONLY);
+        fputs(",\"hdr_hex\":\"", out);
+        if (fd >= 0) {
+            unsigned char buf[4096];
+            size_t total = 0;
+            while (total < IDENT_HDR_BYTES) {
+                size_t want = sizeof(buf);
+                if (IDENT_HDR_BYTES - total < want) want = IDENT_HDR_BYTES - total;
+                ssize_t r = read(fd, buf, want);
+                if (r <= 0) break;
+                for (ssize_t i = 0; i < r; i++) fprintf(out, "%02x", buf[i]);
+                total += (size_t)r;
+            }
+            close(fd);
+        }
+        fputc('"', out);
+    }
+    fputs("}\n", out);
+    fflush(out);
+    return 0;
+}
+
+int collector_report_procfile(pid_t pid, const char *name, void *out_file) {
+    FILE *out = out_file ? (FILE *)out_file : stdout;
+    static const char *const allowed[] = {"maps", "status", "stat", "limits", "comm", NULL};
+    int ok = 0;
+    for (int i = 0; allowed[i]; i++) if (strcmp(allowed[i], name) == 0) ok = 1;
+    if (!ok) {
+        fprintf(out, "{\"success\":false,\"error\":\"INVALID_ARGS\"}\n");
+        fflush(out);
+        return -1;
+    }
+    char path[96];
+    snprintf(path, sizeof(path), "/proc/%ld/%s", (long)pid, name);
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) {
+        fprintf(out, "{\"success\":false,\"error\":\"%s\"}\n", errno == ENOENT || errno == ESRCH ? "TARGET_TERMINATED" : "UNREADABLE");
+        fflush(out);
+        return -1;
+    }
+    size_t cap = 65536, n = 0;
+    char *buf = (char *)malloc(cap);
+    if (!buf) { close(fd); fprintf(out, "{\"success\":false,\"error\":\"NO_MEMORY\"}\n"); fflush(out); return -1; }
+    int truncated = 0;
+    for (;;) {
+        if (n + 4096 > cap) {
+            if (cap >= PROCFILE_MAX) { truncated = 1; break; }
+            char *nb = (char *)realloc(buf, cap * 2);
+            if (!nb) { truncated = 1; break; }
+            buf = nb; cap *= 2;
+        }
+        ssize_t r = read(fd, buf + n, cap - n);
+        if (r < 0 && errno == EINTR) continue;
+        if (r <= 0) break;
+        n += (size_t)r;
+    }
+    close(fd);
+    fprintf(out, "{\"success\":true,\"pid\":%ld,\"name\":\"%s\",\"truncated\":%s,\"text\":\"", (long)pid, name, truncated ? "true" : "false");
+    put_json_escaped(out, buf, n);
+    fputs("\"}\n", out);
+    fflush(out);
+    free(buf);
+    return 0;
+}
+
 int collector_daemon_loop(int backend, void *in_file, void *out_file) {
     FILE *in = in_file ? (FILE *)in_file : stdin;
     FILE *out = out_file ? (FILE *)out_file : stdout;
@@ -1845,6 +1968,51 @@ int collector_daemon_loop(int backend, void *in_file, void *out_file) {
                 continue;
             }
             collector_report_impact((pid_t)p_val, out);
+            continue;
+        }
+        if (strncmp(p, "IDENT ", 6) == 0) {
+            char *rest = p + 6;
+            while (*rest == ' ') rest++;
+            int with_hdr = 0;
+            char *space = strchr(rest, ' ');
+            if (space) {
+                *space = '\0';
+                char *opt = space + 1;
+                while (*opt == ' ') opt++;
+                with_hdr = (strcmp(opt, "HDR") == 0);
+            }
+            char *endp = NULL;
+            errno = 0;
+            long p_val = strtol(rest, &endp, 10);
+            if (errno != 0 || endp == rest || *endp != '\0' || p_val <= 0 || p_val > 4194304L) {
+                fprintf(out, "{\"success\":false,\"error\":\"INVALID_PID\"}\n");
+                fflush(out);
+                continue;
+            }
+            collector_report_ident((pid_t)p_val, with_hdr, out);
+            continue;
+        }
+        if (strncmp(p, "PROCFILE ", 9) == 0) {
+            char *rest = p + 9;
+            while (*rest == ' ') rest++;
+            char *space = strchr(rest, ' ');
+            if (!space) {
+                fprintf(out, "{\"success\":false,\"error\":\"INVALID_ARGS\"}\n");
+                fflush(out);
+                continue;
+            }
+            *space = '\0';
+            char *name = space + 1;
+            while (*name == ' ') name++;
+            char *endp = NULL;
+            errno = 0;
+            long p_val = strtol(rest, &endp, 10);
+            if (errno != 0 || endp == rest || *endp != '\0' || p_val <= 0 || p_val > 4194304L) {
+                fprintf(out, "{\"success\":false,\"error\":\"INVALID_PID\"}\n");
+                fflush(out);
+                continue;
+            }
+            collector_report_procfile((pid_t)p_val, name, out);
             continue;
         }
         if (strncmp(p, "PING", 4) == 0) {

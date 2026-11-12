@@ -22,6 +22,7 @@ import subprocess
 import tempfile
 import time
 import unittest
+from tests.remote_ident_compat import is_ident_probe, legacy_probe_reply
 from unittest.mock import MagicMock
 
 from extractor.agent_runtime import AgentRuntime
@@ -370,6 +371,8 @@ class TestPhase23RemoteWatchSession(unittest.TestCase):
         # 2. Remote Build ID mismatch: target binary returns different Build ID
         def mock_mismatch_remote_runner(cmd_args, timeout):
             cmd_str = " ".join(cmd_args)
+            if is_ident_probe(cmd_str):
+                return legacy_probe_reply(cmd_str, lambda q: mock_mismatch_remote_runner(["ssh", q], timeout))
             if f"kill -0 {proc.pid}" in cmd_str:
                 return 0, "ALIVE\n", ""
             elif f"/proc/{proc.pid}/exe" in cmd_str and "head" in cmd_str:

@@ -25,6 +25,7 @@ import unittest
 import zlib
 from typing import Any, Dict, List, Optional, Tuple
 
+from tests.remote_ident_compat import is_ident_probe, legacy_probe_reply
 from extractor.target_adapter import (
     LocalTargetAdapter,
     PIDReusedError,
@@ -46,12 +47,17 @@ class MockRemoteAdapter(RemoteSshTargetAdapter):
     def set_cmd_response(self, cmd_prefix: str, rc: int, stdout: str, stderr: str = ""):
         self.cmd_responses[cmd_prefix] = (rc, stdout, stderr)
 
-    def run_ssh(self, cmd: str, timeout: Optional[int] = None) -> Tuple[int, str, str]:
-        self.cmd_log.append(cmd)
+    def _lookup(self, cmd: str) -> Tuple[int, str, str]:
         for prefix, resp in self.cmd_responses.items():
             if prefix in cmd:
                 return resp
         return 0, "", ""
+
+    def run_ssh(self, cmd: str, timeout: Optional[int] = None) -> Tuple[int, str, str]:
+        self.cmd_log.append(cmd)
+        if is_ident_probe(cmd):
+            return legacy_probe_reply(cmd, self._lookup)
+        return self._lookup(cmd)
 
 
 class TestPhase241RemoteIdentityAndArchNegatives(unittest.TestCase):
