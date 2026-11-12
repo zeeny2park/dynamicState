@@ -668,6 +668,9 @@ class RuntimeEvidenceProvider:
             "state_vars": [],
             "magic_canaries": [],
             "capacity_length_pairs": [],
+            # IMP-018: structure-based candidates (type / layout, no names): "<var>.<count member>" of a struct
+            # holding a pointer and an integer count (a pointer+length container); enum-typed state variables.
+            "container_counts": [],
         }
         if not companion_elf or not os.path.exists(companion_elf):
             return discovered
@@ -737,6 +740,36 @@ class RuntimeEvidenceProvider:
             for c in cap_vars:
                 for l in len_vars:
                     discovered["capacity_length_pairs"].append((c, l))
+
+            # IMP-018: structure-based selection.  Name keywords above only RANK (they come first); the type /
+            # layout tells what a variable is.
+            _INT_BASES = ("int", "long", "short", "size_t", "unsigned", "uint", "int32", "int64", "uint32", "uint64")
+            for v in idx.global_variables:
+                if not v.name or v.name.startswith("__") or not v.type_offset:
+                    continue
+                t = idx.resolve_canonical_type(v.type_offset)
+                if t is None:
+                    continue
+                if t.tag == "DW_TAG_enumeration_type" and v.name not in discovered["state_vars"]:
+                    discovered["state_vars"].append(v.name)
+                if t.tag not in ("DW_TAG_structure_type", "DW_TAG_class_type"):
+                    continue
+                has_ptr, counts = False, []
+                for m in getattr(t, "members", []) or []:
+                    if not m.name or not m.type_offset:
+                        continue
+                    mt = idx.resolve_canonical_type(m.type_offset)
+                    if mt is None:
+                        continue
+                    if mt.tag == "DW_TAG_pointer_type":
+                        has_ptr = True
+                    elif mt.tag == "DW_TAG_base_type" and any(b in (mt.name or "").lower() for b in _INT_BASES) \
+                            and "char" not in (mt.name or "").lower():
+                        counts.append(f"{v.name}.{m.name}")
+                    elif mt.tag == "DW_TAG_enumeration_type" and f"{v.name}.{m.name}" not in discovered["state_vars"]:
+                        discovered["state_vars"].append(f"{v.name}.{m.name}")
+                if has_ptr and counts:
+                    discovered["container_counts"].append(counts[0])
 
         except Exception:
             pass
@@ -1139,6 +1172,22 @@ class RuntimeEvidenceProvider:
                     observation_data["container_size"] = leak_count
                     observation_data["container_name"] = c_cand
                     if leak_count > 0:
+                        break
+            # IMP-018: structure-based containers (pointer + integer count) when no named container was found
+            if not observation_data.get("container_size"):
+                for c_cand in dwarf_syms.get("container_counts", []):
+                    cnt_val, cnt_recs = self.evaluate_dwarf_expression(pid, companion_elf, c_cand)
+                    all_records.extend(cnt_recs)
+                    v = cnt_val.get("value") if cnt_val.get("status") == "OBSERVED" else None
+                    try:
+                        v = int(v, 0) if isinstance(v, str) else v
+                    except ValueError:
+                        v = None
+                    if isinstance(v, int) and not isinstance(v, bool) and v > 0:
+                        epoch_sample["container_sizes"][c_cand] = v
+                        observation_data["container_size"] = v
+                        observation_data["container_name"] = c_cand
+                        observation_data["container_selected_by"] = "structure"
                         break
 
             # Inspect allocation & free counters dynamically + counter reset detection

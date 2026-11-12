@@ -31,6 +31,21 @@ int main(void) {
 }
 """
 
+NEUTRAL_SRC = r"""
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+enum phase { P_IDLE, P_RUN, P_DONE };
+struct bag { void **items; unsigned long n; };
+struct bag g_bag;
+enum phase g_phase = P_RUN;
+int main(void) {
+    g_bag.items = calloc(8, sizeof(void *)); g_bag.n = 3;
+    puts("READY"); fflush(stdout);
+    for (;;) sleep(1);
+}
+"""
+
 NULL_GLOBALS_SRC = r"""
 #include <stdio.h>
 #include <unistd.h>
@@ -68,6 +83,7 @@ class TestDeclarativeRecipes(unittest.TestCase):
         cls.tmp = tempfile.mkdtemp(prefix="imp018_")
         cls.fdleak = _build(cls.tmp, "fdleak", FD_LEAK_SRC)
         cls.nullg = _build(cls.tmp, "null_globals", NULL_GLOBALS_SRC)
+        cls.neutral = _build(cls.tmp, "neutral", NEUTRAL_SRC)
 
     @classmethod
     def tearDownClass(cls):
@@ -144,6 +160,16 @@ class TestDeclarativeRecipes(unittest.TestCase):
         self.assertIn("/dev/null", fd[0]["subjects"])
         self.assertTrue(any("open fds" in o and "->" in o for o in fd[0]["observed"]), fd[0]["observed"])
         self.assertIn(res.verdict, ("CONFIRMED_FAULT", "PROBABLE_FAULT"))
+
+    def test_structure_based_candidates_without_name_keywords(self):
+        syms = RuntimeEvidenceProvider()._discover_dwarf_symbols(self.neutral)
+        self.assertIn("g_bag.n", syms["container_counts"])   # pointer + integer count member
+        self.assertIn("g_phase", syms["state_vars"])          # enum-typed
+        p = self._proc(self.neutral)
+        rec = DiagnosticRecipeRegistry.get_recipe("RECIPE_LONG_LIVED_OBJECT_ACCUMULATION")
+        data, _ = RuntimeEvidenceProvider().collect_for_recipe(rec, p.pid, companion_elf=self.neutral)
+        self.assertEqual(data.get("container_name"), "g_bag.n")
+        self.assertEqual(data.get("container_size"), 3)
 
     def test_idle_process_has_no_fd_leak(self):
         p = self._proc(self.nullg)

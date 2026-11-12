@@ -5603,7 +5603,9 @@ class WatchSessionManager:
                 nl = var.name.lower()
                 tl = t_name.lower()
                 is_explicit = bool(lock_expressions and var.name in lock_expressions)
-                is_lock_like = any(k in nl or k in tl for k in ("mutex", "lock", "rwlock", "spinlock", "sem"))
+                # IMP-018: a lock is selected by its TYPE; the name is used only when the type name is unknown
+                is_lock_like = any(k in tl for k in ("mutex", "lock", "rwlock", "spinlock", "sem_t")) or (
+                    not tl.strip() and any(k in nl for k in ("mutex", "lock", "rwlock", "spinlock")))
                 if (is_explicit or is_lock_like) and var.name not in seen_lock_names:
                     seen_lock_names.add(var.name)
                     rt_addr = (m_bias + var.link_time_address) if m_dyn else var.link_time_address
