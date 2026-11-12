@@ -10,7 +10,7 @@ from .snapshot_consistency import SnapshotConsistency
 from .snapshot_regions import filter_regions
 from .modules import RuntimeModule, ModuleAddressResolver, discover_modules, LoadBiasResolutionError
 from .debug_artifacts import DebugArtifactProvider, compute_gnu_debuglink_crc
-from .debug_info import DebugInfoProvider, GdbDebugInfoProvider, NativeDwarfDebugInfoProvider
+from .debug_info import DebugInfoProvider, GdbDebugInfoProvider
 from .observation_backends import ObservationBackend, GDBObservationBackend, LowImpactObservationBackend
 
 __all__ = [
@@ -34,7 +34,6 @@ __all__ = [
     "compute_gnu_debuglink_crc",
     "DebugInfoProvider",
     "GdbDebugInfoProvider",
-    "NativeDwarfDebugInfoProvider",
     "ObservationBackend",
     "GDBObservationBackend",
     "LowImpactObservationBackend",

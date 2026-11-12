@@ -22,12 +22,6 @@ import time
 import unittest
 
 from tests.fixture_builds import ensure_real_runtime_app_debug
-from extractor.adaptive_engine import (
-    AdaptiveInvestigationEngine,
-    AdaptiveInvestigationPlanner,
-    DeterministicScheduler,
-    EvidenceCache,
-)
 from extractor.evidence_adapter import (
     COLLECTION_STATUS_ABSTAIN,
     COLLECTION_STATUS_COLLECTED,
@@ -39,13 +33,6 @@ from extractor.evidence_ledger import (
     PROVENANCE_CLASS_LIVE_RUNTIME_CAPTURE,
     PROVENANCE_CLASS_SYNTHETIC_FIXTURE,
     EvidenceLedger,
-)
-from extractor.inspection_module import (
-    DOMAIN_CONCURRENCY,
-    DOMAIN_MEMORY,
-    FunctionalInspectionModule,
-    InspectionModuleRegistry,
-    InspectionProfile,
 )
 from extractor.observation_budget import (
     ObservationBudgetLimits,
@@ -187,27 +174,6 @@ class TestAdaptiveInvestigationEngine(unittest.TestCase):
         )
         self.assertEqual(v_prov.final_diagnosis, DIAG_CONFIRMED)
 
-    def test_04_scheduler_determinism_and_tie_breaking(self):
-        """Phase 3 Invariant: Deterministic scheduling order by priority DESC then ID ASC."""
-        reg = InspectionModuleRegistry()
-        p1 = InspectionProfile(profile_id="p_beta", domain=DOMAIN_CONCURRENCY, name="Beta", priority=100)
-        p2 = InspectionProfile(profile_id="p_alpha", domain=DOMAIN_CONCURRENCY, name="Alpha", priority=100)
-        p3 = InspectionProfile(profile_id="p_urgent", domain=DOMAIN_MEMORY, name="Urgent", priority=150)
-
-        reg.register(FunctionalInspectionModule(p1, lambda wm, **kw: {}))
-        reg.register(FunctionalInspectionModule(p2, lambda wm, **kw: {}))
-        reg.register(FunctionalInspectionModule(p3, lambda wm, **kw: {}))
-
-        sched = DeterministicScheduler(reg)
-        sched.enqueue("p_beta")
-        sched.enqueue("p_urgent")
-        sched.enqueue("p_alpha")
-
-        # Must pop: p_urgent (150), then p_alpha (100, alphabetic), then p_beta (100)
-        self.assertEqual(sched.pop_next(), "p_urgent")
-        self.assertEqual(sched.pop_next(), "p_alpha")
-        self.assertEqual(sched.pop_next(), "p_beta")
-        self.assertTrue(sched.is_empty())
 
     def test_05_multi_dimensional_budget_and_early_termination(self):
         """Phase 4: Budget tracker enforces wall clock, bytes read, and consecutive failure ceilings."""
@@ -324,28 +290,6 @@ class TestAdaptiveInvestigationEngine(unittest.TestCase):
         self.assertTrue(len(diff) > 0)
         self.assertEqual(v_mut.final_diagnosis, DIAG_REFUTED)  # Counter != 10 contradicted the hypothesis
 
-    def test_08_live_target_operational_acceptance(self):
-        """Phase 7: Live C++ multithread process operational evaluation with 0.00ms stop time."""
-        if not self.proc:
-            self.skipTest("Real runtime target binary not running; skipping live operational test.")
-
-        wm = WatchSessionManager(corpus_dir=self.corpus_dir)
-        engine = AdaptiveInvestigationEngine(wm)
-
-        res = engine.run_adaptive_investigation(
-            goal="Inspect live worker thread mutex contention and counter",
-            pid=self.proc.pid,
-            companion_elf_path=self.target_bin,
-            hypothesis="Worker thread session is initialized",
-            assertions=["g_session.worker.state.counter >= 0"],
-            budget_limits=ObservationBudgetLimits(max_wall_clock_ms=2000.0, max_bytes_read=16777216),
-        )
-
-        self.assertTrue(res["success"])
-        self.assertEqual(res["budget_usage"]["metrics"]["target_stop_duration_ms"], 0.0)
-        self.assertIn("report_html", res)
-        self.assertIn("report_json", res)
-        self.assertTrue(res["evidence_ledger_count"] > 0)
 
 
 if __name__ == "__main__":

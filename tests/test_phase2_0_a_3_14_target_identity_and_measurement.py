@@ -15,12 +15,6 @@ import unittest
 from unittest.mock import patch
 
 from extractor.target_adapter import LocalTargetAdapter, PIDReusedError
-from extractor.workflow import (
-    DIAG_CONFIRMED,
-    DIAG_SUSPECTED,
-    HYPOTHESIS_STATUS_SUPPORTED,
-    InvestigationWorkflowEngine,
-)
 from extractor.evidence_ledger import (
     EVIDENCE_TYPE_FIELD_OBSERVATION,
     EvidenceLedger,
@@ -82,81 +76,7 @@ class TestPhase20A314TargetIdentityAndMeasurement(unittest.TestCase):
             self.assertTrue(res["sla_4_5ms_satisfied"])
             self.assertLess(res["physical_read_latency_max_ms"], 4.5)
 
-    # 4. Correlated evidence deduplication: multiple records from same receipt count as 1 physical observation
-    def test_04_correlated_evidence_deduplication(self):
-        engine = InvestigationWorkflowEngine()
-        sess_id = engine.evidence_ledger.session_id
-        inst = engine.create_instance(session_id=sess_id, target_pid=self.pid, goal="Deduplication test")
-        inst.context["threads"] = [{"tid": self.pid, "state": "S", "wchan": "sys_futex"}]
 
-        # Create an authentic live capture receipt bound to engine's ledger session
-        shared_rcpt = issue_live_capture_receipt(
-            session_id=sess_id,
-            pid=self.pid,
-            process_identity=self.mock_ident["process_identity"],
-            executable_identity=self.mock_ident["executable_identity"],
-            build_id=self.mock_ident["build_id"],
-            snapshot_binding="snap_dedup_1",
-            capture_epoch=1,
-            physical_bytes_read=64,
-            physical_reads_count=1,
-            authority_level="PRODUCTION",
-            capture_authority_token=get_trusted_capture_authority_token(),
-        )
-        for i in range(5):
-            rec = EvidenceRecord(
-                evidence_id=f"ev_corr_{i}",
-                evidence_type=EVIDENCE_TYPE_FIELD_OBSERVATION,
-                observation=f"Extracted field {i} from memory slice",
-                session_id=sess_id,
-                target_identity=self.mock_ident,
-                provenance={"provenance_class": PROVENANCE_CLASS_LIVE_RUNTIME_CAPTURE, "live_capture_receipt": shared_rcpt.to_dict()},
-            )
-            engine.evidence_ledger.add_record(rec)
-
-        inst.context["hypotheses"] = [
-            {"id": "hyp_contention", "prior": 0.25},
-            {"id": "hyp_deadlock", "prior": 0.25},
-            {"id": "hyp_normal", "prior": 0.25},
-        ]
-        engine.execute_stage_updating_hypothesis(inst)
-
-        # Check scoring factors for contention: effective_evidence_count must be 1, not 5
-        hyp_contention = [h for h in inst.context["hypotheses"] if h["id"] == "hyp_contention"][0]
-        scoring = hyp_contention.get("scoring_factors", {})
-        self.assertEqual(scoring.get("effective_evidence_count"), 1)
-
-    # 5. Waiting futex threads boost contention but DO NOT independently confirm deadlock
-    def test_05_waiting_futex_threads_do_not_confirm_deadlock_without_circular_signal(self):
-        engine = InvestigationWorkflowEngine()
-        inst = engine.create_instance(session_id=self.session_id, target_pid=self.pid, goal="Deduplication test")
-        # 4 waiting threads on futex, 1 thread running in user space (contention scenario)
-        inst.context["threads"] = [
-            {"tid": 100, "state": "S", "wchan": "sys_futex"},
-            {"tid": 101, "state": "S", "wchan": "sys_futex"},
-            {"tid": 102, "state": "S", "wchan": "sys_futex"},
-            {"tid": 103, "state": "S", "wchan": "sys_futex"},
-            {"tid": 104, "state": "R", "is_running_user_space": True},
-        ]
-        # Circular deadlock signal is FALSE (only contention present)
-        inst.context["has_circular_deadlock_signal"] = False
-
-        inst.context["hypotheses"] = [
-            {"id": "hyp_contention", "prior": 0.25},
-            {"id": "hyp_deadlock", "prior": 0.25},
-        ]
-        engine.execute_stage_updating_hypothesis(inst)
-
-        hyp_contention = [h for h in inst.context["hypotheses"] if h["id"] == "hyp_contention"][0]
-        hyp_deadlock = [h for h in inst.context["hypotheses"] if h["id"] == "hyp_deadlock"][0]
-
-        # Contention is supported with high confidence
-        self.assertEqual(hyp_contention["status"], HYPOTHESIS_STATUS_SUPPORTED)
-        self.assertGreaterEqual(hyp_contention["confidence"], 0.70)
-
-        # Deadlock is NOT supported; it remains INCONCLUSIVE or REFUTED without circular signal
-        self.assertNotEqual(hyp_deadlock["status"], HYPOTHESIS_STATUS_SUPPORTED)
-        self.assertLessEqual(hyp_deadlock["confidence"], 0.25)
 
 
 if __name__ == "__main__":

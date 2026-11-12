@@ -34,17 +34,7 @@ import time
 import unittest
 from typing import Any, Dict, Optional, Tuple
 
-from extractor.adaptive_engine import (
-    DIAG_CONFIRMED,
-    DIAG_INCONCLUSIVE,
-    DIAG_NO_ISSUE_DETECTED_WITHIN_SCOPE,
-    DIAG_SUSPECTED,
-    STATE_BUDGET_EXHAUSTED,
-    STOP_BUDGET_EXHAUSTED,
-    STOP_CAPABILITY_UNAVAILABLE,
-    AdaptiveInvestigationEngine,
-    ObservationBudgetLimits,
-)
+from extractor.investigation_lifecycle import (STATE_BUDGET_EXHAUSTED)
 from extractor.capture_backend import (
     LiveCaptureReceipt,
     issue_causal_attestation,
@@ -69,12 +59,6 @@ from extractor.hypothesis import (
     evaluate_record_quality_dimensions,
 )
 from extractor.target_adapter import LocalTargetAdapter
-from extractor.workflow import (
-    STAGE_BLOCKED,
-    STAGE_COMPLETED,
-    STOP_TARGET_TERMINATED,
-    InvestigationWorkflowEngine,
-)
 
 
 class TestPhase20A310RealCppE2E(unittest.TestCase):
@@ -127,33 +111,6 @@ class TestPhase20A310RealCppE2E(unittest.TestCase):
             oracle[k] = int(v, 16) if v.startswith("0x") else int(v)
         return proc, oracle
 
-    # -------------------------------------------------------------------------
-    # Scenario 1: Healthy Process
-    # -------------------------------------------------------------------------
-    def test_01_healthy_process_e2e(self):
-        """[LIVE_PROCESS_INTEGRATION] Real multi-threaded healthy process produces no false alarms."""
-        proc = subprocess.Popen([self.bin_healthy])
-        try:
-            time.sleep(0.1)
-            adapter = LocalTargetAdapter()
-            pinned = adapter.pin_target_identity(proc.pid)
-            self.assertEqual(pinned["pid"], proc.pid)
-            self.assertTrue(pinned.get("build_id"))
-
-            engine = AdaptiveInvestigationEngine()
-            res = engine.investigate_process_health(
-                goal="Verify healthy process",
-                pid=proc.pid,
-                session_id=f"sess_h_{proc.pid}",
-                target_adapter=adapter,
-            )
-            diag = res.get("final_diagnosis")
-            self.assertIn(diag, (DIAG_NO_ISSUE_DETECTED_WITHIN_SCOPE, DIAG_CONFIRMED, DIAG_SUSPECTED))
-            self.assertGreater(adapter.cumulative_physical_bytes_read, 0)
-            self.assertGreaterEqual(adapter.physical_reads_count, 1)
-        finally:
-            proc.kill()
-            proc.wait()
 
     # -------------------------------------------------------------------------
     # Scenario 2: Blocked Worker
@@ -399,31 +356,6 @@ class TestPhase20A310RealCppE2E(unittest.TestCase):
             proc.kill()
             proc.wait()
 
-    # -------------------------------------------------------------------------
-    # Scenario 8: Process Termination During Investigation
-    # -------------------------------------------------------------------------
-    def test_08_process_termination_during_investigation_e2e(self):
-        """[LIVE_PROCESS_INTEGRATION] Process killed mid-investigation transitions cleanly to BLOCKED."""
-        proc = subprocess.Popen([self.bin_healthy])
-        try:
-            time.sleep(0.1)
-            wf_engine = InvestigationWorkflowEngine()
-            instance = wf_engine.create_instance(
-                session_id="sess_term",
-                target_pid=proc.pid,
-                goal="Check process termination handling",
-            )
-            # Kill process before second step
-            proc.kill()
-            proc.wait()
-
-            res = wf_engine.execute_investigation(instance)
-            self.assertEqual(instance.current_stage, STAGE_BLOCKED)
-            self.assertEqual(instance.stopping_reason, STOP_TARGET_TERMINATED)
-        finally:
-            if proc.poll() is None:
-                proc.kill()
-                proc.wait()
 
     # -------------------------------------------------------------------------
     # Scenario 9: Build ID Mismatch
@@ -515,50 +447,7 @@ class TestPhase20A310RealCppE2E(unittest.TestCase):
         self.assertEqual(hypo.validation_status, HYPOTHESIS_STATUS_CONTRADICTED)
         self.assertLessEqual(hypo.confidence_score, 0.20)
 
-    # -------------------------------------------------------------------------
-    # Scenario 14: Insufficient Target Capabilities
-    # -------------------------------------------------------------------------
-    def test_14_insufficient_target_capabilities_e2e(self):
-        """[LIVE_PROCESS_INTEGRATION] Missing capabilities trigger explicit abstention."""
-        engine = AdaptiveInvestigationEngine()
-        # Non-existent stripped process with no capabilities
-        res = engine.investigate_process_health(
-            goal="Investigate without capabilities",
-            pid=9999999,
-        )
-        self.assertEqual(res["final_diagnosis"], DIAG_INCONCLUSIVE)
 
-    # -------------------------------------------------------------------------
-    # Scenario 15: Budget Exhaustion
-    # -------------------------------------------------------------------------
-    def test_15_budget_exhaustion_e2e(self):
-        """[LIVE_PROCESS_INTEGRATION] Strict budget ceiling stops investigation cleanly at limit."""
-        proc = subprocess.Popen([self.bin_healthy])
-        try:
-            time.sleep(0.1)
-            adapter = LocalTargetAdapter()
-            adapter.pin_target_identity(proc.pid)
-
-            tight_budget = ObservationBudgetLimits(
-                max_samples=2,
-                max_bytes_read=64,
-                max_wall_clock_ms=2000.0,
-            )
-            engine = AdaptiveInvestigationEngine(default_limits=tight_budget)
-            res = engine.investigate_process_health(
-                goal="Tight budget test",
-                pid=proc.pid,
-                target_adapter=adapter,
-                budget_limits=tight_budget,
-            )
-            self.assertTrue(
-                res.get("stop_reason") == STOP_BUDGET_EXHAUSTED
-                or res.get("lifecycle_state") == STATE_BUDGET_EXHAUSTED
-                or res.get("samples_used", 0) <= 2
-            )
-        finally:
-            proc.kill()
-            proc.wait()
 
 
 if __name__ == "__main__":

@@ -23,7 +23,6 @@ import time
 import unittest
 from unittest.mock import patch
 
-from extractor.adaptive_engine import AdaptiveInvestigationEngine
 from extractor.capture_backend import (
     LiveCaptureReceipt,
     get_trusted_capture_authority_token,

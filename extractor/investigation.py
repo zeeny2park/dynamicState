@@ -60,7 +60,7 @@ from .evidence_ledger import (
     CLAIM_FUNCTION_ATTRIBUTION_VERIFIED,
     ALL_TRUST_CLAIMS,
 )
-from .adaptive_engine import (
+from .investigation_lifecycle import (
     STATE_BUDGET_EXHAUSTED,
     STATE_CANCELED,
     STATE_COMPLETED,
@@ -74,7 +74,6 @@ from .adaptive_engine import (
     STATE_INITIAL_TRIAGE,
     STATE_OBSERVATION,
     STATE_TARGET_VALIDATION,
-    AdaptiveInvestigationEngine,
     InvestigationStateMachine,
 )
 from .evidence_adapter import (
@@ -3703,69 +3702,6 @@ class InvestigationManager:
             return True
         except Exception:
             return False
-
-    def investigate_process_health(
-        self,
-        goal: str = "이 프로세스에 문제가 있는지 검사해주세요.",
-        pid: int = 0,
-        debug_image: str = "",
-        budgets: Optional[Dict[str, Any]] = None,
-        fixture_data: Optional[Dict[str, Any]] = None,
-        follow_up_executor: Optional[Any] = None,
-        watch_manager: Optional[Any] = None,
-        provenance_class: str = PROVENANCE_CLASS_LIVE_RUNTIME_CAPTURE,
-    ) -> Dict[str, Any]:
-        """Runs an evidence-grounded, budget-bounded Process Health Investigation and registers the session."""
-        inv_id = f"inv_{uuid.uuid4().hex[:10]}"
-        session = InvestigationSession(
-            investigation_id=inv_id,
-            goal=goal,
-            corpus_dir=self.corpus_dir,
-            budgets=budgets,
-            corpus=self.corpus,
-        )
-        self.sessions[inv_id] = session
-
-        engine = AdaptiveInvestigationEngine(
-            watch_manager=watch_manager,
-            default_limits=ObservationBudgetLimits.from_dict(budgets),
-            ledger=session.ledger,
-        )
-        res = engine.investigate_process_health(
-            goal=goal,
-            pid=pid,
-            companion_elf_path=debug_image,
-            budget_limits=ObservationBudgetLimits.from_dict(budgets),
-            session_id=inv_id,
-            provenance_class=provenance_class,
-            fixture_data=fixture_data,
-            follow_up_executor=follow_up_executor,
-            existing_state_machine=session.state_machine,
-            existing_executed_keys=session.executed_observation_keys,
-        )
-        session.status = res.get("lifecycle_state", STATE_COMPLETED)
-        session.executed_observation_keys = set(res.get("executed_observation_keys", []))
-        session.hypotheses = [
-            InvestigationHypothesis.from_dict(h) if isinstance(h, dict) else h
-            for h in res.get("competing_hypotheses", [])
-        ]
-        if isinstance(res.get("budget_usage"), dict):
-            session.budgets.update(res["budget_usage"])
-        session.summary.update({
-            "verdict": res.get("verdict"),
-            "final_diagnosis": res.get("final_diagnosis"),
-            "execution_status": res.get("execution_status"),
-            "failure_category": res.get("failure_category"),
-            "confidence_score": res.get("confidence_score"),
-            "confidence_rationale": res.get("confidence_rationale"),
-            "stop_reason": res.get("stop_reason"),
-            "stop_explanation": res.get("stop_explanation"),
-            "inspected_scope": res.get("inspected_scope"),
-            "uninspected_scope": res.get("uninspected_scope"),
-            "evidence_coverage": res.get("evidence_coverage"),
-            "consumed_execution_budget": res.get("consumed_execution_budget") or res.get("budget_usage"),
-        })
-        return res
 
     def get_investigation_timeline(self, investigation_id: str) -> Dict[str, Any]:
         """Retrieve the auditable, sequential timeline of events for an investigation."""

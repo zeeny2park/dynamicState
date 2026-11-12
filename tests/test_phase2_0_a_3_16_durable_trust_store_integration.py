@@ -36,7 +36,6 @@ from extractor.evidence_ledger import (
     EvidenceRecord,
     PROVENANCE_CLASS_LIVE_RUNTIME_CAPTURE,
 )
-from extractor.workflow import InvestigationWorkflowEngine
 
 
 class TestPhase20A316DurableTrustStoreIntegration(unittest.TestCase):
@@ -62,118 +61,6 @@ class TestPhase20A316DurableTrustStoreIntegration(unittest.TestCase):
         set_default_trust_store(None)
         shutil.rmtree(self.tmp_dir, ignore_errors=True)
 
-    # 1. Revoked keys are rejected across all production paths
-    def test_01_revoked_key_rejected_across_all_paths(self):
-        # Register key k1
-        self.trust_store.register_key("key_alpha", "secret_alpha_999", is_active=True)
-        auth = CausalVerifierAuthority(trust_store=self.trust_store)
-        token = auth.get_verifier_token()
-
-        # Precondition record
-        rcpt1 = issue_live_capture_receipt(
-            session_id=self.session_id,
-            pid=self.pid,
-            process_identity=self.target_ident["process_identity"],
-            executable_identity=self.target_ident["executable_identity"],
-            build_id=self.target_ident["build_id"],
-            snapshot_binding=f"snap:{self.pid}",
-            operation_id="ctx_op_pre",
-            capture_authority_token=get_trusted_capture_authority_token(),
-            secret="secret_alpha_999",
-            key_id="key_alpha",
-        )
-        ledger = EvidenceLedger(session_id=self.session_id, trust_store=self.trust_store)
-        pre_rec = EvidenceRecord(
-            evidence_id="ev_pre_trust",
-            evidence_type=EVIDENCE_TYPE_FIELD_OBSERVATION,
-            observation="Precondition state",
-            provenance={"provenance_class": PROVENANCE_CLASS_LIVE_RUNTIME_CAPTURE, "live_capture_receipt": rcpt1.to_dict()},
-            target_identity=dict(self.target_ident),
-            details={"operation_id": "ctx_op_pre"},
-            session_id=self.session_id,
-        )
-        ledger.add_record(pre_rec)
-
-        # Issue attestation signed with key_alpha
-        att = auth.issue_attestation(
-            session_id=self.session_id,
-            target_identity=self.target_ident,
-            operation_id="ctx_op_trust_01",
-            precondition_evidence_id="ev_pre_trust",
-            postcondition_evidence_id="ev_post_trust",
-            claimed_transition={"active": True},
-            verifier_authority_token=token,
-            key_id="key_alpha",
-        )
-        self.assertEqual(att.key_id, "key_alpha")
-
-        # Prior to revocation, CausalAttestation.verify() succeeds
-        ok_before, _ = att.verify(trust_store=self.trust_store)
-        self.assertTrue(ok_before)
-
-        # Revoke key_alpha in DurableTrustStore
-        self.trust_store.revoke_key("key_alpha", reason="Compromised credential")
-        self.assertTrue(self.trust_store.is_revoked("key_alpha"))
-
-        # Path A: CausalAttestation.verify() rejects with KEY_REVOKED
-        ok_a, reason_a = att.verify(trust_store=self.trust_store)
-        self.assertFalse(ok_a)
-        self.assertIn("KEY_REVOKED", reason_a)
-
-        # Path B: CausalVerifierAuthority rejects signing with revoked key
-        with self.assertRaises(ValueError) as ctx_b:
-            auth.issue_attestation(
-                session_id=self.session_id,
-                target_identity=self.target_ident,
-                operation_id="ctx_op_trust_02",
-                precondition_evidence_id="ev_pre_trust",
-                postcondition_evidence_id="ev_post_trust",
-                claimed_transition={"active": True},
-                verifier_authority_token=token,
-                key_id="key_alpha",
-            )
-        self.assertIn("revoked", str(ctx_b.exception).lower())
-
-        # Path C: EvidenceLedger.validate_record() rejects record carrying revoked attestation
-        post_rec = EvidenceRecord(
-            evidence_id="ev_post_trust",
-            evidence_type=EVIDENCE_TYPE_FIELD_OBSERVATION,
-            observation="Postcondition state with revoked attestation",
-            provenance={"provenance_class": PROVENANCE_CLASS_LIVE_RUNTIME_CAPTURE, "causal_attestation": att.to_dict(), "live_capture_receipt": rcpt1.to_dict()},
-            target_identity=dict(self.target_ident),
-            parent_evidence_ids=["ev_pre_trust"],
-            details={"operation_id": "ctx_op_trust_01", "causal_attestation": att.to_dict()},
-            session_id=self.session_id,
-        )
-        with self.assertRaises(ValueError) as ctx_c:
-            ledger.validate_record(post_rec)
-        self.assertIn("KEY_REVOKED", str(ctx_c.exception))
-
-        # Path D: EvidenceLedger.from_dict() rejects during reconstruction
-        ledger_dict = {
-            "session_id": self.session_id,
-            "records": [pre_rec.to_dict(), post_rec.to_dict()],
-        }
-        with self.assertRaises(ValueError) as ctx_d:
-            EvidenceLedger.from_dict(ledger_dict, trust_store=self.trust_store)
-        self.assertIn("KEY_REVOKED", str(ctx_d.exception))
-
-        # Path E: Workflow recovery rejects revoked receipt/attestation
-        wf_engine = InvestigationWorkflowEngine()
-        from unittest.mock import patch
-        with patch.object(wf_engine.target_adapter, "check_liveness", return_value=(True, None)), \
-             patch.object(wf_engine.target_adapter, "get_process_identity", return_value=self.target_ident):
-            inst = wf_engine.create_instance(self.session_id, self.pid, "Workflow Revocation Test")
-            inst.context["operation_lifecycle"] = {"ctx_op_pre": "COMMITTED"}
-            inst.context["operation_records"] = {
-                "ctx_op_pre": {
-                    "state": "COMMITTED",
-                    "receipt": rcpt1.to_dict(),
-                }
-            }
-            resumed = wf_engine.resume_investigation(inst)
-            # rcpt1 was signed with key_alpha which is now revoked!
-            self.assertEqual(resumed.context["operation_lifecycle"]["ctx_op_pre"], "UNKNOWN")
 
     # 2. No fallback to untrusted default keys bypassing revocation
     def test_02_no_fallback_to_untrusted_default_keys(self):

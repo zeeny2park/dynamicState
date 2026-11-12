@@ -22,14 +22,6 @@ import time
 import unittest
 from typing import Any, Dict, Tuple
 
-from extractor.adaptive_engine import (
-    DIAG_CONFIRMED,
-    DIAG_INCONCLUSIVE,
-    DIAG_NO_ISSUE_DETECTED_WITHIN_SCOPE,
-    DIAG_SUSPECTED,
-    AdaptiveInvestigationEngine,
-    ObservationBudgetLimits,
-)
 from extractor.evidence_ledger import (
     EVIDENCE_TYPE_COMPARISON,
     EVIDENCE_TYPE_FIELD_OBSERVATION,
@@ -41,23 +33,6 @@ from extractor.target_adapter import (
     LocalTargetAdapter,
     PIDReusedError,
     TargetIdentityChangedError,
-)
-from extractor.workflow import (
-    DIAG_CONFIRMED as WF_DIAG_CONFIRMED,
-    DIAG_NO_ISSUE_DETECTED_WITHIN_SCOPE as WF_DIAG_NO_ISSUE,
-    STAGE_BLOCKED,
-    STAGE_CHECKING_BUDGET,
-    STAGE_COMPLETED,
-    STAGE_EVALUATING_EVIDENCE,
-    STAGE_EXECUTING_OBSERVATION,
-    STAGE_FORMULATING_HYPOTHESIS,
-    STAGE_INITIALIZING,
-    STAGE_PROBING,
-    STAGE_SELECTING_RECIPE,
-    STAGE_UPDATING_HYPOTHESIS,
-    InvestigationWorkflowDefinition,
-    InvestigationWorkflowEngine,
-    WorkflowExecutionState,
 )
 
 
@@ -107,117 +82,8 @@ class TestPhase20A312RealCppE2E(unittest.TestCase):
             oracle[k] = int(v, 16) if v.startswith("0x") else int(v)
         return proc, oracle
 
-    # -------------------------------------------------------------------------
-    # Scenario 1: Healthy Process E2E
-    # -------------------------------------------------------------------------
-    def test_01_healthy_process_e2e(self):
-        """Healthy process runs through InvestigationWorkflowEngine stages producing grounded verdict."""
-        proc = subprocess.Popen([self.bin_healthy])
-        try:
-            time.sleep(0.1)
-            adapter = LocalTargetAdapter()
-            pinned = adapter.pin_target_identity(proc.pid)
-            self.assertEqual(pinned["pid"], proc.pid)
-            self.assertTrue(pinned.get("build_id"))
 
-            engine = InvestigationWorkflowEngine(target_adapter=adapter)
-            inst = engine.create_instance(
-                session_id=f"sess_h_{proc.pid}",
-                target_pid=proc.pid,
-                goal="Check healthy process for deadlocks or leaks",
-            )
-            # Execute workflow through observation and hypothesis updating to completion
-            self.assertTrue(engine.execute_stage_initializing(inst))
-            self.assertTrue(engine.execute_stage_probing(inst))
-            self.assertTrue(engine.execute_stage_formulating_hypothesis(inst))
-            self.assertTrue(engine.execute_stage_selecting_recipe(inst))
-            self.assertTrue(engine.execute_stage_executing_observation(inst))
-            self.assertTrue(engine.execute_stage_evaluating_evidence(inst))
-            self.assertTrue(engine.execute_stage_updating_hypothesis(inst))
-            self.assertTrue(engine.execute_stage_checking_budget(inst))
-            self.assertTrue(engine.execute_stage_comparing_competing(inst))
-            self.assertTrue(engine.execute_stage_verifying_causation(inst))
-            self.assertTrue(engine.execute_stage_forming_diagnosis(inst))
-            self.assertTrue(engine.execute_stage_generating_report(inst))
 
-            self.assertEqual(inst.current_stage, STAGE_COMPLETED)
-            report = inst.context.get("report", {})
-            self.assertIn("verdict", report)
-            self.assertIn(report["verdict"], (WF_DIAG_NO_ISSUE, "SUSPECTED"))
-            self.assertGreater(adapter.cumulative_physical_bytes_read, 0)
-        finally:
-            if proc.stdin:
-                proc.stdin.close()
-            if proc.stdout:
-                proc.stdout.close()
-            if proc.stderr:
-                proc.stderr.close()
-            proc.kill()
-            proc.wait()
-
-    # -------------------------------------------------------------------------
-    # Scenario 2: Mutex Contention E2E
-    # -------------------------------------------------------------------------
-    def test_02_mutex_contention_e2e(self):
-        """Real process with thread contention observes futex-waiting threads and discriminates hypotheses."""
-        proc = subprocess.Popen([self.bin_contention])
-        try:
-            time.sleep(0.2)
-            adapter = LocalTargetAdapter()
-            adapter.pin_target_identity(proc.pid)
-
-            engine = AdaptiveInvestigationEngine()
-            res = engine.investigate_process_health(
-                goal="Diagnose lock contention vs deadlock",
-                pid=proc.pid,
-                session_id=f"sess_cont_{proc.pid}",
-                target_adapter=adapter,
-            )
-            diag = res.get("final_diagnosis")
-            self.assertIn(diag, (DIAG_CONFIRMED, DIAG_SUSPECTED, DIAG_NO_ISSUE_DETECTED_WITHIN_SCOPE))
-            self.assertGreater(adapter.cumulative_physical_bytes_read, 0)
-        finally:
-            if proc.stdin:
-                proc.stdin.close()
-            if proc.stdout:
-                proc.stdout.close()
-            if proc.stderr:
-                proc.stderr.close()
-            proc.kill()
-            proc.wait()
-
-    # -------------------------------------------------------------------------
-    # Scenario 3: Circular Deadlock E2E
-    # -------------------------------------------------------------------------
-    def test_03_circular_deadlock_e2e(self):
-        """Real circular deadlock cycle is probed with genuine target state and evaluated."""
-        proc = subprocess.Popen([self.bin_deadlock])
-        try:
-            time.sleep(0.2)
-            adapter = LocalTargetAdapter()
-            adapter.pin_target_identity(proc.pid)
-
-            threads = adapter.get_threads(proc.pid)
-            self.assertGreaterEqual(len(threads), 2)
-
-            engine = AdaptiveInvestigationEngine()
-            res = engine.investigate_process_health(
-                goal="Investigate circular deadlock condition",
-                pid=proc.pid,
-                session_id=f"sess_dl_{proc.pid}",
-                target_adapter=adapter,
-            )
-            self.assertTrue(res.get("success"))
-            self.assertIn(res.get("final_diagnosis"), (DIAG_CONFIRMED, DIAG_SUSPECTED, DIAG_NO_ISSUE_DETECTED_WITHIN_SCOPE))
-        finally:
-            if proc.stdin:
-                proc.stdin.close()
-            if proc.stdout:
-                proc.stdout.close()
-            if proc.stderr:
-                proc.stderr.close()
-            proc.kill()
-            proc.wait()
 
     # -------------------------------------------------------------------------
     # Scenario 4: Memory Growth E2E
@@ -387,87 +253,7 @@ class TestPhase20A312RealCppE2E(unittest.TestCase):
             proc.kill()
             proc.wait()
 
-    # -------------------------------------------------------------------------
-    # Scenario 7: Live Workflow Recovery and Resumption E2E
-    # -------------------------------------------------------------------------
-    def test_07_live_workflow_recovery_and_resume_e2e(self):
-        """Workflow persisted to checkpoint resumes against live target, revalidating identity and avoiding duplicate reads."""
-        proc = subprocess.Popen([self.bin_healthy])
-        try:
-            time.sleep(0.1)
-            adapter = LocalTargetAdapter()
-            engine = InvestigationWorkflowEngine(target_adapter=adapter)
-            inst = engine.create_instance(
-                session_id=f"sess_resume_{proc.pid}",
-                target_pid=proc.pid,
-                goal="Live resume test",
-            )
-            engine.execute_stage_initializing(inst)
-            engine.execute_stage_probing(inst)
-            engine.execute_stage_formulating_hypothesis(inst)
-            engine.execute_stage_selecting_recipe(inst)
-            engine.execute_stage_executing_observation(inst)
 
-            reads_before = adapter.physical_reads_count
-            self.assertGreater(reads_before, 0)
-
-            # Persist checkpoint
-            ckpt_path = os.path.join(self.tmp_dir, f"live_ckpt_{proc.pid}.json")
-            engine.persist_state(inst, ckpt_path)
-
-            # Resume with a fresh engine instance
-            fresh_engine = InvestigationWorkflowEngine(target_adapter=adapter)
-            resumed_inst = fresh_engine.resume_investigation(ckpt_path)
-
-            self.assertEqual(resumed_inst.instance_id, inst.instance_id)
-            self.assertEqual(resumed_inst.target_pid, proc.pid)
-
-            # Resumed engine completes remaining stages
-            self.assertTrue(fresh_engine.execute_stage_evaluating_evidence(resumed_inst))
-            self.assertTrue(fresh_engine.execute_stage_updating_hypothesis(resumed_inst))
-            self.assertTrue(fresh_engine.execute_stage_checking_budget(resumed_inst))
-            self.assertTrue(fresh_engine.execute_stage_comparing_competing(resumed_inst))
-            self.assertTrue(fresh_engine.execute_stage_verifying_causation(resumed_inst))
-            self.assertTrue(fresh_engine.execute_stage_forming_diagnosis(resumed_inst))
-            self.assertTrue(fresh_engine.execute_stage_generating_report(resumed_inst))
-
-            self.assertEqual(resumed_inst.current_stage, STAGE_COMPLETED)
-        finally:
-            if proc.stdin:
-                proc.stdin.close()
-            if proc.stdout:
-                proc.stdout.close()
-            if proc.stderr:
-                proc.stderr.close()
-            proc.kill()
-            proc.wait()
-
-    # -------------------------------------------------------------------------
-    # Scenario 8: Live Process Termination Detection on Resume E2E
-    # -------------------------------------------------------------------------
-    def test_08_live_pid_reuse_detection_on_resume_e2e(self):
-        """Terminating target before resumption triggers fail-closed identity verification."""
-        proc = subprocess.Popen([self.bin_healthy])
-        pid = proc.pid
-        time.sleep(0.1)
-        adapter = LocalTargetAdapter()
-        engine = InvestigationWorkflowEngine(target_adapter=adapter)
-        inst = engine.create_instance(
-            session_id=f"sess_term_{pid}",
-            target_pid=pid,
-            goal="Process termination check",
-        )
-        engine.execute_stage_initializing(inst)
-        ckpt_path = os.path.join(self.tmp_dir, f"term_ckpt_{pid}.json")
-        engine.persist_state(inst, ckpt_path)
-
-        # Terminate target process
-        proc.kill()
-        proc.wait()
-
-        fresh_engine = InvestigationWorkflowEngine(target_adapter=adapter)
-        with self.assertRaises((PIDReusedError, TargetIdentityChangedError, ProcessLookupError)):
-            fresh_engine.resume_investigation(ckpt_path)
 
     # -------------------------------------------------------------------------
     # Scenario 9: Stop-Time SLA Under 4.5ms E2E
@@ -504,58 +290,6 @@ class TestPhase20A312RealCppE2E(unittest.TestCase):
             proc.kill()
             proc.wait()
 
-    # -------------------------------------------------------------------------
-    # Scenario 10: Full Live Incident Report Generation E2E
-    # -------------------------------------------------------------------------
-    def test_10_full_live_incident_report_generation_e2e(self):
-        """End-to-end investigation generates full diagnostic report fulfilling full contract."""
-        proc = subprocess.Popen([self.bin_healthy])
-        try:
-            time.sleep(0.1)
-            adapter = LocalTargetAdapter()
-            engine = InvestigationWorkflowEngine(target_adapter=adapter)
-            inst = engine.create_instance(
-                session_id=f"sess_rep_{proc.pid}",
-                target_pid=proc.pid,
-                goal="Full live report generation",
-            )
-            engine.execute_stage_initializing(inst)
-            engine.execute_stage_probing(inst)
-            engine.execute_stage_formulating_hypothesis(inst)
-            engine.execute_stage_selecting_recipe(inst)
-            engine.execute_stage_executing_observation(inst)
-            engine.execute_stage_evaluating_evidence(inst)
-            engine.execute_stage_updating_hypothesis(inst)
-            engine.execute_stage_checking_budget(inst)
-            engine.execute_stage_comparing_competing(inst)
-            engine.execute_stage_verifying_causation(inst)
-            engine.execute_stage_forming_diagnosis(inst)
-            engine.execute_stage_generating_report(inst)
-
-            report = inst.context.get("report")
-            self.assertIsNotNone(report)
-            self.assertIn("verdict", report)
-            self.assertIn("primary_diagnosis", report)
-            self.assertIn("confidence_score", report)
-            self.assertIn("hypotheses_evaluated", report)
-            self.assertIn("hypotheses_uninspected", report)
-            self.assertIn("contradictory_evidence", report)
-            self.assertIn("operational_limitations", report)
-
-            # Hypotheses evaluation contract
-            eval_hyps = report["hypotheses_evaluated"]
-            self.assertIsInstance(eval_hyps, list)
-            for h in eval_hyps:
-                self.assertIn(h.get("status"), ("SUPPORTED", "REFUTED", "INCONCLUSIVE", "INVALIDATED", "NOT_TESTED"))
-        finally:
-            if proc.stdin:
-                proc.stdin.close()
-            if proc.stdout:
-                proc.stdout.close()
-            if proc.stderr:
-                proc.stderr.close()
-            proc.kill()
-            proc.wait()
 
 
 if __name__ == "__main__":
