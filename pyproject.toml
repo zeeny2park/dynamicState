@@ -29,7 +29,7 @@ dynamic-state-workspace = "extractor.web.workspace:main"
 dynamic-state-mcp = "dynamicstate_mcp.mcp_server:main"
 
 [tool.setuptools]
-packages = ["extractor", "extractor.recipe_plugins", "extractor.web", "extractor.web.static", "extractor.web.workspace_static", "dynamicstate_mcp", "dynamicstate_skills"]
+packages = ["extractor", "extractor.inspection", "extractor.recipe_plugins", "extractor.web", "extractor.web.static", "extractor.web.workspace_static", "dynamicstate_mcp", "dynamicstate_skills"]
 
 [tool.setuptools.package-dir]
 dynamicstate_mcp = "scripts"

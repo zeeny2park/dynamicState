@@ -15,6 +15,7 @@ import unittest
 from unittest import mock
 
 from extractor import watch_session as ws
+from extractor.inspection import threads as ws_threads  # the lock-owner decision lives here (moved from watch_session)
 from extractor.diagnostic_recipes import (
     RECIPE_POTENTIAL_DEADLOCK_PATTERNS, RECIPE_STATUS_CONTRADICTED, RECIPE_STATUS_INSUFFICIENT_EVIDENCE,
     DiagnosticRecipeRegistry,
@@ -71,7 +72,7 @@ class TestLockOwnerUnsupportedIsNotNoDeadlock(unittest.TestCase):
 
     def _assert_not_evaluated(self, status):
         proc = self._launch()
-        with mock.patch.object(ws, "check_support", _patched(status)):
+        with mock.patch.object(ws_threads, "check_support", _patched(status)):
             # provider -> recipe, directly
             recipe = DiagnosticRecipeRegistry.get_recipe(RECIPE_POTENTIAL_DEADLOCK_PATTERNS)
             obs, _ = RuntimeEvidenceProvider().collect_for_recipe(recipe, proc.pid, self.exe, session_id="d1", epoch_id=1)
