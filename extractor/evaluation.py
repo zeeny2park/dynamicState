@@ -460,10 +460,11 @@ class CausalValidationEvaluator:
             source="test",
             session_id=inv_id,
             observation="Child record",
-            parent_evidence_ids=["ev_ghost_parent"],  # Missing parent!
             capture_quality={"completeness": "COMPLETE"},
         )
+        # Admission rejects dangling parents: admit, then corrupt the lineage in place.
         session.ledger.add_record(rec)
+        rec.parent_evidence_ids = ["ev_ghost_parent"]  # Missing parent!
         hypo = InvestigationHypothesis(
             hypothesis_id="hypo_ghost",
             investigation_id=inv_id,

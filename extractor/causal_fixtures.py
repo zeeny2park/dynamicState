@@ -710,7 +710,6 @@ class CausalDefectFixtures:
             source="state_diff",
             session_id=inv_id,
             observation="Initial state change",
-            parent_evidence_ids=["ev_h_2"],
             capture_quality={"completeness": "COMPLETE"},
         )
         rec2 = EvidenceRecord(
@@ -720,11 +719,15 @@ class CausalDefectFixtures:
             source="investigation_observer",
             session_id=inv_id,
             observation="Cycle step",
-            parent_evidence_ids=["ev_h_1"],  # Back edge creating cycle!
+            parent_evidence_ids=["ev_h_1"],
             capture_quality={"completeness": "COMPLETE"},
         )
+        # The ledger rejects dangling/cyclic parents at admission, so admit the records acyclically and then
+        # corrupt rec1's lineage in place (tampered/deserialized state) to close the ev_h_1 <-> ev_h_2 cycle
+        # that the provenance-integrity evaluation must fail safe on.
         session.ledger.add_record(rec1)
         session.ledger.add_record(rec2)
+        rec1.parent_evidence_ids = ["ev_h_2"]
 
         hypo = InvestigationHypothesis(
             hypothesis_id="hypo_scen_h",

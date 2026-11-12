@@ -3501,8 +3501,6 @@ class TestPhase7FunctionAttributionAndIdentityHardening(unittest.TestCase):
 class TestFalsePositiveEvaluationHarness(unittest.TestCase):
     """Test suite verifying the machine-readable false-positive evaluation harness."""
 
-    # IMP-005 baseline: real defect — CausalValidationEvaluator.run_all() raises ValueError ("EvidenceRecord 'ev_h_1' references nonexistent parent record 'ev_h_2'") instead of returning the 18-case report; expected zero-FP report. Production fixture extractor/causal_fixtures.py:726 (create_scenario_h_cyclic_missing_duplicate_evidence, called from extractor/evaluation.py:422) still admits a dangling/cyclic parent that evidence_ledger.py:1510 now rejects.
-    @unittest.expectedFailure
     def test_evaluation_harness_execution_and_zero_fp_sla(self):
         """Run the complete evaluation suite and assert zero false validations."""
         evaluator = CausalValidationEvaluator()
