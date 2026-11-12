@@ -3,6 +3,8 @@
   "origin": "new",
   "naming": "neutral",
   "kind": "long_stall",
+  "scored": false,
+  "scored_reason": "Not scored (owner decision): from outside a thread blocked forever and an idle worker look identical, so the tool deliberately answers 'long wait observed, cannot determine whether expected' instead of a fault. Must never be required to produce a fault; any verdict is reported informationally.",
   "source": "benchmarks/diagnosis_accuracy/targets/stall_sleep.c",
   "language": "c",
   "symptom": "requests are not being processed anymore",

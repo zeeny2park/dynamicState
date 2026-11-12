@@ -21,10 +21,20 @@ the symptom text, `origin` (`project_fixture`, `external_style`, `new`) and `nam
 New programs print `READY` once in the faulty steady state and stay alive; reused fixtures use a fixed settle time.
 Heap-corruption targets do the bad write once, then idle without calling malloc/free again.
 
-13 defect targets (memory_leak 3, heap_overflow 2, use_after_free 2, deadlock 2, busy_wait 2, long_stall 2),
-8 healthy controls, 3 `external_style` (small LRU cache, ring buffer, job queue written in a neutral style).
+11 scored defect targets (memory_leak 3, heap_overflow 2, use_after_free 2, deadlock 2, busy_wait 2), 2 unscored
+`long_stall` targets (`stall_pipe`, `stall_sleep`), 8 healthy controls, 3 `external_style` (small LRU cache, ring buffer, job queue written in a neutral style).
 
 ## Scoring (per target, one `diagnose` call)
+
+- Unscored targets: a ground-truth record with `"scored": false` (and a mandatory `"scored_reason"`) is still built, run
+  and printed, but under a separate "unscored (informational)" heading in the table and an `unscored` section in the
+  results JSON (`totals.unscored`; rows carry `"scored": false`). It is excluded from every detection, cause-name,
+  location, per-kind/origin/naming, false-positive and error total and rate. Currently only the `long_stall` targets
+  (`stall_pipe`, `stall_sleep`) are unscored (owner decision): from outside, a thread blocked forever and an idle worker
+  look identical, so the tool deliberately answers "long wait observed, cannot determine whether expected" rather than a
+  fault, and counting that as a miss gave no actionable signal. A stall target is defective, so a fault-class verdict on it
+  is not a false positive (false positives are defined for healthy controls only); the verdict is just reported.
+  `KIND_CATEGORIES` keeps `long_stall` only to label and describe those rows.
 
 - Detection (defect): some finding's `category` is in `KIND_CATEGORIES[kind]` (table in `run_benchmark.py`). A fault
   verdict without a matching-category finding is not a detection. `confidence` is never used.
@@ -39,6 +49,11 @@ Heap-corruption targets do the bad write once, then idle without calling malloc/
 
 ## Baseline (2026-11-12, aarch64, commit in file name)
 
+Results files written before the `long_stall` scope change include `long_stall` (2 targets) in the totals, i.e. they say
+`/13` defect targets; they are not rewritten. Results from this change on use 11 scored defect targets. The first-score
+numbers below are of the old 13-target scoring; rescored on the 11 scored targets the current state is detected 7/11
+(deadlock 2/2, busy_wait 2/2, memory_leak 3/3), healthy false positives 0/8.
+
 Symptom from ground truth (`results/2026-11-12-aarch64-6718369.json`): detected 0/13, cause names 0/13, false positives 0,
 healthy cleared 0, not cleared 8/8. Every target returns INCONCLUSIVE with no findings. Same code with
 `--symptom generic` (`...-generic-symptom.json`): detected 2/13 (both deadlock), cause names 2/13 (`deadlock_pipeline`
@@ -50,3 +65,4 @@ deadlock, "the process hangs" is not).
 
 IMP-007 ... IMP-011 count as complete only when their defect kind passes cause-name match (`full`) here, on the
 `external_style` and neutral-naming targets as well as project fixtures, with no increase in healthy false positives.
+`long_stall` is unscored and gates nothing; the stall targets must only keep running without a crash or hang.

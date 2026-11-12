@@ -48,7 +48,10 @@ KIND_CATEGORIES: Dict[str, frozenset] = {
     "busy_wait": frozenset({"PROCESS_INSTABILITY", "RESOURCE_EXHAUSTION"}),
     "long_stall": frozenset({"PROCESS_INSTABILITY"}),
 }
+# `long_stall` stays here only so unscored stall rows can be labelled and described; it never enters a total.
 DEFECT_KINDS = tuple(KIND_CATEGORIES)
+# A ground-truth record may carry "scored": false (+ "scored_reason"). Such targets are still built, run and
+# printed, but are excluded from every detection / cause-name / location / false-positive total and rate.
 HEALTHY_KIND = "none"
 FAULT_VERDICTS = frozenset({"CONFIRMED_FAULT", "PROBABLE_FAULT", "FAULT"})
 CLEARED_VERDICTS = frozenset({"HEALTHY"})
@@ -77,6 +80,13 @@ def validate_ground_truth(gt: Dict[str, Any], repo_root: str = REPO_ROOT) -> Lis
             errs.append(f"missing key {key}")
     if errs:
         return errs
+    if "scored" in gt:
+        if not isinstance(gt["scored"], bool):
+            errs.append("scored must be a boolean")
+        elif gt["scored"] is False and not str(gt.get("scored_reason", "")).strip():
+            errs.append("unscored target needs a scored_reason")
+        elif gt["scored"] is False and gt["kind"] == HEALTHY_KIND:
+            errs.append("a healthy control cannot be unscored")
     if gt["kind"] != HEALTHY_KIND and gt["kind"] not in KIND_CATEGORIES:
         errs.append(f"unknown kind {gt['kind']}")
     if gt["origin"] not in ORIGINS:
@@ -124,6 +134,10 @@ def validate_ground_truth(gt: Dict[str, Any], repo_root: str = REPO_ROOT) -> Lis
 
 
 # ------------------------------------------------------------------------------------------------ scoring
+def is_scored(gt: Dict[str, Any]) -> bool:
+    return gt.get("scored", True) is not False
+
+
 def _file_line_subjects(subjects: List[str]) -> List[tuple]:
     out = []
     for s in subjects:
@@ -135,7 +149,10 @@ def _file_line_subjects(subjects: List[str]) -> List[tuple]:
 
 def score_result(gt: Dict[str, Any], result: Optional[Dict[str, Any]], error: Optional[str] = None) -> Dict[str, Any]:
     """Score one ``DiagnoseResult.to_dict()`` against one ground-truth record. Pure function."""
-    row: Dict[str, Any] = {"id": gt["id"], "kind": gt["kind"], "origin": gt["origin"], "naming": gt["naming"]}
+    row: Dict[str, Any] = {"id": gt["id"], "kind": gt["kind"], "origin": gt["origin"], "naming": gt["naming"],
+                           "scored": is_scored(gt)}
+    if not row["scored"]:
+        row["scored_reason"] = gt.get("scored_reason", "")
     if result is None:
         row.update(error=error or "no result", verdict=None, finding_categories=[], subjects=[],
                    not_covered_kinds=[], capture_mode=None, measured_stop_ms=None, non_zero_stop=None)
@@ -213,14 +230,24 @@ def _stats(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     }
 
 
-def summarize(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+def summarize(all_rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Totals over scored rows only. Unscored rows are listed under ``unscored`` and change nothing else."""
+    rows = [r for r in all_rows if r.get("scored", True)]
+    unscored = [r for r in all_rows if not r.get("scored", True)]
     d_total = sum(1 for r in rows if r["kind"] != HEALTHY_KIND)
     overall = _stats(rows)
     overall["detection_rate"] = round(overall["detected"] / d_total, 4) if d_total else None
     overall["cause_name_match_rate"] = round(overall["name_full"] / d_total, 4) if d_total else None
     return {
         "overall": overall,
-        "per_kind": {k: _stats([r for r in rows if r["kind"] == k]) for k in DEFECT_KINDS},
+        "unscored": {
+            "note": "informational; excluded from every total and rate in this report",
+            "targets": [{k: r.get(k) for k in ("id", "kind", "scored_reason", "verdict", "detected", "name_match",
+                                                "location_match", "finding_categories", "subjects", "error")}
+                        for r in unscored],
+        },
+        "per_kind": {k: _stats([r for r in rows if r["kind"] == k]) for k in DEFECT_KINDS
+                     if any(r["kind"] == k for r in rows)},
         "per_origin": {o: _stats([r for r in rows if r["origin"] == o]) for o in ORIGINS},
         "per_naming": {n: _stats([r for r in rows if r["naming"] == n]) for n in ("neutral", "project")},
     }
@@ -374,7 +401,7 @@ def run_all(targets: List[Dict[str, Any]], diagnose_fn: Callable = _default_diag
 
 def format_table(report: Dict[str, Any]) -> str:
     lines = [f"{'target':20} {'kind':15} {'origin':15} {'verdict':16} {'det':>3} {'names':>7} {'loc':>3}  categories"]
-    for r in report["rows"]:
+    def row_line(r):
         if r["kind"] == HEALTHY_KIND:
             det = "FP" if r.get("false_positive") else ("ok" if r.get("cleared") else "nc")
             names = loc = "-"
@@ -383,11 +410,14 @@ def format_table(report: Dict[str, Any]) -> str:
             names = r.get("name_match", "none")
             loc = "yes" if r.get("location_match") else "no"
         extra = f"ERROR {r['error']}" if r.get("error") else ",".join(sorted(set(r["finding_categories"]))) or "-"
-        lines.append(f"{r['id']:20} {r['kind']:15} {r['origin']:15} {str(r['verdict']):16} {det:>3} {names:>7} {loc:>3}  {extra}")
+        return f"{r['id']:20} {r['kind']:15} {r['origin']:15} {str(r['verdict']):16} {det:>3} {names:>7} {loc:>3}  {extra}"
+
+    lines.extend(row_line(r) for r in report["rows"] if r.get("scored", True))
+    unscored_rows = [r for r in report["rows"] if not r.get("scored", True)]
     t = report["totals"]
     o = t["overall"]
     lines.append("")
-    lines.append(f"defects: detected {o['detected']}/{o['defect_targets']}, cause names full {o['name_full']}"
+    lines.append(f"scored defects: detected {o['detected']}/{o['defect_targets']}, cause names full {o['name_full']}"
                  f" partial {o['name_partial']}, location {o['location_match']}")
     lines.append(f"healthy: cleared {o['cleared']}, not cleared {o['not_cleared']}, false positives "
                  f"{o['false_positives']} (of {o['healthy_targets']}); errors {o['errors']}; "
@@ -401,6 +431,12 @@ def format_table(report: Dict[str, Any]) -> str:
             lines.append(f"  origin {k:15} detected {s['detected']}/{s['defect_targets']}  names "
                          f"{s['name_full']}/{s['defect_targets']}  healthy FP {s['false_positives']}/"
                          f"{s['healthy_targets']} nc {s['not_cleared']}")
+    if unscored_rows:
+        lines.append("")
+        lines.append("unscored (informational; not in any total above; a fault verdict here is reported, not penalised)")
+        lines.extend(row_line(r) for r in unscored_rows)
+        for r in unscored_rows:
+            lines.append(f"  {r['id']}: {r.get('scored_reason', '')}")
     lines.append(f"total wall time {report['total_wall_s']}s")
     return "\n".join(lines)
 

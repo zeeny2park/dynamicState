@@ -13,6 +13,8 @@ from benchmarks.diagnosis_accuracy import run_benchmark as rb
 
 GT = rb.load_ground_truth()
 DEFECTS = [g for g in GT if g["kind"] != rb.HEALTHY_KIND]
+SCORED_DEFECTS = [g for g in DEFECTS if rb.is_scored(g)]
+UNSCORED = [g for g in GT if not rb.is_scored(g)]
 HEALTHY = [g for g in GT if g["kind"] == rb.HEALTHY_KIND]
 
 
@@ -54,12 +56,23 @@ class TestGroundTruthFiles(unittest.TestCase):
             self.assertTrue(os.path.isfile(os.path.join(rb.GT_DIR, g["id"] + ".json")))
 
     def test_corpus_composition_requirements(self):
-        for kind in rb.DEFECT_KINDS:
+        for kind in {g["kind"] for g in DEFECTS}:
             self.assertGreaterEqual(sum(1 for g in DEFECTS if g["kind"] == kind), 2, kind)
         self.assertGreaterEqual(len(HEALTHY), 5)
         self.assertGreaterEqual(sum(1 for g in GT if g["origin"] == "external_style"), 3)
         new_defects = [g for g in DEFECTS if g["origin"] != "project_fixture"]
         self.assertGreaterEqual(2 * sum(1 for g in new_defects if g["naming"] == "neutral"), len(new_defects))
+
+    def test_scored_field_schema(self):
+        for g in UNSCORED:
+            self.assertIs(g["scored"], False)
+            self.assertTrue(g["scored_reason"].strip())
+            self.assertNotEqual(g["kind"], rb.HEALTHY_KIND)
+        self.assertEqual({g["id"] for g in UNSCORED}, {"stall_pipe", "stall_sleep"})
+        base = UNSCORED[0]
+        self.assertTrue(rb.validate_ground_truth({k: v for k, v in base.items() if k != "scored_reason"}))
+        self.assertTrue(rb.validate_ground_truth(dict(base, scored="no")))
+        self.assertTrue(rb.validate_ground_truth(dict(HEALTHY[0], scored=False, scored_reason="x")))
 
     def test_validator_rejects_broken_records(self):
         base = DEFECTS[0]
@@ -75,6 +88,33 @@ class TestScorer(unittest.TestCase):
     def test_mapping_table_covers_every_defect_kind(self):
         self.assertEqual({g["kind"] for g in DEFECTS}, set(rb.KIND_CATEGORIES))
 
+    def test_unscored_targets_do_not_change_totals(self):
+        for fake in (_wrong_result, _everything_result, _clean_result):
+            with self.subTest(fake=fake.__name__):
+                full = rb.summarize([rb.score_result(g, fake(g)) for g in GT])
+                scored_only = rb.summarize([rb.score_result(g, fake(g)) for g in GT if rb.is_scored(g)])
+                self.assertEqual(full["overall"], scored_only["overall"])
+                self.assertEqual(full["per_kind"], scored_only["per_kind"])
+                self.assertEqual(full["per_origin"], scored_only["per_origin"])
+                self.assertEqual(full["overall"]["defect_targets"], len(SCORED_DEFECTS))
+                self.assertNotIn("long_stall", full["per_kind"])
+                self.assertEqual([t["id"] for t in full["unscored"]["targets"]], [g["id"] for g in UNSCORED])
+        # a fault verdict on an unscored target is reported but never a false positive nor a detection total
+        row = rb.score_result(UNSCORED[0], _everything_result(UNSCORED[0]))
+        self.assertFalse(row["scored"])
+        self.assertEqual(row["verdict"], "CONFIRMED_FAULT")
+        self.assertNotIn("false_positive", row)
+
+    def test_unscored_rows_listed_under_separate_heading(self):
+        rows = [rb.score_result(g, _clean_result(g)) for g in GT]
+        report = {"rows": rows, "totals": rb.summarize(rows), "total_wall_s": 0}
+        text = rb.format_table(report)
+        head, _, tail = text.partition("unscored (informational")
+        self.assertTrue(tail)
+        for g in UNSCORED:
+            self.assertNotIn(g["id"], head)
+            self.assertIn(g["id"], tail)
+
     def test_all_wrong_answers_score_zero_detections_and_names(self):
         rows = [rb.score_result(g, _wrong_result(g)) for g in GT]
         o = rb.summarize(rows)["overall"]
@@ -87,7 +127,7 @@ class TestScorer(unittest.TestCase):
         o = rb.summarize(rows)["overall"]
         self.assertEqual(o["false_positives"], len(HEALTHY))
         self.assertEqual(o["cleared"] + o["not_cleared"], 0)
-        self.assertEqual(o["detected"], len(DEFECTS))  # allowed to be high: that is why FP is counted
+        self.assertEqual(o["detected"], len(SCORED_DEFECTS))  # allowed to be high: that is why FP is counted
 
     def test_clean_answers_clear_healthy_and_miss_defects(self):
         o = rb.summarize([rb.score_result(g, _clean_result(g)) for g in GT])["overall"]
