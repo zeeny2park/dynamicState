@@ -988,8 +988,9 @@ class EvidenceToSourceCorrelator:
     Source file/line -> Function candidates -> Hypothesis -> Verification.
     """
 
-    def __init__(self, companion_elf: Optional[str] = None):
+    def __init__(self, companion_elf: Optional[str] = None, adapter: Optional[Any] = None):
         self.companion_elf = companion_elf
+        self.adapter = adapter   # a remote adapter supplies /proc/<pid>/maps (a local file would be another host's)
 
     def correlate(
         self,
@@ -1042,21 +1043,31 @@ class EvidenceToSourceCorrelator:
                         load_bias_status = "RESOLVED"
                     elif target_pid and target_pid > 0:
                         maps_path = f"/proc/{target_pid}/maps"
-                        if os.path.exists(maps_path):
+                        remote = self.adapter is not None and self.adapter.is_remote()
+                        if remote or os.path.exists(maps_path):
                             elf_base = os.path.basename(self.companion_elf)
                             mappings = []
-                            with open(maps_path, "r", errors="replace") as f:
-                                for line in f:
-                                    parts = line.split()
-                                    if len(parts) >= 6 and elf_base in parts[5]:
-                                        addr_range = parts[0].split("-")
+                            if remote:
+                                for m in self.adapter.get_proc_maps(target_pid) or []:
+                                    if elf_base in str(m.get("pathname") or ""):
                                         mappings.append({
-                                            "start": int(addr_range[0], 16),
-                                            "end": int(addr_range[1], 16),
-                                            "permissions": parts[1],
-                                            "offset": int(parts[2], 16),
-                                            "pathname": parts[5],
+                                            "start": m["start_int"], "end": m["end_int"],
+                                            "permissions": m["permissions"], "offset": m["offset_int"],
+                                            "pathname": m["pathname"],
                                         })
+                            else:
+                                with open(maps_path, "r", errors="replace") as f:
+                                    for line in f:
+                                        parts = line.split()
+                                        if len(parts) >= 6 and elf_base in parts[5]:
+                                            addr_range = parts[0].split("-")
+                                            mappings.append({
+                                                "start": int(addr_range[0], 16),
+                                                "end": int(addr_range[1], 16),
+                                                "permissions": parts[1],
+                                                "offset": int(parts[2], 16),
+                                                "pathname": parts[5],
+                                            })
                             if mappings and elf_info:
                                 try:
                                     load_bias = ModuleAddressResolver.calculate_load_bias(mappings, elf_info)
@@ -1248,7 +1259,7 @@ class AdaptiveInvestigationSession:
         self.assessor = TargetAssessor()
         self.recipe_registry = DiagnosticRecipeRegistry()
         self.planner = InvestigationPlanner(self.recipe_registry)
-        self.correlator = EvidenceToSourceCorrelator(companion_elf)
+        self.correlator = EvidenceToSourceCorrelator(companion_elf, self.adapter)
         self.ledger = EvidenceLedger(session_id=self.investigation_id)
         self.evidence_adapter = EvidenceAdapter()
         self.evidence_provider = RuntimeEvidenceProvider(

@@ -35,3 +35,28 @@ Rules:
 Tests: a unit test of the rule and the presentation on synthetic observations (see `tests/test_report_registry.py`),
 and, for a defect kind that should be scored, a target program and ground-truth record under
 `benchmarks/diagnosis_accuracy/`.
+
+## Remote targets
+
+A collector must read the target only through `provider.adapter` (`get_proc_maps`, `get_process_status`,
+`read_thread_samples`, `read_memory_batch`, `read_target_file`, and `run_ssh` for a host-wide question such as "does tid
+N exist"). A direct `open("/proc/<pid>/...")`, `os.listdir` or `os.path.isdir` reads the diagnosing machine, which on a
+remote target is another host. Where a collector needs a local fallback it must branch on `adapter.is_remote()` (see
+`fd_leak._read_text`, `thread_leak._limits`, `lock_faults._tid_exists`) and, if the remote read is not possible, report
+"not read" / "unverified", never the local value.
+
+All seven diagnoses of the second wave work on a remote target (ssh with the collector daemon, or the loopback used in
+the tests); none is marked unsupported:
+
+| Diagnosis | Reads, through the adapter | Remote-specific limit |
+| :--- | :--- | :--- |
+| Orphan lock, self-deadlock | thread table and futex syscall record (`read_thread_samples`, collector THREADS), mutex words (`read_memory`), context switches, owner-tid existence (`run_ssh "[ -d /proc/<tid> ]"`) | the owner-tid check needs the ssh shell; without it the owner is "unverified" and the result is INSUFFICIENT_EVIDENCE |
+| Lock contention (degraded) | the same thread rows and mutex words | none beyond the generic remote limits (no TLS, no running-thread stacks) |
+| Thread leak | thread-count series and thread rows of the sampler, `limits` and `/proc/sys/kernel/threads-max` via `read_target_file` | a limit that cannot be read is "not read" (the rule then cannot clear on it); 300 threads make a remote window slow |
+| Memory growth outside malloc | `get_proc_maps`, `get_process_status`, `read_memory_batch` (chunk headers, typed globals) | none |
+| Heap fragmentation / retention (degraded) | `get_proc_maps`, `get_process_status`, heap walk (`read_memory_batch`) | none |
+| Double free | heap walk, tcache/fastbin lists, stability re-reads (`read_memory_batch`) | none |
+
+`tests/test_remote_new_diagnoses.py` runs each benchmark target locally and through the collector behind a loopback
+transport, compares the findings, and fails when the remote run touches `/proc/<pid>`, one of its tids, or `/proc/sys`
+of the diagnosing machine. It cannot show behaviour on a real second host (different clock, latency, shell).
