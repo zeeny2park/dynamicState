@@ -11,6 +11,7 @@ Validates:
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -394,7 +395,8 @@ class TestCliAdaptiveReportIntegration(unittest.TestCase):
         with open(html_out, "r", encoding="utf-8") as f:
             html_content = f.read()
         self.assertIn(data["verdict"], html_content)
-        self.assertNotIn("CONFIRMED_FAULT", html_content)
+        # the shared theme's stylesheet names every verdict tone (.tone-CONFIRMED_FAULT); the report itself must not
+        self.assertNotIn("CONFIRMED_FAULT", re.sub(r"(?is)<style\b.*?</style>", "", html_content))
 
 
 if __name__ == "__main__":

@@ -315,7 +315,7 @@ class TestPresentation(unittest.TestCase):
         en = build_visual_summary(res, res["report"], "en")
         card = en[en.index('id="dsv-finding-1"'):][:900]
         self.assertIn("not a fault: degradation", card)
-        self.assertIn("dsv-tone-unk", en[en.index('id="dsv-finding-1"') - 40:en.index('id="dsv-finding-1"')])
+        self.assertIn("badge-tone tone-skip", card)                      # the theme's neutral tone
         self.assertNotIn("probable cause", card)
         ko = build_visual_summary(res, res["report"], "ko")
         self.assertIn("결함 아님: 성능 저하", ko)

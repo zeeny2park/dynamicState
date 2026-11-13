@@ -220,8 +220,10 @@ class TestPhase50HypothesisVerifierAndIncidentReport(unittest.TestCase):
         self.assertRegex(md, r"(?m)^## \d+\. What to do next$")
         method = re.search(r"^## \d+\. How the diagnosis was done and what it cost the target\n(.*?)(?=^## )", md,
                            re.S | re.M).group(1)
-        self.assertIn("pid %d" % self.proc.pid, method)
-        self.assertIn("never paused", method)
+        self.assertIn("ZERO_STOP", method)                              # the zero-stop statement
+        target = re.search(r"^## \d+\. Target\n(.*?)(?=^## )", md, re.S | re.M).group(1)
+        self.assertIn("pid %d" % self.proc.pid, target)                # the identity, stated once in the target card
+        self.assertIn("never paused", md.split("\n## ", 2)[1])        # the four figures close the conclusion
 
 
 if __name__ == "__main__":
