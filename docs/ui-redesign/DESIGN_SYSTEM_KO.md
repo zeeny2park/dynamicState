@@ -1,7 +1,7 @@
 # 공통 디자인 시스템과 화면 구성
 
 - **작성일**: 2026-11-13 · 브랜치 `feat/web-ui-redesign`
-- **파일**: `extractor/web/ui/theme.css` (단일 원본. 목업 `mock/*.html` 도 이 파일을 직접 읽는다) (토큰 + 컴포넌트, 14 KB, 의존성 없음), 쇼케이스 `mock/design-system.html`
+- **파일**: `extractor/web/ui/theme.css` (단일 원본. 목업 `mock/*.html` 도 이 파일을 직접 읽는다) (토큰 + 컴포넌트 + 발견 그림, 약 30 KB, 의존성 없음; 정적 보고서가 생성 시 인라인), 쇼케이스 `mock/design-system.html`
 - **근거**: shadcn/ui 스킬(`.claude/skills/shadcn`, `npx skills add shadcn-ui/ui`)의 토큰 규약(`customization.md`)과 스타일 선택 기준(`design-system.md`)
 
 ## 1. UX 통일성은 어떻게 유지되는가
@@ -68,7 +68,8 @@ shadcn/ui의 `name` / `name-foreground` 규약, OKLCH, 중립 팔레트(크로�
 | Progress · Skeleton · Spinner | `.progress`, `.progress-stack`, `.skeleton`, `.spinner` | 배너, 타일, 로딩 |
 | Alert | `.alert` `-tone` | 판단 불가 사유, 오류 |
 | Table · Separator · Kbd | `.table` `.separator` `.kbd` | 근거 표, 단축키 |
-| Collapsible | `details.collapsible`, `-plain` | 근거, 실행 안 함, 상세 A–I |
+| Collapsible | `details.collapsible`, `-plain` (라벨 "펼치기/접기"·"Show/Hide" 는 `:lang()` 으로 테마 안에서 정해짐) | 근거, 실행 안 함, 부분별 상세 기록 |
+| 발견 그림 | `.dsv-*` (`theme.css` 의 "Finding pictures" 절: 시퀀스 그림, 메모리 칸, 스레드 표, 단계 넘기기) | 발견 카드 (화면과 보고서 공통) |
 | 상태 아이콘 | `.status-icon.{PASS,FAIL,INCONCLUSIVE,SKIPPED,RUNNING,PENDING}` | 검사 행 |
 
 React/Tailwind 컴포넌트 자체는 쓰지 않는다. 이 프로젝트는 Python 서버가 정적 파일 하나를 내보내고 폐쇄망에서 열려야 하므로 빌드 체인을 들이지 않는다. 가져온 것은 토큰 규약, 컴포넌트 어휘와 변형 체계, "레이아웃만 className, 색은 토큰" 규칙이다.
