@@ -266,6 +266,12 @@ class ProblemClassificationResult:
     extracted_entities: Dict[str, List[str]]
     is_vague: bool
     screening_strategy: Optional[str] = None
+    # Stage 2 (symptom_interpretation): the symptom class behind primary_category, whether the symptom was
+    # understood specifically (False: LOW confidence, the broad plan was used) and the full interpretation.
+    symptom_class: str = ""
+    understood: bool = True
+    confidence_level: str = "HIGH"
+    interpretation: Optional[Dict[str, Any]] = None
 
 
 class ProblemClassifier:
@@ -327,110 +333,58 @@ class ProblemClassifier:
         },
     }
 
-    # Indicators that a query is vague / broad screening
-    VAGUE_PATTERNS = [
-        r"check\s+(?:whether|if)\s+(?:this\s+|the\s+|target\s+)?process",
-        r"is\s+(?:the\s+|this\s+)?(?:target\s+)?process\s+(?:healthy|ok|running\s+fine)",
-        r"health\s*check",
-        r"status\s*check",
-        r"diagnose\s+process",
-        r"investigate\s+process",
-        r"any\s+problems?",
-        r"find\s+bugs?",
-        r"overall\s+check",
-        r"이\s*프로세스(?:에)?\s*문제(?:가)?\s*있(?:는지|나)",
-        r"상태\s*검사",
-        r"이상\s*유무",
-        r"프로세스\s*점검",
-        r"건강\s*상태",
-        r"전체적(?:인)?\s*문제",
-        r"종합\s*분석",
-        r"왜\s*멈췄지",
-        r"뭐가\s*문제",
-    ]
+    def classify(self, query: str, fields: Any = None) -> ProblemClassificationResult:
+        """Classify a symptom (free text and/or structured fields) into a symptom class and plan categories.
 
-    def classify(self, query: str) -> ProblemClassificationResult:
-        """Classifies a problem query into candidate categories and extracts entities."""
+        Delegates the interpretation to :func:`extractor.symptom_interpretation.interpret_symptom` (normalisation,
+        bilingual vocabulary per class, precedence, explicit confidence).  CATEGORY_KEYWORDS above is the legacy
+        keyword table; it is no longer used for classification.
+        """
+        from .symptom_interpretation import interpret_symptom, parse_symptom_fields, related_identifiers
         raw_query = query or ""
-        normalized = raw_query.strip().lower()
-
-        # Check for vague / broad query
-        is_vague = False
-        for pat in self.VAGUE_PATTERNS:
-            if re.search(pat, normalized, re.IGNORECASE):
-                is_vague = True
-                break
-
-        # If query is very short and generic, also mark as vague
-        if len(normalized.split()) <= 4 and any(w in normalized for w in ["check", "inspect", "검사", "점검", "확인"]):
-            is_vague = True
-
-        # Entity extraction
+        parsed = parse_symptom_fields(fields)
+        interp = interpret_symptom(raw_query, parsed)
         extracted_entities = self._extract_entities(raw_query)
+        if parsed and parsed.related_objects:
+            variables, functions = related_identifiers(parsed.related_objects)
+            for key, vals in (("variables", variables), ("functions", functions)):
+                for v in vals:
+                    if v not in extracted_entities[key]:
+                        extracted_entities[key].append(v)
+            extracted_entities["related_objects"] = list(parsed.related_objects)
 
-        # Category scoring
-        category_scores: Dict[str, float] = {}
-        for cat, lang_dict in self.CATEGORY_KEYWORDS.items():
-            score = 0.0
-            for lang, keywords in lang_dict.items():
-                for kw in keywords:
-                    if kw in normalized:
-                        # Longer matching keywords have higher weight
-                        score += 1.0 + 0.1 * len(kw.split())
-            if score > 0.0:
-                category_scores[cat] = score
-
-        # If entities point to specific categories, boost them
-        if extracted_entities.get("error_codes"):
-            for err in extracted_entities["error_codes"]:
-                if "SEGV" in err or "BUS" in err:
-                    category_scores[CATEGORY_MEMORY_CORRUPTION] = category_scores.get(CATEGORY_MEMORY_CORRUPTION, 0.0) + 3.0
-                elif "ABRT" in err:
-                    category_scores[CATEGORY_STACK_CORRUPTION] = category_scores.get(CATEGORY_STACK_CORRUPTION, 0.0) + 2.0
-                    category_scores[CATEGORY_INVALID_DOUBLE_FREE] = category_scores.get(CATEGORY_INVALID_DOUBLE_FREE, 0.0) + 2.0
-                elif "DEADLK" in err:
-                    category_scores[CATEGORY_DEADLOCK_INDICATORS] = category_scores.get(CATEGORY_DEADLOCK_INDICATORS, 0.0) + 3.0
-
-        # Determine primary and ranked candidates
-        if category_scores:
-            max_score = max(category_scores.values())
-            normalized_scores = [(cat, round(sc / (max_score + 1.0), 3)) for cat, sc in category_scores.items()]
-            normalized_scores.sort(key=lambda x: x[1], reverse=True)
-            primary_cat = normalized_scores[0][0]
-            confidence = min(0.95, round(normalized_scores[0][1] + 0.2, 2))
-        else:
-            # Fallback for completely unknown or totally vague query
-            if is_vague:
-                primary_cat = CATEGORY_PROCESS_INSTABILITY
-                normalized_scores = [
-                    (CATEGORY_PROCESS_INSTABILITY, 0.50),
-                    (CATEGORY_DEADLOCK_INDICATORS, 0.45),
-                    (CATEGORY_MEMORY_LEAK, 0.40),
-                    (CATEGORY_MEMORY_CORRUPTION, 0.35),
-                ]
-                confidence = 0.45
-            else:
-                primary_cat = CATEGORY_FUNCTIONAL_STATE_INCONSISTENCY
-                normalized_scores = [(primary_cat, 0.30)]
-                confidence = 0.30
-
-        screening_strategy = None
-        if is_vague:
+        if interp.broad_plan:
+            # Broad multi-domain screening: asked for (health check / no text) or the fallback of LOW confidence.
+            normalized_scores = [
+                (CATEGORY_PROCESS_INSTABILITY, 0.50),
+                (CATEGORY_DEADLOCK_INDICATORS, 0.45),
+                (CATEGORY_MEMORY_LEAK, 0.40),
+                (CATEGORY_MEMORY_CORRUPTION, 0.35),
+            ]
+            confidence = 0.45 if interp.understood else 0.0
             screening_strategy = (
                 "BROAD_MULTI_DOMAIN_SCREENING: Multi-domain assessment across "
                 "Memory Integrity (null/guard probes), Memory Growth (RSS/heap delta), "
                 "Abnormal State (variable boundaries), and Concurrency (thread blocking & deadlock check)."
             )
+        else:
+            normalized_scores = list(interp.candidate_categories)
+            confidence = interp.confidence
+            screening_strategy = None
 
         return ProblemClassificationResult(
             raw_query=raw_query,
-            normalized_query=normalized,
-            primary_category=primary_cat,
+            normalized_query=raw_query.strip().lower(),
+            primary_category=interp.primary_category,
             candidate_categories=normalized_scores,
             confidence=confidence,
             extracted_entities=extracted_entities,
-            is_vague=is_vague,
+            is_vague=interp.broad_plan,
             screening_strategy=screening_strategy,
+            symptom_class=interp.symptom_class,
+            understood=interp.understood,
+            confidence_level=interp.confidence_level,
+            interpretation=interp.to_dict(),
         )
 
     def _extract_entities(self, text: str) -> Dict[str, List[str]]:
@@ -909,6 +863,11 @@ class InvestigationPlanner:
             f"category '{classification.primary_category}'. Ordered by relevance, diagnostic value, "
             f"and zero-stop safety. Baseline checks always planned: {', '.join(BASELINE_RECIPE_IDS)}."
         )
+        if not getattr(classification, "understood", True):
+            plan_rationale = (
+                "Symptom not understood specifically (low classification confidence): broad multi-domain plan "
+                "used instead of a narrow one. " + plan_rationale
+            )
 
         return InvestigationPlan(
             steps=steps,
@@ -1229,9 +1188,12 @@ class AdaptiveInvestigationSession:
         recipe_thresholds: Optional[Dict[str, Any]] = None,
         budget_tracker: Optional[ObservationBudgetTracker] = None,
         budget_limits: Optional[ObservationBudgetLimits] = None,
+        symptom_fields: Any = None,
     ):
+        from .symptom_interpretation import parse_symptom_fields
         self.investigation_id = investigation_id
         self.raw_problem_statement = problem_statement
+        self.symptom_fields = parse_symptom_fields(symptom_fields)   # structured symptom input (stage 2), or None
         self.pid = pid
         self.companion_elf = companion_elf
         self.corpus_dir = corpus_dir or "/tmp/dynamicstate_corpus"
@@ -1529,7 +1491,7 @@ class AdaptiveInvestigationSession:
 
     def _step_classify(self) -> Dict[str, Any]:
         self.state = STATE_CLASSIFYING
-        self.classification_result = self.classifier.classify(self.raw_problem_statement)
+        self.classification_result = self.classifier.classify(self.raw_problem_statement, self.symptom_fields)
         if self.target_expressions:
             for exp in self.target_expressions:
                 if exp not in self.classification_result.extracted_entities.setdefault("variables", []):
@@ -1551,6 +1513,9 @@ class AdaptiveInvestigationSession:
             "primary_category": self.classification_result.primary_category,
             "confidence": self.classification_result.confidence,
             "is_vague": self.classification_result.is_vague,
+            "symptom_class": self.classification_result.symptom_class,
+            "understood": self.classification_result.understood,
+            "confidence_level": self.classification_result.confidence_level,
             "extracted_entities": self.classification_result.extracted_entities,
             "competing_hypotheses_count": len(self.competing_hypotheses),
         })
@@ -3480,6 +3445,7 @@ class AdaptiveInvestigationSession:
             "schema_version": "2.1.8",
             "investigation_id": self.investigation_id,
             "raw_problem_statement": self.raw_problem_statement,
+            "symptom_fields": self.symptom_fields.to_dict() if self.symptom_fields else None,
             "pid": self.pid,
             "companion_elf": self.companion_elf,
             "corpus_dir": self.corpus_dir,
@@ -3563,6 +3529,7 @@ class AdaptiveInvestigationSession:
             pid=data.get("pid"),
             companion_elf=data.get("companion_elf"),
             corpus_dir=data.get("corpus_dir"),
+            symptom_fields=data.get("symptom_fields"),
         )
         sess.state = data.get("state", STATE_CREATED)
         sess.is_paused = bool(data.get("is_paused", False))
@@ -3680,8 +3647,9 @@ class ExpertDiagnosticEngine:
         recipe_thresholds: Optional[Dict[str, Any]] = None,
         budget_tracker: Optional[ObservationBudgetTracker] = None,
         budget_limits: Optional[ObservationBudgetLimits] = None,
+        symptom_fields: Any = None,
     ) -> AdaptiveInvestigationSession:
-        """Launches a new adaptive investigation session."""
+        """Launches a new adaptive investigation session (symptom_fields: optional structured symptom input)."""
         inv_id = investigation_id or f"inv_{uuid.uuid4().hex[:12]}"
         session = AdaptiveInvestigationSession(
             investigation_id=inv_id,
@@ -3699,6 +3667,7 @@ class ExpertDiagnosticEngine:
             recipe_thresholds=recipe_thresholds,
             budget_tracker=budget_tracker,
             budget_limits=budget_limits,
+            symptom_fields=symptom_fields,
         )
         self.sessions[inv_id] = session
         return session
@@ -3853,6 +3822,11 @@ class ExpertDiagnosticEngine:
 #                           not_checked [{kind, item, label, label_ko, reason}] (scope limits of a HEALTHY verdict),
 #                           blocking [{kind, item, reason}] (why the run is NOT healthy; empty when HEALTHY)}.
 #                          verdict == HEALTHY  <=>  healthy_scope.healthy.
+#   symptom_interpretation dict  how the symptom was read (extractor.symptom_interpretation): {symptom_class,
+#                          source (text|structured|default), understood (False: LOW confidence, the broad plan
+#                          was used and the report says so), confidence_level (HIGH|LOW), confidence, reason
+#                          (clear|no_match|weak_evidence|conflicting_classes), primary_category, broad_plan,
+#                          scores, competing_class, text_class, fields}; {} when the run ended before classification.
 DIAGNOSE_SCHEMA_VERSION = "1"
 DIAGNOSE_DEFAULT_SYMPTOM = "general health check"
 
@@ -3901,6 +3875,7 @@ class DiagnoseResult:
     duration_s: float = 0.0
     schema_version: str = DIAGNOSE_SCHEMA_VERSION
     healthy_scope: Dict[str, Any] = field(default_factory=dict)
+    symptom_interpretation: Dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
         return json.loads(json.dumps(asdict(self), default=str))
@@ -4076,6 +4051,7 @@ def diagnose(
     max_steps: Optional[int] = None,
     include_report: bool = False,
     engine: Optional["ExpertDiagnosticEngine"] = None,
+    symptom_fields: Any = None,
 ) -> DiagnoseResult:
     """Diagnose live process ``pid`` end to end in one call and return a :class:`DiagnoseResult`.
 
@@ -4086,6 +4062,10 @@ def diagnose(
     symptom: natural-language symptom; default "general health check" (the planner then runs its broad
         recipe set).  adapter: ready target adapter (default local).  time_limit_s: wall-clock observation
         budget (default: 20 s local, 120 s for a remote target, where every read is an SSH round trip).  max_steps: explicit state-machine step cap (default: sized from the plan).
+    symptom_fields: optional structured symptom input (``extractor.symptom_interpretation.SymptomFields`` or a dict
+        with symptom_kind, symptom_frequency, symptom_duration, affected_area, related_objects).  A given
+        symptom_kind decides the investigation plan; the free text ``symptom`` alone behaves as before.  Invalid
+        values give an INCONCLUSIVE result with ``invalid_symptom_fields`` in ``not_covered``.
     target: remote target as a :class:`TargetSpec` or dict (``remote_host``, ``ssh_user``, ``ssh_port``,
         ``ssh_key``, ``ssh_proxy_jump``, ``auto_deploy_collector``, ``collector_path``); builds an SSH
         adapter that is closed again when the call ends.  An unreachable host or failed SSH is INCONCLUSIVE
@@ -4113,6 +4093,12 @@ def diagnose(
         return r
 
     try:
+        from .symptom_interpretation import SymptomFieldError, parse_symptom_fields
+        try:
+            symptom_fields = parse_symptom_fields(symptom_fields)
+        except SymptomFieldError as exc:
+            return _early("invalid_symptom_fields", "symptom fields", str(exc),
+                          f"The structured symptom input is invalid: {exc}. No conclusion was reached.")
         if target is not None:
             try:
                 spec = TargetSpec.from_value(target)
@@ -4169,7 +4155,8 @@ def diagnose(
                               "matching unstripped ELF. No conclusion was reached.")
         return _diagnose_run(pid, debug_image, symptom, adapter=adapter, corpus_dir=corpus_dir,
                              time_limit_s=time_limit_s, max_steps=max_steps, include_report=include_report,
-                             engine=engine, extra_target=extra_target, pre_nc=pre_nc, t0=t0, remote=remote)
+                             engine=engine, extra_target=extra_target, pre_nc=pre_nc, t0=t0, remote=remote,
+                             symptom_fields=symptom_fields)
     finally:
         if own_adapter is not None:
             try:
@@ -4222,6 +4209,7 @@ def _diagnose_run(
     pre_nc: List[Dict[str, Any]],
     t0: float,
     remote: bool,
+    symptom_fields: Any = None,
 ) -> DiagnoseResult:
     res = _new_diagnose_result(pid, debug_image)
     res.target.update(extra_target)
@@ -4280,8 +4268,9 @@ def _diagnose_run(
         stage = "start_investigation"
         try:
             session = engine.start_investigation(
-                problem_statement=symptom or DIAGNOSE_DEFAULT_SYMPTOM,
+                problem_statement=symptom or ("" if symptom_fields else DIAGNOSE_DEFAULT_SYMPTOM),
                 pid=pid, companion_elf=debug_image, adapter=adapter, budget_limits=limits,
+                symptom_fields=symptom_fields,
             )
             res.investigation_id = session.investigation_id
             if getattr(session, "budget_tracker", None) is not None:
@@ -4297,6 +4286,8 @@ def _diagnose_run(
             return _finish(f"The diagnosis failed during '{stage}' ({type(exc).__name__}). No conclusion was reached.")
 
         res.state = session.state
+        if session.classification_result is not None and session.classification_result.interpretation:
+            res.symptom_interpretation = dict(session.classification_result.interpretation)
         res.stop_reason = conclusion.stop_reason if conclusion else None
         executed = [c for c in session.checks if c.status not in (CheckStatus.NOT_EXECUTED, CheckStatus.SKIPPED)]
         res.checks_run = [_diagnose_check_row(c) for c in executed]

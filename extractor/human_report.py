@@ -278,6 +278,16 @@ T: Dict[str, Tuple[str, str]] = {
                        "image so the cause can be named.",
                        "발견에 이름이 붙어 있지 않습니다. 더 구체적인 증상을 주거나 디버그 이미지를 제공해 다시 "
                        "실행하면 원인을 지목할 수 있습니다."),
+    # stage 2: the symptom text was not understood specifically, so the broad plan was used
+    "sym_unclear": ("Note: the symptom was not understood specifically ({why}), so a broad plan was used: every "
+                    "baseline check plus one representative check from each domain. To narrow the investigation, "
+                    "describe what you observe (for example: it hangs, memory keeps growing) or give the symptom kind.",
+                    "참고: 증상을 구체적으로 이해하지 못했습니다({why}). 그래서 넓은 계획을 사용했습니다. 모든 기본 검사와 "
+                    "각 영역의 대표 검사 하나씩을 실행합니다. 조사를 좁히려면 관찰한 현상(예: 멈춘다, 메모리가 계속 "
+                    "늘어난다)을 적거나 증상 종류를 지정하세요."),
+    "sym_why_no_match": ("no known symptom wording was recognised", "알려진 증상 표현을 찾지 못했습니다"),
+    "sym_why_weak": ("only weak hints were found", "약한 단서만 있었습니다"),
+    "sym_why_conflict": ("the description points to several different problems", "설명이 서로 다른 여러 문제를 가리킵니다"),
     "n_incon_intro": ("A conclusion needs more input. Any of these would help:", "결론을 내려면 입력이 더 필요합니다. 다음 중 하나가 도움이 됩니다:"),
     "n_incon_img": ("Provide the debug image (the unstripped build of the same program version) with the "
                     "--debug-image option.",
@@ -1084,6 +1094,16 @@ def _registered_text(ctx: _Ctx, f: Dict[str, Any], report: Optional[Dict[str, An
     return r
 
 
+def _symptom_note(ctx: _Ctx, res: Dict[str, Any]) -> List[str]:
+    """The one-line statement that a broad plan was used because the symptom was not understood specifically."""
+    si = res.get("symptom_interpretation") or {}
+    if not isinstance(si, dict) or si.get("understood", True):
+        return []
+    why = {"no_match": "sym_why_no_match", "weak_evidence": "sym_why_weak",
+           "conflicting_classes": "sym_why_conflict"}.get(str(si.get("reason")), "sym_why_no_match")
+    return [ctx.t("sym_unclear", why=ctx.t(why)), ""]
+
+
 def render_human_report(result: Dict[str, Any], report: Optional[Dict[str, Any]] = None, lang: str = "en") -> str:
     """Render the human summary (Markdown) of a ``DiagnoseResult`` dict.  ``lang`` is ``"en"`` or ``"ko"``."""
     if lang not in SUPPORTED_LANGS:
@@ -1121,8 +1141,9 @@ def render_human_report(result: Dict[str, Any], report: Optional[Dict[str, Any]]
         renders.append(r)
 
     concl = _conclusion(ctx, res, renders)
+    sym_note = _symptom_note(ctx, res)
     parts = [f"# {ctx.t('title', proc=(_c(res.get('target', {}).get('process_name')) if (res.get('target') or {}).get('process_name') else ctx.t('unknown_proc')), pid=(res.get('target') or {}).get('pid'))}",
-             "", f"## {ctx.t('h1')}", "", concl, "",
+             "", f"## {ctx.t('h1')}", "", concl, ""] + sym_note + [
              f"## {ctx.t('h2')}", ""]
     parts += _section2(ctx, res, renders)
     parts += ["", f"## {ctx.t('h3')}", ""] + _section3(ctx, res, renders, report)
@@ -1138,7 +1159,7 @@ def render_human_report(result: Dict[str, Any], report: Optional[Dict[str, Any]]
 def diagnose_with_summary(pid: int, debug_image: Optional[str] = None, symptom: Optional[str] = None,
                           time_limit_s: Optional[float] = None, engine: Any = None, lang: str = "en",
                           corpus_dir: Optional[str] = None, target: Any = None,
-                          adapter: Any = None) -> Tuple[Dict[str, Any], str]:
+                          adapter: Any = None, symptom_fields: Any = None) -> Tuple[Dict[str, Any], str]:
     """Run ``diagnose`` once and return ``(result_dict_without_inline_report, human_summary_markdown)``.
 
     The inline full report is requested only to give the summary its names and numbers; it is dropped from the
@@ -1150,6 +1171,8 @@ def diagnose_with_summary(pid: int, debug_image: Optional[str] = None, symptom: 
         kw["target"] = target
     if adapter is not None:
         kw["adapter"] = adapter
+    if symptom_fields is not None:
+        kw["symptom_fields"] = symptom_fields
     res = diagnose(pid, debug_image=debug_image, symptom=symptom, time_limit_s=time_limit_s,
                    include_report=True, **kw)
     d = res.to_dict()
