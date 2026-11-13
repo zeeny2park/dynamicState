@@ -30,6 +30,7 @@ from extractor.runtime_evidence_provider import (
     RuntimeEvidenceRecord,
 )
 from extractor.target_adapter import LocalTargetAdapter
+from tests.support.fixture_process import fixture_popen
 
 
 class TestPhase211LiveEvidenceAcquisition(unittest.TestCase):
@@ -61,7 +62,7 @@ class TestPhase211LiveEvidenceAcquisition(unittest.TestCase):
                     pass
 
     def _spawn_target(self, mode: str) -> subprocess.Popen:
-        p = subprocess.Popen([self.debug_elf, mode], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        p = fixture_popen([self.debug_elf, mode], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         self.procs.append(p)
         time.sleep(0.12)
         return p

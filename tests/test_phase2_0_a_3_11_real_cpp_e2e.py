@@ -41,6 +41,7 @@ from extractor.evidence_ledger import (
     PROVENANCE_CLASS_LIVE_RUNTIME_CAPTURE,
 )
 from extractor.target_adapter import LocalTargetAdapter, PIDReusedError
+from tests.support.fixture_process import fixture_popen
 
 
 class TestPhase20A311RealCppE2E(unittest.TestCase):
@@ -72,7 +73,7 @@ class TestPhase20A311RealCppE2E(unittest.TestCase):
         shutil.rmtree(cls.tmp_dir, ignore_errors=True)
 
     def _start_scenario_process(self) -> Tuple[subprocess.Popen, Dict[str, Any]]:
-        proc = subprocess.Popen(
+        proc = fixture_popen(
             [self.bin_scenario],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
@@ -98,8 +99,8 @@ class TestPhase20A311RealCppE2E(unittest.TestCase):
     # -------------------------------------------------------------------------
     def test_05_multiple_concurrent_targets_isolated_e2e(self):
         """[LIVE] Two simultaneously running processes are captured and isolated cleanly."""
-        proc1 = subprocess.Popen([self.bin_healthy])
-        proc2 = subprocess.Popen([self.bin_healthy])
+        proc1 = fixture_popen([self.bin_healthy])
+        proc2 = fixture_popen([self.bin_healthy])
         try:
             time.sleep(0.1)
             adapter = LocalTargetAdapter()
@@ -171,7 +172,7 @@ class TestPhase20A311RealCppE2E(unittest.TestCase):
     # -------------------------------------------------------------------------
     def test_07_high_thread_count_e2e(self):
         """[LIVE] Target process with multiple threads reports threads and stack memory accurately."""
-        proc = subprocess.Popen([self.bin_healthy])
+        proc = fixture_popen([self.bin_healthy])
         try:
             time.sleep(0.1)
             adapter = LocalTargetAdapter()
@@ -189,7 +190,7 @@ class TestPhase20A311RealCppE2E(unittest.TestCase):
     # -------------------------------------------------------------------------
     def test_08_process_restart_during_investigation_e2e(self):
         """[LIVE] Target process exit/restart during capture transaction fails closed."""
-        proc = subprocess.Popen([self.bin_healthy])
+        proc = fixture_popen([self.bin_healthy])
         pid = proc.pid
         time.sleep(0.1)
         adapter = LocalTargetAdapter()
@@ -211,7 +212,7 @@ class TestPhase20A311RealCppE2E(unittest.TestCase):
     # -------------------------------------------------------------------------
     def test_09_probe_vs_diagnostic_capture_transaction_e2e(self):
         """[LIVE] Probe transactions cannot attest to diagnostic records."""
-        proc = subprocess.Popen([self.bin_healthy])
+        proc = fixture_popen([self.bin_healthy])
         try:
             time.sleep(0.1)
             adapter = LocalTargetAdapter()
@@ -260,7 +261,7 @@ class TestPhase20A311RealCppE2E(unittest.TestCase):
     # -------------------------------------------------------------------------
     def test_13_stop_time_sla_under_4_5ms_e2e(self):
         """[LIVE] Zero-stop memory reads execute with stop-time SLA < 4.5ms (benchmark < 1.0ms)."""
-        proc = subprocess.Popen([self.bin_healthy])
+        proc = fixture_popen([self.bin_healthy])
         try:
             time.sleep(0.1)
             adapter = LocalTargetAdapter()
@@ -287,7 +288,7 @@ class TestPhase20A311RealCppE2E(unittest.TestCase):
     # -------------------------------------------------------------------------
     def test_14_repeated_capture_operations_stability_e2e(self):
         """[LIVE] Multiple successive capture operations complete cleanly without resource leak."""
-        proc = subprocess.Popen([self.bin_healthy])
+        proc = fixture_popen([self.bin_healthy])
         try:
             time.sleep(0.1)
             adapter = LocalTargetAdapter()

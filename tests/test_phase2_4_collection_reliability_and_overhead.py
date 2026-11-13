@@ -32,6 +32,7 @@ from extractor.observation_budget import (
 from extractor.runtime_evidence_provider import RuntimeEvidenceProvider
 from extractor.target_adapter import LocalTargetAdapter
 from extractor.watch_session import read_process_memory_slice
+from tests.support.fixture_process import fixture_popen
 
 
 PAGE_BOUNDARY_TARGET_CPP = """
@@ -84,7 +85,7 @@ class TestPhase24CollectionReliabilityAndOverhead(unittest.TestCase):
 
     def test_01_unmapped_and_fault_memory_reads_fail_closed(self):
         """Verify unmapped addresses and null pointers fail-closed without fabricating bytes."""
-        proc = subprocess.Popen([self.bin_path], stdout=subprocess.PIPE, text=True)
+        proc = fixture_popen([self.bin_path], stdout=subprocess.PIPE, text=True)
         try:
             line = proc.stdout.readline()
             while "READY" not in line:
@@ -123,7 +124,7 @@ class TestPhase24CollectionReliabilityAndOverhead(unittest.TestCase):
         """Read across page boundary from valid page into PROT_NONE guard page.
         Must preserve valid bytes (or fail-closed) without inventing or padding data.
         """
-        proc = subprocess.Popen([self.bin_path], stdout=subprocess.PIPE, text=True)
+        proc = fixture_popen([self.bin_path], stdout=subprocess.PIPE, text=True)
         try:
             page_size = 4096
             guarded_addr = 0
@@ -166,7 +167,7 @@ class TestPhase24CollectionReliabilityAndOverhead(unittest.TestCase):
         - Verify measured target stop duration is 0.00ms
         - Verify zero leaked reservations in budget tracker
         """
-        proc = subprocess.Popen([self.bin_path], stdout=subprocess.PIPE, text=True)
+        proc = fixture_popen([self.bin_path], stdout=subprocess.PIPE, text=True)
         try:
             guarded_addr = 0
             for _ in range(50):

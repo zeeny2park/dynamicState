@@ -24,6 +24,7 @@ from extractor.diagnostic_recipes import (
     DiagnosticRecipeRegistry,
 )
 from extractor.runtime_evidence_provider import RuntimeEvidenceProvider
+from tests.support.fixture_process import fixture_popen
 
 FIXTURES = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures", "real_runtime")
 SETTLE_S = 0.3          # let the fixture threads reach their steady (blocked) state
@@ -54,7 +55,7 @@ class TestDeadlockRealProcessBaseline(unittest.TestCase):
         cls.recipe = DiagnosticRecipeRegistry.get_recipe(RECIPE_POTENTIAL_DEADLOCK_PATTERNS)
 
     def _launch(self, name):
-        proc = subprocess.Popen(
+        proc = fixture_popen(
             [self.bins[name]], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
         )
 

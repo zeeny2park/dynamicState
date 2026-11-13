@@ -18,6 +18,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 
 from extractor import expert_diagnostic_engine as ede  # noqa: E402
+from tests.support.fixture_process import fixture_popen
 
 TARGETS = os.path.join(ROOT, "benchmarks", "diagnosis_accuracy", "targets")
 
@@ -43,7 +44,7 @@ class TestBudgetStop(unittest.TestCase):
         self.addCleanup(shutil.rmtree, tmp, True)
         exe = os.path.join(tmp, name)
         subprocess.run(["gcc", "-g", "-O0", "-pthread", os.path.join(TARGETS, name + ".c"), "-o", exe], check=True)
-        p = subprocess.Popen([exe], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        p = fixture_popen([exe], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
         self.addCleanup(p.wait)
         self.addCleanup(p.kill)
         self.assertEqual(p.stdout.readline().strip(), b"READY")

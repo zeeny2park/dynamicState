@@ -33,6 +33,7 @@ from tests.fixture_builds import ensure_expert_diagnostic_fixture
 from extractor.agent_runtime import AgentRuntime
 from extractor.web.server import WebApiAdapter
 import scripts.mcp_server as mcp_srv
+from tests.support.fixture_process import fixture_popen
 
 
 class TestPhase21McpAndUiIntegration(unittest.TestCase):
@@ -42,7 +43,7 @@ class TestPhase21McpAndUiIntegration(unittest.TestCase):
         self.runtime = AgentRuntime(corpus_dir="/tmp/phase2_1_mcp_corpus")
         self.web_adapter = WebApiAdapter(self.runtime)
         self.companion_elf, _ = ensure_expert_diagnostic_fixture(need_stripped=False)
-        self.proc = subprocess.Popen([self.companion_elf, "healthy"], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        self.proc = fixture_popen([self.companion_elf, "healthy"], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         time.sleep(0.15)
         self.pid = self.proc.pid
 

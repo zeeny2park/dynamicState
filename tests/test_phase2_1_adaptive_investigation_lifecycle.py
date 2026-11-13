@@ -25,6 +25,7 @@ from extractor.expert_diagnostic_engine import (
     AdaptiveInvestigationSession,
     ExpertDiagnosticEngine,
 )
+from tests.support.fixture_process import fixture_popen
 
 
 class TestPhase21AdaptiveInvestigationLifecycle(unittest.TestCase):
@@ -38,7 +39,7 @@ class TestPhase21AdaptiveInvestigationLifecycle(unittest.TestCase):
         # lifecycle runs against the matching healthy fixture process (not the test interpreter
         # paired with an unrelated companion ELF, whose checks are all INCONCLUSIVE).
         ensure_expert_diagnostic_fixture(need_stripped=False)
-        proc = subprocess.Popen(["/tmp/expert_diagnostic_debug.elf", "healthy"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        proc = fixture_popen(["/tmp/expert_diagnostic_debug.elf", "healthy"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         self.addCleanup(lambda: (proc.kill(), proc.wait(timeout=5)))
         time.sleep(0.2)
         return proc.pid

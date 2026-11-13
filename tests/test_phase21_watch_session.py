@@ -35,6 +35,7 @@ from extractor.watch_session import (
     read_process_memory_slice,
 )
 from extractor.web.server import WebApiAdapter
+from tests.support.fixture_process import fixture_popen
 
 
 class TestPhase21WatchSession(unittest.TestCase):
@@ -80,7 +81,7 @@ class TestPhase21WatchSession(unittest.TestCase):
         shutil.rmtree(cls.work_dir, ignore_errors=True)
 
     def _start_target_process(self, bin_path):
-        proc = subprocess.Popen(
+        proc = fixture_popen(
             [bin_path],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,

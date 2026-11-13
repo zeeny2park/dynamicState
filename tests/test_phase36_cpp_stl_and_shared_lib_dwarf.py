@@ -22,6 +22,7 @@ from extractor.agent_runtime import AgentRuntime
 from extractor.watch_session import WatchSessionManager
 from extractor.web.server import WebApiAdapter
 import scripts.mcp_server as mcp_srv
+from tests.support.fixture_process import fixture_popen
 
 
 class TestPhase36CppStlAndSharedLibDwarf(unittest.TestCase):
@@ -156,7 +157,7 @@ int main() {
                         pass
 
     def _start_target(self) -> subprocess.Popen:
-        p = subprocess.Popen(
+        p = fixture_popen(
             [self.app_stripped_bin],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,

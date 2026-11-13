@@ -26,6 +26,10 @@ static void *intake(void *arg)
         reg_head = e;
         reg_n++;
         usleep(500);
+        /* FIXTURE_CAP: ~1.8 MiB/s measured; stop at ~500 MiB (~5 min), stay alive. */
+        if (reg_n >= 500000u)
+            for (;;)
+                pause();
     }
     return NULL;
 }

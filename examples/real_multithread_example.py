@@ -40,6 +40,7 @@ if PROJECT_ROOT not in sys.path:
 from extractor.capture_backend import ProcessVmCaptureBackend
 from extractor.semantic_state import OfflineSemanticEngine
 from extractor.state_lab import SnapshotMutator, compute_semantic_diff
+from tests.support.fixture_process import fixture_popen
 
 
 def main():
@@ -76,7 +77,7 @@ def main():
         # Step 2: Start target process in background
         # ----------------------------------------------------------------------
         print("\n[Step 2] Launching Multithreaded Target Process...")
-        proc = subprocess.Popen(
+        proc = fixture_popen(
             [stripped_binary],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,

@@ -9,6 +9,7 @@ import unittest
 from extractor.agent_runtime import AgentRuntime
 from extractor.watch_session import WatchSessionManager
 from extractor.web.server import WebApiAdapter
+from tests.support.fixture_process import fixture_popen
 
 
 PHASE48_CPP_SOURCE = r"""
@@ -130,7 +131,7 @@ class TestPhase48StatefulContextAndForgivingExpressions(unittest.TestCase):
 
     @classmethod
     def _spawn_target(cls) -> subprocess.Popen:
-        p = subprocess.Popen(
+        p = fixture_popen(
             [cls.bin_path],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,

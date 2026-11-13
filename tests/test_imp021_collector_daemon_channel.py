@@ -19,6 +19,7 @@ import time
 import unittest
 
 from extractor.target_adapter import RemoteSshTargetAdapter
+from tests.support.fixture_process import fixture_popen
 
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 COLLECTOR_SRC = os.path.join(REPO_ROOT, "target", "collector")
@@ -78,7 +79,7 @@ class DaemonChannelTests(unittest.TestCase):
         if r.returncode != 0:
             raise unittest.SkipTest("native collector build failed: " + r.stderr[-300:])
         cls.real = os.path.join(build, "dynamicstate-collector")
-        cls.target = subprocess.Popen([sys.executable, "-c", TARGET_PROG], stdout=subprocess.PIPE, text=True)
+        cls.target = fixture_popen([sys.executable, "-c", TARGET_PROG], stdout=subprocess.PIPE, text=True)
         cls.base = int(cls.target.stdout.readline())
         cls.pid = cls.target.pid
 
@@ -287,7 +288,7 @@ class DaemonChannelTests(unittest.TestCase):
             print(a.read_memory({self.pid}, {self.base}, 8)[1], flush=True)
             import time; time.sleep(60)
         """)
-        host = subprocess.Popen([sys.executable, "-c", driver], stdout=subprocess.PIPE, text=True)
+        host = fixture_popen([sys.executable, "-c", driver], stdout=subprocess.PIPE, text=True)
         try:
             self.assertEqual(host.stdout.readline().strip(), "OBSERVED")
             pids = self._spawned_pids()
@@ -374,7 +375,7 @@ class TrueSshTests(unittest.TestCase):
         with open(wrapper, "w") as f:
             f.write(f"#!/bin/sh\necho $$ >> {shlex.quote(log)}\nexec {shlex.quote(os.path.join(build, 'dynamicstate-collector'))} \"$@\"\n")
         os.chmod(wrapper, 0o755)
-        target = subprocess.Popen([sys.executable, "-c", TARGET_PROG], stdout=subprocess.PIPE, text=True)
+        target = fixture_popen([sys.executable, "-c", TARGET_PROG], stdout=subprocess.PIPE, text=True)
         self.addCleanup(lambda: (target.kill(), target.wait(), target.stdout.close()))
         base = int(target.stdout.readline())
         ad = RemoteSshTargetAdapter(host="localhost", port=_SSH_PORT, key_file=_SSH_KEY,

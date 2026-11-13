@@ -91,6 +91,7 @@ from extractor.investigation import (
 from extractor.agent_models import AgentAction
 from extractor.agent_runtime import AgentRuntime
 from extractor.web.server import WebApiAdapter
+from tests.support.fixture_process import fixture_popen
 
 
 
@@ -2040,7 +2041,7 @@ class TestAttestationIssuanceSecurityAndCausality(unittest.TestCase):
             corpus_dir = os.path.join(work_dir, "corpus")
             mgr = InvestigationManager(corpus_dir=corpus_dir)
 
-            proc = subprocess.Popen(
+            proc = fixture_popen(
                 [debug_bin],
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
@@ -3551,7 +3552,7 @@ class TestPhase8RuntimeEvidenceAuthenticity(unittest.TestCase):
 
     @staticmethod
     def _start_target_process(bin_path: str) -> subprocess.Popen:
-        proc = subprocess.Popen(
+        proc = fixture_popen(
             [bin_path],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
@@ -4702,7 +4703,7 @@ class TestPhase9CrossProcessEvidenceTrust(unittest.TestCase):
 
     @staticmethod
     def _start_target_process(bin_path: str) -> subprocess.Popen:
-        proc = subprocess.Popen(
+        proc = fixture_popen(
             [bin_path],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,

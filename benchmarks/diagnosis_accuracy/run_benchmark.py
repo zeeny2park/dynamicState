@@ -26,8 +26,13 @@ import threading
 import time
 from typing import Any, Callable, Dict, List, Optional
 
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO_ROOT = os.path.abspath(os.path.join(HERE, "..", ".."))
+if REPO_ROOT not in sys.path:
+    sys.path.insert(0, REPO_ROOT)
+from tests.support.fixture_process import FixtureLimitExceeded, FixtureProcess, fixture_popen  # noqa: E402
+
 GT_DIR = os.path.join(HERE, "ground_truth")
 RESULTS_DIR = os.path.join(HERE, "results")
 
@@ -386,40 +391,24 @@ def _wait_ready(proc: subprocess.Popen, gt: Dict[str, Any]) -> None:
     raise RuntimeError("timeout waiting for READY")
 
 
-TARGET_ADDRESS_SPACE_LIMIT = 8 << 30  # bytes; the leak targets grow without bound by design
+# Defect kinds whose target keeps allocating or spawning while it runs. With --repeat each repeat gets a fresh
+# process, so every repeat diagnoses the target at the same age (a single process would grow for minutes and
+# the later repeats would see a different, much larger state than the first).
+GROWTH_KINDS = frozenset({"memory_leak", "mapping_growth", "thread_growth"})
 
 
-def _contain_target() -> None:
-    """Runs in the target between fork and exec: the target dies with the benchmark and cannot eat the host.
-
-    A benchmark killed from outside never reaches its ``finally``; a leak target left behind that way grew to 21 GB
-    and brought the host to the OOM killer. PR_SET_PDEATHSIG ends the target when the benchmark process dies for
-    any reason, and the address-space limit bounds what a leak target can take while it runs.
-    """
-    import ctypes
-    import resource
-    try:
-        ctypes.CDLL(None, use_errno=True).prctl(1, int(signal.SIGKILL), 0, 0, 0)  # 1 = PR_SET_PDEATHSIG
-    except Exception:  # noqa: BLE001 - containment is best effort; the run itself must not depend on it
-        pass
-    try:
-        resource.setrlimit(resource.RLIMIT_AS, (TARGET_ADDRESS_SPACE_LIMIT, TARGET_ADDRESS_SPACE_LIMIT))
-    except (ValueError, OSError):
-        pass
+def _launch(binary: str, gt: Dict[str, Any], repeat_slots: int = 1) -> FixtureProcess:
+    """Start the target through the shared containment launcher (tests/support/fixture_process.py): it dies with the
+    benchmark however the benchmark ends (SIGKILL included), is killed by a resident-memory watchdog and by a hard
+    lifetime limit. A benchmark killed from outside once left a leak target growing to 21 GB."""
+    lifetime = READY_TIMEOUT_S + repeat_slots * DIAGNOSE_TIMEOUT_S + 60.0
+    return fixture_popen([binary], stdin=subprocess.DEVNULL,
+                         stdout=subprocess.PIPE if gt["ready"]["mode"] == "stdout_marker" else subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL, max_lifetime_s=lifetime, name=gt["id"])
 
 
-def _kill(proc: subprocess.Popen) -> None:
-    try:
-        os.killpg(proc.pid, signal.SIGKILL)
-    except OSError:
-        try:
-            proc.kill()
-        except OSError:
-            pass
-    try:
-        proc.wait(timeout=10)
-    except subprocess.SubprocessError:
-        pass
+def _kill(proc: FixtureProcess) -> None:
+    proc.kill_tree()
     if proc.stdout:
         proc.stdout.close()
 
@@ -435,7 +424,7 @@ GENERIC_SYMPTOM = "general health check"
 
 def run_target(gt: Dict[str, Any], tmp: str, diagnose_fn: Callable, symptom_mode: str = "ground_truth",
                repeat: int = 1) -> Dict[str, Any]:
-    """Build, launch, diagnose once (``repeat`` times if > 1, same process; scoring uses the first run), kill, score. ``diagnose_fn(pid, debug_image, symptom, corpus_dir)`` -> dict."""
+    """Build, launch, diagnose once (``repeat`` times if > 1, same process, or a fresh one per repeat for growth-type targets; scoring uses the first run), kill, score. ``diagnose_fn(pid, debug_image, symptom, corpus_dir)`` -> dict."""
     t_start = time.monotonic()
     symptom = gt["symptom"] if symptom_mode == "ground_truth" else GENERIC_SYMPTOM
     try:
@@ -444,14 +433,17 @@ def run_target(gt: Dict[str, Any], tmp: str, diagnose_fn: Callable, symptom_mode
         row = score_result(gt, None, f"build failed: {exc}")
         row["wall_s"] = round(time.monotonic() - t_start, 2)
         return row
-    proc = subprocess.Popen([binary], stdin=subprocess.DEVNULL,
-                            stdout=subprocess.PIPE if gt["ready"]["mode"] == "stdout_marker" else subprocess.DEVNULL,
-                            stderr=subprocess.DEVNULL, start_new_session=True, preexec_fn=_contain_target)
+    restart = repeat > 1 and gt.get("kind") in GROWTH_KINDS
+    proc = _launch(binary, gt, 1 if restart else max(1, repeat))
     result, error, diag_s = None, None, None
     runs: List[Dict[str, Any]] = []  # one entry per diagnose call: {"result", "error", "diagnose_s"}
     try:
         _wait_ready(proc, gt)
         for _i in range(max(1, repeat)):
+            if _i > 0 and restart:
+                _kill(proc)
+                proc = _launch(binary, gt, 1)
+                _wait_ready(proc, gt)
             box: Dict[str, Any] = {}
 
             def _call():
@@ -469,6 +461,11 @@ def run_target(gt: Dict[str, Any], tmp: str, diagnose_fn: Callable, symptom_mode
                 runs.append({"result": None, "diagnose_s": run_s,
                              "error": f"diagnose did not return within {DIAGNOSE_TIMEOUT_S:.0f}s (hang)"})
                 break  # the hung thread still uses the target; do not call again
+            try:
+                proc.check()  # the watchdog killed the target (memory ceiling / lifetime): never score that run
+            except FixtureLimitExceeded as exc:
+                runs.append({"result": None, "diagnose_s": run_s, "error": f"target setup failed: {exc}"})
+                break
             runs.append({"result": box.get("result"), "error": box.get("error"), "diagnose_s": run_s})
             # Each diagnosis leaves tens of MB of session and report files in the corpus; the benchmark only uses the
             # returned result, so drop them per run (35 targets x 20 repeats filled a 45 GB disk otherwise).

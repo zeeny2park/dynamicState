@@ -91,6 +91,7 @@ from extractor.expert_diagnostic_engine import (
     STATE_INCONCLUSIVE,
 )
 from extractor.target_adapter import TargetExecutionAdapter, LocalTargetAdapter
+from tests.support.fixture_process import fixture_popen
 
 
 # =============================================================================
@@ -700,7 +701,7 @@ class TestIntegrationParity(unittest.TestCase):
 
     def test_case_af_process_tests_using_fixture(self):
         """Test AF: Live target process assessment using companion ELF fixture."""
-        proc = subprocess.Popen([self.fixture_bin])
+        proc = fixture_popen([self.fixture_bin])
         try:
             assessor = TargetAssessor()
             result = assessor.assess(pid=proc.pid, companion_elf=self.fixture_bin)

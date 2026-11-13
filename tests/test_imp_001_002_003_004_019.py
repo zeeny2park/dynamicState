@@ -46,6 +46,7 @@ from extractor.runtime_evidence_provider import (
 from extractor.verdict_engine import DIAG_INCONCLUSIVE
 from extractor.watch_session import WatchSessionManager
 from extractor.web.server import run_server
+from tests.support.fixture_process import fixture_popen
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 FIXTURE_DIR = os.path.join(REPO_ROOT, "tests", "fixtures", "real_runtime")
@@ -154,7 +155,7 @@ class _ImpTestBase(unittest.TestCase):
         with open(cls.src_path, "w", encoding="utf-8") as f:
             f.write(C_TARGET_SRC)
         _compile(cls.src_path, cls.bin_path)
-        cls.proc = subprocess.Popen([cls.bin_path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        cls.proc = fixture_popen([cls.bin_path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         time.sleep(0.2)
         cls.corpus_dir = os.path.join(cls.tmp_dir.name, "corpus")
 
@@ -172,7 +173,7 @@ class _ImpTestBase(unittest.TestCase):
         out = os.path.join(self.tmp_dir.name, os.path.splitext(fixture_name)[0])
         if not os.path.exists(out):
             _compile(os.path.join(FIXTURE_DIR, fixture_name), out)
-        proc = subprocess.Popen([out], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        proc = fixture_popen([out], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
         def _cleanup() -> None:
             if proc.poll() is None:
@@ -278,7 +279,7 @@ class TestImp001CollectionFailureIsInconclusive(_ImpTestBase):
         times per run and can measure that an idle process is stable, so it is no longer insufficient. The
         object-lifetime recipe goes through the same memory collection path, including the heap walks.)
         """
-        idle = subprocess.Popen(["sleep", "60"])
+        idle = fixture_popen(["sleep", "60"])
         self.addCleanup(lambda: (idle.kill(), idle.wait(timeout=5)))
         time.sleep(0.1)
         eng = ExpertDiagnosticEngine(corpus_dir=self.corpus_dir)
@@ -308,7 +309,7 @@ class TestImp002ZeroStopDefault(_ImpTestBase):
         work = tempfile.mkdtemp(dir=self.tmp_dir.name)
         stop_file = os.path.join(work, "stop")
         out_file = os.path.join(work, "out")
-        poller = subprocess.Popen([sys.executable, "-I", "-c", POLLER_SRC, str(pid), stop_file, out_file])
+        poller = fixture_popen([sys.executable, "-I", "-c", POLLER_SRC, str(pid), stop_file, out_file])
         try:
             deadline = time.monotonic() + 10
             while not os.path.exists(out_file + ".ready"):

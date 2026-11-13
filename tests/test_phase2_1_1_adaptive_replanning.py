@@ -23,6 +23,7 @@ from extractor.expert_diagnostic_engine import (
     AdaptiveInvestigationSession,
     ExpertDiagnosticEngine,
 )
+from tests.support.fixture_process import fixture_popen
 
 
 class TestPhase211AdaptiveReplanning(unittest.TestCase):
@@ -56,7 +57,7 @@ class TestPhase211AdaptiveReplanning(unittest.TestCase):
                     pass
 
     def _spawn_target(self, mode: str) -> subprocess.Popen:
-        p = subprocess.Popen([self.debug_elf, mode], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+        p = fixture_popen([self.debug_elf, mode], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
         self.procs.append(p)
         # The fixture prints its banner (flushed) immediately before applying the scenario state
         # (e.g. the "corrupt" mode mutates globals right after it). Wait for the banner instead of a

@@ -97,6 +97,7 @@ from scripts.mcp_server import (
     runtime_get_investigation_report,
     runtime_export_incident_report,
 )
+from tests.support.fixture_process import fixture_popen
 
 
 class TestDiagnosticMethodologyAndChecks(unittest.TestCase):
@@ -577,7 +578,7 @@ class TestRealisticCppScenarios(unittest.TestCase):
         debug_elf = "/tmp/expert_diagnostic_debug.elf"
         ensure_expert_diagnostic_fixture(need_stripped=False)
 
-        proc = subprocess.Popen([debug_elf, "leak"], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        proc = fixture_popen([debug_elf, "leak"], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         try:
             time.sleep(0.15)
             engine = ExpertDiagnosticEngine(corpus_dir=tempfile.gettempdir())

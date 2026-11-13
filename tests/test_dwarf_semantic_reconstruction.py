@@ -30,6 +30,7 @@ from extractor.raw_snapshot import RawRuntimeSnapshot
 from extractor.semantic_state import OfflineSemanticEngine, SemanticState, compute_semantic_state_hash
 from extractor.state_lab import SnapshotMutator, StateLaboratory, compute_semantic_diff
 from extractor.typed_memory_reader import TypedMemoryReader
+from tests.support.fixture_process import fixture_popen
 
 
 def _approved_full_plan():
@@ -108,7 +109,7 @@ class TestDwarfSemanticReconstruction(unittest.TestCase):
         self.assertEqual(id_stripped.build_id, id_debug.build_id)
 
         # 2. Launch stripped runtime process
-        proc = subprocess.Popen([self.dwarf_stripped], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        proc = fixture_popen([self.dwarf_stripped], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         try:
             time.sleep(0.1)  # Ensure g_session.worker.state.counter = 42 is written
 
@@ -192,7 +193,7 @@ class TestDwarfSemanticReconstruction(unittest.TestCase):
 
     def test_04_pie_aslr_load_bias(self):
         """Verify PIE binaries correctly calculate load bias from runtime memory mappings."""
-        proc = subprocess.Popen([self.pie_bin], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        proc = fixture_popen([self.pie_bin], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         try:
             time.sleep(0.1)
 
@@ -231,7 +232,7 @@ class TestDwarfSemanticReconstruction(unittest.TestCase):
 
     def test_05_pointer_graph_and_stable_object_identity(self):
         """Verify pointer edges and stable shared object identity (A -> C and B -> C)."""
-        proc = subprocess.Popen([self.cycle_bin], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        proc = fixture_popen([self.cycle_bin], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         try:
             time.sleep(0.1)
 
@@ -273,7 +274,7 @@ class TestDwarfSemanticReconstruction(unittest.TestCase):
 
     def test_06_cyclic_graph_recursion_safety(self):
         """Verify cyclic references (A -> B -> A) do not cause infinite recursion."""
-        proc = subprocess.Popen([self.cycle_bin], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        proc = fixture_popen([self.cycle_bin], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         try:
             time.sleep(0.1)
 

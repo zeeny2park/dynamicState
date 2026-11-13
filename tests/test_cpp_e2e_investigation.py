@@ -40,6 +40,7 @@ from extractor.static_analyzer import (
     EVIDENCE_LEVEL_UNKNOWN,
     LAYOUT_MUTATION_CAVEAT,
 )
+from tests.support.fixture_process import fixture_popen
 
 
 def _approved_full_plan():
@@ -92,7 +93,7 @@ class TestCppE2EInvestigation(unittest.TestCase):
         shutil.rmtree(cls.work_dir, ignore_errors=True)
 
     def _start_process(self, bin_path):
-        proc = subprocess.Popen(
+        proc = fixture_popen(
             [bin_path],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,

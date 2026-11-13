@@ -23,8 +23,10 @@ cleanup() {
     if [[ -n "${TARGET_PID}" ]] && kill -0 "${TARGET_PID}" 2>/dev/null; then
         kill -9 "${TARGET_PID}" 2>/dev/null || true
     fi
+    stop_fixture_runner
     rm -rf "${TMP_DIR}"
 }
+. "${ROOT_DIR}/tests/support/fixture_process.sh"
 trap cleanup EXIT
 
 echo "=== Phase 5.1 Low-Impact Memory Snapshot Integration Test ==="
@@ -37,8 +39,8 @@ strip -s -o "${TMP_DIR}/sample_stripped" "${TMP_DIR}/sample"
 
 # 2. Launch stripped production binary in background
 echo "[2/8] Launching stripped process in background..."
-"${TMP_DIR}/sample_stripped" 10 > "${TMP_DIR}/app.log" 2>&1 &
-TARGET_PID=$!
+start_fixture "${TMP_DIR}/app.log" "${TMP_DIR}/sample_stripped" 10
+TARGET_PID="${FIXTURE_PID}"
 
 # Wait for process initialization
 for i in {1..30}; do
@@ -98,7 +100,7 @@ sleep 1
 if kill -0 "${TARGET_PID}" 2>/dev/null; then
     kill -TERM "${TARGET_PID}" 2>/dev/null || true
 fi
-wait "${TARGET_PID}" 2>/dev/null || true
+wait "${FIXTURE_RUNNER_PID}" 2>/dev/null || true
 TARGET_PID=""
 
 # Verify stdout log shows active worker thread increments
@@ -211,8 +213,8 @@ python3 -m extractor.cli --help >/dev/null
 "${ROOT_DIR}/bin/dynamic-state" --help >/dev/null
 
 # Launch short target for CLI test
-"${TMP_DIR}/sample_stripped" 5 >/dev/null 2>&1 &
-CLI_PID=$!
+start_fixture /dev/null "${TMP_DIR}/sample_stripped" 5
+CLI_PID="${FIXTURE_PID}"
 sleep 0.2
 
 "${ROOT_DIR}/bin/dynamic-state" capture-memory \
@@ -222,7 +224,7 @@ sleep 0.2
     --snapshot-id "M_CLI_001" >/dev/null
 
 kill -TERM "${CLI_PID}" 2>/dev/null || true
-wait "${CLI_PID}" 2>/dev/null || true
+wait "${FIXTURE_RUNNER_PID}" 2>/dev/null || true
 
 test -f "${TMP_DIR}/cli_mem_snap/metadata.json"
 test -f "${TMP_DIR}/cli_mem_snap/manifest.json"

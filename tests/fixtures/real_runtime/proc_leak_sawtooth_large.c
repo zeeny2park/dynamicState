@@ -42,6 +42,10 @@ static void *batcher(void *arg)
         for (int i = 0; i < NB; i++)
             free(blk[i]);
         g_batches++;
+        /* FIXTURE_CAP: leaks 400 KB per batch (~0.35 MiB/s); stop after 600 batches (~240 MB leaked, ~11 min),
+         * stay alive. */
+        if (g_batches >= 600)
+            for (;;) pause();
     }
     return NULL;
 }

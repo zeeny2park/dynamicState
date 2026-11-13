@@ -46,6 +46,7 @@ from extractor.investigation import (
 from extractor.target_adapter import LocalTargetAdapter
 from extractor.watch_session import WatchItem, WatchSessionManager, read_process_memory_slice
 from extractor.web.server import WebApiAdapter, run_server
+from tests.support.fixture_process import fixture_popen
 
 
 class TestPhase28MemoryExplorerUX(unittest.TestCase):
@@ -106,7 +107,7 @@ class TestPhase28MemoryExplorerUX(unittest.TestCase):
 
     @classmethod
     def _start_target_process(cls, bin_path: str) -> Tuple[subprocess.Popen, Dict[str, Any]]:
-        proc = subprocess.Popen(
+        proc = fixture_popen(
             [bin_path],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,

@@ -17,7 +17,7 @@ in 16/16 runs.  Not a test: the result depends on the machine and on whatever el
 import argparse
 import collections
 import json
-import multiprocessing as mp
+import subprocess
 import os
 import shutil
 import sys
@@ -29,13 +29,12 @@ ROOT = os.path.dirname(os.path.dirname(HERE))
 sys.path.insert(0, ROOT)
 sys.path.insert(0, HERE)
 import run_benchmark as rb  # noqa: E402
+from tests.support.fixture_process import fixture_popen  # noqa: E402
 
 TEST_SYMPTOM = "the process feels slow, check for lock problems"
 
 
-def _spin() -> None:
-    while True:
-        pass
+_SPIN = [sys.executable, "-c", "while True: pass"]
 
 
 def main(argv=None) -> int:
@@ -50,9 +49,9 @@ def main(argv=None) -> int:
     unknown = [t for t in a.targets if t not in gts]
     if unknown:
         ap.error(f"unknown target(s): {unknown}")
-    hogs = [mp.Process(target=_spin, daemon=True) for _ in range(a.load)]
-    for p in hogs:
-        p.start()
+    # contained: the spinners die with this script (also on SIGKILL) and after a hard lifetime
+    hogs = [fixture_popen(_SPIN, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                          max_lifetime_s=max(1800.0, a.n * len(a.targets) * 120.0)) for _ in range(a.load)]
     time.sleep(1.0)
     out = {}
     try:
@@ -90,7 +89,7 @@ def main(argv=None) -> int:
             out[tid] = dict(dist)
     finally:
         for p in hogs:
-            p.terminate()
+            p.kill_tree()
     print(json.dumps({"load": a.load, "n": a.n, "test_style": a.test_style, "verdicts": out}))
     return 0
 

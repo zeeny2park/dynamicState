@@ -26,6 +26,7 @@ from extractor.runtime_evidence_provider import RuntimeEvidenceProvider
 from extractor.target_abi import (
     FEATURE_MUTEX_OWNER, SUPPORT_INCONCLUSIVE, SUPPORT_NOT_SUPPORTED_ON_TARGET, SupportDecision,
 )
+from tests.support.fixture_process import fixture_popen
 
 FIXTURE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures", "real_runtime",
                        "proc_thread_circular_deadlock.c")
@@ -50,7 +51,7 @@ class TestLockOwnerUnsupportedIsNotNoDeadlock(unittest.TestCase):
         subprocess.run(["gcc", "-g", "-O0", "-Wl,--build-id=sha1", FIXTURE, "-o", cls.exe, "-pthread"], check=True)
 
     def _launch(self):
-        proc = subprocess.Popen([self.exe], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+        proc = fixture_popen([self.exe], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                                 stderr=subprocess.DEVNULL)
 
         def _kill():

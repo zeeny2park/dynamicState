@@ -39,6 +39,7 @@ from extractor.thread_sampler import (
     derive,
     judge,
 )
+from tests.support.fixture_process import fixture_popen
 
 FIXTURES = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures", "real_runtime")
 SPIN_FUNCTIONS = ("spin_forever", "spin_thread")   # leaf recovery names the callee on x86_64, the caller elsewhere
@@ -69,7 +70,7 @@ class _RealProcessBase(unittest.TestCase):
 
     def _spawn(self, name, *args, ready=True, min_threads=0):
         binary = self._binary(name)
-        proc = subprocess.Popen([binary, *args], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+        proc = fixture_popen([binary, *args], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                                 stderr=subprocess.DEVNULL)
 
         def _kill():
