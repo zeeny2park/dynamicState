@@ -1,0 +1,478 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>dynamicState · 진단 (UI 목업)</title>
+<style>
+:root{
+  --bg:#f8fafc; --panel:#ffffff; --ink:#0f172a; --mute:#64748b; --line:#cbd5e1; --soft:#e2e8f0;
+  --bad:#b91c1c; --bad-bg:#fee2e2; --warn:#b45309; --warn-bg:#fef3c7; --good:#15803d; --good-bg:#dcfce7;
+  --unk:#475569; --unk-bg:#e2e8f0; --accent:#2563eb; --accent-bg:#dbeafe;
+  --tone:var(--unk); --tone-bg:var(--unk-bg);
+  --mono:ui-monospace,"JetBrains Mono",SFMono-Regular,Menlo,Consolas,monospace;
+}
+*{box-sizing:border-box}
+html,body{margin:0;background:var(--bg);color:var(--ink);
+  font:15px/1.55 -apple-system,"Segoe UI","Noto Sans KR","Apple SD Gothic Neo",Roboto,sans-serif}
+code,.mono{font-family:var(--mono);font-size:.92em}
+code{background:var(--soft);padding:1px 6px;border-radius:5px}
+a{color:var(--accent);text-decoration:none}
+button{font:inherit;cursor:pointer}
+.hidden{display:none!important}
+
+/* ---------- header ---------- */
+.top{position:sticky;top:0;z-index:10;background:rgba(255,255,255,.92);backdrop-filter:blur(8px);
+  border-bottom:1px solid var(--soft);height:52px;display:flex;align-items:center;gap:16px;padding:0 20px}
+.brand{font-weight:700;letter-spacing:-.01em;display:flex;align-items:center;gap:8px;white-space:nowrap}
+.brand .dot{width:10px;height:10px;border-radius:50%;background:var(--accent)}
+.brand small{font-weight:500;color:var(--mute)}
+.top .grow{flex:1}
+.top .ghost{background:none;border:1px solid var(--soft);border-radius:8px;padding:5px 10px;color:var(--mute);font-size:13px}
+.top .ghost:hover{color:var(--ink);background:var(--bg)}
+/* target chip (while running / done) */
+.tchip{display:flex;align-items:center;gap:10px;font-size:13px;color:var(--mute);min-width:0}
+.tchip b{color:var(--ink);font-family:var(--mono);font-weight:600}
+.tchip .sep{color:var(--line)}
+.tchip .live{display:inline-flex;align-items:center;gap:6px}
+.tchip .live i{width:8px;height:8px;border-radius:50%;background:var(--accent);animation:pulse 1.2s infinite}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.25}}
+
+/* ---------- layout ---------- */
+main{max-width:920px;margin:0 auto;padding:24px 20px 120px}
+.card{background:var(--panel);border:1px solid var(--soft);border-radius:12px;padding:18px 22px;margin:0 0 14px;
+  animation:rise .35s ease both}
+@keyframes rise{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:none}}
+.card h2{margin:0 0 10px;font-size:15px;font-weight:700;display:flex;align-items:center;gap:10px}
+.card h2 .cnt{font-weight:500;color:var(--mute);font-size:13px}
+.card h2 .right{margin-left:auto;font-weight:500;font-size:13px;color:var(--mute)}
+.muted{color:var(--mute)}
+.small{font-size:13px}
+
+/* ---------- idle form ---------- */
+.hero{max-width:640px;margin:72px auto 0;text-align:center}
+.hero h1{font-size:26px;letter-spacing:-.02em;margin:0 0 8px}
+.hero p{color:var(--mute);margin:0 0 26px}
+.form{background:var(--panel);border:1px solid var(--soft);border-radius:14px;padding:14px;text-align:left;
+  box-shadow:0 10px 30px -18px rgba(15,23,42,.25)}
+.row{display:flex;gap:8px;align-items:center}
+.row+.row{margin-top:8px}
+.seg{display:inline-flex;border:1px solid var(--line);border-radius:9px;overflow:hidden;flex:none}
+.seg button{border:0;background:#fff;padding:9px 12px;font-size:13px;color:var(--mute)}
+.seg button.on{background:var(--ink);color:#fff}
+.inp{flex:1;border:1px solid var(--line);border-radius:9px;padding:9px 12px;font:inherit;font-size:14px;min-width:0;
+  background:#fff}
+.inp.mono{font-family:var(--mono);font-size:13px}
+.inp::placeholder{color:#94a3b8}
+.btn{border:0;border-radius:9px;padding:9px 16px;font-weight:600;font-size:14px;background:var(--accent);color:#fff;flex:none}
+.btn:hover{filter:brightness(.95)}
+.opt{display:flex;justify-content:space-between;margin-top:8px;font-size:12.5px;color:var(--mute);padding:0 2px}
+.opt a{color:var(--mute);border-bottom:1px dashed var(--line)}
+.recent{max-width:640px;margin:28px auto 0}
+.recent h3{font-size:13px;color:var(--mute);font-weight:600;margin:0 0 8px;text-transform:uppercase;letter-spacing:.04em}
+.recent .it{display:flex;align-items:center;gap:12px;padding:10px 12px;background:var(--panel);
+  border:1px solid var(--soft);border-radius:10px;margin-bottom:6px;font-size:13.5px}
+.recent .it .n{font-family:var(--mono);font-weight:600}
+.recent .it .t{color:var(--mute);margin-left:auto;white-space:nowrap}
+
+/* ---------- badges ---------- */
+.badge{display:inline-flex;align-items:center;gap:6px;padding:2px 10px;border-radius:999px;font-weight:700;font-size:12.5px;
+  background:var(--tone-bg);color:var(--tone);border:1px solid var(--tone);white-space:nowrap}
+.chip{display:inline-block;padding:1px 8px;border-radius:999px;font-size:12px;border:1px solid var(--soft);
+  background:var(--bg);color:var(--mute);white-space:nowrap}
+.chip.ok{color:var(--good);border-color:#86efac;background:var(--good-bg)}
+.chip.warn{color:var(--warn);border-color:#fcd34d;background:var(--warn-bg)}
+.chip.bad{color:var(--bad);border-color:#fca5a5;background:var(--bad-bg)}
+.chip.acc{color:var(--accent);border-color:#93c5fd;background:var(--accent-bg)}
+.tone-bad{--tone:var(--bad);--tone-bg:var(--bad-bg)}
+.tone-warn{--tone:var(--warn);--tone-bg:var(--warn-bg)}
+.tone-good{--tone:var(--good);--tone-bg:var(--good-bg)}
+.tone-unk{--tone:var(--unk);--tone-bg:var(--unk-bg)}
+.tone-acc{--tone:var(--accent);--tone-bg:var(--accent-bg)}
+
+/* ---------- verdict banner ---------- */
+.banner{border-left:8px solid var(--tone)}
+.banner .line1{display:flex;align-items:center;gap:12px;flex-wrap:wrap}
+.banner .phase{color:var(--mute);font-size:13px}
+.banner .elapsed{margin-left:auto;font-family:var(--mono);font-size:13px;color:var(--mute)}
+.banner .sum{margin:10px 0 0;font-size:16.5px;line-height:1.5}
+.banner .sum b{font-weight:600}
+.prog{height:4px;background:var(--soft);border-radius:2px;margin-top:12px;overflow:hidden}
+.prog i{display:block;height:100%;background:var(--accent);border-radius:2px;transition:width .5s ease}
+.phases{display:flex;gap:4px;margin-top:8px;font-size:11.5px;color:var(--mute)}
+.phases span{flex:1;text-align:center;padding:3px 0;border-top:2px solid var(--soft)}
+.phases span.done{border-color:var(--accent);color:var(--ink)}
+.phases span.now{border-color:var(--accent);color:var(--accent);font-weight:600}
+
+/* ---------- tiles ---------- */
+.tiles{display:grid;grid-template-columns:repeat(5,1fr);gap:10px;margin-bottom:14px}
+.tile{background:var(--panel);border:1px solid var(--soft);border-radius:10px;padding:10px 12px;animation:rise .35s ease both}
+.tile .k{font-size:12px;color:var(--mute)}
+.tile .v{font-size:20px;font-weight:700;letter-spacing:-.01em;margin-top:2px}
+.tile .v.pend{color:var(--line);font-weight:500}
+.tile .s{font-size:11.5px;color:var(--mute);margin-top:2px}
+.bar{display:flex;height:6px;border-radius:3px;overflow:hidden;margin-top:6px;background:var(--soft)}
+.bar i{display:block;height:100%}
+
+/* ---------- target ---------- */
+.kv{display:grid;grid-template-columns:1.5fr 1fr;gap:8px 28px;font-size:13.5px}
+.kv div{display:flex;gap:8px;align-items:baseline;min-width:0}
+.kv .k{color:var(--mute);flex:none;width:84px;white-space:nowrap}
+.kv .v{font-family:var(--mono);font-size:13px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+
+/* ---------- findings ---------- */
+.fhead{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+.fhead h3{margin:0;font-size:15px}
+.fbody{display:grid;grid-template-columns:300px 1fr;gap:18px;margin-top:12px;align-items:start}
+.fbody p{margin:0 0 8px;font-size:14px}
+.svgbox{border:1px solid var(--soft);border-radius:10px;background:var(--bg);padding:8px}
+.steps{list-style:none;margin:0;padding:0;font-size:13.5px}
+.steps li{display:flex;gap:10px;padding:6px 0;border-top:1px dashed var(--soft)}
+.steps li:first-child{border-top:0}
+.steps .n{flex:none;width:20px;height:20px;border-radius:50%;background:var(--ink);color:#fff;font-size:11px;font-weight:700;
+  display:inline-flex;align-items:center;justify-content:center;margin-top:2px}
+.steps .pend .n{background:var(--line)}
+.steps .pend{color:var(--mute)}
+.obs{font-size:11px;padding:0 6px;border-radius:999px;border:1px solid var(--good);color:var(--good);margin-left:4px}
+.rec{font-size:11px;padding:0 6px;border-radius:999px;border:1px solid var(--warn);color:var(--warn);margin-left:4px}
+details.ev{margin-top:12px;border:1px solid var(--soft);border-left:3px solid var(--line);border-radius:8px;background:var(--bg)}
+details.ev summary{cursor:pointer;padding:8px 12px;font-size:13px;font-weight:600;color:var(--unk);list-style:none;display:flex;gap:8px}
+details.ev summary::after{content:"펼치기";margin-left:auto;font-weight:500;color:var(--mute)}
+details.ev[open] summary::after{content:"접기"}
+details.ev .in{padding:0 12px 12px;font-size:13px}
+details.ev table{width:100%;border-collapse:collapse}
+details.ev td,details.ev th{text-align:left;padding:5px 6px;border-top:1px solid var(--soft);vertical-align:top}
+details.ev th{color:var(--mute);font-weight:600;border-top:0}
+
+/* ---------- checks ---------- */
+.ck{list-style:none;margin:0;padding:0}
+.ck li{display:flex;align-items:center;gap:10px;padding:7px 4px;border-top:1px solid var(--soft);font-size:13.5px;cursor:pointer}
+.ck li:first-child{border-top:0}
+.ck li:hover{background:var(--bg)}
+.ck .st{flex:none;width:18px;height:18px;border-radius:50%;display:inline-flex;align-items:center;justify-content:center;
+  font-size:11px;font-weight:800;color:#fff;background:var(--line)}
+.ck .st.PASS{background:var(--good)} .ck .st.FAIL{background:var(--bad)} .ck .st.INCONCLUSIVE{background:var(--warn)}
+.ck .st.RUNNING{background:#fff;border:2px solid var(--accent);border-top-color:transparent;animation:spin .8s linear infinite}
+.ck .st.SKIPPED{background:var(--soft);color:var(--mute)}
+@keyframes spin{to{transform:rotate(360deg)}}
+.ck .nm{font-weight:600;min-width:170px}
+.ck .cat{color:var(--mute);font-size:12px;min-width:92px}
+.ck .ln{color:var(--mute);font-size:12.5px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1}
+.ck .ms{color:var(--mute);font-family:var(--mono);font-size:12px;flex:none}
+.ck li.pend{color:var(--mute)} .ck li.pend .nm{font-weight:500}
+.ck .dt{display:none;flex-basis:100%;padding:6px 0 6px 28px;font-size:13px;color:var(--ink);cursor:default}
+.ck li.open{flex-wrap:wrap} .ck li.open .dt{display:block}
+.grp{margin-top:10px}
+.grp summary{cursor:pointer;font-size:13px;color:var(--mute);padding:6px 4px;list-style:none;display:flex;gap:8px;align-items:center}
+.grp summary::before{content:"▸";font-size:11px} .grp[open] summary::before{content:"▾"}
+.grp summary b{color:var(--ink)}
+
+/* ---------- lists ---------- */
+.ul{margin:0;padding-left:18px;font-size:14px}
+.ul li{margin:4px 0}
+.ul li .why{color:var(--mute);font-size:13px}
+.actions{display:flex;gap:8px;flex-wrap:wrap}
+.actions .a{border:1px solid var(--line);background:#fff;border-radius:9px;padding:7px 12px;font-size:13px;font-weight:600;color:var(--ink)}
+.actions .a.pri{background:var(--ink);color:#fff;border-color:var(--ink)}
+
+/* ---------- mock toolbar ---------- */
+.mock{position:fixed;right:16px;bottom:16px;background:#0f172a;color:#cbd5e1;border-radius:12px;padding:10px 12px;font-size:12px;
+  display:flex;gap:6px;align-items:center;box-shadow:0 12px 30px -10px rgba(0,0,0,.5);z-index:50}
+.mock b{color:#fff;margin-right:4px}
+.mock button{background:#1e293b;color:#e2e8f0;border:1px solid #334155;border-radius:7px;padding:4px 9px;font-size:12px}
+.mock button.on{background:#2563eb;border-color:#2563eb;color:#fff}
+@media (max-width:760px){.tiles{grid-template-columns:repeat(2,1fr)}.fbody{grid-template-columns:1fr}.kv{grid-template-columns:1fr 1fr}}
+</style>
+</head>
+<body>
+
+<header class="top">
+  <div class="brand"><span class="dot"></span>dynamicState <small>진단</small></div>
+  <div id="tchip" class="tchip hidden"></div>
+  <div class="grow"></div>
+  <button class="ghost" id="btn-new" title="다른 프로세스 진단">새 진단</button>
+  <button class="ghost">KO</button>
+  <button class="ghost" title="스냅샷·상태 그래프·워치리스트 등 기존 도구">도구 ▾</button>
+</header>
+
+<main id="main"></main>
+
+<div class="mock" id="mock">
+  <b>목업 단계</b>
+  <button data-s="0">0 대기</button><button data-s="1">1 대상</button><button data-s="2">2 계획</button>
+  <button data-s="3">3 수집</button><button data-s="4">4 검증</button><button data-s="5">5 판정</button>
+  <button data-s="6">정상 사례</button>
+  <button id="play">▶ 재생</button>
+</div>
+
+<script>
+/* ======================================================================
+   The mock is event-driven on purpose: each entry below is one event the
+   server would stream (SSE) while diagnose() runs.  The renderer only
+   ever adds information; nothing is re-laid-out or moved.
+   ====================================================================== */
+const CHECKS = [
+ ["프로세스 메모리 증가","메모리 증가","PASS","no growth trend (RSS +0 KB over 1.40 s, 6 samples)",1400],
+ ["힙 증가","메모리 증가","PASS","Heap stable (delta=0 bytes)",310],
+ ["파일 디스크립터 누수","프로그램 상태","PASS","open fds 3 → 3 → 3 over 0.8 s (+0, 0.0/s), limit 1048576",800],
+ ["힙 메타데이터 무결성","메모리 무결성","PASS","heap metadata intact: 4 chunks walked, top chunk, free lists and bin links consistent",120],
+ ["해제된 메모리 사용","메모리 무결성","PASS","no typed pointer refers to a free chunk and no free chunk was written: 0 free chunks",95],
+ ["오래 막힌 스레드","스레드와 락","FAIL","Blocked threads: 2; 'ingest' (tid 3351225) stayed in pthread_mutex_lock for all 5 samples",630],
+ ["교착 상태(대기 고리)","스레드와 락","FAIL","Cycle verified persistent across threads: ingest → flush → ingest",210],
+ ["의심스러운 락 소유","스레드와 락","FAIL","Suspicious/circular mutex ownership detected: m_in owned by ingest, m_out owned by flush",140],
+ ["스레드 상태 이상","스레드와 락","INCONCLUSIVE","검사가 사유를 기록하지 않았습니다.",60],
+ ["해제 후 사용(추적 기반)","메모리 무결성","INCONCLUSIVE","여기서 사용할 수 없는 기능이 필요함: DYNAMIC_EVENT_TRACING",5],
+];
+const SKIPPED = [["공유 상태 불일치","스레드와 락"],["이중 해제","메모리 무결성"],["잘못된 해제","메모리 무결성"],["잘못된 메모리 접근","메모리 무결성"],
+ ["의심스러운 경계 값","메모리 무결성"],["널·잘못된 포인터","메모리 무결성"],["할당·해제 불균형","메모리 증가"],["오래 남는 객체 누적","메모리 증가"],
+ ["객체 수명 이상","메모리 증가"],["반복 할당 패턴","메모리 증가"],["의심스러운 할당 패턴","메모리 증가"],["연관 변수 불일치","프로그램 상태"],
+ ["상태 전이 위반","프로그램 상태"],["예상 밖 변수 변화","프로그램 상태"]];
+
+let CUR = CHECKS;
+const EV = [];
+let t=0;
+EV.push({t:0, type:"started", pid:"3351223", symptom:"서비스가 응답하지 않음"});
+EV.push({t:350, type:"target", name:"deadlock_pipeli", pid:3351223, exe:"/opt/pipeline/bin/deadlock_pipeline", arch:"aarch64",
+  buildid:"a1f3…9c2e (일치)", threads:3, debug:"DWARF 있음 (대상 실행 파일)", transport:"local · process_vm_readv", libc:"glibc 2.39"});
+EV.push({t:700, type:"classified", category:"스레드와 락", hyps:["교착 상태","오래 막힌 스레드","스핀 대기"]});
+EV.push({t:1000, type:"plan", run:CHECKS.length, skipped:SKIPPED.length, base:14, extra:1});
+t=1000;
+CHECKS.forEach((c,i)=>{ t+=120; EV.push({t, type:"check_start", i}); t+=Math.min(c[4],700); EV.push({t, type:"check_done", i});
+  if(i===5) EV.push({t:t+10,type:"finding_provisional"});
+  if(i===6) EV.push({t:t+10,type:"finding_cycle"});
+});
+EV.push({t:t+300,type:"analyzing"});
+EV.push({t:t+900,type:"verified", reread:"2회 재읽기 일치", refuted:["스핀 대기 (CPU 0%, 모든 샘플 sleep)","오래 막힌 I/O (대기 대상이 뮤텍스)"]});
+EV.push({t:t+1500,type:"verdict", verdict:"CONFIRMED_FAULT", conf:92, duration:"5.1 s", bytes:"162.8 KB", stop:"0 ms",
+  summary:"<code>deadlock_pipeli</code> (pid 3351223)에서 확인된 문제가 있습니다: <b>교착 상태</b>. <code>ingest</code>(tid 3351225)가 락 <code>m_out</code>을 기다리고, <code>flush</code>(tid 3351226)가 락 <code>m_in</code>을 기다립니다.",
+  next:[["락 획득 순서를 하나로 통일","<code>deadlock_pipeline.c:15</code>와 <code>:27</code>에서 <code>m_in</code>·<code>m_out</code>을 서로 반대 순서로 잡습니다."],
+        ["즉시 복구가 필요하면 프로세스 재시작","두 스레드 모두 깨어날 수 없으므로 자연 회복은 없습니다."],
+        ["재발 확인은 같은 명령으로","<code>dynamic-state diagnose 3351223</code>을 수정 배포 후 한 번 더 실행"]],
+  nc:[["스레드 상태 이상 검사","검사가 사유를 기록하지 않아 판단하지 못함"],["해제 후 사용(추적 기반)","추적 모드(DYNAMIC_EVENT_TRACING)가 꺼져 있음. 이번 결론과는 무관"]]});
+// stage boundaries (index into EV, exclusive)
+const STAGE = {0:0, 1:EV.findIndex(e=>e.type==="classified")+1, 2:EV.findIndex(e=>e.type==="plan")+1,
+  3:EV.findIndex(e=>e.type==="finding_cycle")+1, 4:EV.findIndex(e=>e.type==="verified")+1, 5:EV.length};
+
+/* -------------------- healthy variant (stage 6) -------------------- */
+const CHECKS_OK = [
+ ["프로세스 메모리 증가","메모리 증가","PASS","no growth trend (RSS +12 KB over 6.0 s, 13 samples)",6000],
+ ["힙 증가","메모리 증가","PASS","Heap stable (delta=+2,048 bytes, within noise)",420],
+ ["파일 디스크립터 누수","프로그램 상태","PASS","open fds 41 → 41 → 42 → 41 over 3.0 s (+0, 0.0/s), limit 1048576",3000],
+ ["힙 메타데이터 무결성","메모리 무결성","PASS","heap metadata intact: 1,912 chunks walked, 3 arenas, bin links consistent",380],
+ ["해제된 메모리 사용","메모리 무결성","PASS","no typed pointer refers to a free chunk and no free chunk was written: 211 free chunks",260],
+ ["오래 막힌 스레드","스레드와 락","PASS","no thread stayed blocked on one lock across 5 samples (9 threads)",640],
+ ["교착 상태(대기 고리)","스레드와 락","PASS","no wait-for cycle among 9 threads / 4 mutexes",150],
+ ["의심스러운 락 소유","스레드와 락","PASS","every owned mutex has a live owner; no orphan lock",90],
+ ["스레드 상태 이상","스레드와 락","PASS","thread count 9 → 9, no zombie/unnamed worker growth",70],
+ ["스핀 대기","스레드와 락","PASS","no thread above 90% CPU on an unchanging variable",520],
+];
+const EV_OK = [
+ {t:0,type:"started",pid:"41177",symptom:"(증상 없음 · 일반 점검)"},
+ {t:350,type:"target",name:"ok_busy_server",pid:41177,exe:"/opt/svc/bin/ok_busy_server",arch:"aarch64",buildid:"7d02…41aa (일치)",threads:9,debug:"DWARF 있음 (대상 실행 파일)",transport:"local · process_vm_readv",libc:"glibc 2.39"},
+ {t:700,type:"classified",category:"일반 점검",hyps:["메모리 증가","교착 상태","힙 손상","FD 누수"]},
+ {t:1000,type:"plan",run:10,skipped:14,base:14,extra:0},
+ {t:4000,type:"verdict",verdict:"HEALTHY",conf:88,duration:"6.4 s",bytes:"91.2 KB",stop:"0 ms",ok:true,
+  summary:"<code>ok_busy_server</code> (pid 41177)에서 <b>기본 검사 14개 범위 안에서는 이상을 찾지 못했습니다.</b> 메모리는 6.4초 동안 안정적이었고, 막힌 스레드와 힙 손상은 없었습니다.",
+  next:[["증상이 계속되면 증상을 적어 다시 실행","증상이 있으면 그에 맞는 추가 검사가 계획에 들어갑니다."],["장시간 추세는 반복 실행으로","느린 누수는 6초 창에서 보이지 않을 수 있습니다."]],
+  nc:[["느린 메모리 증가 (수 분 이상)","관측 창 6.4 s"],["추적 기반 검사 3개","추적 모드가 꺼져 있음"]]},
+];
+
+/* ============================ renderer ============================ */
+const $ = s=>document.querySelector(s);
+const el = (h)=>{const d=document.createElement("div");d.innerHTML=h.trim();return d.firstElementChild;};
+let S;  // state
+function reset(){ S={started:false,target:null,cls:null,plan:null,checks:[],finding:null,verified:null,verdict:null,phase:"",elapsed:0}; $("#main").innerHTML=""; $("#tchip").classList.add("hidden"); }
+
+function renderIdle(){
+  $("#main").innerHTML = `
+  <div class="hero">
+    <h1>실행 중인 프로세스를 멈추지 않고 진단합니다</h1>
+    <p>PID 하나면 됩니다. 결과는 이 화면에 진행되는 대로 쌓이고, 끝나면 그대로 보고서가 됩니다.</p>
+    <div class="form">
+      <div class="row">
+        <div class="seg"><button class="on">로컬</button><button>SSH</button></div>
+        <input class="inp mono" placeholder="PID 또는 프로세스 이름  (예: 3351223, deadlock_pipeline)">
+        <button class="btn" id="go">진단</button>
+      </div>
+      <div class="row">
+        <input class="inp" placeholder="증상 (선택)  예: 서비스가 응답하지 않음, 메모리가 계속 늘어남">
+        <input class="inp mono" style="flex:.8" placeholder="디버그 ELF 경로 (선택 · 기본 /proc/PID/exe)">
+      </div>
+      <div class="opt"><span>읽기 전용 · 대상 정지 없음 · 기본 시간 예산 20 s</span><a href="#">고급 옵션</a></div>
+    </div>
+  </div>
+  <div class="recent">
+    <h3>최근 진단</h3>
+    <div class="it"><span class="chip bad">확정 결함</span><span class="n">deadlock_pipeli</span><span class="muted">교착 상태 · pid 3351223</span><span class="t">12분 전</span></div>
+    <div class="it"><span class="chip warn">결함 가능</span><span class="n">leak_registry</span><span class="muted">메모리 누수 · pid 40211</span><span class="t">어제</span></div>
+    <div class="it"><span class="chip ok">정상</span><span class="n">ok_busy_server</span><span class="muted">14개 검사 통과 · pid 41177</span><span class="t">어제</span></div>
+    <div class="it"><span class="chip">판단 불가</span><span class="n">board-7 · svc_main</span><span class="muted">디버그 이미지 없음 · 192.168.1.50</span><span class="t">2일 전</span></div>
+  </div>`;
+  $("#go").onclick=()=>play(EV);
+}
+
+function tone(v){return {CONFIRMED_FAULT:"tone-bad",PROBABLE_FAULT:"tone-warn",HEALTHY:"tone-good",INCONCLUSIVE:"tone-unk"}[v]||"tone-acc"}
+function vword(v){return {CONFIRMED_FAULT:"확정 결함",PROBABLE_FAULT:"결함 가능",HEALTHY:"정상",INCONCLUSIVE:"판단 불가"}[v]||v}
+
+function ensure(id,html,after){ let n=document.getElementById(id); if(n) return n; n=el(html); n.id=id;
+  const m=$("#main"); if(after && document.getElementById(after)) document.getElementById(after).insertAdjacentElement("afterend",n); else m.appendChild(n); return n; }
+
+const PH=["대상 확인","증상 분류","계획","수집","분석·검증","판정"];
+function renderBanner(){
+  const v=S.verdict; const b=ensure("banner",`<section class="card banner"></section>`);
+  b.className="card banner "+(v?tone(v.verdict):"tone-acc");
+  const idx=PH.indexOf(S.phase);
+  const done = S.checks.filter(c=>c.st!=="PENDING"&&c.st!=="RUNNING").length, tot=S.checks.length;
+  const pct = v?100: S.plan? 45+Math.round(40*done/tot) + (S.verified?10:0) : S.cls?30:S.target?15:5;
+  b.innerHTML = v ? `
+    <div class="line1"><span class="badge">판정: ${v.verdict}</span><span class="phase">${vword(v.verdict)} · 신뢰도 ${v.conf}%</span>
+      <span class="elapsed">${v.duration}</span></div>
+    <p class="sum">${v.summary}</p>` : `
+    <div class="line1"><span class="badge">진단 중</span><span class="phase">${S.phase}${S.phase==="수집"?` · 검사 ${done}/${tot}`:""}</span>
+      <span class="elapsed">${(S.elapsed/1000).toFixed(1)} s</span></div>
+    ${S.verified?`<p class="sum">지금까지: <b>교착 상태 검증됨</b> — 재읽기에서도 같은 고리. 판정을 정리하는 중…</p>`:S.finding?`<p class="sum">지금까지: <b>교착 상태 의심</b> — 스레드 2개가 서로의 락을 기다립니다. 검증 중…</p>`:
+      S.cls?`<p class="sum muted">증상 “${S.started.symptom}” → <b>${S.cls.category}</b> 쪽 가설 ${S.cls.hyps.length}개를 먼저 봅니다.</p>`:``}
+    <div class="prog"><i style="width:${pct}%"></i></div>
+    <div class="phases">${PH.map((p,i)=>`<span class="${i<idx?"done":i===idx?"now":""}">${p}</span>`).join("")}</div>`;
+}
+function renderTiles(){
+  const t=ensure("tiles",`<div class="tiles"></div>`,"banner");
+  const v=S.verdict, c=S.checks, n={PASS:0,FAIL:0,INCONCLUSIVE:0}; c.forEach(x=>{if(n[x.st]!=null)n[x.st]++});
+  const ran=S.plan?S.plan.run+S.plan.skipped:null;
+  const bar = S.plan?`<div class="bar"><i style="background:var(--bad);width:${100*n.FAIL/ran}%"></i><i style="background:var(--warn);width:${100*n.INCONCLUSIVE/ran}%"></i><i style="background:var(--good);width:${100*n.PASS/ran}%"></i></div>`:"";
+  t.innerHTML=`
+   <div class="tile"><div class="k">신뢰도</div><div class="v ${v?"":"pend"}">${v?v.conf+"%":"—"}</div><div class="s">${v?"검증 조건 충족 범위 기준":"판정 후 표시"}</div></div>
+   <div class="tile"><div class="k">검사</div><div class="v ${S.plan?"":"pend"}">${ran??"—"}</div>${bar}<div class="s">${S.plan?`✖ ${n.FAIL} · ? ${n.INCONCLUSIVE} · ✔ ${n.PASS} · – ${S.plan.skipped}`:"계획 후 표시"}</div></div>
+   <div class="tile"><div class="k">대상 정지 시간</div><div class="v">${S.target?(v?v.stop:"0 ms"):"—"}</div><div class="s">${S.target?"한 번도 멈추지 않음":""}</div></div>
+   <div class="tile"><div class="k">읽은 데이터</div><div class="v ${S.target?"":"pend"}">${v?v.bytes:S.plan?Math.round(12+150*(c.filter(x=>x.st!=="PENDING").length/c.length))+" KB":"—"}</div><div class="s">process_vm_readv</div></div>
+   <div class="tile"><div class="k">진단 소요 시간</div><div class="v">${v?v.duration:(S.elapsed/1000).toFixed(1)+" s"}</div><div class="s">예산 20 s</div></div>`;
+}
+function renderTarget(){
+  const g=S.target; if(!g) return;
+  const n=ensure("target",`<section class="card"></section>`,"tiles");
+  n.innerHTML=`<h2>대상 <span class="cnt">연결됨 · 읽기 전용</span></h2>
+   <div class="kv">
+    <div><span class="k">프로세스</span><span class="v">${g.name} · pid ${g.pid} · 스레드 ${g.threads}</span></div>
+    <div><span class="k">아키텍처</span><span class="v">${g.arch} · ${g.libc}</span></div>
+    <div><span class="k">실행 파일</span><span class="v" title="${g.exe}">${g.exe}</span></div>
+    <div><span class="k">Build ID</span><span class="v">${g.buildid}</span></div>
+    <div><span class="k">디버그 정보</span><span class="v">${g.debug}</span></div>
+    <div><span class="k">전송</span><span class="v">${g.transport}</span></div>
+   </div>`;
+  const tc=$("#tchip"); tc.classList.remove("hidden");
+  tc.innerHTML=`<b>${g.name}</b><span class="sep">·</span>pid ${g.pid}<span class="sep">·</span>${g.arch}${S.verdict?"":`<span class="sep">·</span><span class="live"><i></i>진단 중</span>`}`;
+}
+function svgCycle(full){
+  const box=(x,y,w,h,fill,stroke,t1,t2,tc)=>`<rect x="${x}" y="${y}" width="${w}" height="${h}" rx="7" fill="${fill}" stroke="${stroke||'none'}"/>
+    <text x="${x+w/2}" y="${y+(t2?15:19)}" fill="${tc}" text-anchor="middle" font-weight="700">${t1}</text>${t2?`<text x="${x+w/2}" y="${y+27}" fill="${tc}" fill-opacity=".8" text-anchor="middle" font-size="9">${t2}</text>`:""}`;
+  return `<svg viewBox="0 0 300 168" width="100%" height="168" font-family="ui-monospace,Menlo,monospace" font-size="11">
+   <defs><marker id="ar" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0L10 5L0 10z" fill="currentColor"/></marker></defs>
+   ${box(12,14,92,34,"#2563eb",null,"ingest","tid 3351225","#fff")}
+   ${box(196,14,92,30,"#fff","#0f172a","m_out",null,"#0f172a")}
+   ${box(196,104,92,34,"#7c3aed",null,"flush","tid 3351226","#fff")}
+   ${box(12,104,92,30,"#fff","#0f172a","m_in",null,"#0f172a")}
+   <g color="#b91c1c"><line x1="106" y1="30" x2="194" y2="30" stroke="currentColor" stroke-width="2" stroke-dasharray="5 4" marker-end="url(#ar)"/><text x="150" y="23" fill="currentColor" text-anchor="middle" font-size="9.5">대기 ✖  :15</text></g>
+   <g color="#15803d"><line x1="242" y1="46" x2="242" y2="102" stroke="currentColor" stroke-width="2" marker-end="url(#ar)"/><text x="248" y="78" fill="currentColor" font-size="9.5">소유자</text></g>
+   <g color="#b91c1c"><line x1="194" y1="122" x2="106" y2="122" stroke="currentColor" stroke-width="2" stroke-dasharray="5 4" marker-end="url(#ar)"/><text x="150" y="137" fill="currentColor" text-anchor="middle" font-size="9.5">대기 ✖  :27</text></g>
+   <g color="#15803d"><line x1="58" y1="102" x2="58" y2="50" stroke="currentColor" stroke-width="2" marker-end="url(#ar)"/><text x="52" y="78" fill="currentColor" text-anchor="end" font-size="9.5">소유자</text></g>
+   ${full?`<rect x="12" y="150" width="276" height="15" rx="4" fill="#fee2e2"/><text x="150" y="161" fill="#b91c1c" text-anchor="middle" font-weight="700" font-size="9.5">고리가 닫힘: ingest → m_out → flush → m_in → ingest</text>`:
+          `<text x="150" y="161" fill="#64748b" text-anchor="middle" font-size="9.5">고리가 닫히는지 확인 중…</text>`}
+  </svg>`;
+}
+function renderFinding(){
+  const f=S.finding; if(!f) return;
+  const n=ensure("findings",`<section class="card"></section>`,"target");
+  const st = S.verdict?`<span class="badge tone-bad">확정된 근본 원인</span>`:S.verified?`<span class="badge tone-bad">검증됨</span>`:`<span class="badge tone-warn">의심 · 검증 중</span>`;
+  n.innerHTML=`<h2>발견된 문제 <span class="cnt">1</span></h2>
+   <div class="fhead"><h3>발견 1: 교착 상태(deadlock)</h3>${st}<span class="chip">심각도 CRITICAL</span><span class="chip mono">DEADLOCK_INDICATORS</span></div>
+   <div class="fbody">
+    <div class="svgbox">${svgCycle(f.cycle)}</div>
+    <div>
+     <ol class="steps">
+      <li><span class="n">1</span><span><code>ingest</code>가 락 <code>m_in</code>을 잡고 있음<span class="rec">재구성</span></span></li>
+      <li><span class="n">2</span><span><code>flush</code>가 락 <code>m_out</code>을 잡고 있음<span class="rec">재구성</span></span></li>
+      <li class="${f.cycle?"":"pend"}"><span class="n">3</span><span><code>ingest</code>가 <code>m_out</code>을 요청하고 대기<span class="obs">관측</span><br><span class="muted small"><code>deadlock_pipeline.c:15</code> · <code>pthread_mutex_lock(&amp;m_out)</code></span></span></li>
+      <li class="${f.cycle?"":"pend"}"><span class="n">4</span><span><code>flush</code>가 <code>m_in</code>을 요청하고 대기<span class="obs">관측</span><br><span class="muted small"><code>deadlock_pipeline.c:27</code> · <code>pthread_mutex_lock(&amp;m_in)</code></span></span></li>
+      <li class="${S.verified?"":"pend"}"><span class="n">5</span><span>${S.verified?`고리가 닫힘: 0.63초 동안 5회 샘플, 모두 같은 대기. <b>${S.verified.reread}</b><span class="obs">관측</span>`:"재읽기로 고리가 유지되는지 확인 중…"}</span></li>
+     </ol>
+     ${S.verified?`<p class="small muted" style="margin-top:8px">반박된 경쟁 가설: ${S.verified.refuted.map(r=>`<span class="chip">${r}</span>`).join(" ")}</p>`:""}
+    </div>
+   </div>
+   <details class="ev"><summary>근거 <span class="muted" style="font-weight:500">스레드별 샘플 · 스택 · 락 소유자</span></summary><div class="in">
+    <table><tr><th>스레드</th><th>샘플 5회</th><th>CPU</th><th>머문 위치</th></tr>
+     <tr><td><code>ingest</code> tid 3351225</td><td class="mono">S S S S S</td><td>0%</td><td><code>deadlock_pipeline.c:15</code> pthread_mutex_lock(&amp;m_out) · 락 m_out 대기</td></tr>
+     <tr><td><code>flush</code> tid 3351226</td><td class="mono">S S S S S</td><td>0%</td><td><code>deadlock_pipeline.c:27</code> pthread_mutex_lock(&amp;m_in) · 락 m_in 대기</td></tr>
+     <tr><td><code>deadlock_pipeli</code> tid 3351223</td><td class="mono">S S S S S</td><td>0%</td><td><code>deadlock_pipeline.c:42</code> pause() · ppoll</td></tr></table>
+    <p class="muted" style="margin:8px 0 0">상세 보고서의 해당 절로: <a href="#">D. 검사 결과 › 교착 상태</a> · <a href="#">F. 경쟁 가설</a> · <a href="#">G. 증거 색인</a></p>
+   </div></details>`;
+}
+function renderChecks(){
+  if(!S.plan) return;
+  const n=ensure("checks",`<section class="card"></section>`,"findings")||ensure("checks",`<section class="card"></section>`,"target");
+  const rows=S.checks.map((c,i)=>{const d=CUR[i]; const st=c.st; const ic={PASS:"✔",FAIL:"✖",INCONCLUSIVE:"?",RUNNING:"",PENDING:"",SKIPPED:"–"}[st];
+    return `<li class="${st==="PENDING"?"pend":""}" data-i="${i}"><span class="st ${st}">${ic}</span><span class="nm">${d[0]}</span><span class="cat">${d[1]}</span>
+      <span class="ln">${st==="PENDING"?"대기":st==="RUNNING"?"실행 중…":d[3]}</span><span class="ms">${st==="PASS"||st==="FAIL"||st==="INCONCLUSIVE"?d[4]+" ms":""}</span>
+      <div class="dt">${d[3]}<br><span class="muted small">판정 규칙과 읽은 값은 상세 보고서 <a href="#">D절 › ${d[0]}</a>에서 봅니다.</span></div></li>`;}).join("");
+  const done=S.checks.filter(c=>c.st!=="PENDING"&&c.st!=="RUNNING").length;
+  n.innerHTML=`<h2>검사 <span class="cnt">${done}/${S.plan.run} 완료 · 기본 ${S.plan.base}${S.plan.extra?` + 증상 추가 ${S.plan.extra}`:""}</span>
+     <span class="right">행을 누르면 그 검사의 결과만 펼쳐집니다</span></h2>
+   <ul class="ck">${rows}</ul>
+   <details class="grp"><summary><b>실행 안 함 ${S.plan.skipped}</b> 이 증상에 대해 선택되지 않음. 정상이라는 근거가 아님</summary>
+    <ul class="ck">${SKIPPED.map(s=>`<li class="pend"><span class="st SKIPPED">–</span><span class="nm">${s[0]}</span><span class="cat">${s[1]}</span><span class="ln">선택되지 않음</span></li>`).join("")}</ul></details>`;
+  n.querySelectorAll(".ck li[data-i]").forEach(li=>li.onclick=()=>li.classList.toggle("open"));
+}
+function renderVerdictTail(){
+  const v=S.verdict; if(!v) return;
+  const a=ensure("nc",`<section class="card"></section>`,"checks");
+  a.innerHTML=`<h2>확인하지 못한 것 <span class="cnt">${v.nc.length}</span><span class="right">정상이라는 근거가 아님</span></h2>
+   <ul class="ul">${v.nc.map(x=>`<li>${x[0]} <span class="why">— ${x[1]}</span></li>`).join("")}</ul>`;
+  const b=ensure("next",`<section class="card"></section>`,"nc");
+  b.innerHTML=`<h2>다음에 할 일</h2><ol class="ul">${v.next.map(x=>`<li><b>${x[0]}</b><br><span class="why">${x[1]}</span></li>`).join("")}</ol>`;
+  const c=ensure("report",`<section class="card"></section>`,"next");
+  c.innerHTML=`<h2>보고서 <span class="cnt">이 화면과 같은 내용 + 상세 A–I</span></h2>
+   <div class="actions"><button class="a pri">HTML 보고서 열기</button><button class="a">Markdown</button><button class="a">JSON (<span class="mono">diagnose</span> 결과)</button><button class="a">요약 복사</button><button class="a">같은 대상 다시 진단</button></div>
+   <p class="small muted" style="margin:10px 0 0">수집이 대상에 준 영향: 정지 ${v.stop} · 읽기 ${v.bytes} · ${v.duration} · 쓰기 없음</p>`;
+}
+function renderAll(){
+  if(!S.started){renderIdle();return;}
+  renderBanner(); renderTiles(); renderTarget(); renderFinding(); renderChecks(); renderVerdictTail();
+}
+function apply(e){
+  switch(e.type){
+    case "started": S.started=e; S.phase="대상 확인"; break;
+    case "target": S.target=e; S.phase="증상 분류"; break;
+    case "classified": S.cls=e; S.phase="계획"; break;
+    case "plan": S.plan=e; S.phase="수집"; S.checks=Array.from({length:Math.min(e.run,CUR.length)},()=>({st:"PENDING"})); break;
+    case "check_start": S.checks[e.i].st="RUNNING"; break;
+    case "check_done": S.checks[e.i].st=CUR[e.i][2]; break;
+    case "finding_provisional": S.finding={cycle:false}; break;
+    case "finding_cycle": S.finding={cycle:true}; break;
+    case "analyzing": S.phase="분석·검증"; break;
+    case "verified": S.verified=e; break;
+    case "verdict": S.verdict=e; S.phase="판정"; if(e.ok){S.checks=S.checks.map(()=>({st:"PASS"}));} break;
+  }
+  S.elapsed=e.t;
+}
+let timer=[];
+function stop(){timer.forEach(clearTimeout);timer=[];}
+function jump(stage){
+  stop(); reset();
+  if(stage===6){ CUR=CHECKS_OK; EV_OK.forEach(apply); renderAll(); mark(6); return; }
+  CUR=CHECKS;
+  for(let i=0;i<STAGE[stage];i++) apply(EV[i]);
+  if(stage===3){ /* show a running check so the live look is visible */ const i=S.checks.findIndex(c=>c.st==="PENDING"); if(i>=0) S.checks[i].st="RUNNING"; }
+  renderAll(); mark(stage);
+}
+function play(evs){
+  stop(); reset(); CUR=CHECKS; const t0=performance.now();
+  evs.forEach(e=>timer.push(setTimeout(()=>{apply(e);renderAll();}, e.t*0.9)));
+  mark(-1);
+}
+function mark(s){document.querySelectorAll("#mock button[data-s]").forEach(b=>b.classList.toggle("on",+b.dataset.s===s));}
+document.querySelectorAll("#mock button[data-s]").forEach(b=>b.onclick=()=>jump(+b.dataset.s));
+$("#play").onclick=()=>play(EV);
+$("#btn-new").onclick=()=>jump(0);
+jump(+(new URLSearchParams(location.search).get("stage")||0));
+</script>
+</body>
+</html>
