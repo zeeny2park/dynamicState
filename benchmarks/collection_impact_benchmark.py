@@ -41,6 +41,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from benchmarks.capture_benchmark import collect_environment_metadata  # noqa: E402
 from extractor.collection_impact import CollectionImpactMeter  # noqa: E402
 from extractor.target_adapter import LocalTargetAdapter, RemoteSshTargetAdapter  # noqa: E402
+from tests.support.fixture_process import fixture_popen
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SCHEMA_VERSION = 1
@@ -70,7 +71,7 @@ class Target:
 
     def __init__(self, exe: str, cpu: Optional[int]):
         pre = (lambda: os.sched_setaffinity(0, {cpu})) if cpu is not None else None
-        self.proc = subprocess.Popen([exe], stdout=subprocess.PIPE, text=True, preexec_fn=pre)
+        self.proc = fixture_popen([exe], stdout=subprocess.PIPE, text=True, preexec_fn=pre)
         self.base = int(self.proc.stdout.readline().split()[1])
         self.pid = self.proc.pid
         self.points: List[Tuple[int, int]] = []

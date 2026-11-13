@@ -9,6 +9,7 @@ import unittest
 from extractor.agent_runtime import AgentRuntime
 from extractor.watch_session import WatchSessionManager
 from extractor.web.server import WebApiAdapter
+from tests.support.fixture_process import fixture_popen
 
 
 PHASE45_TARGET_CPP = r"""
@@ -113,7 +114,7 @@ class TestPhase45FlightRecorderAndBehavioralDrift(unittest.TestCase):
             ["g++", "-g", "-O0", "-fno-omit-frame-pointer", "-pthread", cls.cpp_path, "-o", cls.bin_path],
             check=True,
         )
-        cls.proc = subprocess.Popen([cls.bin_path])
+        cls.proc = fixture_popen([cls.bin_path])
         cls.pid = cls.proc.pid
 
         cls.wm = WatchSessionManager(corpus_dir=os.path.join(cls.tmp_dir, "corpus"))

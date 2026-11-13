@@ -25,6 +25,7 @@ import tempfile
 import threading
 import time
 from typing import Any, Callable, Dict, List, Optional
+from tests.support.fixture_process import fixture_popen
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO_ROOT = os.path.abspath(os.path.join(HERE, "..", ".."))
@@ -444,7 +445,7 @@ def run_target(gt: Dict[str, Any], tmp: str, diagnose_fn: Callable, symptom_mode
         row = score_result(gt, None, f"build failed: {exc}")
         row["wall_s"] = round(time.monotonic() - t_start, 2)
         return row
-    proc = subprocess.Popen([binary], stdin=subprocess.DEVNULL,
+    proc = fixture_popen([binary], stdin=subprocess.DEVNULL,
                             stdout=subprocess.PIPE if gt["ready"]["mode"] == "stdout_marker" else subprocess.DEVNULL,
                             stderr=subprocess.DEVNULL, start_new_session=True, preexec_fn=_contain_target)
     result, error, diag_s = None, None, None

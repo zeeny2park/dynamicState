@@ -13,6 +13,7 @@ import unittest
 import scripts.mcp_server as mcp_srv
 from extractor.human_report import conclusion_sentence, markdown_to_html
 from extractor.incident_report import export_incident_report
+from tests.support.fixture_process import fixture_popen
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SRC = os.path.join(ROOT, "tests", "fixtures", "real_runtime", "proc_thread_circular_deadlock.c")
@@ -45,7 +46,7 @@ class TestIncidentHtml(unittest.TestCase):
         cls.binary = os.path.join(cls.tmp, "dl")
         subprocess.run(["gcc", "-g", "-O0", "-pthread", "-Wl,--build-id=sha1", SRC, "-o", cls.binary],
                        check=True, capture_output=True, timeout=120)
-        cls.proc = subprocess.Popen([cls.binary], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        cls.proc = fixture_popen([cls.binary], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                                     stdin=subprocess.DEVNULL)
         cls.addClassCleanup(cls._kill)
         time.sleep(0.7)

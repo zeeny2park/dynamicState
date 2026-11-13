@@ -42,6 +42,7 @@ from extractor.semantic_state import OfflineSemanticEngine
 from extractor.state_lab import compute_semantic_diff
 from extractor.typed_memory_reader import TypedMemoryReader
 from extractor.watch_session import CaptureGap, Observation, WatchItem, WatchSessionManager
+from tests.support.fixture_process import fixture_popen
 
 
 class TestHarnessScenarios(unittest.TestCase):
@@ -83,7 +84,7 @@ class TestHarnessScenarios(unittest.TestCase):
         """Start target process and parse explicit synchronization line containing independent oracle addresses."""
         if bin_path is None:
             bin_path = self.stripped_bin
-        proc = subprocess.Popen(
+        proc = fixture_popen(
             [bin_path],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,

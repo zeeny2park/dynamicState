@@ -12,6 +12,7 @@ from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 from . import build_targets
 from .results import BLOCKED, FAIL, PASS, SKIPPED, check
+from tests.support.fixture_process import fixture_popen
 
 KNOWN = b"DYNAMICSTATE-MATRIX-KNOWN-BUFFER-0123456789abcd\x00"
 EXPECTED_LOCKS = {"g_mutex_a", "g_mutex_b"}
@@ -355,7 +356,7 @@ def host_reference() -> Dict[str, Any]:
         out = os.path.join(tmp, "deadlock")
         subprocess.run(build_targets.cc_cmd(cc, build_targets.TARGET_SRC["deadlock"], out), check=True,
                        capture_output=True)
-        proc = subprocess.Popen([out], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        proc = fixture_popen([out], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         time.sleep(0.5)
         prov = RuntimeEvidenceProvider()
         recipe = DiagnosticRecipeRegistry.get_recipe(RECIPE_POTENTIAL_DEADLOCK_PATTERNS)
@@ -478,7 +479,7 @@ def host_diagnose_reference() -> Dict[str, Any]:
         out = os.path.join(tmp, "deadlock")
         subprocess.run(build_targets.cc_cmd(cc, build_targets.TARGET_SRC["deadlock"], out), check=True,
                        capture_output=True)
-        proc = subprocess.Popen([out], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        proc = fixture_popen([out], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         time.sleep(1.0)
         res = diagnose(proc.pid, out, corpus_dir=os.path.join(tmp, "corpus")).to_dict()
         return {"available": True, **_diag_shape(res), "host_arch": os.uname().machine}

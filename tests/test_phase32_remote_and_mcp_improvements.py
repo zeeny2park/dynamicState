@@ -23,6 +23,7 @@ from extractor.target_adapter import LocalTargetAdapter, RemoteSshTargetAdapter
 from extractor.watch_session import WatchSessionManager
 from extractor.web.server import WebApiAdapter
 import scripts.mcp_server as mcp_srv
+from tests.support.fixture_process import fixture_popen
 
 
 class TestPhase32RemoteAndMcpImprovements(unittest.TestCase):
@@ -71,7 +72,7 @@ class TestPhase32RemoteAndMcpImprovements(unittest.TestCase):
                         pass
 
     def _start_target(self, bin_path: str) -> subprocess.Popen:
-        p = subprocess.Popen(
+        p = fixture_popen(
             [bin_path],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,

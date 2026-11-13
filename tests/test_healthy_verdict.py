@@ -36,6 +36,7 @@ from extractor.target_abi import FEATURE_MUTEX_OWNER, SUPPORT_NOT_SUPPORTED_ON_T
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "benchmarks", "diagnosis_accuracy"))
 import run_benchmark as rb  # noqa: E402
+from tests.support.fixture_process import fixture_popen
 
 GENERIC = "general health check"
 
@@ -96,7 +97,7 @@ class TestHealthyVerdictRealProcesses(unittest.TestCase):
             cls.bins[name] = out
 
     def _launch(self, name):
-        proc = subprocess.Popen([self.bins[name]], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+        proc = fixture_popen([self.bins[name]], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                                 stderr=subprocess.DEVNULL)
 
         def _kill():

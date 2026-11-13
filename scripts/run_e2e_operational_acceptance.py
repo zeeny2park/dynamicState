@@ -61,6 +61,7 @@ from extractor.investigation import (
     InvestigationManager,
     TrustedCausalVerifier,
 )
+from tests.support.fixture_process import fixture_popen
 
 
 def log(step: str, msg: str, status: str = "INFO"):
@@ -118,7 +119,7 @@ def main():
 
         # Step 2: Spawn Process & Handshake
         log("STEP 2", f"Launching target inferior from stripped binary (PID tracking)...")
-        proc = subprocess.Popen(
+        proc = fixture_popen(
             [stripped_bin],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,

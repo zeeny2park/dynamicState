@@ -25,6 +25,7 @@ from extractor.heap_walker import (ST_FASTBIN, ST_FREE, ST_IN_USE, ST_INTERNAL, 
                                    HeapWalkResult, MemorySnapshot, layout_for_version)
 from extractor.recipe_plugins.double_free import (OBS_FREE_LIST_REPEATS, DoubleFreeConfig, FreeListRepeatDetector,
                                                   double_free_finding_viz, double_free_rule)
+from tests.support.fixture_process import fixture_popen
 
 FIXTURES = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures", "real_runtime")
 EVIL = "<script>alert(1)</script>"
@@ -485,7 +486,7 @@ class TestLive(unittest.TestCase):
             subprocess.run(["gcc", "-g", "-O0", "-pthread", os.path.join(FIXTURES, src), "-o", out], check=True,
                            capture_output=True, timeout=120)
             self.bins[src] = out
-        proc = subprocess.Popen([self.bins[src]], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+        proc = fixture_popen([self.bins[src]], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                                 stdin=subprocess.DEVNULL)
 
         def kill():

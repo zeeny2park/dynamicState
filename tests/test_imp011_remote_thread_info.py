@@ -20,6 +20,7 @@ from unittest import mock
 from extractor.target_adapter import LocalTargetAdapter, RemoteSshTargetAdapter
 from extractor.thread_sampler import ThreadSampler, ThreadSamplingConfig, judge
 from extractor.watch_session import WatchSessionManager
+from tests.support.fixture_process import fixture_popen
 
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 COLLECTOR_SRC = os.path.join(REPO_ROOT, "target", "collector")
@@ -91,7 +92,7 @@ class RemoteThreadInfoTests(unittest.TestCase):
 
     # ---- infrastructure ---------------------------------------------------------------------
     def _spawn(self, name, *args, min_threads=0):
-        proc = subprocess.Popen([self._binary(name), *args], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+        proc = fixture_popen([self._binary(name), *args], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                                 stderr=subprocess.DEVNULL)
 
         def _kill():
@@ -226,7 +227,7 @@ class RemoteThreadInfoTests(unittest.TestCase):
 
     def test_a_syscall_wire_format_and_framing(self):
         proc = self._spawn("proc_thread_spin_work_block", "b")
-        p = subprocess.Popen([self.real, "--daemon"], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+        p = fixture_popen([self.real, "--daemon"], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
         self.addCleanup(lambda: (p.kill(), p.wait(), p.stdout.close(), p.stdin.close()))
 
         def ask(line):

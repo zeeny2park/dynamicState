@@ -35,6 +35,7 @@ from extractor.diagnostic_recipes import (
 )
 from extractor.target_adapter import LocalTargetAdapter
 from extractor.watch_session import WatchSessionManager
+from tests.support.fixture_process import fixture_popen
 
 
 C_POINTER_FIXTURE_SRC = """
@@ -99,7 +100,7 @@ class TestPhase22AllocatorPointerIntegrity(unittest.TestCase):
         shutil.rmtree(cls.tmpdir, ignore_errors=True)
 
     def setUp(self):
-        self.proc = subprocess.Popen([self.bin_path])
+        self.proc = fixture_popen([self.bin_path])
         time.sleep(0.1)
         self.adapter = LocalTargetAdapter()
         self.wm = WatchSessionManager(corpus_dir=self.tmpdir)

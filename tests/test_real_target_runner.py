@@ -9,6 +9,7 @@ from unittest import mock
 
 import scripts.mcp_server as mcp_srv
 import scripts.validate_real_target as vrt
+from tests.support.fixture_process import fixture_popen
 
 
 class TestRealTargetRunner(unittest.TestCase):
@@ -74,7 +75,7 @@ class TestRealTargetRunner(unittest.TestCase):
     def test_02_ready_handshake_missing_ready(self) -> None:
         """Verifies that target output missing 'READY: PID=' is detected and rejected promptly."""
         # Process that writes something else and stays alive, so the reader never races with process exit
-        proc = subprocess.Popen(
+        proc = fixture_popen(
             ["python3", "-u", "-c", "print('STARTING_UP...', flush=True); import time; time.sleep(30)"],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -91,7 +92,7 @@ class TestRealTargetRunner(unittest.TestCase):
         """Verifies that non-integer or mismatched PIDs in the handshake are rejected."""
         # Children keep running after printing so the handshake reader never races with process exit (timing-deterministic).
         # Non-integer PID
-        proc1 = subprocess.Popen(
+        proc1 = fixture_popen(
             ["python3", "-u", "-c", "print('READY: PID=not_a_number', flush=True); import time; time.sleep(30)"],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -105,7 +106,7 @@ class TestRealTargetRunner(unittest.TestCase):
             vrt.cleanup_target_process(proc1)
 
         # Mismatched PID
-        proc2 = subprocess.Popen(
+        proc2 = fixture_popen(
             ["python3", "-u", "-c", "print('READY: PID=9999999', flush=True); import time; time.sleep(30)"],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -120,7 +121,7 @@ class TestRealTargetRunner(unittest.TestCase):
 
     def test_04_ready_handshake_early_exit_with_stderr(self) -> None:
         """Verifies that early target process exit captures stderr and returncode."""
-        proc = subprocess.Popen(
+        proc = fixture_popen(
             ["python3", "-u", "-c", "import sys; sys.stderr.write('Fatal crash\\n'); sys.exit(42)"],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -138,7 +139,7 @@ class TestRealTargetRunner(unittest.TestCase):
     def test_05_ready_handshake_timeout_nonblocking(self) -> None:
         """Verifies that a hanging target process does not block readline() and times out promptly."""
         # Process that hangs without writing anything
-        proc = subprocess.Popen(
+        proc = fixture_popen(
             ["python3", "-u", "-c", "import time; time.sleep(10)"],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,

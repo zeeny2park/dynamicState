@@ -19,6 +19,7 @@ import unittest
 import scripts.mcp_server as mcp_srv
 from extractor.expert_diagnostic_engine import diagnose
 from extractor.human_report import T, diagnose_with_summary, render_human_report
+from tests.support.fixture_process import fixture_popen
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 FIXTURES = os.path.join(ROOT, "tests", "fixtures", "real_runtime")
@@ -72,7 +73,7 @@ class TestHumanReportReal(unittest.TestCase):
 
     def _launch(self, src, wait_ready=False):
         binary = self._binary(src)
-        proc = subprocess.Popen([binary], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL)
+        proc = fixture_popen([binary], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL)
 
         def _kill():
             try:

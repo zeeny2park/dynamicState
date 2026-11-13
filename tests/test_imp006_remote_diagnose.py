@@ -31,6 +31,7 @@ from extractor.expert_diagnostic_engine import ExpertDiagnosticEngine, TargetSpe
 from extractor.heap_walker import STATUS_OK, HeapWalker
 from extractor.target_abi import detect_target_abi
 from extractor.target_adapter import LocalTargetAdapter, RemoteSshTargetAdapter
+from tests.support.fixture_process import fixture_popen
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 FIXTURES = os.path.join(ROOT, "tests", "fixtures", "real_runtime")
@@ -95,7 +96,7 @@ class RemoteDiagnoseTests(unittest.TestCase):
 
     def _launch(self, src, ready=True):
         binary = self._binary(src)
-        proc = subprocess.Popen([binary], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL)
+        proc = fixture_popen([binary], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL)
 
         def _kill():
             try:

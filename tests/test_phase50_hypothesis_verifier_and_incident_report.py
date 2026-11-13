@@ -9,6 +9,7 @@ import unittest
 from extractor.agent_runtime import AgentRuntime
 from extractor.watch_session import WatchSessionManager
 from extractor.web.server import WebApiAdapter
+from tests.support.fixture_process import fixture_popen
 
 
 PHASE50_CPP_SOURCE = r"""
@@ -109,7 +110,7 @@ class TestPhase50HypothesisVerifierAndIncidentReport(unittest.TestCase):
             check=True,
         )
 
-        cls.proc = subprocess.Popen(
+        cls.proc = fixture_popen(
             [cls.bin_path],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,

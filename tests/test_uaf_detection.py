@@ -27,6 +27,7 @@ import unittest
 from extractor.diagnostic_recipes import BASELINE_RECIPE_IDS, DiagnosticRecipeRegistry
 from extractor.expert_diagnostic_engine import diagnose
 from extractor.recipe_plugins.use_after_free import RECIPE_FREED_MEMORY_USE, freed_memory_use_rule
+from tests.support.fixture_process import fixture_popen
 
 FIXTURES = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures", "real_runtime")
 READY_TIMEOUT_S = 60.0
@@ -54,7 +55,7 @@ class _Base(unittest.TestCase):
 
     def _launch(self, src):
         binary = self._binary(src)
-        proc = subprocess.Popen([binary], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL)
+        proc = fixture_popen([binary], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL)
         self.addCleanup(self._kill, proc)
         lines, buf = [], b""
         deadline = time.monotonic() + READY_TIMEOUT_S
@@ -78,7 +79,7 @@ class _Base(unittest.TestCase):
 
     def _settle(self, src):
         binary = self._binary(src)
-        proc = subprocess.Popen([binary], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL)
+        proc = fixture_popen([binary], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL)
         self.addCleanup(self._kill, proc)
         time.sleep(1.0)
         self.assertIsNone(proc.poll())

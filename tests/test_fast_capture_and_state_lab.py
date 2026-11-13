@@ -36,6 +36,7 @@ from extractor.semantic_state import (
     compute_semantic_state_hash,
 )
 from extractor.state_lab import SnapshotMutator, StateLaboratory, compute_semantic_diff
+from tests.support.fixture_process import fixture_popen
 
 
 class TestFastCaptureAndStateLab(unittest.TestCase):
@@ -59,7 +60,7 @@ class TestFastCaptureAndStateLab(unittest.TestCase):
     # Test A: Fast capture stop time < 10ms & process resumes
     # --------------------------------------------------------------------------
     def test_A_fast_capture_stop_time_under_10ms_and_process_resumes(self):
-        proc = subprocess.Popen(
+        proc = fixture_popen(
             [sys.executable, "-c", "import time; [time.sleep(0.01) for _ in range(500)]"],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
@@ -369,7 +370,7 @@ class TestFastCaptureAndStateLab(unittest.TestCase):
     # --------------------------------------------------------------------------
     def test_I_live_multithread_sample_capture_and_continued_execution(self):
         env = {**os.environ, "SAMPLE_HOLD_MS": "2500"}
-        proc = subprocess.Popen(
+        proc = fixture_popen(
             [self.sample_bin],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -404,7 +405,7 @@ class TestFastCaptureAndStateLab(unittest.TestCase):
     def test_J_timeout_safety_and_fail_open_resume(self):
         from unittest.mock import patch
 
-        proc = subprocess.Popen(
+        proc = fixture_popen(
             [sys.executable, "-c", "import time; [time.sleep(0.01) for _ in range(500)]"],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
@@ -431,7 +432,7 @@ class TestFastCaptureAndStateLab(unittest.TestCase):
     # Test K: Provenance verification (exact latency, backend, bytes, threads)
     # --------------------------------------------------------------------------
     def test_K_provenance_verification(self):
-        proc = subprocess.Popen(
+        proc = fixture_popen(
             [sys.executable, "-c", "import time; [time.sleep(0.01) for _ in range(500)]"],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,

@@ -23,6 +23,7 @@ import time
 import unittest
 
 from extractor.expert_diagnostic_engine import TargetSpec, diagnose
+from tests.support.fixture_process import fixture_popen
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TARGETS = os.path.join(ROOT, "benchmarks", "diagnosis_accuracy", "targets")
@@ -123,7 +124,7 @@ class RemoteNewDiagnosesTests(unittest.TestCase):
 
     def _launch(self, name):
         binary = self._binary(name)
-        proc = subprocess.Popen([binary], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL)
+        proc = fixture_popen([binary], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL)
 
         def _kill():
             try:

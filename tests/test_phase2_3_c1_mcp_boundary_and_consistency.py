@@ -39,6 +39,7 @@ from extractor.diagnostic_recipes import DiagnosticRecipeRegistry
 from extractor.expert_diagnostic_engine import ExpertDiagnosticEngine
 from extractor.observation_budget import ObservationBudgetLimits
 import scripts.mcp_server as mcp_server_mod
+from tests.support.fixture_process import fixture_popen
 
 
 CPP_TARGET_SRC = """
@@ -79,7 +80,7 @@ class TestPhase23C1McpBoundaryAndConsistency(unittest.TestCase):
         shutil.rmtree(cls.tmpdir, ignore_errors=True)
 
     def setUp(self):
-        self.proc = subprocess.Popen(
+        self.proc = fixture_popen(
             [self.bin_path],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,

@@ -18,6 +18,7 @@ import time
 import unittest
 import urllib.request
 import urllib.error
+from tests.support.fixture_process import fixture_popen
 
 
 def find_free_port() -> int:
@@ -74,7 +75,7 @@ class TestWebServerLifecycle(unittest.TestCase):
         port = find_free_port()
         cmd = [sys.executable, "-m", "extractor", "server", "--host", "127.0.0.1", "--port", str(port)]
 
-        proc = subprocess.Popen(
+        proc = fixture_popen(
             cmd,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -118,7 +119,7 @@ class TestWebServerLifecycle(unittest.TestCase):
         port = find_free_port()
         cmd = [sys.executable, "-m", "extractor", "server", "--host", "127.0.0.1", "--port", str(port)]
 
-        proc = subprocess.Popen(
+        proc = fixture_popen(
             cmd,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,

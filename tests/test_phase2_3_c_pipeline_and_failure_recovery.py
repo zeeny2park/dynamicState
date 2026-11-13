@@ -41,6 +41,7 @@ from extractor.runtime_evidence_provider import (
 )
 from extractor.target_adapter import TargetExecutionAdapter
 from scripts.mcp_server import runtime_run_diagnostic_recipe
+from tests.support.fixture_process import fixture_popen
 
 
 CPP_TARGET_SOURCE = """
@@ -121,7 +122,7 @@ class TestPhase23CPipelineAndFailureRecovery(unittest.TestCase):
         shutil.rmtree(cls.tmpdir, ignore_errors=True)
 
     def setUp(self):
-        self.proc = subprocess.Popen(
+        self.proc = fixture_popen(
             [self.bin_path],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,

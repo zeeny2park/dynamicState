@@ -39,6 +39,7 @@ from extractor.expert_diagnostic_engine import (
     TERMINAL_STATES,
 )
 from extractor.observation_budget import ObservationBudgetLimits
+from tests.support.fixture_process import fixture_popen
 
 
 # ---------------------------------------------------------------------------
@@ -106,7 +107,7 @@ def compile_and_start(src: str, tmp_dir: str, name: str):
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
-    proc = subprocess.Popen(
+    proc = fixture_popen(
         [elf_path],
         stdout=subprocess.PIPE,
         stderr=subprocess.DEVNULL,
@@ -293,7 +294,7 @@ class TestPhase244AdaptiveInvestigationScenarioE(unittest.TestCase):
         # Use the same PID slot — it's already gone
         # We use the engine with a PID that is gone
         # Actually start a real process and immediately kill it
-        proc = subprocess.Popen([elf_path], stdout=subprocess.DEVNULL)
+        proc = fixture_popen([elf_path], stdout=subprocess.DEVNULL)
         pid = proc.pid
         proc.wait()  # process already done
 

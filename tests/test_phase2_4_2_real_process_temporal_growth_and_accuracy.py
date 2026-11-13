@@ -48,6 +48,7 @@ from extractor.diagnostic_recipes import (
 from extractor.expert_diagnostic_engine import ExpertDiagnosticEngine
 from extractor.runtime_evidence_provider import RuntimeEvidenceProvider
 from extractor.target_adapter import LocalTargetAdapter
+from tests.support.fixture_process import fixture_popen
 
 
 class TestPhase242RealProcessTemporalGrowthAndAccuracy(unittest.TestCase):
@@ -176,7 +177,7 @@ class TestPhase242RealProcessTemporalGrowthAndAccuracy(unittest.TestCase):
         shutil.rmtree(cls.tmp_dir, ignore_errors=True)
 
     def _spawn_target(self, binary_path: str, ready_prefix: str) -> subprocess.Popen:
-        proc = subprocess.Popen(
+        proc = fixture_popen(
             [binary_path],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,

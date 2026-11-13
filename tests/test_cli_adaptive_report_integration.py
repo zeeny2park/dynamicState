@@ -19,6 +19,7 @@ import time
 import unittest
 
 from tests.fixture_builds import ensure_real_runtime_app_debug
+from tests.support.fixture_process import fixture_popen
 
 
 class TestCliAdaptiveReportIntegration(unittest.TestCase):
@@ -29,7 +30,7 @@ class TestCliAdaptiveReportIntegration(unittest.TestCase):
         cls.tmp_dir = tempfile.mkdtemp(prefix="ds_cli_test_")
         cls.target_bin = ensure_real_runtime_app_debug()
 
-        cls.proc = subprocess.Popen(
+        cls.proc = fixture_popen(
             [cls.target_bin],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,

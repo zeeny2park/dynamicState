@@ -25,6 +25,7 @@ from extractor.expert_diagnostic_engine import (
     STATE_COMPLETED,
     ExpertDiagnosticEngine,
 )
+from tests.support.fixture_process import fixture_popen
 
 
 class TestPhase21RealCppDiagnosticScenarios(unittest.TestCase):
@@ -57,7 +58,7 @@ class TestPhase21RealCppDiagnosticScenarios(unittest.TestCase):
 
     def _spawn_target(self, mode: str, use_debug: bool = True) -> subprocess.Popen:
         bin_path = self.debug_elf if use_debug else self.stripped_elf
-        proc = subprocess.Popen([bin_path, mode], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        proc = fixture_popen([bin_path, mode], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         self.procs.append(proc)
         time.sleep(0.15)  # Allow process to initialize
         return proc

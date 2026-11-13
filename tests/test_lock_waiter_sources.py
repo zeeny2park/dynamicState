@@ -13,6 +13,7 @@ sys.path.insert(0, REPO)
 from benchmarks.diagnosis_accuracy import run_benchmark as rb  # noqa: E402
 from extractor.thread_sampler import _lock_digest  # noqa: E402
 from extractor.watch_session import WatchSessionManager  # noqa: E402
+from tests.support.fixture_process import fixture_popen
 
 
 class LockDigestSeparatesInferredWaiters(unittest.TestCase):
@@ -33,7 +34,7 @@ class LiveWaiterSources(unittest.TestCase):
         cls.tmp = tempfile.mkdtemp()
         gt = next(g for g in rb.load_ground_truth() if g["id"] == "lock_hotspot")
         cls.binary = rb.build_target(gt, cls.tmp)
-        cls.proc = subprocess.Popen([cls.binary], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+        cls.proc = fixture_popen([cls.binary], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                                     stdin=subprocess.DEVNULL, start_new_session=True)
         rb._wait_ready(cls.proc, gt)
 

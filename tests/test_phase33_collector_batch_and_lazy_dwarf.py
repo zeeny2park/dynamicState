@@ -24,6 +24,7 @@ if PROJECT_ROOT not in sys.path:
 from extractor.dwarf_indexer import DwarfIndex, DwarfIndexer
 from extractor.target_adapter import RemoteSshTargetAdapter
 from extractor.watch_session import WatchSessionManager
+from tests.support.fixture_process import fixture_popen
 
 
 class TestPhase33CollectorBatchAndLazyDwarf(unittest.TestCase):
@@ -84,7 +85,7 @@ __attribute__((constructor)) static void _enable_sibling_collector_ptracer() {
                         pass
 
     def _start_target(self, bin_path: str) -> subprocess.Popen:
-        p = subprocess.Popen(
+        p = fixture_popen(
             [bin_path],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
@@ -130,7 +131,7 @@ __attribute__((constructor)) static void _enable_sibling_collector_ptracer() {
         self.assertEqual(struct.unpack("<i", bytes.fromhex(payload["slices"][1]["hex"]))[0], 111)
 
         # 2. Persistent --daemon stdio RPC mode across live mutation
-        daemon = subprocess.Popen(
+        daemon = fixture_popen(
             [self.collector_bin, "--daemon"],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,

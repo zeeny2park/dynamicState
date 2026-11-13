@@ -38,6 +38,7 @@ from extractor.expert_diagnostic_engine import (
 )
 from extractor.agent_runtime import AgentRuntime
 import scripts.mcp_server as mcp_srv
+from tests.support.fixture_process import fixture_popen
 
 
 class TestPhase1CanonicalEvidenceIngestion(unittest.TestCase):
@@ -355,7 +356,7 @@ class TestPhase1CanonicalEvidenceIngestion(unittest.TestCase):
     def test_group_e_mcp_lifecycle_and_canonical_evidence_flow(self):
         """Verifies MCP tools invoke canonical evidence ingestion and reports reflect valid evidence."""
         companion_elf, _ = ensure_expert_diagnostic_fixture(need_stripped=False)
-        proc = subprocess.Popen([companion_elf, "healthy"], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        proc = fixture_popen([companion_elf, "healthy"], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         time.sleep(0.15)
         pid = proc.pid
 

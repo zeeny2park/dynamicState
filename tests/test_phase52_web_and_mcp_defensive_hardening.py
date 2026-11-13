@@ -23,6 +23,7 @@ import unittest
 from extractor.agent_runtime import AgentRuntime
 from extractor.web.server import run_server
 import scripts.mcp_server as mcp_srv
+from tests.support.fixture_process import fixture_popen
 
 
 TARGET_C_SRC = r"""
@@ -84,7 +85,7 @@ class TestPhase52WebAndMcpDefensiveHardening(unittest.TestCase):
             ["gcc", "-g", "-O0", cls.src_path, "-o", cls.bin_path],
             check=True,
         )
-        cls.target_proc = subprocess.Popen(
+        cls.target_proc = fixture_popen(
             [cls.bin_path],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,

@@ -19,6 +19,7 @@ import urllib.request
 from extractor.agent_runtime import AgentRuntime
 from extractor.web.server import WebApiAdapter, run_server
 from extractor.web.workspace import get_workspace_static_dir
+from tests.support.fixture_process import fixture_popen
 
 
 class TestPhase39ChatTraceWorkspaceUI(unittest.TestCase):
@@ -97,7 +98,7 @@ int main() {
             ["g++", "-g", "-O0", "-pthread", cls.src_path, "-o", cls.bin_path],
             check=True,
         )
-        cls.proc = subprocess.Popen([cls.bin_path])
+        cls.proc = fixture_popen([cls.bin_path])
         time.sleep(0.25)
 
     @classmethod

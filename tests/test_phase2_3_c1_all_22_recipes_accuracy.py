@@ -27,6 +27,7 @@ from extractor.diagnostic_recipes import (
     RECIPE_STATUS_NOT_APPLICABLE,
 )
 from extractor.expert_diagnostic_engine import ExpertDiagnosticEngine
+from tests.support.fixture_process import fixture_popen
 
 
 CPP_CONTROLLED_TARGET_SRC = """
@@ -105,7 +106,7 @@ class TestPhase23C1All22RecipesAccuracy(unittest.TestCase):
 
     def _start_proc(self, bin_path: str, args=None):
         cmd = [bin_path] + (args or [])
-        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        proc = fixture_popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         line = proc.stdout.readline()
         self.assertIn("READY_PID=", line)
         return proc

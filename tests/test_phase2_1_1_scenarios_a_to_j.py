@@ -34,6 +34,7 @@ from extractor.expert_diagnostic_engine import (
     ExpertDiagnosticEngine,
     TargetAssessor,
 )
+from tests.support.fixture_process import fixture_popen
 
 
 class TestPhase211ScenariosAToJ(unittest.TestCase):
@@ -62,7 +63,7 @@ class TestPhase211ScenariosAToJ(unittest.TestCase):
 
     def _spawn_target(self, mode: str, use_debug: bool = True) -> subprocess.Popen:
         elf = self.debug_elf if use_debug else self.stripped_elf
-        p = subprocess.Popen([elf, mode], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        p = fixture_popen([elf, mode], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         self.procs.append(p)
         time.sleep(0.12)
         return p

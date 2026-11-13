@@ -18,6 +18,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from tests.support.fixture_process import fixture_popen
 
 
 class TestPhase20A316MultiprocessVerification(unittest.TestCase):
@@ -195,7 +196,7 @@ except ValueError:
         env = dict(os.environ)
         env["PYTHONPATH"] = "."
         procs = [
-            subprocess.Popen([sys.executable, "-c", code_worker], env=env)
+            fixture_popen([sys.executable, "-c", code_worker], env=env)
             for _ in range(8)
         ]
 

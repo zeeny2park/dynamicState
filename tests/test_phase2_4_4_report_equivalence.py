@@ -31,6 +31,7 @@ from extractor.expert_diagnostic_engine import (
     TERMINAL_STATES,
 )
 from extractor.observation_budget import ObservationBudgetLimits
+from tests.support.fixture_process import fixture_popen
 
 STABLE_C_SRC = r"""
 #include <stdio.h>
@@ -54,7 +55,7 @@ def compile_and_start(src, tmp_dir, name):
         [cc, "-g", "-O0", "-no-pie", "-o", elf_path, src_path],
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
     )
-    proc = subprocess.Popen([elf_path], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+    proc = fixture_popen([elf_path], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
     line = proc.stdout.readline(100)
     assert "TARGET_READY" in line
     pid = int(line.strip().split()[1])

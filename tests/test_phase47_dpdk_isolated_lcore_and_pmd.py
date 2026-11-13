@@ -23,6 +23,7 @@ from extractor.agent_runtime import AgentRuntime
 from extractor.dwarf_indexer import DwarfIndexer
 from extractor.watch_session import WatchSessionManager
 from extractor.web.server import WebApiAdapter
+from tests.support.fixture_process import fixture_popen
 
 
 DPDK_CPP_SOURCE = r"""
@@ -181,7 +182,7 @@ class TestPhase47DpdkIsolatedLcoreAndPmd(unittest.TestCase):
             check=True,
         )
 
-        cls.proc = subprocess.Popen(
+        cls.proc = fixture_popen(
             [cls.elf_path],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,

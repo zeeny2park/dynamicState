@@ -26,6 +26,7 @@ from extractor.observation_budget import (
     ObservationBudgetTracker,
 )
 from scripts.mcp_server import runtime_run_diagnostic_recipe
+from tests.support.fixture_process import fixture_popen
 
 
 class TestPhase23BudgetEnforcement(unittest.TestCase):
@@ -58,7 +59,7 @@ class TestPhase23BudgetEnforcement(unittest.TestCase):
         ])
 
     def setUp(self):
-        self.proc = subprocess.Popen([self.bin_path])
+        self.proc = fixture_popen([self.bin_path])
         time.sleep(0.05)
 
     def tearDown(self):

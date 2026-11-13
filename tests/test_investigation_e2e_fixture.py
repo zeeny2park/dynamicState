@@ -19,6 +19,7 @@ from extractor.debug_image import inspect_elf
 from extractor.investigation import InvestigationManager
 from extractor.raw_snapshot import RawRuntimeSnapshot
 from extractor.static_analyzer import DwarfStaticAnalysisProvider
+from tests.support.fixture_process import fixture_popen
 
 
 def _approved_full_plan():
@@ -56,7 +57,7 @@ class TestInvestigationE2EFixture(unittest.TestCase):
         shutil.rmtree(cls.work_dir, ignore_errors=True)
 
     def _start_target_process(self):
-        proc = subprocess.Popen(
+        proc = fixture_popen(
             [self.stripped_bin],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,

@@ -38,6 +38,7 @@ if PROJECT_ROOT not in sys.path:
 
 from extractor.debug_image import inspect_elf
 import scripts.mcp_server as mcp_srv
+from tests.support.fixture_process import fixture_popen
 
 
 def reset_target_context(wm: Any) -> None:
@@ -354,7 +355,7 @@ def run_real_target_validation(
         # Step 4: Spawn production stripped target process
         if verbose:
             print("[4/7] Spawning live production stripped target process...")
-        proc = subprocess.Popen([stripped_elf, "20"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        proc = fixture_popen([stripped_elf, "20"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
 
         # Read ready handshake with non-blocking I/O
         parsed_pid, ready_line = read_ready_handshake(proc, timeout=5.0)

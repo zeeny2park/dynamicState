@@ -59,6 +59,7 @@ from extractor.hypothesis import (
     evaluate_record_quality_dimensions,
 )
 from extractor.target_adapter import LocalTargetAdapter
+from tests.support.fixture_process import fixture_popen
 
 
 class TestPhase20A310RealCppE2E(unittest.TestCase):
@@ -94,7 +95,7 @@ class TestPhase20A310RealCppE2E(unittest.TestCase):
 
     def _start_scenario_process(self) -> Tuple[subprocess.Popen, Dict[str, Any]]:
         """Start scenario_target.cpp and parse READY oracle banner."""
-        proc = subprocess.Popen(
+        proc = fixture_popen(
             [self.bin_scenario],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
@@ -117,7 +118,7 @@ class TestPhase20A310RealCppE2E(unittest.TestCase):
     # -------------------------------------------------------------------------
     def test_02_blocked_worker_e2e(self):
         """[LIVE_PROCESS_INTEGRATION] Real process with blocked threads is observed and verified."""
-        proc = subprocess.Popen([self.bin_contention])
+        proc = fixture_popen([self.bin_contention])
         try:
             time.sleep(0.15)
             adapter = LocalTargetAdapter()
@@ -157,7 +158,7 @@ class TestPhase20A310RealCppE2E(unittest.TestCase):
     # -------------------------------------------------------------------------
     def test_03_mutex_contention_e2e(self):
         """[LIVE_PROCESS_INTEGRATION] Real process with multiple waiters on single mutex."""
-        proc = subprocess.Popen([self.bin_contention])
+        proc = fixture_popen([self.bin_contention])
         try:
             time.sleep(0.2)
             adapter = LocalTargetAdapter()
@@ -192,7 +193,7 @@ class TestPhase20A310RealCppE2E(unittest.TestCase):
     # -------------------------------------------------------------------------
     def test_04_deadlock_circular_wait_e2e(self):
         """[LIVE_PROCESS_INTEGRATION] Circular deadlock (T1->L1->T2->L2->T1) persists across epochs."""
-        proc = subprocess.Popen([self.bin_deadlock])
+        proc = fixture_popen([self.bin_deadlock])
         try:
             time.sleep(0.15)
             adapter = LocalTargetAdapter()
@@ -225,7 +226,7 @@ class TestPhase20A310RealCppE2E(unittest.TestCase):
     # -------------------------------------------------------------------------
     def test_05_memory_growth_e2e(self):
         """[LIVE_PROCESS_INTEGRATION] Actively allocating process exhibits positive RSS delta."""
-        proc = subprocess.Popen([self.bin_growing_mem])
+        proc = fixture_popen([self.bin_growing_mem])
         try:
             adapter = LocalTargetAdapter()
             adapter.pin_target_identity(proc.pid)
@@ -362,7 +363,7 @@ class TestPhase20A310RealCppE2E(unittest.TestCase):
     # -------------------------------------------------------------------------
     def test_09_build_id_mismatch_e2e(self):
         """[LIVE_PROCESS_INTEGRATION] Target process Build ID mismatch fails closed."""
-        proc = subprocess.Popen([self.bin_healthy])
+        proc = fixture_popen([self.bin_healthy])
         try:
             time.sleep(0.1)
             adapter = LocalTargetAdapter()
@@ -378,7 +379,7 @@ class TestPhase20A310RealCppE2E(unittest.TestCase):
     # -------------------------------------------------------------------------
     def test_10_permission_denied_e2e(self):
         """[LIVE_PROCESS_INTEGRATION] Kernel memory address read returns error and fails closed."""
-        proc = subprocess.Popen([self.bin_healthy])
+        proc = fixture_popen([self.bin_healthy])
         try:
             time.sleep(0.1)
             adapter = LocalTargetAdapter()

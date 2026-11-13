@@ -60,6 +60,7 @@ from extractor.expert_diagnostic_engine import (
 from extractor.runtime_evidence_provider import RuntimeEvidenceProvider
 from extractor.target_adapter import LocalTargetAdapter
 from scripts.mcp_server import runtime_run_diagnostic_recipe
+from tests.support.fixture_process import fixture_popen
 
 
 class TestPhase243ProductionPathAndCounterValidation(unittest.TestCase):
@@ -130,7 +131,7 @@ class TestPhase243ProductionPathAndCounterValidation(unittest.TestCase):
 
     def test_01_real_c_target_balanced_counter_progression(self):
         """Real compiled C target with balanced alloc/free progression evaluates CONTRADICTED (healthy)."""
-        proc = subprocess.Popen(
+        proc = fixture_popen(
             [self.bin_counter],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -179,7 +180,7 @@ class TestPhase243ProductionPathAndCounterValidation(unittest.TestCase):
 
     def test_02_real_c_target_imbalanced_counter_progression(self):
         """Real compiled C target with imbalanced progression evaluates SUPPORTED (defect)."""
-        proc = subprocess.Popen(
+        proc = fixture_popen(
             [self.bin_counter],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -225,7 +226,7 @@ class TestPhase243ProductionPathAndCounterValidation(unittest.TestCase):
 
     def test_03_counter_reset_and_rollover_fails_honest(self):
         """When allocation counters reset or roll over across epochs, evaluates INSUFFICIENT_EVIDENCE."""
-        proc = subprocess.Popen(
+        proc = fixture_popen(
             [self.bin_counter],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -267,7 +268,7 @@ class TestPhase243ProductionPathAndCounterValidation(unittest.TestCase):
 
     def test_04_missing_counter_or_unreadable_dwarf_fails_honest(self):
         """Target without observable counters fails honest with INSUFFICIENT_EVIDENCE."""
-        proc = subprocess.Popen(
+        proc = fixture_popen(
             ["sleep", "10"],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -290,7 +291,7 @@ class TestPhase243ProductionPathAndCounterValidation(unittest.TestCase):
 
     def test_05_lifecycle_capability_boundaries_dynamic_tracing_missing(self):
         """Lifecycle recipes without dynamic event tracer fail-honest with INSUFFICIENT_EVIDENCE / NOT_APPLICABLE."""
-        proc = subprocess.Popen(
+        proc = fixture_popen(
             [self.bin_counter],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -338,7 +339,7 @@ class TestPhase243ProductionPathAndCounterValidation(unittest.TestCase):
 
     def test_06_production_mcp_entry_point_and_report_serialization(self):
         """Dispatches recipe via MCP runtime_run_diagnostic_recipe and serializes DiagnosticReport to JSON, Markdown, HTML."""
-        proc = subprocess.Popen(
+        proc = fixture_popen(
             [self.bin_counter],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -416,7 +417,7 @@ class TestPhase243ProductionPathAndCounterValidation(unittest.TestCase):
 
     def test_07_adaptive_investigation_vague_query_fails_honest_inconclusive(self):
         """Vague query 'Check whether this process has a problem' on live target results in INCONCLUSIVE verdict."""
-        proc = subprocess.Popen(
+        proc = fixture_popen(
             [self.bin_counter],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,

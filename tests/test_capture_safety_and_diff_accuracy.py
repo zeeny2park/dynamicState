@@ -37,6 +37,7 @@ from extractor.evidence_ledger import (
     VALID_EVIDENCE_TYPES,
     VALID_NATURES,
 )
+from tests.support.fixture_process import fixture_popen
 
 
 def _make_snapshot(objects, function="process_packet", pc="0x401200", thread_id=1):
@@ -64,7 +65,7 @@ class TestCaptureSafetyPreexistingStop(unittest.TestCase):
 
     def setUp(self):
         # Spawn a python child process that stays alive
-        self.proc = subprocess.Popen(
+        self.proc = fixture_popen(
             [sys.executable, "-c", "import time; time.sleep(60)"],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
@@ -179,7 +180,7 @@ class TestPidReuseMitigation(unittest.TestCase):
     """Test ProcessTargetHandle, pidfd support, and deterministic fallback testing."""
 
     def setUp(self):
-        self.proc = subprocess.Popen(
+        self.proc = fixture_popen(
             [sys.executable, "-c", "import time; time.sleep(60)"],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,

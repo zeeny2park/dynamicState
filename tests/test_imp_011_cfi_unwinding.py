@@ -57,6 +57,7 @@ from extractor.target_abi import (
 )
 from extractor.target_adapter import LocalTargetAdapter
 from extractor.watch_session import WatchSessionManager
+from tests.support.fixture_process import fixture_popen
 
 _NATIVE = {"x86_64": "x86_64", "amd64": "x86_64", "aarch64": "aarch64", "arm64": "aarch64"}.get(
     platform.machine().lower()
@@ -703,7 +704,7 @@ class TestRealProcessCfiUnwind(unittest.TestCase):
         DwarfIndexer.clear_cache()
 
     def _start(self, tag, spinner=False):
-        p = subprocess.Popen([self.bins[tag]] + (["spin"] if spinner else []), stdout=subprocess.PIPE)
+        p = fixture_popen([self.bins[tag]] + (["spin"] if spinner else []), stdout=subprocess.PIPE)
         self.procs.append(p)
         self.addCleanup(p.kill)
         self.assertEqual(p.stdout.readline().strip(), b"READY")

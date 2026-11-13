@@ -51,6 +51,7 @@ from extractor.ebpf_tracer import (
     TraceObservationSession,
 )
 from extractor.observation_backends import EbpfObservationBackend
+from tests.support.fixture_process import fixture_popen
 
 
 def validate_gdb_oracle_parity(
@@ -188,7 +189,7 @@ class TestEbpfFixtureIntegration(unittest.TestCase):
             shutil.rmtree(cls.tmp_dir, ignore_errors=True)
 
     def _start_autonomous_fixture(self, binary_path: str, loops: int = 20, interval_ms: int = 100) -> Tuple[subprocess.Popen, int]:
-        proc = subprocess.Popen(
+        proc = fixture_popen(
             [binary_path, "--loop", str(loops), "--interval-ms", str(interval_ms)],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -524,7 +525,7 @@ class TestEbpfFixtureIntegration(unittest.TestCase):
     def test_11_zero_events_returns_partial_status(self):
         """Scenario 11: Probe attached cleanly to live target without function invocation reports PARTIAL."""
         # Start fixture in interactive mode (sits on stdin; trace_target_function is never called)
-        proc = subprocess.Popen(
+        proc = fixture_popen(
             [self.debug_bin],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,

@@ -25,6 +25,7 @@ from extractor.recipe_plugins import thread_leak as tl  # noqa: E402
 from extractor.runtime_evidence_provider import RuntimeEvidenceProvider  # noqa: E402
 from extractor.target_adapter import LocalTargetAdapter  # noqa: E402
 from extractor.watch_session import WatchSessionManager  # noqa: E402
+from tests.support.fixture_process import fixture_popen
 
 N_THREADS = 60
 CHILD = ("import threading,time\n"
@@ -58,7 +59,7 @@ class _Spy(LocalTargetAdapter):
 class TestThreadReadBudget(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.proc = subprocess.Popen([sys.executable, "-c", CHILD], stdout=subprocess.PIPE, stdin=subprocess.DEVNULL)
+        cls.proc = fixture_popen([sys.executable, "-c", CHILD], stdout=subprocess.PIPE, stdin=subprocess.DEVNULL)
         cls.proc.stdout.readline()
         time.sleep(0.3)
         cls.tmp = tempfile.mkdtemp(prefix="thread_budget_")

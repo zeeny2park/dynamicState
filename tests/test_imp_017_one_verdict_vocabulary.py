@@ -26,6 +26,7 @@ from extractor.diagnostic_verdict_aggregator import (
 from extractor.verdict_engine import HYPOTHESIS_OUTCOME_TO_DIAGNOSIS, VALID_FINAL_DIAGNOSES
 from extractor.incident_report import export_incident_report
 from extractor.watch_session import WatchSessionManager
+from tests.support.fixture_process import fixture_popen
 
 
 class TestBoundaryMappings(unittest.TestCase):
@@ -66,7 +67,7 @@ class TestInterfacesUseTheOneVocabulary(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.tmp = tempfile.TemporaryDirectory(prefix="imp017_vocab_")
-        cls.proc = subprocess.Popen(["sleep", "60"])
+        cls.proc = fixture_popen(["sleep", "60"])
         time.sleep(0.2)
 
     @classmethod

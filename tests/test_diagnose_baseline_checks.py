@@ -22,6 +22,7 @@ from extractor.expert_diagnostic_engine import (
     ProblemClassifier,
     diagnose,
 )
+from tests.support.fixture_process import fixture_popen
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 FIXTURES = os.path.join(ROOT, "tests", "fixtures", "real_runtime")
@@ -74,7 +75,7 @@ class TestBaselineAlwaysRuns(unittest.TestCase):
         cls.bins["deadlock"] = out
 
     def _launch(self, name):
-        proc = subprocess.Popen([self.bins[name]], stdin=subprocess.DEVNULL,
+        proc = fixture_popen([self.bins[name]], stdin=subprocess.DEVNULL,
                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
         def _kill():

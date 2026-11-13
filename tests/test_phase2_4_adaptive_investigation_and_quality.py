@@ -30,6 +30,7 @@ from extractor.expert_diagnostic_engine import (
 )
 from extractor.observation_budget import ObservationBudgetLimits, ObservationBudgetTracker
 from extractor.target_adapter import LocalTargetAdapter
+from tests.support.fixture_process import fixture_popen
 
 
 HEALTHY_AND_DEFECT_TARGET_CPP = """
@@ -101,7 +102,7 @@ class TestPhase24AdaptiveInvestigationAndQuality(unittest.TestCase):
         """Execute complete adaptive investigation lifecycle against running target process:
         STATE_CREATED -> CLASSIFYING -> ASSESSING -> PLANNING -> COLLECTING -> VERIFYING -> COMPLETED
         """
-        proc = subprocess.Popen([self.bin_path], stdout=subprocess.PIPE, text=True)
+        proc = fixture_popen([self.bin_path], stdout=subprocess.PIPE, text=True)
         try:
             line = proc.stdout.readline()
             self.assertIn("TARGET_READY", line)

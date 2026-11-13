@@ -33,6 +33,8 @@ import urllib.error
 ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT_DIR)
 
+from tests.support.fixture_process import fixture_popen  # noqa: E402
+
 
 def build_workload(build_dir):
     """Compile shared library, production target, extract debug info, strip binary."""
@@ -104,7 +106,7 @@ def validate_low_impact_mode(meta, results):
     agent = AgentRuntime(controller=None, corpus_dir=corpus_dir)
 
     # 1. Start daemon process with background worker thread
-    proc = subprocess.Popen(
+    proc = fixture_popen(
         [meta["app_stripped"], "100", "--daemon"],
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,

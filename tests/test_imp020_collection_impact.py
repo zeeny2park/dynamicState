@@ -33,6 +33,7 @@ from extractor.investigation import InvestigationSession
 from extractor.observation_budget import ObservationBudgetLimits, ObservationBudgetTracker
 from extractor.target_adapter import LocalTargetAdapter, RemoteSshTargetAdapter
 from tests.test_capture_lifecycle_seam import MockProcessTargetAdapter
+from tests.support.fixture_process import fixture_popen
 
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 COLLECTOR_SRC = os.path.join(REPO_ROOT, "target", "collector")
@@ -106,7 +107,7 @@ class CollectionImpactTests(unittest.TestCase):
             p.stdout.close()
 
     def _spawn(self, mode):
-        p = subprocess.Popen([self.fixture, mode], stdout=subprocess.PIPE, text=True)
+        p = fixture_popen([self.fixture, mode], stdout=subprocess.PIPE, text=True)
         self._procs.append(p)
         return p, int(p.stdout.readline())
 

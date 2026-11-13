@@ -32,6 +32,7 @@ from extractor.diagnostic_recipes import (
     RECIPE_STATUS_SUPPORTED,
 )
 from extractor.expert_diagnostic_engine import ExpertDiagnosticEngine
+from tests.support.fixture_process import fixture_popen
 
 
 class TestPhase241RecipeAccuracyAndEvidencePath(unittest.TestCase):
@@ -160,7 +161,7 @@ class TestPhase241RecipeAccuracyAndEvidencePath(unittest.TestCase):
 
     def test_01_real_process_healthy_target_evaluation(self):
         """Execute recipes on real running healthy process; verify True Negatives."""
-        proc = subprocess.Popen(
+        proc = fixture_popen(
             [self.bin_healthy],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -222,7 +223,7 @@ class TestPhase241RecipeAccuracyAndEvidencePath(unittest.TestCase):
 
     def test_02_real_process_defect_injection_evaluation(self):
         """Execute recipes on real running defect target; verify True Positives."""
-        proc = subprocess.Popen(
+        proc = fixture_popen(
             [self.bin_defect],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -267,7 +268,7 @@ class TestPhase241RecipeAccuracyAndEvidencePath(unittest.TestCase):
 
     def test_03_real_process_circular_deadlock_detection(self):
         """Execute deadlock recipe against living process with circular mutex deadlock; verify True Positive."""
-        proc = subprocess.Popen(
+        proc = fixture_popen(
             [self.bin_deadlock],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
