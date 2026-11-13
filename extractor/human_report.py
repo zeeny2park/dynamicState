@@ -124,6 +124,20 @@ T: Dict[str, Tuple[str, str]] = {
                   "running at {loc}{call}{inl} (in {fn}).",
                   "스레드 {thr} (tid {tid})은(는) 샘플의 {frac}%에서 실행 가능 상태였고 CPU를 {cpu}% 사용하며 "
                   "{fn} 안의 {loc}{call}{inl}에서 돌고 있었습니다."),
+    # yield-polling busy wait judged from dispatch counts (judgement_basis schedstat_runnable_fraction_dispatches):
+    # the CPU share it received is a property of the host load, not of the thread, so it is not printed
+    "w_spin_disp": ("Thread {thr} (tid {tid}) was runnable for {frac}% of the window and was put on a CPU {n} times, "
+                    "but never blocked: it gave the CPU back after every turn without waiting for anything, and its "
+                    "top frame stayed the same, in {fn} (defined at {loc}).",
+                    "스레드 {thr} (tid {tid})은(는) 관측 구간의 {frac}% 동안 실행 가능 상태였고 CPU에 {n}번 올려졌지만 "
+                    "한 번도 대기 상태가 되지 않았습니다. 매 차례 아무것도 기다리지 않고 CPU를 반납했으며, "
+                    "최상단 프레임은 {loc}에 정의된 {fn}(으)로 계속 같았습니다."),
+    "w_spin_disp_at": ("Thread {thr} (tid {tid}) was runnable for {frac}% of the window and was put on a CPU {n} times, "
+                       "but never blocked: it gave the CPU back after every turn without waiting for anything, and its "
+                       "top frame stayed the same, at {loc}{call}{inl} (in {fn}).",
+                       "스레드 {thr} (tid {tid})은(는) 관측 구간의 {frac}% 동안 실행 가능 상태였고 CPU에 {n}번 올려졌지만 "
+                       "한 번도 대기 상태가 되지 않았습니다. 매 차례 아무것도 기다리지 않고 CPU를 반납했으며, "
+                       "최상단 프레임은 {fn} 안의 {loc}{call}{inl}(으)로 계속 같았습니다."),
     "w_spin_short": ("Thread {thr} (tid {tid}) shows an anomaly in {fn} (defined at {loc}).",
                      "스레드 {thr} (tid {tid})에서 {loc}에 정의된 {fn} 관련 이상이 관측되었습니다."),
     "w_gen_cat": ("Category: {cat}", "범주: {cat}"),
@@ -633,12 +647,15 @@ def _render_thread(ctx: _Ctx, f: Dict[str, Any], report: Optional[Dict[str, Any]
         if fn and loc and r.get("runnable_fraction") is not None:
             frac = round(float(r["runnable_fraction"]) * 100)
             cpu = r.get("cpu_share_pct") if r.get("cpu_share_pct") is not None else round(float(r.get("cpu_share") or 0) * 100, 1)
+            disp = r.get("cpu_dispatches") if r.get("judgement_basis") == "schedstat_runnable_fraction_dispatches" else None
+            k = "w_spin_disp" if isinstance(disp, int) else "w_spin"
             if r.get("top_source_line_exact"):
                 call, inl = _at_parts(ctx, r, fn)
-                lines.append(ctx.t("w_spin_at", thr=_c(r.get("name")), tid=r.get("tid"), frac=frac, cpu=cpu,
+                lines.append(ctx.t(k + "_at", thr=_c(r.get("name")), tid=r.get("tid"), frac=frac, cpu=cpu, n=disp,
                                    fn=_c(fn), loc=_c(loc), call=call, inl=inl))
             else:
-                lines.append(ctx.t("w_spin", thr=_c(r.get("name")), tid=r.get("tid"), frac=frac, cpu=cpu, fn=_c(fn), loc=_c(loc)))
+                lines.append(ctx.t(k, thr=_c(r.get("name")), tid=r.get("tid"), frac=frac, cpu=cpu, n=disp,
+                                   fn=_c(fn), loc=_c(loc)))
                 inexact = True
     if lines and inexact:
         lines.append(ctx.t("w_lines_note"))
