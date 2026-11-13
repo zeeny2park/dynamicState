@@ -488,14 +488,15 @@
         sum = '<p class="sum text-muted">' + (sym ? (c.category_label ? tr(lang, "cls_sym_cat", { sym: esc(sym), cat: esc(L(c.category_label, lang)), n: nchk })
           : tr(lang, "cls_sym", { sym: esc(sym), n: nchk })) : esc(tr(lang, "cls_nosym"))) + "</p>";
       }
+      if (!sum) sum = '<p class="sum text-muted" aria-hidden="true">&nbsp;</p>';      // the line is there from the start
+      if (ui.conn === "retry") phaseTxt += " · " + tr(lang, "conn_retry", { seq: s.lastSeq });
+      if (ui.conn === "poll") phaseTxt += " · " + tr(lang, "conn_poll");
       var pct = s.plan ? 40 + Math.round(45 * n.done / Math.max(n.total, 1)) + (s.verified ? 10 : 0)
         : s.classified ? 28 : s.target ? 14 : 4;
       html = '<div class="line1"><span class="badge badge-tone badge-lg">' +
         (stopped ? "" : '<span class="spinner" aria-hidden="true"></span>') +
         esc(tr(lang, stopped ? "aborted" : "running")) + '</span><span class="phase">' + esc(phaseTxt) + "</span>" +
         '<span class="elapsed">' + esc(fmtMs(ui.elapsed, lang)) + "</span></div>" + sum +
-        (ui.conn === "retry" ? '<p class="note">' + esc(tr(lang, "conn_retry", { seq: s.lastSeq })) + "</p>" : "") +
-        (ui.conn === "poll" ? '<p class="note">' + esc(tr(lang, "conn_poll")) + "</p>" : "") +
         (stopped ? "" : '<div class="progress" style="margin-top:12px" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="' +
           pct + '"><i style="width:' + pct + '%"></i></div>') +
         '<ol class="phases">' + tr(lang, "phases").map(function (p, i) {
@@ -533,7 +534,7 @@
     if (!T.checks && s.verdict) ran = n.total - n.SKIPPED;
     var bar = ran != null ? '<div class="progress-stack" aria-hidden="true">' + ["FAIL", "INCONCLUSIVE", "PASS"].map(function (st) {
       return '<i class="s-' + st + '" style="width:' + (100 * cnt[st] / denom).toFixed(1) + '%"></i>';
-    }).join("") + "</div>" : "";
+    }).join("") + "</div>" : '<div class="progress-stack" aria-hidden="true"></div>';
     var sub1 = ran != null ? '<span title="' + esc(tr(lang, "st_FAIL")) + '">✖ ' + cnt.FAIL + '</span> · <span title="' + esc(tr(lang, "st_INCONCLUSIVE")) + '">? ' + cnt.INCONCLUSIVE +
       '</span> · <span title="' + esc(tr(lang, "st_PASS")) + '">✔ ' + cnt.PASS + '</span> · <span title="' + esc(tr(lang, "st_SKIPPED")) + '">– ' + cnt.notrun + "</span>"
       : esc(tr(lang, "after_plan"));
@@ -913,7 +914,20 @@
     }
     ui.reportUrl = s.verdict && s.verdict.report_url ? s.verdict.report_url
       : job ? "api/diagnose/" + encodeURIComponent(job) + "/report?lang={lang}" : "";
+    /* what the reader is looking at stays where it is: when a card above it grows (a finding arrives, its picture
+       comes in with the verdict), the page scrolls by the same amount */
+    var anchor = null, before = 0;
+    if (window.scrollY > 0) {
+      for (var c0 = main.firstElementChild; c0; c0 = c0.nextElementSibling) {
+        var r0 = c0.getBoundingClientRect();
+        if (r0.bottom > window.innerHeight / 3) { anchor = c0; before = r0.top; break; }   // the card at the reading line
+      }
+    }
     patch(main, render(s, ui));
+    if (anchor && anchor.isConnected) {
+      var delta = anchor.getBoundingClientRect().top - before;
+      if (delta) window.scrollBy(0, delta);
+    }
     var c = renderChip(s, ui);
     chip.hidden = !c;
     patch(chip, c);

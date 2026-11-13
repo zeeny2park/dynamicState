@@ -2,7 +2,10 @@
 
 - **작성일**: 2026-11-13
 - **브랜치 / worktree**: `feat/web-ui-redesign` · `/home/ubuntu/workspace/ut-webui` (기준 `feat/visual-incident-report` `bba6cf7`)
-- **상태**: 제안. 아래 6장의 결정이 나면 구현 단계로 간다.
+- **상태**: 제안 → A-UI·B-UI 구현됨 (`extractor/web/ui/`, 2026-11-13). 구현은 이 문서와 목업을 따르되 다음 결정이 우선한다:
+  신뢰도 타일·수치 없음(타일 4개: 검사 · 대상 정지 시간 · 읽은 데이터 · 소요 시간), 카드 순서는 `DESIGN_SYSTEM_KO.md`,
+  "상세 A–I"·"쉬운 말 요약" 블록 대신 항목별 보고서 앵커(`#finding-<n>-detail`, `#check-<ID>-detail` 등), 서버와의 이벤트는
+  `API_CONTRACT.md` + `UI_EVENTS.md`. 구현 화면: `screens/impl/`.
 - **목업**: `docs/ui-redesign/mock/index.html` + 공통 테마 `mock/theme.css` (의존성 없음). `?stage=0..6` 으로 단계를 고르고,
   오른쪽 아래 "목업 단계" 바의 **▶ 재생** 을 누르면 진단이 실제 속도의 약 0.9배로 흘러가며 화면이 쌓이는 모습을 볼 수 있다.
   `?view=report` 는 같은 카드로 만든 정적 보고서 화면, `?theme=dark` 는 다크 모드, `mock/design-system.html` 은 토큰·컴포넌트 쇼케이스.

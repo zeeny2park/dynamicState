@@ -27,7 +27,7 @@
 /* ---- one column ---- */
 :lang(ko) body { word-break: keep-all; }
 main { max-width: 920px; margin: 0 auto; padding: 22px 20px 120px; display: flex; flex-direction: column; gap: 12px;
-  overflow-anchor: auto; outline: none; }
+  overflow-anchor: none; outline: none; }   /* ui.js keeps the card in view in place itself */
 main > * { min-width: 0; }
 
 /* ---- idle ---- */
@@ -62,7 +62,8 @@ main > * { min-width: 0; }
 .banner .line1 { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
 .banner .phase { color: var(--muted-foreground); font-size: 12.5px; }
 .banner .elapsed { margin-left: auto; font-family: var(--font-mono); font-size: 12.5px; color: var(--muted-foreground); font-variant-numeric: tabular-nums; }
-.banner .sum { margin: 10px 0 0; font-size: 16px; line-height: 1.5; overflow-wrap: anywhere; }
+.banner > .card-content { min-height: 168px; }      /* the running banner's height: the verdict does not shrink it */
+.banner .sum { margin: 10px 0 0; font-size: 16px; line-height: 1.5; overflow-wrap: anywhere; min-height: 3em; }
 .banner .sum b { font-weight: 600; }
 .banner .sum.text-muted { font-size: 15px; }
 .banner .note { margin: 6px 0 0; font-size: 13px; color: var(--muted-foreground); }
