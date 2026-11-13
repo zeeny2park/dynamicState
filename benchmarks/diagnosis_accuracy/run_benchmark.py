@@ -47,8 +47,11 @@ KIND_CATEGORIES: Dict[str, frozenset] = {
     "deadlock": frozenset({"DEADLOCK_INDICATORS"}),
     "busy_wait": frozenset({"PROCESS_INSTABILITY", "RESOURCE_EXHAUSTION"}),
     "long_stall": frozenset({"PROCESS_INSTABILITY"}),
+    "mapping_growth": frozenset({"MAPPING_GROWTH"}),   # memory growth outside malloc (mmap, custom pool)
+    "heap_retention": frozenset({"HEAP_RETENTION"}),   # fragmentation: a degradation, its targets are unscored
 }
-# `long_stall` stays here only so unscored stall rows can be labelled and described; it never enters a total.
+# `long_stall` and `heap_retention` stay here only so unscored rows can be labelled and described; they never
+# enter a total.
 DEFECT_KINDS = tuple(KIND_CATEGORIES)
 # A ground-truth record may carry "scored": false (+ "scored_reason"). Such targets are still built, run and
 # printed, but are excluded from every detection / cause-name / location / false-positive total and rate.

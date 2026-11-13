@@ -3225,12 +3225,13 @@ class AdaptiveInvestigationSession:
                     epistemic_level="confirmed_root_cause",
                 ))
             elif h.status in ("LIKELY", "PROPOSED", "SUPPORTED") and h.category not in ("HEALTHY", "HEALTHY_PROCESS"):
-                # IMP-009: a rule may mark its observation as a warning (e.g. stack nearly exhausted)
+                # IMP-009: a rule may mark its observation as a warning (e.g. stack nearly exhausted) or as INFO,
+                # a degradation that is not a fault (e.g. heap retention; see diagnose: DEGRADED)
                 sev = [e.get("details", {}).get("finding_severity") for e in h.supporting_evidence
                        if e.get("status") == "SUPPORTED"]
                 findings_sec.probable_causes.append(FindingRecord(
                     finding_id=f_id,
-                    severity="WARNING" if sev and all(x == "WARNING" for x in sev) else "MEDIUM",
+                    severity=sev[0] if sev and sev[0] in ("WARNING", "INFO") and len(set(sev)) == 1 else "MEDIUM",
                     classification=CLASSIFICATION_PROBABLE_CAUSE,
                     problem_description=h.problem_statement,
                     affected_entity=h.category,
@@ -4313,6 +4314,14 @@ def _diagnose_run(
                            "reason": "the finding named no lock, thread, variable or function, so it was not confirmed"})
         if res.verdict == "CONFIRMED_FAULT" and not any(f["status"] == "CONFIRMED_ROOT_CAUSE" for f in res.findings):
             res.verdict = "PROBABLE_FAULT" if res.findings else "INCONCLUSIVE"
+        # Findings that are all INFO (a degradation the rule marked as not a fault, e.g. heap retention) never
+        # make a fault verdict: DEGRADED (aggregator vocabulary; never HEALTHY either, since there is a finding).
+        if res.findings and res.verdict in ("CONFIRMED_FAULT", "PROBABLE_FAULT", "FAULT") \
+                and all(f.get("severity") == "INFO" for f in res.findings):
+            res.verdict = "DEGRADED"
+            sec_a["overall_result"] = res.verdict
+            sec_a["verdict_rationale"] = ("No fault was found; the finding(s) describe a degradation, not a fault: "
+                                          + ", ".join(dict.fromkeys(str(f["category"]) for f in res.findings)) + ".")
 
         # IMP-008: the leak-owner part (heap walks) could not be done / completed on this target
         leak_nc_seen = set()

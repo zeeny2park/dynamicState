@@ -68,7 +68,9 @@ class TestGroundTruthFiles(unittest.TestCase):
             self.assertIs(g["scored"], False)
             self.assertTrue(g["scored_reason"].strip())
             self.assertNotEqual(g["kind"], rb.HEALTHY_KIND)
-        self.assertEqual({g["id"] for g in UNSCORED}, {"stall_pipe", "stall_sleep"})
+        # long_stall (owner decision) and heap_retention (a degradation, not a defect: neither scoring fits)
+        self.assertEqual({g["id"] for g in UNSCORED}, {"stall_pipe", "stall_sleep", "frag_sparse", "frag_worker"})
+        self.assertEqual({g["kind"] for g in UNSCORED}, {"long_stall", "heap_retention"})
         base = UNSCORED[0]
         self.assertTrue(rb.validate_ground_truth({k: v for k, v in base.items() if k != "scored_reason"}))
         self.assertTrue(rb.validate_ground_truth(dict(base, scored="no")))

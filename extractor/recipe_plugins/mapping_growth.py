@@ -336,7 +336,7 @@ def collect_mapping_growth(provider: Any, ctx: Dict[str, Any]) -> None:
         snaps.append(s)
         if i + 1 < SAMPLES:
             time.sleep(INTERVAL_S)
-    obs: Dict[str, Any] = {"samples": [], "steps": steps}
+    obs: Dict[str, Any] = {"samples": [], "steps": steps, "t0": snaps[0]["t"] if snaps else None}
     if not snaps:
         obs["unavailable"] = "/proc/<pid>/maps or status could not be read"
     t0 = snaps[0]["t"] if snaps else 0.0
@@ -491,3 +491,204 @@ register_recipe(DiagnosticRecipe(
     observations=(OBS_MAPPING_GROWTH,),
     rule=mapping_growth_rule,
 ), baseline=True, category=CATEGORY_MAPPING_GROWTH)
+
+
+# ---------------------------------------------------------------------------------------------- presentation
+# How this diagnosis is shown to a person (extractor/report_registry.py): en and ko text, the HTML picture.
+_TXT = {
+    "trend": ("Memory outside malloc grew by {out} KB in {win} s while RSS grew by {rss} KB; the malloc heap "
+              "mappings changed by {mal} KB.",
+              "{win}초 동안 malloc 밖의 메모리가 {out} KB 늘었고 RSS는 {rss} KB 늘었습니다. malloc 힙 매핑의 변화는 "
+              "{mal} KB입니다."),
+    "what": ("What grew: {n} anonymous mapping(s), {new} of them new; the largest, {rng}, is now {size} KB "
+             "(+{added} KB in the observation).",
+             "늘어난 것: 익명 매핑 {n}개 (그중 새로 생긴 것 {new}개). 가장 큰 {rng}은(는) 현재 {size} KB입니다 "
+             "(관측 중 +{added} KB)."),
+    "stack": ("{kb} KB of it is in mappings laid out like thread stacks (a guard page below); threads {a} -> {b}.",
+              "그중 {kb} KB는 스레드 스택 형태(아래에 가드 페이지)의 매핑에 있습니다. 스레드 수 {a} -> {b}."),
+    "owner": ("{n} pointer(s) in the {kind} variable {var} point into the new memory.",
+              "{kind} 변수 {var}의 포인터 {n}개가 새 메모리를 가리킵니다."),
+    "no_owner": ("No typed global or static variable points into the new memory (pointers kept in the heap, on "
+                 "stacks or in registers are not searched).",
+                 "새 메모리를 가리키는 타입 있는 전역/정적 변수는 없습니다 (힙, 스택, 레지스터에 있는 포인터는 찾지 "
+                 "않았습니다)."),
+    "walks": ("The heap in use changed by {kb} KB across {n} heap walks.",
+              "힙 조사 {n}회 동안 사용 중인 힙의 변화는 {kb} KB입니다."),
+    "walk1": ("The heap in use was {kb} KB at the one heap walk; its trend was not observed.",
+              "힙 조사 1회에서 사용 중인 힙은 {kb} KB였습니다. 그 추세는 관측되지 않았습니다."),
+    "nowalk": ("The heap in use was not walked in this diagnosis.", "이번 진단에서는 사용 중인 힙을 조사하지 않았습니다."),
+    "closer": ("Which code maps this memory was not observed; look for mmap() (or the custom allocator / thread "
+               "creation) without the matching release{x}.",
+               "어느 코드가 이 메모리를 매핑하는지는 관측되지 않았습니다. 해제가 짝지어지지 않은 mmap() (또는 자체 "
+               "할당자 / 스레드 생성)을 찾으세요{x}."),
+    "closer_var": (", starting from what {var} holds", ". {var}이(가) 가진 것부터 보세요"),
+    "kind_global": ("global", "전역"), "kind_static": ("static", "정적"),
+    "chart": ("Memory over the observation (KB)", "관측하는 동안의 메모리 (KB)"),
+    "x": ("seconds since first sample", "첫 샘플 이후 경과(초)"),
+    "l_rss": ("RSS", "RSS"), "l_out": ("anonymous mappings outside the malloc heap", "malloc 힙 밖의 익명 매핑"),
+    "l_heap": ("malloc heap mappings", "malloc 힙 매핑"), "l_inuse": ("heap in use (heap walks)", "사용 중인 힙 (힙 조사)"),
+    "tbl": ("Mappings that appeared or grew", "새로 생기거나 커진 매핑"),
+    "c_rng": ("address range", "주소 범위"), "c_size": ("size", "크기"), "c_added": ("added", "증가"),
+    "c_kind": ("kind", "종류"), "c_new": ("new", "신규"),
+    "k_anonymous": ("anonymous (outside malloc)", "익명 (malloc 밖)"),
+    "k_thread_stack_like": ("thread-stack-like", "스레드 스택 형태"),
+    "yes": ("yes", "예"), "no": ("no", "아니오"),
+    "who": ("Code that mapped it", "매핑한 코드"),
+}
+
+
+def _mg_obs(report: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    checks = ((report or {}).get("section_d_detailed_inspection_results") or {}).get("checks") or []
+    for c in checks:
+        if isinstance(c, dict) and c.get("recipe_id") == RECIPE_MAPPING_GROWTH:
+            mg = (c.get("actual_observations") or {}).get(OBS_MAPPING_GROWTH)
+            if isinstance(mg, dict):
+                return mg
+    return {}
+
+
+def _num(x: Any) -> Optional[float]:
+    return float(x) if isinstance(x, (int, float)) and not isinstance(x, bool) else None
+
+
+def _mg_facts(i: int, mg: Dict[str, Any], wrap: Any) -> List[str]:
+    """The sentences of the finding; ``wrap`` formats an identifier from the target for the output medium."""
+    s = [x for x in mg.get("samples") or [] if isinstance(x, dict) and _num(x.get("t_s")) is not None]
+    out: List[str] = []
+    if len(s) < 2:
+        return out
+    win = float(s[-1]["t_s"]) - float(s[0]["t_s"])
+    out.append(_TXT["trend"][i].format(out="%+d" % int(_num(mg.get("outside_growth_kb")) or 0), win="%.1f" % win,
+                                        rss="%+d" % int(_num(mg.get("rss_growth_kb")) or 0),
+                                        mal="%+d" % int(_num(mg.get("malloc_growth_kb")) or 0)))
+    rows = [r for r in mg.get("grown_mappings") or [] if isinstance(r, dict)]
+    if rows:
+        r = rows[0]
+        out.append(_TXT["what"][i].format(n=int(_num(mg.get("grown_mapping_count")) or len(rows)),
+                                           new=int(_num(mg.get("new_anonymous_mappings")) or 0),
+                                           rng=wrap("%s-%s" % (r.get("start"), r.get("end"))),
+                                           size=int(_num(r.get("size_kb")) or 0),
+                                           added=int(_num(r.get("added_kb")) or 0)))
+    if _num(mg.get("thread_stack_like_kb")):
+        out.append(_TXT["stack"][i].format(kb=int(mg["thread_stack_like_kb"]), a=wrap(s[0].get("threads")),
+                                            b=wrap(s[-1].get("threads"))))
+    owners = [o for o in (mg.get("owner_search") or {}).get("owners") or []
+              if isinstance(o, dict) and o.get("variable_path")]
+    for o in owners[:3]:
+        kind = _TXT.get("kind_" + str(o.get("root_kind")), ("", ""))[i]
+        out.append(_TXT["owner"][i].format(n=int(_num(o.get("pointers_into_new_ranges")) or 0), kind=kind,
+                                            var=wrap(o["variable_path"])))
+    if not owners and (mg.get("owner_search") or {}).get("status") == "COMPLETED":
+        out.append(_TXT["no_owner"][i])
+    walks = [w for w in mg.get("heap_walks") or [] if isinstance(w, dict) and _num(w.get("in_use_bytes")) is not None]
+    if len(walks) >= 2:
+        out.append(_TXT["walks"][i].format(kb="%+d" % ((walks[-1]["in_use_bytes"] - walks[0]["in_use_bytes"]) // 1024),
+                                            n=len(walks)))
+    elif walks:
+        out.append(_TXT["walk1"][i].format(kb=int(walks[0]["in_use_bytes"]) // 1024))
+    else:
+        out.append(_TXT["nowalk"][i])
+    out.append(_TXT["closer"][i].format(
+        x=_TXT["closer_var"][i].format(var=wrap(owners[0]["variable_path"])) if owners else ""))
+    return out
+
+
+def mapping_finding_text(ctx: Any, finding: Dict[str, Any], report: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    return {"lines": _mg_facts(ctx.i, _mg_obs(report), lambda x: "`" + str(x).replace("`", "'") + "`")}
+
+
+def lines_chart(lines: List[Tuple[str, str, List[float], List[float]]], title: str, x_label: str) -> str:
+    """Several observed series on one zero-based chart (labels escaped here); ``lines``: (label, CSS colour
+    variable of the report palette, xs, ys).  No script, no event handlers."""
+    from ..report_visuals import esc
+    lines = [ln for ln in lines if ln[2] and len(ln[2]) == len(ln[3])]
+    if not lines or max(len(ln[2]) for ln in lines) < 2:
+        return ""
+    w, h, ml, mr, mt, mb = 640, 246, 70, 20, 34, 42
+    allx = [x for ln in lines for x in ln[2]]
+    x0, xr = min(allx), (max(allx) - min(allx)) or 1.0
+    ymax = (max(y for ln in lines for y in ln[3]) * 1.1) or 1.0
+    px = lambda v: ml + (w - ml - mr) * (v - x0) / xr  # noqa: E731
+    py = lambda v: mt + (h - mt - mb) * (1 - v / ymax)  # noqa: E731
+    o = [f'<svg viewBox="0 0 {w} {h}" width="{w}" role="img" aria-label="{esc(title)}">']
+    for k in range(5):
+        v = ymax * k / 4
+        o.append(f'<line class="dsv-grid" x1="{ml}" y1="{py(v):.1f}" x2="{w - mr}" y2="{py(v):.1f}"/>'
+                 f'<text class="dsv-t-mute" x="{ml - 8}" y="{py(v) + 4:.1f}" text-anchor="end" font-size="11">{v:,.0f}</text>')
+    o.append(f'<line class="dsv-axis" x1="{ml}" y1="{py(0):.1f}" x2="{w - mr}" y2="{py(0):.1f}"/>')
+    for label, colour, xs, ys in lines:
+        st = 'style="stroke:var(%s)"' % esc(colour)
+        if len(xs) >= 2:
+            pts = " ".join(f"{px(a):.1f},{py(b):.1f}" for a, b in zip(xs, ys))
+            o.append(f'<polyline class="dsv-linep" {st} points="{pts}"/>')
+        for a, b in zip(xs, ys):
+            o.append(f'<circle class="dsv-pt" {st} cx="{px(a):.1f}" cy="{py(b):.1f}" r="4">'
+                     f'<title>{esc(label)}: {b:,.0f}</title></circle>')
+    o.append(f'<text class="dsv-t-mute" x="{(ml + w - mr) / 2}" y="{h - 6}" text-anchor="middle" font-size="11">'
+             f'{esc(x_label)}</text></svg>')
+    legend = "".join(f'<span><i style="display:inline-block;width:14px;height:3px;vertical-align:middle;'
+                     f'background:var({esc(c)})"></i> {esc(lb)}</span>' for lb, c, _, _ in lines)
+    return f'<div class="dsv-svgbox">{"".join(o)}</div><div class="dsv-legend">{legend}</div>'
+
+
+def mapping_finding_viz(lx: Any, finding: Dict[str, Any], report: Optional[Dict[str, Any]], uid: str = "0") -> str:
+    from ..report_visuals import chip, code, esc, facts_list
+    mg = _mg_obs(report)
+    s = [x for x in mg.get("samples") or [] if isinstance(x, dict) and _num(x.get("t_s")) is not None
+         and _num(x.get("rss_kb")) is not None]
+    if len(s) < 2:
+        return ""
+    i = lx.i
+    xs = [float(x["t_s"]) for x in s]
+    lines = [(_TXT["l_rss"][i], "--bad", xs, [float(x["rss_kb"]) for x in s])]
+    if all(_num(x.get("anon_rw_kb")) is not None and _num(x.get("malloc_heap_kb")) is not None for x in s):
+        lines.append((_TXT["l_out"][i], "--warn", xs,
+                      [float(x["anon_rw_kb"]) - float(x["malloc_heap_kb"]) for x in s]))
+        lines.append((_TXT["l_heap"][i], "--good", xs, [float(x["malloc_heap_kb"]) for x in s]))
+    t0 = _num(mg.get("t0"))
+    walks = [w for w in mg.get("heap_walks") or [] if isinstance(w, dict) and _num(w.get("t")) is not None
+             and _num(w.get("in_use_bytes")) is not None]
+    if t0 is not None and walks:
+        lines.append((_TXT["l_inuse"][i], "--accent", [float(w["t"]) - t0 for w in walks],
+                      [float(w["in_use_bytes"]) / 1024.0 for w in walks]))
+    out = [f'<h4>{esc(_TXT["chart"][i])} {chip(lx, "obs")}</h4>', lines_chart(lines, _TXT["chart"][i], _TXT["x"][i])]
+    # the sentences carry target-controlled values: escape the sentence, then mark those values as code
+    marks: List[str] = []
+
+    def wrap(x: Any) -> str:
+        marks.append(str(x))
+        return f"\x00{len(marks) - 1}\x00"
+
+    facts = []
+    for line in _mg_facts(i, mg, wrap):
+        h = esc(line)
+        for k, m in enumerate(marks):
+            h = h.replace(f"\x00{k}\x00", code(m))
+        facts.append(h)
+    out.append(facts_list(facts))
+    rows = [r for r in mg.get("grown_mappings") or [] if isinstance(r, dict)]
+    if rows:
+        head = "".join(f"<th>{esc(_TXT[c][i])}</th>" for c in ("c_rng", "c_size", "c_added", "c_kind", "c_new"))
+        body = "".join(
+            f'<tr><td>{code("%s-%s" % (r.get("start"), r.get("end")))}</td><td>{esc(r.get("size_kb"))} KB</td>'
+            f'<td>+{esc(r.get("added_kb"))} KB</td>'
+            f'<td>{esc(_TXT.get("k_" + str(r.get("kind")), (str(r.get("kind")),) * 2)[i])}</td>'
+            f'<td>{esc(_TXT["yes" if r.get("appeared") else "no"][i])}</td></tr>' for r in rows[:12])
+        out.append(f'<h4>{esc(_TXT["tbl"][i])} {chip(lx, "obs")}</h4><div class="dsv-scroll"><table class="dsv-tbl">'
+                   f'<thead><tr>{head}</tr></thead><tbody>{body}</tbody></table></div>')
+    out.append(f'<p class="dsv-note">{esc(_TXT["who"][i])}: {chip(lx, "no")}</p>')
+    return "".join(out)
+
+
+def _register_presentation() -> None:
+    from ..report_registry import register_category, register_finding_text, register_finding_viz, register_recipe_label
+    register_category(CATEGORY_MAPPING_GROWTH, "memory growth outside malloc", "malloc 밖의 메모리 증가")
+    register_recipe_label(RECIPE_MAPPING_GROWTH, "MEMORY_GROWTH", "Memory growth outside malloc", "malloc 밖 메모리 증가",
+                          "anonymous mappings (mmap, custom allocators, thread stacks) that keep growing while the "
+                          "malloc heap does not",
+                          "malloc 힙은 그대로인데 계속 늘어나는 익명 매핑 (mmap, 자체 할당자, 스레드 스택)")
+    register_finding_text(CATEGORY_MAPPING_GROWTH, mapping_finding_text)
+    register_finding_viz(CATEGORY_MAPPING_GROWTH, mapping_finding_viz)
+
+
+_register_presentation()

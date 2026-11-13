@@ -850,7 +850,8 @@ def _section2(ctx: _Ctx, res: Dict[str, Any], renders: List[Dict[str, Any]]) -> 
                                 status=_status_word(ctx, str(f.get("status"))), sev=f.get("severity")) + "**")
         if not (f.get("subjects") or f.get("subject_details")):
             out.append(ctx.t("w_noname"))
-            continue
+            if not r.get("registered"):     # a registered text (report_registry) states what was observed
+                continue
         out.extend(r["lines"])
         if r.get("diagram"):
             out.append("")
@@ -1051,6 +1052,7 @@ def _registered_text(ctx: _Ctx, f: Dict[str, Any], report: Optional[Dict[str, An
     if not isinstance(r, dict) or not isinstance(r.get("lines"), list) or not r["lines"]:
         return None
     r.setdefault("kinds", _by_kind(f))
+    r["registered"] = True
     return r
 
 
