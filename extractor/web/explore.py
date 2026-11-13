@@ -255,6 +255,7 @@ class JobExplorer:
         self.target = JobTarget(job, corpus_dir)
         self.watch: Optional["WatchSession"] = None
         self.watch_lock = threading.Lock()
+        self._dwarf_seen: Dict[str, bool] = {}
 
     # -- helpers
     def _need_elf(self) -> str:
@@ -265,17 +266,30 @@ class JobExplorer:
 
     def _index(self) -> Any:
         from extractor.dwarf_indexer import DwarfIndexer
-        return DwarfIndexer.get_index(self._need_elf())
+        elf = self._need_elf()
+        self._need_dwarf()
+        return DwarfIndexer.get_index(elf)
+
+    def _need_dwarf(self) -> None:
+        """Everything that names a variable, a type or a lock needs DWARF: say so plainly instead of "symbol not found"."""
+        self._need_elf()
+        if not self.has_dwarf():
+            raise ExploreError("NO_DEBUG_INFO", "the executable has no DWARF debug information", 409)
 
     def has_dwarf(self) -> bool:
         elf = self.target.elf()
         if not elf:
             return False
+        hit = self._dwarf_seen.get(elf)
+        if hit is not None:
+            return hit
         try:
             from extractor.debug_image import inspect_elf
-            return bool(inspect_elf(elf).has_debug_info)
+            ok = bool(inspect_elf(elf).has_debug_info)
         except Exception:  # noqa: BLE001
             return False
+        self._dwarf_seen[elf] = ok
+        return ok
 
     # -- threads
     def thread(self, tid: int) -> Dict[str, Any]:
@@ -290,6 +304,8 @@ class JobExplorer:
                                                            **t.remote_kw())
             lo = None
             try:
+                if not self.has_dwarf():
+                    raise ValueError("no DWARF debug information")
                 lo = t.mgr.inspect_thread_locals_and_frame_vars(pid=t.pid, companion_elf_path=elf, tid=tid,
                                                                 max_frames=MAX_FRAMES, **t.remote_kw())
             except Exception as exc:  # noqa: BLE001 - locals are optional (no DWARF, remote)
@@ -346,7 +362,7 @@ class JobExplorer:
     # -- memory
     def memory_maps(self) -> Dict[str, Any]:
         t = self.target
-        elf = t.elf()
+        elf = t.elf() if self.has_dwarf() else None          # the maps do not need DWARF; a stripped image must not fail them
         raw, cost = t.run(lambda: t.mgr.get_memory_map_and_threads(pid=t.pid, companion_elf_path=elf, max_discoverable_vars=0,
                                                                    **t.remote_kw()))
         maps = [{"start": m.get("start"), "end": m.get("end"), "size": m.get("size"), "perm": m.get("permissions"),
@@ -513,6 +529,7 @@ class JobExplorer:
 
     def value(self, expr: str) -> Dict[str, Any]:
         t = self.target
+        self._need_dwarf()
         elf = self._need_elf()
         raw, cost = t.run(lambda: t.mgr.evaluate_symbol_paths(pid=t.pid, companion_elf_path=elf, expressions=[expr],
                                                               **t.remote_kw()))
@@ -524,6 +541,7 @@ class JobExplorer:
     def lock(self, name: str) -> Dict[str, Any]:
         """A mutex: owner and waiters with where each one is (one stack read of every thread) and the mutex words."""
         t = self.target
+        self._need_dwarf()
         elf = t.elf() or ""
         exprs = [name] if _EXPR_RE.match(name) else None
         raw, cost = t.run(lambda: t.mgr.inspect_thread_callstacks_and_locks(pid=t.pid, companion_elf_path=elf, tid=None,
