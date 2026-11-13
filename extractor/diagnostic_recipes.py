@@ -294,39 +294,7 @@ _register(DiagnosticRecipe(
     output_structure={"faulting_address": "str", "vma_match": "bool", "violation_type": "str", "permissions": "str"},
 ))
 
-_register(DiagnosticRecipe(
-    recipe_id="RECIPE_DOUBLE_FREE",
-    version="1.0.0",
-    name="Double Free & Corrupted Freelist Audit",
-    domain=DOMAIN_MEMORY_INTEGRITY,
-    observations=(OBS_MEMORY_INTEGRITY, OBS_PROCESS_INFO,),
-    applicable_problem_categories=[CATEGORY_INVALID_DOUBLE_FREE, CATEGORY_MEMORY_CORRUPTION],
-    required_prerequisites=["memory_read_available", "heap_inspection_available"],
-    evidence_sources=["heap_metadata", "freelist", "allocator_bins"],
-    collection_steps=[
-        {"step": 1, "action": "inspect_chunk_header", "purpose": "Inspect PREV_INUSE bit and size fields of chunk"},
-        {"step": 2, "action": "traverse_freelist", "purpose": "Check if target chunk pointer already exists in bin/freelist"},
-        {"step": 3, "action": "verify_neighbour_chunks", "purpose": "Verify next chunk's prev_size and prev_inuse consistency"},
-    ],
-    analysis_rules=[
-        "Chunk with PREV_INUSE==0 while being deallocated indicates double free.",
-        "Finding the same chunk pointer multiple times in a freelist confirms double free corruption.",
-        "Fastbin/tcache double free detected if chunk->next equals chunk or matches top of bin.",
-    ],
-    thresholds_and_conditions={"max_freelist_depth": 1024},
-    supporting_evidence_criteria=[
-        "Chunk address is already present in allocator freelist / fastbin / tcache",
-        "Chunk header prev_inuse flag is 0 when deallocation was requested",
-    ],
-    contradicting_evidence_criteria=[
-        "Chunk is in active allocated state (prev_inuse==1, not present in any freelist)",
-        "Freelist traversal completes without finding chunk pointer",
-    ],
-    verification_procedure="Traverse fastbins, tcache bins, and smallbins to confirm whether chunk pointer is already enqueued.",
-    stop_conditions=["Duplicate chunk found in freelist", "All freelists traversed without duplicate"],
-    limitations=["Requires glibc/musl or pool-specific allocator metadata layout."],
-    output_structure={"chunk_address": "str", "freelist_occurrences": "int", "is_double_free": "bool"},
-))
+# RECIPE_DOUBLE_FREE is defined (recipe, free-list observation and rule) in recipe_plugins/double_free.py.
 
 _register(DiagnosticRecipe(
     recipe_id="RECIPE_INVALID_FREE",
@@ -1597,69 +1565,6 @@ def _rule_invalid_memory_access(recipe: DiagnosticRecipe, data: Dict[str, Any]) 
     return None
 
 
-def _rule_double_free(recipe: DiagnosticRecipe, data: Dict[str, Any]) -> Optional[RecipeEvaluationResult]:
-    """Verdict rule of RECIPE_DOUBLE_FREE (None: no rule matched; the generic rule decides)."""
-    rid = recipe.recipe_id
-    in_freelist = data.get("in_freelist", False)
-    freelist_occ = data.get("freelist_occurrences", 0)
-    double_free_recorded = data.get("double_free_recorded", False) or data.get("duplicate_free_event", False)
-    alloc_events = data.get("allocation_event_history", [])
-    prev_inuse = data.get("prev_inuse")
-    if data.get("slot_status") == "IN_USE":
-        freelist_occ = 0
-        prev_inuse = 1
-
-    is_double_free = (
-        double_free_recorded
-        or freelist_occ > 1
-        or (in_freelist and data.get("operation") == "FREE")
-        or (data.get("slot_status") == "FREE" and data.get("operation") == "FREE")
-        or bool(data.get("freed_epoch") and data.get("current_epoch") and data.get("operation") == "FREE")
-    )
-
-    # Case D: A single free-list observation must not confirm double free
-    if not is_double_free and (freelist_occ == 1 or in_freelist):
-        return RecipeEvaluationResult(
-            recipe_id=rid,
-            status=RECIPE_STATUS_INSUFFICIENT_EVIDENCE,
-            confidence=0.35,
-            confidence_basis="Chunk appears once in freelist, which represents normal single deallocation. A single freelist observation cannot prove double free without repeated deallocation evidence.",
-            missing_evidence=["second_deallocation_event", "duplicate_freelist_entry"],
-            limitations=recipe.limitations,
-            details={"double_free_confirmed": False, "single_freelist_occurrence": True, "single_freelist_observation": True},
-        )
-
-    if is_double_free:
-        return RecipeEvaluationResult(
-            recipe_id=rid,
-            status=RECIPE_STATUS_SUPPORTED,
-            confidence=0.96,
-            confidence_basis="Chunk deallocation was observed twice in event history or chunk appears multiple times in freelist. Double free confirmed.",
-            supporting_facts=["Double free observed on chunk/slot"],
-            recommended_action="Audit object destruction lifecycle to ensure single ownership.",
-            details={"double_free_confirmed": True},
-        )
-    elif freelist_occ == 0 and prev_inuse == 1 and not double_free_recorded:
-        return RecipeEvaluationResult(
-            recipe_id=rid,
-            status=RECIPE_STATUS_CONTRADICTED,
-            confidence=0.92,
-            confidence_basis="Chunk is in active state (prev_inuse==1) and absent from freelist with zero duplicate free events.",
-            contradicting_facts=["Chunk not present in freelist", "prev_inuse is 1"],
-            recommended_action="Refute double free hypothesis for this chunk.",
-            details={"double_free_confirmed": False},
-        )
-    return RecipeEvaluationResult(
-        recipe_id=rid,
-        status=RECIPE_STATUS_INSUFFICIENT_EVIDENCE,
-        confidence=0.20,
-        confidence_basis="A single snapshot cannot prove that a free operation occurred twice. Allocation/free event history or allocator metadata required.",
-        missing_evidence=["allocation_free_event_history", "freelist_traversal_data"],
-        limitations=recipe.limitations,
-    )
-    return None
-
-
 def _rule_invalid_free(recipe: DiagnosticRecipe, data: Dict[str, Any]) -> Optional[RecipeEvaluationResult]:
     """Verdict rule of RECIPE_INVALID_FREE (None: no rule matched; the generic rule decides)."""
     rid = recipe.recipe_id
@@ -2824,7 +2729,6 @@ def _rule_shared_state_inconsistencies(recipe: DiagnosticRecipe, data: Dict[str,
 
 _RULES: Dict[str, Callable[[DiagnosticRecipe, Dict[str, Any]], Optional[RecipeEvaluationResult]]] = {
     "RECIPE_INVALID_MEMORY_ACCESS": _rule_invalid_memory_access,
-    "RECIPE_DOUBLE_FREE": _rule_double_free,
     "RECIPE_INVALID_FREE": _rule_invalid_free,
     "RECIPE_USE_AFTER_FREE": _rule_use_after_free,
     "RECIPE_PROCESS_MEMORY_GROWTH": _rule_process_memory_growth,
@@ -2848,8 +2752,9 @@ _RULES: Dict[str, Callable[[DiagnosticRecipe, Dict[str, Any]], Optional[RecipeEv
 }
 
 
-# The 22 built-in recipes defined in this module (recipe definition files add more; see below).
-BUILTIN_RECIPE_IDS: Tuple[str, ...] = tuple(_RECIPES)
+# The 22 built-in recipes: those defined in this module plus RECIPE_DOUBLE_FREE, whose definition moved to its
+# recipe definition file (recipe_plugins/double_free.py) under its built-in id.  Other definition files add more.
+BUILTIN_RECIPE_IDS: Tuple[str, ...] = tuple(_RECIPES) + (RECIPE_DOUBLE_FREE,)
 
 # IMP-018: recipe definition files (extractor/recipe_plugins/*.py) register themselves here.
 def _load_recipe_plugins() -> None:

@@ -18,6 +18,8 @@ A diagnosis is HEALTHY only if ALL of the following hold:
    * RECIPE_HEAP_METADATA_CORRUPTION INCONCLUSIVE only because the heap was above the baseline walk cap (a declared
      cost limit: ``memory_integrity.heap.not_checked_reason == "above_baseline_cap"``) while the global-adjacency
      and stack-margin parts completed and found nothing.  Listed in ``not_checked``.
+   * RECIPE_FREED_MEMORY_USE / RECIPE_DOUBLE_FREE INCONCLUSIVE only because they reuse that heap walk and it was
+     skipped for the same cap.  Listed in ``not_checked``.
    Anything else (INCONCLUSIVE, ERROR, NOT_APPLICABLE, UNSUPPORTED, NOT_EXECUTED) blocks.  In particular a baseline
    check that could not run for a target-support reason (e.g. mutex owners not decodable -> the deadlock / lock
    checks are INCONCLUSIVE) blocks: the question it owns was not answered.
@@ -28,8 +30,9 @@ A diagnosis is HEALTHY only if ALL of the following hold:
    (non-baseline) checks that reached no result, and recipes not planned for the symptom.
 
 Symptom-specific checks never gate HEALTHY (a FAIL still does, through rule 2): their scope is the symptom, the
-HEALTHY scope is the baseline.  Defect classes no baseline check looks for (use-after-free, double free, data
-races, logic errors) are always listed as not checked (``outside_baseline``).
+HEALTHY scope is the baseline.  Defect classes no baseline check looks for (data races, logic errors) and the
+forms of use-after-free / double free that leave no trace in a heap walk are always listed as not checked
+(``outside_baseline``).
 """
 
 from __future__ import annotations
@@ -66,9 +69,12 @@ BASELINE_SCOPE_LABELS: Dict[str, Tuple[str, str]] = {
     "RECIPE_FD_LEAK": ("file-descriptor leak", "파일 디스크립터 누수"),
 }
 
-OUTSIDE_BASELINE = ("use-after-free, double free, data races and program-logic errors (no baseline check looks "
-                    "for them)",
-                    "해제 후 사용, 이중 해제, 데이터 레이스, 프로그램 논리 오류 (기본 검사가 찾지 않는 종류)")
+OUTSIDE_BASELINE = ("data races and program-logic errors (no baseline check looks for them); a use-after-free "
+                    "that leaves no typed pointer to a freed block and no write into one, and a double free of a "
+                    "block re-allocated in between (the heap walk cannot see them)",
+                    "데이터 레이스, 프로그램 논리 오류 (기본 검사가 찾지 않는 종류); 해제된 블록을 가리키는 타입 있는 "
+                    "포인터도, 해제된 블록에 대한 쓰기도 남기지 않은 해제 후 사용, 그리고 사이에 다시 할당된 블록의 "
+                    "이중 해제 (힙 순회로는 보이지 않음)")
 
 
 _NOT_CHECKED_ORDER = {k: i for i, k in enumerate((
@@ -107,6 +113,23 @@ def _uaf_cap_scope_limit(c: Any) -> Optional[Dict[str, Any]]:
             "label": ("use-after-free (heap above the baseline walk cap; a memory-corruption symptom runs the full walk)",
                       "해제 후 사용 (힙이 기본 검사 상한보다 큼; 메모리 손상 증상을 주면 전체 순회를 실행함)"),
             "reason": "use-after-free not checked: heap larger than the baseline cap"}
+
+
+def _double_free_cap_scope_limit(c: Any) -> Optional[Dict[str, Any]]:
+    """RECIPE_DOUBLE_FREE that could not run only because the heap was not walked under the baseline cap.
+
+    The double-free check reads the free lists of the heap-integrity walk; when that walk was skipped for the
+    declared cost limit, the observation is NOT_CHECKED with ``heap_not_checked_reason == "above_baseline_cap"``:
+    the same scope limit as the integrity check, listed in ``not_checked`` instead of blocking HEALTHY."""
+    u = _obs(c).get("free_list_repeats")
+    if not isinstance(u, dict) or u.get("status") != "NOT_CHECKED" or u.get("findings"):
+        return None
+    if u.get("heap_not_checked_reason") != "above_baseline_cap":
+        return None
+    return {"kind": "double_free_not_checked", "item": "double_free",
+            "label": ("double free (heap above the baseline walk cap; a memory-corruption symptom runs the full walk)",
+                      "이중 해제 (힙이 기본 검사 상한보다 큼; 메모리 손상 증상을 주면 전체 순회를 실행함)"),
+            "reason": "double free not checked: heap larger than the baseline cap"}
 
 
 def _registered_scope_label(recipe_id: str) -> Optional[Tuple[str, str]]:
@@ -207,6 +230,8 @@ def evaluate(*, verdict: str, findings: List[Dict[str, Any]], checks: List[Any],
                     lim = _heap_cap_scope_limit(c)
                 elif rid == "RECIPE_FREED_MEMORY_USE":
                     lim = _uaf_cap_scope_limit(c)
+                elif rid == "RECIPE_DOUBLE_FREE":
+                    lim = _double_free_cap_scope_limit(c)
             if lim is not None:
                 partial.append("global arrays and stack margins checked, heap not walked (above the baseline cap)"
                                if rid == "RECIPE_HEAP_METADATA_CORRUPTION" else "heap not walked (above the baseline cap)")
