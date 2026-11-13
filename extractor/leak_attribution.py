@@ -752,7 +752,7 @@ def not_judged_explanation(inv: Dict[str, Any], trend: Dict[str, Any],
     if inv.get("verdict") != V_INSUFFICIENT or inv.get("status") == INV_UNSUPPORTED:
         return None
     lims = " ".join(str(x) for x in inv.get("limitations") or [])
-    out: Dict[str, Any] = {"walks_usable": 0, "walks_needed": cfg.min_walks}
+    out: Dict[str, Any] = {"walks_usable": int(inv.get("walks") or 0), "walks_needed": cfg.min_walks}
     m = _WALK_BYTES_RE.search(lims)
     if m:
         heap_b, allow_b = int(m.group(1)), int(m.group(2))
