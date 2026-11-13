@@ -306,6 +306,11 @@ def _run(cmd: List[str], max_lines: int, deadline: float) -> Optional[List[str]]
     return out
 
 
+def _attr_value(line: str) -> str:
+    """Value of a readelf attribute line (``DW_AT_name : (indirect line string, offset: 0x4): x.c`` -> ``x.c``)."""
+    return line.rsplit("): ", 1)[-1].strip() if "): " in line else line.split(":", 1)[-1].strip()
+
+
 def _comp_dirs(path: str, deadline: float) -> List[Tuple[str, str]]:
     """(DW_AT_name, DW_AT_comp_dir) of every compilation unit (top-level DIEs only)."""
     out = _run(["readelf", "--debug-dump=info", "--dwarf-depth=1", path], 400_000, deadline) or []
@@ -317,10 +322,9 @@ def _comp_dirs(path: str, deadline: float) -> List[Tuple[str, str]]:
                 cus.append((name or "", comp or ""))
             name = comp = None
         elif "DW_AT_name" in line and name is None:
-            name = line.split(":", 1)[1].split("):")[-1].strip() if ":" in line else None
-            name = line.rsplit("): ", 1)[-1].strip() if "): " in line else (line.split(":", 2)[-1].strip())
+            name = _attr_value(line)
         elif "DW_AT_comp_dir" in line and comp is None:
-            comp = line.rsplit("): ", 1)[-1].strip() if "): " in line else line.split(":", 2)[-1].strip()
+            comp = _attr_value(line)
     if name is not None or comp is not None:
         cus.append((name or "", comp or ""))
     return cus
