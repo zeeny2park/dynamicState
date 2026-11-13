@@ -767,6 +767,11 @@ def runtime_diagnose_process(
     ssh_proxy_jump: Optional[str] = None,
     auto_deploy_collector: bool = False,
     collector_path: Optional[str] = None,
+    symptom_kind: Optional[str] = None,
+    symptom_frequency: Optional[str] = None,
+    symptom_duration: Optional[str] = None,
+    affected_area: Optional[str] = None,
+    related_objects: Optional[List[str]] = None,
 ) -> str:
     """Diagnose a live Linux process end to end in ONE call and return the final verdict.
 
@@ -802,6 +807,15 @@ def runtime_diagnose_process(
         auto_deploy_collector: True to copy the small native collector (matching the target CPU) to the
             target's /tmp (or a fallback directory) first; it makes memory reads much faster. Default False.
         collector_path: Path of an already installed collector on the target (remote only).
+        symptom_kind: Optional structured symptom. When given it decides the investigation plan instead of the
+            free-text 'symptom'. One of: memory_growth, hang_deadlock, cpu_spin, crash_corruption, use_after_free,
+            double_free, stack_corruption, data_race, thread_growth, fd_leak, slow_contended, process_instability,
+            variable_anomaly, state_transition, state_inconsistency, resource_exhaustion, health_check.
+            You can fill this from the user's words; leave it empty when unsure (the text is then interpreted).
+        symptom_frequency: Optional: constant, intermittent or once.
+        symptom_duration: Optional free text, how long it has been going on (e.g. '3 hours').
+        affected_area: Optional: memory, threads, cpu, locks, files, network, state or other.
+        related_objects: Optional list of function / variable / lock names the user associates with the problem.
         For a remote target 'debug_image' is REQUIRED: the matching UNSTRIPPED ELF (with DWARF) of the target
         program, on this machine. Without it the result is INCONCLUSIVE with 'missing_debug_image' in
         not_covered; ask the user for it. An unreachable host gives INCONCLUSIVE with 'target_unreachable'.
@@ -816,9 +830,18 @@ def runtime_diagnose_process(
             remote_target = {"remote_host": remote_host, "ssh_user": ssh_user, "ssh_port": ssh_port,
                              "ssh_key": ssh_key, "ssh_proxy_jump": ssh_proxy_jump,
                              "auto_deploy_collector": bool(auto_deploy_collector), "collector_path": collector_path}
+        from extractor.symptom_interpretation import SymptomFieldError, fields_from_mapping
+        try:
+            symptom_fields = fields_from_mapping({
+                "symptom_kind": symptom_kind, "symptom_frequency": symptom_frequency,
+                "symptom_duration": symptom_duration, "affected_area": affected_area,
+                "related_objects": related_objects})
+        except SymptomFieldError as exc:
+            return _format_watch_result({"success": False, "error": str(exc), "error_code": "INVALID_PARAM"})
         out, summary = diagnose_with_summary(
             pid, debug_image=debug_image, symptom=symptom, time_limit_s=time_limit_s,
             engine=runtime.expert_diagnostic_engine, lang=lang, target=remote_target,
+            symptom_fields=symptom_fields,
         )
         out["human_summary"] = summary
         return _format_watch_result(out)

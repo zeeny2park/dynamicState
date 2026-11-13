@@ -3789,11 +3789,18 @@ class WebApiAdapter:
                 "auto_deploy_collector": params.get("auto_deploy_collector") is True,
                 "collector_path": params.get("collector_path") or None,
             }
+        # Structured symptom input (optional): the same fields as the CLI and the MCP tool.
+        from extractor.symptom_interpretation import SymptomFieldError, fields_from_mapping
+        try:
+            symptom_fields = fields_from_mapping(params)
+        except SymptomFieldError as exc:
+            return {"success": False, "error": {"code": "INVALID_PARAM", "message": str(exc)}}
         try:
             from extractor.human_report import diagnose_with_summary
             result, summary = diagnose_with_summary(
                 pid, debug_image=debug_image, symptom=symptom, time_limit_s=time_limit_s,
                 engine=self.runtime.expert_diagnostic_engine, lang=language, target=remote_target,
+                symptom_fields=symptom_fields,
             )
             return {"success": True, "result": _to_json_serializable({**result, "human_summary": summary})}
         except Exception as e:

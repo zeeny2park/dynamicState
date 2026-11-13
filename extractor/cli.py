@@ -526,6 +526,8 @@ def main():
     dx_p.add_argument("-d", "--debug-image", "--companion-elf", dest="debug_image", type=str, default=None,
                       help="ELF with DWARF symbols (default: the target's own executable)")
     dx_p.add_argument("--symptom", type=str, default=None, help="Optional natural-language symptom (default: general health check)")
+    from .symptom_interpretation import add_cli_arguments as _add_symptom_field_arguments
+    _add_symptom_field_arguments(dx_p)   # optional structured symptom input, shared with the MCP tool and the web API
     dx_p.add_argument("--time-limit", dest="time_limit_s", type=float, default=None, help="Wall-clock observation budget in seconds")
     dx_p.add_argument("--corpus", type=str, default="corpus", help="State Corpus directory (reports are written under <corpus>/reports)")
     dx_p.add_argument("--json", action="store_true", default=False,
@@ -1802,10 +1804,16 @@ def main():
             remote_target = {"remote_host": args.remote_host, "ssh_user": args.ssh_user, "ssh_port": args.ssh_port,
                              "ssh_key": args.ssh_key, "ssh_proxy_jump": args.ssh_proxy_jump,
                              "auto_deploy_collector": args.auto_deploy_collector, "collector_path": args.collector_path}
+        from .symptom_interpretation import SymptomFieldError, fields_from_mapping
+        try:
+            symptom_fields = fields_from_mapping(vars(args))
+        except SymptomFieldError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            sys.exit(2)
         result, summary = diagnose_with_summary(
             args.pid, debug_image=args.debug_image, symptom=args.symptom, time_limit_s=args.time_limit_s,
             engine=ExpertDiagnosticEngine(corpus_dir=os.path.abspath(args.corpus)), lang=args.lang,
-            target=remote_target,
+            target=remote_target, symptom_fields=symptom_fields,
         )
         if args.json:
             result["human_summary"] = summary
