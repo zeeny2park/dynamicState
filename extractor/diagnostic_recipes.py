@@ -1892,7 +1892,7 @@ def _rule_potential_deadlock_patterns(recipe: DiagnosticRecipe, data: Dict[str, 
                 confidence_basis=f"Complete lock graph verified acyclic with zero circular wait cycles ({analysis.summary}).",
                 contradicting_facts=["Complete lock graph verified acyclic (DAG)"],
                 recommended_action="Refute deadlock; inspect thread worker contention or external I/O stall.",
-                details={"deadlock_confirmed": False, "state": "NO_DEADLOCK_ACYCLIC"},
+                details={"deadlock_confirmed": False, "state": "NO_DEADLOCK_ACYCLIC", "lock_graph_acyclic": True},
             )
 
     thread_locks = data.get("thread_locks") or data.get("lock_graph") or data.get("callstacks_info")
@@ -1966,7 +1966,7 @@ def _rule_potential_deadlock_patterns(recipe: DiagnosticRecipe, data: Dict[str, 
             confidence_basis="Wait-for graph is a verified complete acyclic directed graph with no wait cycles.",
             contradicting_facts=["Wait-for graph is complete and acyclic"],
             recommended_action="Refute deadlock hypothesis; inspect thread contention and lock holding durations.",
-            details={"deadlock_confirmed": False, "thread_contention": bool(blocked_threads)},
+            details={"deadlock_confirmed": False, "thread_contention": bool(blocked_threads), "lock_graph_acyclic": True},
         )
     return RecipeEvaluationResult(
         recipe_id=rid,
@@ -2050,7 +2050,7 @@ def _rule_heap_growth(recipe: DiagnosticRecipe, data: Dict[str, Any]) -> Optiona
             confidence_basis=f"Heap footprint is stable (delta={heap_delta} bytes). Unmanaged heap expansion refuted.",
             contradicting_facts=[f"Heap stable (delta={heap_delta} bytes)"],
             recommended_action="Refute heap growth hypothesis.",
-            details={"heap_growth_confirmed": False},
+            details={"heap_growth_confirmed": False, "heap_stable": True},
         )
     return RecipeEvaluationResult(
         recipe_id=rid,
@@ -2113,7 +2113,7 @@ def _rule_long_lived_object_accumulation(recipe: DiagnosticRecipe, data: Dict[st
             confidence_basis=f"Object population remains stable without unbounded accumulation (count={obj_delta}).",
             contradicting_facts=["Object population stable"],
             recommended_action="Refute object accumulation hypothesis.",
-            details={"object_accumulation_confirmed": False},
+            details={"object_accumulation_confirmed": False, "population_stable": True},
         )
     return RecipeEvaluationResult(
         recipe_id=rid,
@@ -2302,7 +2302,7 @@ def _rule_heap_metadata_corruption(recipe: DiagnosticRecipe, data: Dict[str, Any
             confidence_basis="Heap chunk canaries intact across audited chunks.",
             contradicting_facts=["Canaries valid"],
             recommended_action="Refute heap metadata corruption for this region.",
-            details={"corruption_confirmed": False},
+            details={"corruption_confirmed": False, "canaries_intact": True},
         )
     return None
 

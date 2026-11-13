@@ -185,6 +185,18 @@ from .healthy_verdict import (
 )
 from .modules import ModuleAddressResolver
 from .debug_image import inspect_elf
+from .typed_evidence import (
+    CRITERION_INVARIANT,
+    FAMILY_CORRUPTION,
+    FAMILY_DEADLOCK,
+    FAMILY_GROWTH,
+    FAMILY_STATE,
+    POLARITY_CONTRADICTS,
+    POLARITY_SUPPORTS,
+    attach_typed_evidence,
+    criteria_family,
+    typed_evidence_of,
+)
 
 
 class DurableCommitOutcome(str, Enum):
@@ -2037,7 +2049,7 @@ class AdaptiveInvestigationSession:
                 **({"live_capture_receipt": rcpt_dict_payload} if rcpt_dict_payload else {}),
             }
             correlated = self.correlator.correlate(ev_payload, target_pid=self.pid)
-            enriched_ev = {**ev_payload, "correlation": correlated, "step_id": step.step_id}
+            enriched_ev = attach_typed_evidence({**ev_payload, "correlation": correlated, "step_id": step.step_id})
 
             ledger_status = self._record_authoritative_evidence_in_ledger(
                 ev_id=ev_id,
@@ -2072,7 +2084,7 @@ class AdaptiveInvestigationSession:
                 **({"live_capture_receipt": rcpt_dict_payload} if rcpt_dict_payload else {}),
             }
             correlated = self.correlator.correlate(ev_payload, target_pid=self.pid)
-            enriched_ev = {**ev_payload, "correlation": correlated, "step_id": step.step_id}
+            enriched_ev = attach_typed_evidence({**ev_payload, "correlation": correlated, "step_id": step.step_id})
             enriched_ev["ledger_status"] = self._record_authoritative_evidence_in_ledger(
                 ev_id=contra_ev_id,
                 recipe_id=recipe.recipe_id,
@@ -2105,7 +2117,7 @@ class AdaptiveInvestigationSession:
                 **({"live_capture_receipt": rcpt_dict_payload} if rcpt_dict_payload else {}),
             }
             correlated = self.correlator.correlate(ev_payload, target_pid=self.pid)
-            enriched_ev = {**ev_payload, "correlation": correlated, "step_id": step.step_id}
+            enriched_ev = attach_typed_evidence({**ev_payload, "correlation": correlated, "step_id": step.step_id})
             enriched_ev["ledger_status"] = self._record_authoritative_evidence_in_ledger(
                 ev_id=base_ev_id,
                 recipe_id=recipe.recipe_id,
@@ -2441,23 +2453,24 @@ class AdaptiveInvestigationSession:
         return {"action": "ANALYZE", "state": self.state, "hypotheses_count": len(self.active_hypotheses)}
 
     def _build_verification_criteria_for_category(self, category: str) -> List[Dict[str, Any]]:
-        """Constructs executable verification criteria for a problem category."""
-        if "CORRUPTION" in category or "FREE" in category:
+        """Constructs executable verification criteria for a problem category (its criteria family)."""
+        family = criteria_family(category)
+        if family == FAMILY_CORRUPTION:
             return [
                 {"criterion_id": "CRIT_POINTER_VALID_VMA", "description": "Target address resides in valid mapped VMA and outside NULL page [0, 4096]", "expected": True},
                 {"criterion_id": "CRIT_NO_POISON_PATTERN", "description": "Memory buffer does not contain allocator poison bytes (0xbaadbaad/0xdeadbeef)", "expected": True},
             ]
-        elif "LEAK" in category or "GROWTH" in category:
+        elif family == FAMILY_GROWTH:
             return [
                 {"criterion_id": "CRIT_RSS_GROWTH_STABLE", "description": "Process RSS growth rate across observation window is bounded (< 20%)", "expected": True},
                 {"criterion_id": "CRIT_CHUNK_RECLAMATION", "description": "Allocated heap objects/chunks are reclaimed without sustained accumulation", "expected": True},
             ]
-        elif "DEADLOCK" in category or "CONCURRENCY" in category:
+        elif family == FAMILY_DEADLOCK:
             return [
                 {"criterion_id": "CRIT_NO_CIRCULAR_WAIT", "description": "Thread mutex wait-for graph contains no circular wait cycles", "expected": True},
                 {"criterion_id": "CRIT_THREADS_PROGRESSING", "description": "Threads make execution progress without permanent futex lock stall", "expected": True},
             ]
-        elif "STATE" in category or "VARIABLE" in category:
+        elif family == FAMILY_STATE:
             return [
                 {"criterion_id": "CRIT_VALID_STATE_DOMAIN", "description": "State variable values remain within defined enum/boundary domains", "expected": True},
                 {"criterion_id": "CRIT_LEGAL_STATE_TRANSITION", "description": "Observed state transitions conform to valid state machine edges", "expected": True},
@@ -2481,19 +2494,31 @@ class AdaptiveInvestigationSession:
         return {"action": "VERIFY", "state": self.state}
 
     def _execute_verification_for_hypothesis(self, hyp: ExpertHypothesis) -> Dict[str, Any]:
-        """Executes explicit verification criteria for a single hypothesis."""
+        """Executes explicit verification criteria for a single hypothesis.
+
+        Stage 1 (typed evidence): every decision below reads only the typed part of the evidence
+        (``extractor.typed_evidence``: polarity, invariant claims, completeness, observed value / subject, certainty
+        cap, confirmed fault) - never the text of a finding, counter-indicator or description.  Which list an item is
+        in (supporting / contradicting) is the hypothesis's classification of it; the rationale strings are output."""
         results: List[Dict[str, Any]] = []
         has_fail = False
         has_pass = False
 
         criteria_list = hyp.verification_criteria if isinstance(hyp.verification_criteria, list) else []
+        supp = [(e, typed_evidence_of(e)) for e in hyp.supporting_evidence]
+        contra = [(e, typed_evidence_of(e)) for e in hyp.contradicting_evidence]
+        both = supp + contra
+
+        def first(pairs: List[Tuple[Dict[str, Any], Any]], pred: Callable[[Any], bool]) -> Optional[Dict[str, Any]]:
+            return next((e for e, t in pairs if pred(t)), None)
+
         # IMP-009: stable heap metadata damage attributed to a named block (uncapped) is the memory-integrity proof;
         # the pointer / poison-word criteria (written for a single probed pointer) do not apply to it.
-        heap_proof = next((e for e in hyp.supporting_evidence if e.get("status") == "SUPPORTED"
-                           and e.get("details", {}).get("corruption_confirmed")
-                           and e.get("details", {}).get("certainty_cap") != "PROBABLE"), None)
+        heap_proof = first(supp, lambda t: t.polarity == POLARITY_SUPPORTS and t.corruption_confirmed
+                           and t.certainty_cap != "PROBABLE")
         for crit in criteria_list:
             cid = crit.get("criterion_id", "")
+            inv = CRITERION_INVARIANT.get(cid)
             outcome = "INCONCLUSIVE"
             rationale = "No observation evidence available to verify criterion."
             consumed_ids: List[str] = []
@@ -2508,8 +2533,8 @@ class AdaptiveInvestigationSession:
                     rationale = "Not applicable: the damage is proven by heap metadata, not by one probed pointer."
             # 1. Pointer & VMA check
             elif cid == "CRIT_POINTER_VALID_VMA":
-                fault_ev = next((e for e in hyp.supporting_evidence if "NULL" in str(e) or "unmapped" in str(e).lower() or e.get("details", {}).get("violation_type") in ("NULL_POINTER_DEREFERENCE", "UNMAPPED_OR_GUARD_PAGE")), None)
-                contra_ev = next((e for e in hyp.contradicting_evidence if "validly mapped" in str(e) or e.get("details", {}).get("is_healthy") or e.get("details", {}).get("violation_type") == "NONE_IDLE_NULL_POINTER"), None)
+                fault_ev = first(supp, lambda t: t.violates(inv))
+                contra_ev = first(contra, lambda t: t.upholds(inv))
                 if fault_ev:
                     outcome = "FAIL"  # Invariant violated -> fault confirmed
                     consumed_ids.append(fault_ev.get("evidence_id", ""))
@@ -2524,8 +2549,8 @@ class AdaptiveInvestigationSession:
 
             # 2. Poison bytes / magic check
             elif cid == "CRIT_NO_POISON_PATTERN":
-                poison_ev = next((e for e in hyp.supporting_evidence if "magic" in str(e).lower() or "poison" in str(e).lower() or e.get("details", {}).get("magic_corrupted")), None)
-                clean_ev = next((e for e in hyp.contradicting_evidence if "clean" in str(e).lower() or "valid" in str(e).lower()), None)
+                poison_ev = first(supp, lambda t: t.violates(inv))
+                clean_ev = first(contra, lambda t: t.upholds(inv))
                 if poison_ev:
                     outcome = "FAIL"
                     consumed_ids.append(poison_ev.get("evidence_id", ""))
@@ -2536,8 +2561,8 @@ class AdaptiveInvestigationSession:
                     rationale = "Memory slice verified intact with zero corruption or poison patterns."
                 else:
                     # Check if memory was actually read and verified
-                    mem_ev = next((e for e in hyp.supporting_evidence + hyp.contradicting_evidence if e.get("observed_value") is not None), None)
-                    if mem_ev and not poison_ev:
+                    mem_ev = first(both, lambda t: t.has_observation)
+                    if mem_ev:
                         outcome = "PASS"
                         consumed_ids.append(mem_ev.get("evidence_id", ""))
                         rationale = "Memory slice audited clean without poison markers."
@@ -2547,8 +2572,8 @@ class AdaptiveInvestigationSession:
 
             # 3. Memory growth / leak check
             elif cid in ("CRIT_RSS_GROWTH_STABLE", "CRIT_CHUNK_RECLAMATION"):
-                growth_ev = next((e for e in hyp.supporting_evidence if "growth" in str(e).lower() or "leak" in str(e).lower() or e.get("details", {}).get("growth_confirmed")), None)
-                stable_ev = next((e for e in hyp.contradicting_evidence if "stable" in str(e).lower() or "plateau" in str(e).lower() or e.get("details", {}).get("transient_warmup")), None)
+                growth_ev = first(supp, lambda t: t.violates(inv))
+                stable_ev = first(contra, lambda t: t.upholds(inv))
                 if growth_ev:
                     outcome = "FAIL"
                     consumed_ids.append(growth_ev.get("evidence_id", ""))
@@ -2563,16 +2588,15 @@ class AdaptiveInvestigationSession:
 
             # 4. Circular wait / deadlock check
             elif cid == "CRIT_NO_CIRCULAR_WAIT":
-                incomplete_ev = next((e for e in hyp.supporting_evidence + hyp.contradicting_evidence if e.get("details", {}).get("incomplete_lock_graph")), None)
-                deadlock_ev = next((e for e in hyp.supporting_evidence if "deadlock" in str(e).lower() or e.get("details", {}).get("deadlock_detected")), None)
-                acyclic_ev = next((e for e in hyp.contradicting_evidence if "acyclic" in str(e).lower() or "no circular wait" in str(e).lower()), None)
-                blocked_ev = next((e for e in hyp.supporting_evidence if "blocked" in str(e).lower()), None)
+                incomplete_ev = first(both, lambda t: t.lock_graph_incomplete)
+                deadlock_ev = first(supp, lambda t: t.violates(inv))
+                acyclic_ev = first(contra, lambda t: t.upholds(inv))
 
                 if incomplete_ev:
                     outcome = "INCONCLUSIVE"
                     consumed_ids.append(incomplete_ev.get("evidence_id", ""))
                     missing_ev.append("complete_lock_ownership_info")
-                    rationale = "Lock ownership graph is incomplete (threads waiting on locks with unresolvable owner). Cannot determine whether graph is acyclic."
+                    rationale = "Lock ownership graph is incomplete (threads waiting on locks with unresolvable owner). Cannot determine whether graph is acyclic or contains cycles."
                 elif deadlock_ev:
                     outcome = "FAIL"  # Circular wait confirmed
                     consumed_ids.append(deadlock_ev.get("evidence_id", ""))
@@ -2581,18 +2605,14 @@ class AdaptiveInvestigationSession:
                     outcome = "PASS"
                     consumed_ids.append(acyclic_ev.get("evidence_id", ""))
                     rationale = "Complete lock graph verified acyclic with zero circular wait cycles."
-                elif blocked_ev:
-                    outcome = "PASS"
-                    consumed_ids.append(blocked_ev.get("evidence_id", ""))
-                    rationale = "Thread blocked on lock, but lock graph is verified complete and acyclic (thread contention without deadlock)."
                 else:
                     outcome = "INCONCLUSIVE"
                     missing_ev.append("thread_wait_for_graph")
 
             # 5. State domain / transition check
             elif cid in ("CRIT_VALID_STATE_DOMAIN", "CRIT_LEGAL_STATE_TRANSITION"):
-                trans_ev = next((e for e in hyp.supporting_evidence if "transition" in str(e).lower() or "boundary" in str(e).lower() or e.get("details", {}).get("field_inconsistency")), None)
-                valid_trans_ev = next((e for e in hyp.contradicting_evidence if "authorized" in str(e).lower() or "within bounds" in str(e).lower()), None)
+                trans_ev = first(supp, lambda t: t.violates(inv))
+                valid_trans_ev = first(contra, lambda t: t.upholds(inv))
                 if trans_ev:
                     outcome = "FAIL"
                     consumed_ids.append(trans_ev.get("evidence_id", ""))
@@ -2603,8 +2623,8 @@ class AdaptiveInvestigationSession:
                     rationale = "Observed state transitions conform to valid specification."
                 else:
                     # Check if state variable was actually observed
-                    state_obs_ev = next((e for e in hyp.supporting_evidence + hyp.contradicting_evidence if e.get("symbol")), None)
-                    if state_obs_ev and not trans_ev:
+                    state_obs_ev = first(both, lambda t: bool(t.subject))
+                    if state_obs_ev:
                         outcome = "PASS"
                         consumed_ids.append(state_obs_ev.get("evidence_id", ""))
                         rationale = f"Observed variable '{state_obs_ev.get('symbol')}' conforms to normal operational state."
@@ -2638,32 +2658,26 @@ class AdaptiveInvestigationSession:
 
         hyp.verification_execution_results = results
 
-        # Update hypothesis verdict based on criteria outcomes
-        is_clean_hyp = (
-            "No abnormal runtime indicators observed" in hyp.problem_statement or
-            any(c.get("criterion_id") == "CRIT_ZERO_ANOMALIES" for c in criteria_list)
-        )
+        # Update hypothesis verdict based on criteria outcomes.  The clean (HEALTHY) hypothesis is the one the engine
+        # builds with the zero-anomalies criterion; the engine's own "inconclusive" hypothesis has no criteria and
+        # falls through to INCONCLUSIVE below.
+        is_clean_hyp = any(c.get("criterion_id") == "CRIT_ZERO_ANOMALIES" for c in criteria_list)
         if is_clean_hyp:
             if has_pass and not has_fail:
                 hyp.status = "CONFIRMED"
                 hyp.confidence = 0.90
             else:
                 hyp.status = "INCONCLUSIVE"
-        elif "inconclusive" in hyp.problem_statement.lower():
-            hyp.status = "INCONCLUSIVE"
         else:
             # Fault hypothesis: criteria FAIL means safety invariant was violated (fault verified!)
             # Verification rule: CONFIRMED requires verified primary supporting observations with zero unrefuted counter-indicators
-            has_primary_supp = bool(hyp.supporting_evidence and any(e.get("status") == "SUPPORTED" for e in hyp.supporting_evidence))
-            has_unrefuted_contra = bool(hyp.contradicting_evidence and any(e.get("status") == "CONTRADICTED" for e in hyp.contradicting_evidence))
+            has_primary_supp = any(t.polarity == POLARITY_SUPPORTS for _e, t in supp)
 
             # IMP-008: a rule can cap what its observation proves (e.g. unbounded growth of a still-referenced
             # container: the growth is measured, but leak vs intended accumulation is not decidable from memory)
-            capped = [e for e in hyp.supporting_evidence if e.get("details", {}).get("certainty_cap") == "PROBABLE"]
-            uncapped = [e for e in hyp.supporting_evidence if e.get("status") == "SUPPORTED"
-                        and e.get("details", {}).get("certainty_cap") != "PROBABLE"
-                        and (e.get("details", {}).get("leak_confirmed")
-                             or e.get("details", {}).get("corruption_confirmed"))]
+            capped = [e for e, t in supp if t.certainty_cap == "PROBABLE"]
+            uncapped = [e for e, t in supp if t.polarity == POLARITY_SUPPORTS
+                        and t.certainty_cap != "PROBABLE" and t.fault_confirmed]
             if has_fail and has_primary_supp and not has_pass and capped and not uncapped:
                 hyp.status = "LIKELY"
                 hyp.confidence = min(max(hyp.confidence, 0.70), 0.85)
