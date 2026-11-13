@@ -47,6 +47,8 @@ KIND_CATEGORIES: Dict[str, frozenset] = {
     "deadlock": frozenset({"DEADLOCK_INDICATORS"}),
     "busy_wait": frozenset({"PROCESS_INSTABILITY", "RESOURCE_EXHAUSTION"}),
     "long_stall": frozenset({"PROCESS_INSTABILITY"}),
+    "orphan_lock": frozenset({"ORPHAN_LOCK"}),
+    "self_deadlock": frozenset({"SELF_DEADLOCK"}),
 }
 # `long_stall` stays here only so unscored stall rows can be labelled and described; it never enters a total.
 DEFECT_KINDS = tuple(KIND_CATEGORIES)

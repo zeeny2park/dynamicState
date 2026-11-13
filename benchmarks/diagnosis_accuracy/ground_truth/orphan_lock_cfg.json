@@ -1,0 +1,38 @@
+{
+  "id": "orphan_lock_cfg",
+  "origin": "new",
+  "naming": "neutral",
+  "kind": "orphan_lock",
+  "source": "benchmarks/diagnosis_accuracy/targets/orphan_lock_cfg.c",
+  "language": "c",
+  "symptom": "the process hangs",
+  "ready": {
+    "mode": "stdout_marker"
+  },
+  "causes": {
+    "variables": [],
+    "locks": [
+      "m_cfg"
+    ],
+    "threads": [
+      "reader"
+    ],
+    "functions": [
+      "loader",
+      "reader"
+    ]
+  },
+  "locations": [
+    {
+      "file": "benchmarks/diagnosis_accuracy/targets/orphan_lock_cfg.c",
+      "line": 11,
+      "text": "pthread_mutex_lock(&m_cfg)"
+    },
+    {
+      "file": "benchmarks/diagnosis_accuracy/targets/orphan_lock_cfg.c",
+      "line": 19,
+      "text": "pthread_mutex_lock(&m_cfg)"
+    }
+  ],
+  "notes": "a thread returns while holding the mutex; two later threads block on it"
+}
