@@ -7,7 +7,7 @@ reader opens the detail of the part they are reading:
 =========================================  ==============================================================
 report part                                detailed records shown there
 =========================================  ==============================================================
-conclusion (verdict)                       A executive summary, F ranking head, I final conclusions
+conclusion (verdict)                       A summary, F ranking head + null hypothesis, I conclusions
 finding *n*                                E finding records, F hypotheses and G evidence records of that
                                            finding (matched by evidence id, then category / recipe id)
 check row (one recipe)                     D check records of that recipe, the G evidence records attached
@@ -84,6 +84,7 @@ def partition(res: Dict[str, Any], report: Optional[Dict[str, Any]], rows: List[
     hyp_of: Dict[int, List[Dict[str, Any]]] = {i: [] for i in f_ev}
     hyp_row: Dict[str, List[Dict[str, Any]]] = {}
     other_h: List[Dict[str, Any]] = []
+    hyp_verdict: List[Dict[str, Any]] = []
     for h in [h for h in (f_sec.get("hypotheses") or []) if isinstance(h, dict)]:
         supp = set(_ids(h.get("supporting_evidence_ids")))
         hit = next((i for i in f_ev if supp & f_ev[i]), None)
@@ -91,6 +92,9 @@ def partition(res: Dict[str, Any], report: Optional[Dict[str, Any]], rows: List[
             hit = next((i for i in f_cat if str(h.get("category") or h.get("problem_category")) == f_cat[i]), None)
         if hit is not None:
             hyp_of[hit].append(h)
+            continue
+        if str(h.get("category")) in ("HEALTHY", "UNKNOWN"):   # the null hypothesis: it is the verdict itself
+            hyp_verdict.append(h)
             continue
         cand = [str(e.get("recipe_id")) for e in (h.get("contradicting_evidence") or []) if isinstance(e, dict)]
         cand += _ids(h.get("applicable_diagnostic_rules"))
@@ -184,9 +188,12 @@ def partition(res: Dict[str, Any], report: Optional[Dict[str, Any]], rows: List[
 
     # ---- render: verdict, scope, method, other
     i_sec = report.get("section_i_final_conclusions") or {}
-    out["verdict"] = "\n".join(x for x in (dr.detail_section_a_html(a), dr.detail_section_f_header_html(f_sec),
-                                           dr.detail_section_i_html(i_sec, str(a.get("verdict_rationale") or ""))) if x)
-    rec["verdict"] = [{"A": a}, {"F_head": {k: v for k, v in f_sec.items() if k != "hypotheses"}}, {"I": i_sec}]
+    out["verdict"] = "\n".join(x for x in (
+        dr.detail_section_a_html(a), dr.detail_section_f_header_html(f_sec),
+        ("<h4>F. The overall (null) hypothesis</h4>" + dr.detail_hypotheses_html(hyp_verdict)) if hyp_verdict else "",
+        dr.detail_section_i_html(i_sec, str(a.get("verdict_rationale") or ""))) if x)
+    rec["verdict"] = [{"A": a}, {"F_head": {k: v for k, v in f_sec.items() if k != "hypotheses"}, "F": hyp_verdict},
+                      {"I": i_sec}]
     h_sec = report.get("section_h_limitations_and_unverified") or {}
     out["scope"] = "\n".join(x for x in (dr.detail_section_d_summary_html(d_sec), dr.detail_section_h_html(h_sec)) if x)
     rec["scope"] = [{"D_totals": {k: v for k, v in d_sec.items() if k != "checks"}}, {"H": h_sec}]

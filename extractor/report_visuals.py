@@ -354,6 +354,7 @@ _CSS = """
 .dsv-tbl th { color: var(--mute); font-weight: 600; font-size: 12px; }
 .dsv-tbl tr.dsv-hot td:first-child { box-shadow: inset 4px 0 0 var(--bad); }
 .dsv-scroll { overflow-x: auto; }
+.dsv-scroll > .dsv-tbl { min-width: 560px; }   /* narrow screens scroll the table instead of squeezing it */
 .dsv-smp { display: inline-flex; gap: 2px; vertical-align: middle; }
 .dsv-smp i { display: inline-block; width: 16px; height: 16px; border-radius: 3px; font-style: normal; font-size: 10px; line-height: 16px;
   text-align: center; color: #ffffff; background: var(--unk); }
