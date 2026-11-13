@@ -69,9 +69,20 @@ def outcome_notice(result: Dict[str, Any], job: "DiagnoseJob") -> Optional[Dict[
             code = _reason_code(str(n.get("reason") or ""))
             return {"code": "TARGET_EXITED" if code == "TARGET_NOT_FOUND" and job.target_name else code,
                     "message": str(n.get("reason") or "")}
-    if not job.remote_host and job.target_name and not os.path.isdir(f"/proc/{int(job.pid)}"):
+    if not job.remote_host and job.target_name and not _alive(int(job.pid)):
         return {"code": "TARGET_EXITED", "message": f"process {job.pid} exited during the diagnosis"}
     return None
+
+
+def _alive(pid: int) -> bool:
+    """A local process that still runs: present in /proc and not a zombie (an exited child its parent has not reaped
+    yet still has a /proc entry)."""
+    try:
+        with open(f"/proc/{pid}/stat", "r", encoding="utf-8", errors="replace") as fh:
+            state = fh.read().rsplit(")", 1)[1].split()[0]
+    except (OSError, IndexError):
+        return False
+    return state not in ("Z", "X")
 
 
 class DiagnoseJob:

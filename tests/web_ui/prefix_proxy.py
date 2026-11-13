@@ -9,6 +9,7 @@ import http.client
 import http.server
 import socketserver
 import threading
+import time
 from typing import Dict, List
 
 PREFIX = "/dynamicstate/"
@@ -17,9 +18,10 @@ _HOP = {"connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
 
 
 class PrefixProxy:
-    def __init__(self, upstream_port: int, buffering: bool = True, timeout: float = 120.0):
+    def __init__(self, upstream_port: int, buffering: bool = True, timeout: float = 120.0, hold_events_s: float = 0.0):
         self.upstream_port = upstream_port
         self.buffering = buffering
+        self.hold_events_s = hold_events_s   # an event stream is also held this long (a proxy whose buffer fills slowly)
         self.timeout = timeout
         self.log: List[Dict[str, object]] = []
         proxy = self
@@ -41,11 +43,15 @@ class PrefixProxy:
                 body = self.rfile.read(n) if n else None
                 headers = {k: v for k, v in self.headers.items() if k.lower() not in _HOP and k.lower() != "host"}
                 headers["Host"] = f"127.0.0.1:{proxy.upstream_port}"
+                if headers.get("Origin") == f"http://127.0.0.1:{proxy.port}":
+                    del headers["Origin"]       # as the demo's nginx map does: its own public origin is blanked
                 conn = http.client.HTTPConnection("127.0.0.1", proxy.upstream_port, timeout=proxy.timeout)
                 try:
                     conn.request(self.command, path, body=body, headers=headers)
                     resp = conn.getresponse()
                     if proxy.buffering:
+                        if proxy.hold_events_s and "/events" in path:
+                            time.sleep(proxy.hold_events_s)
                         data = resp.read()                      # the whole response first, as a buffering proxy does
                         proxy.log.append({"method": self.command, "path": path, "status": resp.status, "bytes": len(data)})
                         self.send_response(resp.status)
