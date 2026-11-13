@@ -31,6 +31,7 @@ Verdict rule (thresholds in ``thresholds_and_conditions``)
 
 from __future__ import annotations
 
+import math
 import bisect
 import struct
 import time
@@ -607,15 +608,24 @@ def lines_chart(lines: List[Tuple[str, str, List[float], List[float]]], title: s
     w, h, ml, mr, mt, mb = 640, 246, 70, 20, 34, 42
     allx = [x for ln in lines for x in ln[2]]
     x0, xr = min(allx), (max(allx) - min(allx)) or 1.0
-    ymax = (max(y for ln in lines for y in ln[3]) * 1.1) or 1.0
+    ytop = max(y for ln in lines for y in ln[3]) or 1.0
+    mag = 10 ** math.floor(math.log10(ytop / 4))
+    step = next(m * mag for m in (1, 2, 2.5, 5, 10) if m * mag * 4 >= ytop)  # round tick values, axis starts at 0
+    ymax = step * 4
     px = lambda v: ml + (w - ml - mr) * (v - x0) / xr  # noqa: E731
     py = lambda v: mt + (h - mt - mb) * (1 - v / ymax)  # noqa: E731
     o = [f'<svg viewBox="0 0 {w} {h}" width="{w}" role="img" aria-label="{esc(title)}">']
     for k in range(5):
-        v = ymax * k / 4
+        v = step * k
         o.append(f'<line class="dsv-grid" x1="{ml}" y1="{py(v):.1f}" x2="{w - mr}" y2="{py(v):.1f}"/>'
                  f'<text class="dsv-t-mute" x="{ml - 8}" y="{py(v) + 4:.1f}" text-anchor="end" font-size="11">{v:,.0f}</text>')
     o.append(f'<line class="dsv-axis" x1="{ml}" y1="{py(0):.1f}" x2="{w - mr}" y2="{py(0):.1f}"/>')
+    nt = 5
+    for k in range(nt):  # tick labels in seconds on the shared time axis (first sample at the left edge)
+        tv = x0 + xr * k / (nt - 1)
+        o.append(f'<line class="dsv-axis" x1="{px(tv):.1f}" y1="{py(0):.1f}" x2="{px(tv):.1f}" y2="{py(0) + 4:.1f}"/>'
+                 f'<text class="dsv-t-mute" x="{px(tv):.1f}" y="{py(0) + 16:.1f}" text-anchor="middle" '
+                 f'font-size="11">{tv - x0:.1f}</text>')
     for label, colour, xs, ys in lines:
         st = 'style="stroke:var(%s)"' % esc(colour)
         if len(xs) >= 2:
@@ -648,9 +658,12 @@ def mapping_finding_viz(lx: Any, finding: Dict[str, Any], report: Optional[Dict[
     t0 = _num(mg.get("t0"))
     walks = [w for w in mg.get("heap_walks") or [] if isinstance(w, dict) and _num(w.get("t")) is not None
              and _num(w.get("in_use_bytes")) is not None]
-    if t0 is not None and walks:
-        lines.append((_TXT["l_inuse"][i], "--accent", [float(w["t"]) - t0 for w in walks],
-                      [float(w["in_use_bytes"]) / 1024.0 for w in walks]))
+    # one time axis: only heap-walk points inside the sampled window are drawn, and a lone point is not drawn
+    # at all (it suggests no trend; its value is stated in the facts)
+    wp = [(float(w["t"]) - t0, float(w["in_use_bytes"]) / 1024.0) for w in walks] if t0 is not None else []
+    wp = [p for p in wp if xs[0] <= p[0] <= xs[-1]]
+    if len(wp) >= 2:
+        lines.append((_TXT["l_inuse"][i], "--accent", [p[0] for p in wp], [p[1] for p in wp]))
     out = [f'<h4>{esc(_TXT["chart"][i])} {chip(lx, "obs")}</h4>', lines_chart(lines, _TXT["chart"][i], _TXT["x"][i])]
     # the sentences carry target-controlled values: escape the sentence, then mark those values as code
     marks: List[str] = []

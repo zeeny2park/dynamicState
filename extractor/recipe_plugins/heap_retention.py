@@ -227,6 +227,8 @@ def collect_heap_retention(provider: Any, ctx: Dict[str, Any]) -> None:
 
 def _mib(n: Any) -> str:
     v = float(n or 0)
+    if v < 1024:
+        return "%d B" % v  # chunks below 1 KB are printed in bytes, never as "0 KB"
     return "%.1f MiB" % (v / 1048576.0) if v >= 1 << 20 else "%d KB" % (v // 1024)
 
 
@@ -284,9 +286,10 @@ def heap_retention_rule(recipe: DiagnosticRecipe, data: Dict[str, Any]) -> Optio
              + ("; in-use heap flat across %d heap walks" % len(lw) if len(lw) >= 2 else "")]
     big = max(hr.get("arenas") or [{}], key=lambda r: int(r.get("free_bytes") or 0))
     if big:
-        facts.append("most free memory in arena %s (%s): %s free in %d chunks, largest free chunk %s"
+        facts.append("most free memory in arena %s (%s): %s free in %d chunks%s"
                      % (big.get("index"), "main" if big.get("is_main") else "thread", _mib(big.get("free_bytes")),
-                        int(big.get("free_chunks") or 0), _mib(big.get("largest_free"))))
+                        int(big.get("free_chunks") or 0),
+                        ", largest free chunk %s" % _mib(big.get("largest_free")) if big.get("largest_free") else ""))
     details.update(finding_category=CATEGORY_HEAP_RETENTION, finding_severity="INFO", non_fault=True,
                    finding_summary=facts[0], certainty_cap="PROBABLE",
                    certainty_cap_reason="retention explains a high RSS; it is a degradation, not a fault")
@@ -346,8 +349,9 @@ _TXT = {
              "{win}초 동안({n}회 샘플) 힙 매핑과 RSS가 변하지 않았습니다{walks}. 누수가 아니라 할당자가 붙잡고 있는 "
              "메모리입니다."),
     "flat_walks": ("; the heap in use was flat across {n} heap walks", ". 힙 조사 {n}회 동안 사용 중인 힙도 그대로였습니다"),
-    "arena": ("Most of it is in arena {idx} ({kind}): {free} free in {n} chunks, the largest free chunk {big}.",
-              "대부분은 아레나 {idx}({kind})에 있습니다: 빈 청크 {n}개에 {free}, 가장 큰 빈 청크 {big}."),
+    "arena": ("Most of it is in arena {idx} ({kind}): {free} free in {n} chunks{big}.",
+              "대부분은 아레나 {idx}({kind})에 있습니다: 빈 청크 {n}개에 {free}{big}."),
+    "arena_big": (", the largest free chunk {big}", ", 가장 큰 빈 청크 {big}"),
     "main": ("main", "메인"), "thread": ("thread arena", "스레드 아레나"),
     "why": ("glibc gives memory back to the system only from the top of a heap; free chunks between blocks still in "
             "use stay mapped. Which allocation pattern left these gaps was not observed.",
@@ -398,7 +402,8 @@ def _hr_facts(i: int, hr: Dict[str, Any]) -> List[str]:
         a = max(ars, key=lambda r: _n(r.get("free_bytes")))
         out.append(_TXT["arena"][i].format(idx=_n(a.get("index")), kind=_TXT["main" if a.get("is_main") else "thread"][i],
                                             free=_mib(_n(a.get("free_bytes"))), n=_n(a.get("free_chunks")),
-                                            big=_mib(_n(a.get("largest_free")))))
+                                            big=_TXT["arena_big"][i].format(big=_mib(_n(a.get("largest_free"))))
+                                            if _n(a.get("largest_free")) else ""))
     out.append(_TXT["why"][i])
     return out
 

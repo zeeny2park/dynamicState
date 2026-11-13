@@ -1000,6 +1000,8 @@ def _finding_card(lx: _Lx, i: int, f: Dict[str, Any], report: Optional[Dict[str,
     status = str(f.get("status") or "")
     st_word = {"CONFIRMED_ROOT_CAUSE": T["k_fstatus_c"][lx.i], "PROBABLE_CAUSE": T["k_fstatus_p"][lx.i]}.get(status, status)
     tone = "bad" if status == "CONFIRMED_ROOT_CAUSE" else "warn"
+    if str(f.get("severity") or "").upper() == "INFO" and status in ("CONFIRMED_ROOT_CAUSE", "PROBABLE_CAUSE"):
+        st_word, tone = T["k_fstatus_i"][lx.i], "unk"  # not a fault: neutral badge and tone
     try:
         fn = finding_viz(cat) or _VIZ.get(cat)
         viz = (fn(lx, f, report, f"f{i}") or "") if fn else ""

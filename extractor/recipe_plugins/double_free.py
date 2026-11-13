@@ -44,6 +44,7 @@ The rule also accepts a per-chunk record supplied by a caller (an allocator even
 
 from __future__ import annotations
 
+import re
 import struct
 import time
 import uuid
@@ -862,19 +863,46 @@ def _owners(f: Dict[str, Any]) -> List[str]:
     return out
 
 
-def _df_facts(i: int, f: Dict[str, Any], wrap: Callable[[Any], str]) -> List[str]:
+_LIST_KO = (
+    (re.compile(r"^fastbin (\d+) \(chunk size (\d+)\) of arena (\d+)$"), "아레나 {2}의 fastbin {0} (청크 크기 {1})"),
+    (re.compile(r"^tcache bin (\d+) \(chunk size (\d+)\) of the tcache at (0x[0-9a-f]+)$"),
+     "{2}의 tcache bin {0} (청크 크기 {1})"),
+    (re.compile(r"^a regular bin of arena (\d+)$"), "아레나 {0}의 일반 bin"),
+    (re.compile(r"^(unsorted bin|small bin \d+|large bin \d+) of arena (\d+)$"), "아레나 {1}의 {0}"),
+)
+_EVIDENCE_KO = re.compile(r"^next chunk's PREV_INUSE bit clear \(boundary tag at (.+?)\) and (.+) points to the chunk$")
+
+
+def _list_name(name: Any, i: int) -> str:
+    """The list names are produced in English by the walker; the Korean report names them in Korean."""
+    s = str(name or "")
+    if i == 1:
+        for rx, tpl in _LIST_KO:
+            m = rx.match(s)
+            if m:
+                return tpl.format(*m.groups())
+    return s
+
+
+def _evidence_text(ev: Any, i: int) -> str:
+    s = str(ev or "")
+    m = _EVIDENCE_KO.match(s) if i == 1 else None
+    return "다음 청크의 PREV_INUSE 비트가 꺼져 있고(경계 태그 위치 %s) %s이(가) 이 청크를 가리킵니다" % m.groups() if m else s
+
+
+def _df_facts(i: int, f: Dict[str, Any], wrap: Callable[[Any], str], with_who: bool = True) -> List[str]:
     """The sentences of one double-free finding; ``wrap`` formats an identifier for the output medium."""
     out: List[str] = []
     lists = [x for x in f.get("lists") or [] if isinstance(x, dict)]
     addr, size = wrap(f.get("user_address")), f.get("chunk_size")
     rep = next((x for x in lists if x.get("returns_to") is not None), None)
     if rep is not None:
-        out.append(_TXT["repeat"][i].format(addr=addr, size=size, list=wrap(rep.get("list")),
+        out.append(_TXT["repeat"][i].format(addr=addr, size=size, list=wrap(_list_name(rep.get("list"), i)),
                                             n=len(rep.get("chain") or [])))
         if rep.get("tcache_count") is not None and rep.get("distinct_entries") is not None:
             out.append(_TXT["count"][i].format(c=rep["tcache_count"], d=rep["distinct_entries"]))
     if len(lists) > 1 or rep is None:
-        out.append(_TXT["two"][i].format(addr=addr, size=size, lists=", ".join(wrap(x.get("list")) for x in lists)))
+        out.append(_TXT["two"][i].format(addr=addr, size=size, lists=", ".join(wrap(_list_name(x.get("list"), i)) for x in lists)))
     out.append(_TXT["means"][i])
     rq = f.get("request_sizes")
     if isinstance(rq, list) and len(rq) == 2:
@@ -886,7 +914,8 @@ def _df_facts(i: int, f: Dict[str, Any], wrap: Callable[[Any], str]) -> List[str
         out.append(_TXT["no_owner"][i].format(why=f["owner_unknown"]))
     if f.get("stable_rereads"):
         out.append(_TXT["stable"][i].format(n=f["stable_rereads"]))
-    out.append(_TXT["who"][i].format(v=wrap(own[0])) if own else _TXT["who_plain"][i])
+    if with_who:  # the picture states it once, next to its "not observed" chip
+        out.append(_TXT["who"][i].format(v=wrap(own[0])) if own else _TXT["who_plain"][i])
     return out
 
 
@@ -957,7 +986,7 @@ def _chain_picture(lx: Any, f: Dict[str, Any], uid: str) -> Tuple[str, List[str]
     k = 0
     for ri, (x, boxes) in enumerate(rows):
         y = top + ri * row_h
-        name = str(x.get("list") or "")
+        name = _list_name(x.get("list"), i)
         chain = [str(c) for c in x.get("chain") or []]
         repeat = isinstance(x.get("returns_to"), int) and bool(chain)
         bin_row = x.get("list_kind") == "bin"
@@ -1011,7 +1040,7 @@ def _chain_picture(lx: Any, f: Dict[str, Any], uid: str) -> Tuple[str, List[str]
                      f'{esc(_TXT["back"][i].format(addr=_short(uaddr)))}</text></g>')
             steps.append(f'<li{_sa(k)}>{_html_fmt(_TXT["s_back"][i], a=_user(chain[-1]), b=uaddr)} {obs}</li>')
         elif bin_row:
-            steps.append(f'<li{_sa(row_step)}>{_html_fmt(_TXT["s_bin"][i], list=name, addr=uaddr, ev=x.get("evidence") or "")} '
+            steps.append(f'<li{_sa(row_step)}>{_html_fmt(_TXT["s_bin"][i], list=name, addr=uaddr, ev=_evidence_text(x.get("evidence"), i))} '
                          f'{obs}</li>')
         else:
             steps.append(f'<li{_sa(row_step)}>{_html_fmt(_TXT["s_on"][i], list=name, addr=uaddr, k=x.get("position"))} '
@@ -1043,7 +1072,7 @@ def double_free_finding_viz(lx: Any, finding: Dict[str, Any], report: Optional[D
             return f"\x00{len(marks) - 1}\x00"
 
         facts = []
-        for line in _df_facts(i, f, wrap):
+        for line in _df_facts(i, f, wrap, with_who=False):
             h = esc(line)
             for m_i, m in enumerate(marks):
                 h = h.replace(f"\x00{m_i}\x00", code(m))

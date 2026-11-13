@@ -240,11 +240,35 @@ class TestPresentation(unittest.TestCase):
             h = build_visual_summary(res, res["report"], lang)
             self._check_html(h, lang)
             self.assertIn("&lt;script&gt;", h)
-            self.assertEqual(h.count("<polyline"), 4)                 # RSS, outside malloc, malloc heap, heap in use
+            # RSS, outside malloc, malloc heap; the heap in use has one walk inside the sampled window: no lone dot
+            self.assertEqual(h.count("<polyline"), 3)
             self.assertIn("dsv-chip-no", h)                           # which code mapped it: not observed
         h = build_visual_summary(res, res["report"], "en")
         self.assertIn("Mappings that appeared or grew", h)
         self.assertIn("anonymous mappings outside the malloc heap", h)
+
+    def test_mapping_growth_chart_shares_one_time_axis(self):
+        obs = _mg_obs()
+        obs["heap_walks"] = [{"t": 100.0, "in_use_bytes": 288}, {"t": 100.6, "in_use_bytes": 576}]
+        res = _result("MAPPING_GROWTH", mg.RECIPE_MAPPING_GROWTH, mg.OBS_MAPPING_GROWTH, obs, "PROBABLE_FAULT", "MEDIUM",
+                      [{"kind": "variable", "name": "x"}])
+        h = build_visual_summary(res, res["report"], "en")
+        self.assertEqual(h.count("<polyline"), 4)
+        # the first sample sits on the left edge of the plot (x = 70) for every series, incl. the heap walks
+        self.assertEqual(len(re.findall(r'<circle class="dsv-pt"[^>]* cx="70\.0"', h)), 4)
+        ticks = re.findall(r'text-anchor="middle" font-size="11">(\d+\.\d)</text>', h)
+        self.assertEqual(ticks, ["0.0", "0.2", "0.4", "0.7", "0.9"])   # seconds on the x axis
+        ys = [t for t in re.findall(r'text-anchor="end" font-size="11">([\d,]+)</text>', h)]
+        self.assertEqual(ys[0], "0")                                      # y axis starts at 0
+        self.assertEqual(len(set(ys)), len(ys))
+        # a single heap walk: no lone dot, its value is in the facts
+        obs["heap_walks"] = [{"t": 100.2, "in_use_bytes": 4096}]
+        res = _result("MAPPING_GROWTH", mg.RECIPE_MAPPING_GROWTH, mg.OBS_MAPPING_GROWTH, obs, "PROBABLE_FAULT", "MEDIUM",
+                      [{"kind": "variable", "name": "x"}])
+        h = build_visual_summary(res, res["report"], "en")
+        self.assertEqual(h.count("<polyline"), 3)
+        self.assertNotIn("heap in use (heap walks)", h)
+        self.assertIn("The heap in use was 4 KB at the one heap walk", h)
 
     def test_mapping_growth_without_owner_or_walk_says_so(self):
         res = _result("MAPPING_GROWTH", mg.RECIPE_MAPPING_GROWTH, mg.OBS_MAPPING_GROWTH,
@@ -268,6 +292,35 @@ class TestPresentation(unittest.TestCase):
             self.assertIn("dsv-meter", h)
             self.assertIn("dsv-chip-no", h)
         self.assertIn("free but held", build_visual_summary(res, res["report"], "en"))
+
+    def test_heap_retention_small_chunks_print_bytes_and_missing_value_drops_the_clause(self):
+        for lang, word in (("en", "the largest free chunk 768 B"), ("ko", "가장 큰 빈 청크 768 B")):
+            res = _result("HEAP_RETENTION", hr.RECIPE_HEAP_RETENTION, hr.OBS_HEAP_RETENTION, _hr_obs(), "DEGRADED", "INFO", [])
+            self.assertIn(word, render_human_report(res, res["report"], lang))
+            self.assertNotIn("0 KB.", render_human_report(res, res["report"], lang))
+        obs = _hr_obs()
+        obs["arenas"][0]["largest_free"] = 512
+        self.assertEqual(hr._mib(512), "512 B")
+        self.assertEqual(hr._mib(2048), "2 KB")
+        obs["arenas"][0].pop("largest_free")
+        for lang in ("en", "ko"):
+            res = _result("HEAP_RETENTION", hr.RECIPE_HEAP_RETENTION, hr.OBS_HEAP_RETENTION, obs, "DEGRADED", "INFO", [])
+            t = render_human_report(res, res["report"], lang)
+            self.assertNotIn("largest free chunk", t)
+            self.assertNotIn("가장 큰 빈 청크", t)
+            self.assertIn("20004", t)
+
+    def test_heap_retention_info_finding_has_neutral_badge(self):
+        res = _result("HEAP_RETENTION", hr.RECIPE_HEAP_RETENTION, hr.OBS_HEAP_RETENTION, _hr_obs(), "DEGRADED", "INFO", [])
+        en = build_visual_summary(res, res["report"], "en")
+        card = en[en.index('id="dsv-finding-1"'):][:900]
+        self.assertIn("not a fault: degradation", card)
+        self.assertIn("dsv-tone-unk", en[en.index('id="dsv-finding-1"') - 40:en.index('id="dsv-finding-1"')])
+        self.assertNotIn("probable cause", card)
+        ko = build_visual_summary(res, res["report"], "ko")
+        self.assertIn("결함 아님: 성능 저하", ko)
+        self.assertNotIn("probable cause", render_human_report(res, res["report"], "en"))
+        self.assertIn("not a fault: degradation", render_human_report(res, res["report"], "en"))
 
     def test_no_picture_without_evidence(self):
         self.assertEqual(mg.mapping_finding_viz(type("L", (), {"i": 0})(), {}, None), "")

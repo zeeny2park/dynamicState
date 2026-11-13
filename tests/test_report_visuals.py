@@ -113,6 +113,22 @@ class TestVisualSummary(unittest.TestCase):
             self.assertNotRegex(h, "[가-힣]")
         return h
 
+    def test_info_finding_gets_neutral_badge_and_fault_keeps_its_own(self):
+        res = leak_result()
+        h = self._html(res)
+        self.assertIn("probable cause", h)
+        self.assertNotIn("not a fault: degradation", h)
+        res["findings"][0]["severity"] = "INFO"
+        for lang, word in (("en", "not a fault: degradation"), ("ko", "결함 아님: 성능 저하")):
+            h = self._html(res, lang)
+            i = h.index('id="dsv-finding-1"')
+            self.assertIn(word, h[i:i + 700])
+            self.assertIn("dsv-tone-unk", h[i - 40:i])
+            self.assertNotIn("probable cause", h[i:i + 700])
+            self.assertNotIn("추정 원인", h[i:i + 700])
+        fault = deadlock_result()
+        self.assertIn("confirmed root cause", self._html(fault)) if fault["findings"][0]["status"] == "CONFIRMED_ROOT_CAUSE" else None
+
     def test_deadlock_sequence_has_one_step_per_event(self):
         for n in (2, 3):
             h = self._html(deadlock_result(n))

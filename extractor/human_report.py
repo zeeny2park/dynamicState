@@ -177,6 +177,7 @@ T: Dict[str, Tuple[str, str]] = {
     "k_abort": ("aborted", "중단됨"),
     "k_fstatus_c": ("confirmed root cause", "확정된 근본 원인"),
     "k_fstatus_p": ("probable cause", "추정 원인"),
+    "k_fstatus_i": ("not a fault: degradation", "결함 아님: 성능 저하"),
     "k_notexam": ("What was NOT examined (a check that was not run is not evidence of absence):",
                   "확인하지 못한 것 (실행하지 못한 검사는 문제가 없다는 근거가 아닙니다):"),
     "k_none": ("Nothing was reported as unexamined.", "확인하지 못했다고 보고된 항목은 없습니다."),
@@ -656,7 +657,9 @@ def _cat_label(ctx: _Ctx, cat: str) -> str:
     return _c(cat)
 
 
-def _status_word(ctx: _Ctx, st: str) -> str:
+def _status_word(ctx: _Ctx, st: str, severity: Any = None) -> str:
+    if str(severity or "").upper() == "INFO" and st in ("CONFIRMED_ROOT_CAUSE", "PROBABLE_CAUSE"):
+        return ctx.t("k_fstatus_i")  # an INFO finding is a degradation, not a fault: no "cause" wording
     if st == "CONFIRMED_ROOT_CAUSE":
         return ctx.t("k_fstatus_c")
     if st == "PROBABLE_CAUSE":
@@ -847,7 +850,7 @@ def _section2(ctx: _Ctx, res: Dict[str, Any], renders: List[Dict[str, Any]]) -> 
         return out
     for i, (f, r) in enumerate(zip(findings, renders), 1):
         out.append("**" + ctx.t("w_finding", i=i, cat=_cat_label(ctx, str(f.get("category"))),
-                                status=_status_word(ctx, str(f.get("status"))), sev=f.get("severity")) + "**")
+                                status=_status_word(ctx, str(f.get("status")), f.get("severity")), sev=f.get("severity")) + "**")
         if not (f.get("subjects") or f.get("subject_details")):
             out.append(ctx.t("w_noname"))
             if not r.get("registered"):     # a registered text (report_registry) states what was observed
@@ -927,7 +930,7 @@ def _section4(ctx: _Ctx, res: Dict[str, Any]) -> List[str]:
     out = [ctx.t("k_verdict", v=f"{v} - {ctx.t(VERDICT_WORD.get(v, 'k_incon'))}", conf=conf)]
     ctx.term("verdict_healthy" if v == "HEALTHY" else "verdict")
     for f in res.get("findings") or []:
-        out.append(f"- {_cat_label(ctx, str(f.get('category')))}: {_status_word(ctx, str(f.get('status')))}")
+        out.append(f"- {_cat_label(ctx, str(f.get('category')))}: {_status_word(ctx, str(f.get('status')), f.get('severity'))}")
     scope = res.get("healthy_scope") if isinstance(res.get("healthy_scope"), dict) else {}
     if v == "HEALTHY" and scope.get("healthy") and scope.get("checked"):
         out += ["", ctx.t("k_checked")]

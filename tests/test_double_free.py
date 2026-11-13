@@ -408,6 +408,32 @@ class TestPresentation(unittest.TestCase):
         self.assertIn("on two lists at once: `tcache bin 15`, `unsorted bin of arena 0`", en)
         self.assertIn("No typed variable still points at it", en)
 
+    def test_who_sentence_occurs_once_in_the_picture(self):
+        from extractor.report_visuals import build_visual_summary
+        for fs in ([REPEAT], [TWO]):
+            res = _result(fs)
+            for lang, s in (("en", "Which code called free() the second time was not observed"),
+                            ("ko", "어느 코드가 두 번째로 free()를 불렀는지는 관측되지 않았습니다")):
+                h = build_visual_summary(res, res["report"], lang)
+                self.assertEqual(h.count(s), 1, (fs[0]["kind"], lang))
+                self.assertIn("dsv-chip-no", h)
+
+    def test_korean_picture_has_no_english_list_names(self):
+        from extractor.report_visuals import build_visual_summary
+        f = dict(TWO, lists=[
+            {"list": "fastbin 2 (chunk size 64) of arena 0", "list_kind": "fastbin", "chain": ["0x6000"], "position": 0,
+             "returns_to": None},
+            {"list": "unsorted bin of arena 0", "list_kind": "bin", "chain": [], "position": None, "returns_to": None,
+             "evidence": "next chunk's PREV_INUSE bit clear (boundary tag at 0x6118) and unsorted bin fd points to the chunk"}])
+        res = _result([f])
+        ko = build_visual_summary(res, res["report"], "ko")
+        self.assertIn("아레나 0의 fastbin 2 (청크 크기 64)", ko)
+        self.assertNotIn("of arena", ko)
+        self.assertNotIn("PREV_INUSE bit clear", ko)
+        en = build_visual_summary(res, res["report"], "en")
+        self.assertIn("fastbin 2 (chunk size 64) of arena 0", en)
+        self.assertNotRegex(en, "[가-힣]")
+
     def test_picture(self):
         from extractor.report_visuals import build_visual_summary
         for fs in ([REPEAT], [TWO], [LONG]):
