@@ -68,6 +68,10 @@ T: Dict[str, Tuple[str, str]] = {
                     "검사 {ran}개가 실행되어 그중 {dec}개가 결론을 냈지만 원인을 가리키는 발견은 없었고, "
                     "{nc}개 항목은 확인하지 못했습니다"),
     "r_unspecified": ("the engine gave no further reason", "엔진이 더 이상의 이유를 알려주지 않았습니다"),
+    "r_baseline_open": ("; it is not called healthy because the baseline check for {what} ({rid}) could not decide: "
+                        "{raw}",
+                        "; 기본 검사 '{what}'({rid})이(가) 결론을 내지 못해 정상으로 판정하지 않았습니다 "
+                        "(엔진 원문: {raw})"),
     # --- what is wrong
     "w_none": ("No cause could be named: the diagnosis produced no finding.",
                "원인으로 지목할 대상이 없습니다. 이번 진단은 발견을 만들지 못했습니다."),
@@ -760,8 +764,27 @@ def _incon_reason(ctx: _Ctx, res: Dict[str, Any]) -> str:
     checks = res.get("checks_run") or []
     if checks:
         dec = sum(1 for c in checks if c.get("status") in ("PASS", "FAIL"))
-        return ctx.t("r_nofinding", ran=len(checks), dec=dec, nc=len(nc))
+        return ctx.t("r_nofinding", ran=len(checks), dec=dec, nc=len(nc)) + _baseline_open_reason(ctx, res)
     return ctx.t("r_unspecified")
+
+
+def _baseline_open_reason(ctx: _Ctx, res: Dict[str, Any]) -> str:
+    """Why an INCONCLUSIVE result without findings is not HEALTHY: the first baseline check that could not decide
+    and its first limitation (healthy_scope.blocking; docs/HEALTHY_VERDICT.md)."""
+    from .healthy_verdict import BASELINE_SCOPE_LABELS
+    scope = res.get("healthy_scope") if isinstance(res.get("healthy_scope"), dict) else {}
+    for b in scope.get("blocking") or []:
+        if not str(b.get("kind") or "").startswith("baseline_check_"):
+            continue
+        rid = str(b.get("item") or "")
+        raw = str(b.get("reason") or "")
+        raw = raw.split(": ", 1)[1] if raw.startswith("baseline check ended") and ": " in raw else raw
+        raw = raw.split("; ", 1)[0]
+        if not raw:
+            continue
+        what = (BASELINE_SCOPE_LABELS.get(rid) or (rid, rid))[ctx.i]
+        return ctx.t("r_baseline_open", what=what, rid=_c(rid), raw=_c(raw))
+    return ""
 
 
 def _healthy_sentence(ctx: _Ctx, who: str, res: Dict[str, Any]) -> str:

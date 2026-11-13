@@ -21,7 +21,9 @@ One investigation observes the target's memory several times within a single run
    referenced, so leak vs intended accumulation is undecidable from memory alone - reported as
    unbounded growth under that owner, never as a confirmed leak).  Growth held only by thread stacks /
    locals (working sets), untyped data, RSS growth without in-use growth, shrinking or flat in-use heap
-   -> no leak (at most "growth observed, not established as a leak").
+   -> no leak (at most "growth observed, not established as a leak").  A fall of the in-use TOTAL is "released,
+   not a leak" only when no unreachable size class and no global/static owner grew across every walk: a
+   leak under a periodic working set (sawtooth) makes the total rise and fall too.
 """
 
 import re
@@ -156,10 +158,23 @@ def cheap_trend(samples: Sequence[Dict[str, Any]], cfg: MemoryObservationConfig)
         steps_ok = all(b - a >= -cfg.trend_step_tolerance_kb for a, b in zip(series, series[1:]))
         return steps_ok and series[-1] - series[0] >= cfg.trend_min_growth_kb
 
+    def max_rise(series: List[int]) -> int:
+        lo, best = None, 0
+        for v in series:
+            lo = v if lo is None else min(lo, v)
+            best = max(best, v - lo)
+        return best
+
     if ss:
         out["rss_growth_kb"] = ss[-1]["rss_kb"] - ss[0]["rss_kb"]
         out["anon_rw_growth_kb"] = ss[-1]["anon_rw_kb"] - ss[0]["anon_rw_kb"]
         out["indicates_growth"] = grows(out["rss_kb_series"]) or grows(out["anon_rw_kb_series"])
+        # A rise of at least the trend resolution that is (partly) given back within the window is not "no
+        # growth": memory DID grow in the window, and one rise-and-fall cannot tell a periodic working set from
+        # a periodic working set with a leak under it (both rise and fall).  The cheap trend cannot clear it.
+        out["max_rise_kb"] = max(max_rise(out["rss_kb_series"]), max_rise(out["anon_rw_kb_series"]))
+        out["rose_and_fell"] = (not out["indicates_growth"] and len(ss) >= 3
+                                and out["max_rise_kb"] >= cfg.trend_min_growth_kb)
     return out
 
 
@@ -426,19 +441,12 @@ def judge(walks: List[Dict[str, Any]], cfg: MemoryObservationConfig) -> Dict[str
     tol = max(cfg.churn_tolerance_bytes, int(cfg.churn_tolerance_fraction * max(inuse)))
     drops = [(i, a - b) for i, (a, b) in enumerate(zip(inuse, inuse[1:])) if a - b > tol]
     res["in_use_monotonic_growth"] = False
-    if drops:
-        i, d = max(drops, key=lambda x: x[1])
-        res["verdict"] = V_SHRANK
-        res["facts"].append("in-use heap fell by %d KB between observations %d and %d (%s KB series): memory is "
-                            "released (transient or periodic use), not a leak"
-                            % (d // 1024, i + 1, i + 2, [x // 1024 for x in inuse]))
-        return res
-    if inuse[-1] - inuse[0] < cfg.min_inuse_growth_bytes:
+    if not drops and inuse[-1] - inuse[0] < cfg.min_inuse_growth_bytes:
         res["verdict"] = V_NO_GROWTH
         res["facts"].append("in-use heap stable across %d walks over %.2f s (%+d KB, %+d blocks)"
                             % (len(ok), dt, (inuse[-1] - inuse[0]) // 1024, counts[-1] - counts[0]))
         return res
-    res["in_use_monotonic_growth"] = True
+    res["in_use_monotonic_growth"] = not drops
 
     def series_of(get) -> List[int]:
         return [get(w) for w in ok]
@@ -489,6 +497,23 @@ def judge(walks: List[Dict[str, Any]], cfg: MemoryObservationConfig) -> Dict[str
         res["unreachable_growth"].append(row)
     res["unreachable_growth"].sort(key=lambda r: -r["bytes_delta"])
     res["held_growth"].sort(key=lambda r: -r["bytes_delta"])
+    if drops:
+        # The total fell: part of the heap is released (a transient or periodic working set).  A fall of the TOTAL
+        # does not refute steady growth of one component under it (a leak under a sawtooth rises and falls too):
+        # only when no unreachable size class and no global/static owner grew monotonically across the walks is
+        # the fall evidence of "released, not a leak".
+        i, d = max(drops, key=lambda x: x[1])
+        fell = ("in-use heap fell by %d KB between observations %d and %d (%s KB series)"
+                % (d // 1024, i + 1, i + 2, [x // 1024 for x in inuse]))
+        if res["unreachable_growth"] or res["growth_owners"]:
+            res["facts"].insert(0, fell + ", but blocks under it kept growing across every walk: a leak under a "
+                                "periodic working set")
+        else:
+            res["verdict"] = V_SHRANK
+            res["held_growth"] = []
+            res["facts"].append(fell + ": memory is released (transient or periodic use) and no unreachable size "
+                                "class or global/static owner grew across the walks: not a leak")
+            return res
     if res["unreachable_growth"]:
         res["verdict"] = V_LEAK_UNREACHABLE
     elif res["growth_owners"]:
@@ -697,6 +722,55 @@ def investigate(adapter: Any, pid: int, companion_elf: Optional[str], cfg: Memor
     return inv
 
 
+_WALK_BYTES_RE = re.compile(r"estimated (\d+)B > max (\d+)B")
+
+
+def not_judged_explanation(inv: Dict[str, Any], trend: Dict[str, Any],
+                           cfg: MemoryObservationConfig) -> Optional[Dict[str, Any]]:
+    """Plain-language reason why memory growth could not be judged, when the heap walks did not reach the
+    minimum (None otherwise).  The case it is written for: a heap larger than the read budget of one walk, on a
+    process whose /proc samples rose and fell (a sawtooth) - the cheap samples cannot clear it (a leak under a
+    sawtooth rises and falls too, and a leak into memory the allocator already holds does not move RSS), and the
+    walks that could were not affordable.  docs/HEALTHY_VERDICT.md, "Scope limit: memory that rises and falls"."""
+    if inv.get("verdict") != V_INSUFFICIENT or inv.get("status") == INV_UNSUPPORTED:
+        return None
+    lims = " ".join(str(x) for x in inv.get("limitations") or [])
+    out: Dict[str, Any] = {"walks_usable": 0, "walks_needed": cfg.min_walks}
+    m = _WALK_BYTES_RE.search(lims)
+    if m:
+        heap_b, allow_b = int(m.group(1)), int(m.group(2))
+        out.update(cause="heap_above_walk_budget", walk_bytes_estimated=heap_b, walk_budget_bytes=allow_b,
+                   bytes_needed=heap_b * cfg.min_walks)
+        head = ("memory growth not judged: one heap walk of this process needs about %.1f MiB of reads, more than the "
+                "%.1f MiB budget left for it, so whether in-use memory grows could not be measured (%d walks, about "
+                "%.0f MiB of reads, would be needed)"
+                % (heap_b / 1048576.0, allow_b / 1048576.0, cfg.min_walks, heap_b * cfg.min_walks / 1048576.0))
+    elif "budget" in lims or "BUDGET" in lims:
+        out["cause"] = "walk_budget"
+        head = ("memory growth not judged: the observation budget left room for fewer than %d heap walks, so whether "
+                "in-use memory grows could not be measured" % cfg.min_walks)
+    else:
+        out["cause"] = "walks_failed"
+        head = ("memory growth not judged: fewer than %d heap walks completed, so whether in-use memory grows could "
+                "not be measured" % cfg.min_walks)
+    rss = trend.get("rss_kb_series") or []
+    if trend.get("rose_and_fell") and rss:
+        out.update(rose_and_fell=True, rise_kb=trend.get("max_rise_kb"), window_s=trend.get("window_s"))
+        tail = (". The /proc samples rose by %.1f MiB and fell back within %.2f s: one rise and fall cannot tell a "
+                "periodic working set from one with a leak under it, which rises and falls too"
+                % (float(trend.get("max_rise_kb") or 0) / 1024.0, float(trend.get("window_s") or 0.0)))
+    elif trend.get("indicates_growth") and rss:
+        out["rose_and_fell"] = False
+        tail = (". The /proc samples grew by %+d KB over %.2f s without falling back"
+                % (int(trend.get("rss_growth_kb") or 0), float(trend.get("window_s") or 0.0)))
+    else:
+        out["rose_and_fell"] = False
+        tail = (". The /proc samples alone cannot answer a leak question: a leak into memory the allocator already "
+                "holds does not move RSS")
+    out["text"] = head + tail          # one limitation, no "; " inside: it is quoted as the reason
+    return out
+
+
 # --------------------------------------------------------------------------------------------- provider glue
 
 
@@ -771,6 +845,9 @@ def attach_memory_observation(provider: Any, recipe: Any, pid: int, companion_el
         if trend["indicates_growth"]:
             reason = "cheap /proc trend shows growth (RSS %+d KB, anonymous mappings %+d KB over %.2f s)" % (
                 trend.get("rss_growth_kb", 0), trend.get("anon_rw_growth_kb", 0), trend["window_s"])
+        elif trend.get("rose_and_fell"):
+            reason = ("cheap /proc trend rose by %d KB and fell back within %.2f s: a rise and fall cannot tell "
+                      "periodic use from growth under it" % (trend["max_rise_kb"], trend["window_s"]))
         else:
             reason = _memory_interest(rid, classification, cfg)
         if reason:
@@ -779,6 +856,11 @@ def attach_memory_observation(provider: Any, recipe: Any, pid: int, companion_el
             an_obj = inv.pop("_analysis", None)
             if an_obj is not None:
                 st.setdefault("analyses", {})[key] = an_obj
+            nj = not_judged_explanation(inv, trend, cfg)
+            if nj is not None:
+                inv["not_judged"] = nj
+                inv["limitations"].insert(0, nj["text"])
+                inv["summary"] = nj["text"]
         else:
             inv = {"status": INV_NOT_RUN, "verdict": V_NO_TREND if trend["established"] else V_INSUFFICIENT,
                    "walks": 0, "limitations": [] if trend["established"] else
