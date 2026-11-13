@@ -297,7 +297,10 @@ def uaf_finding_text(ctx: Any, finding: Dict[str, Any], report: Optional[Dict[st
 
 
 def _register_presentation() -> None:
-    from ..report_registry import register_finding_text
+    from ..report_registry import register_finding_text, register_recipe_label
+    register_recipe_label(RECIPE_FREED_MEMORY_USE, "MEMORY_INTEGRITY", "Use of freed memory", "해제된 메모리 사용",
+                          "pointers that still refer to freed blocks, and writes into freed blocks",
+                          "해제된 블록을 여전히 가리키는 포인터, 해제된 블록에 대한 쓰기")
     register_finding_text(CATEGORY_USE_AFTER_FREE, uaf_finding_text)
 
 

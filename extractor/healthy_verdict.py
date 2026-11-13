@@ -143,6 +143,17 @@ def _plain(recipe_id: str) -> str:
     return str(recipe_id).replace("RECIPE_", "").replace("_", " ").lower()
 
 
+def _plain_ko(recipe_id: str) -> str:
+    """The Korean check name used in the check list; the English words when the recipe has no Korean name."""
+    from .report_registry import recipe_label
+    lab = recipe_label(recipe_id)
+    if lab:
+        return lab[2]
+    from .report_visuals import _RECIPES
+    meta = _RECIPES.get(str(recipe_id))
+    return meta[2] if meta else _plain(recipe_id)
+
+
 def _heap_cap_scope_limit(c: Any) -> Optional[Dict[str, Any]]:
     """RECIPE_HEAP_METADATA_CORRUPTION that is INCONCLUSIVE only because of the baseline heap cap -> scope item."""
     mi = _obs(c).get("memory_integrity")
@@ -298,9 +309,10 @@ def evaluate(*, verdict: str, findings: List[Dict[str, Any]], checks: List[Any],
                             "reason": "; ".join(f"{n.get('item')}: {n.get('reason')}" for n in long_waits)})
     if sym_open:
         plain = ", ".join(_plain(x) for x in sym_open)
+        plain_ko = ", ".join(_plain_ko(x) for x in sym_open)
         not_checked.append({"kind": "symptom_checks_without_result", "item": ",".join(sym_open),
                             "label": f"symptom-specific checks that reached no result ({plain})",
-                            "label_ko": f"결론을 내지 못한 증상별 추가 검사 ({plain})",
+                            "label_ko": f"결론을 내지 못한 증상별 추가 검사 ({plain_ko})",
                             "reason": "these checks are not part of the baseline; they ran but could not decide"})
     not_checked.append({"kind": "outside_baseline", "item": "outside_baseline", "label": OUTSIDE_BASELINE[0],
                         "label_ko": OUTSIDE_BASELINE[1], "reason": "not covered by any baseline check"})
@@ -308,6 +320,25 @@ def evaluate(*, verdict: str, findings: List[Dict[str, Any]], checks: List[Any],
     not_checked.sort(key=lambda x: _NOT_CHECKED_ORDER.get(x["kind"], len(_NOT_CHECKED_ORDER)))
     return {"rule": HEALTHY_RULE_ID, "healthy": not blocking, "checked": checked, "not_checked": not_checked,
             "blocking": blocking}
+
+
+def display_label(x: Dict[str, Any], ko: bool) -> str:
+    """The text of a ``not_checked`` item of a ``healthy_scope`` for display.  A saved result may carry an English
+    check list inside its Korean label (written before the check names were localised), so the Korean label of a
+    symptom-check item is rebuilt here from the recipe ids it names."""
+    if ko and x.get("kind") == "symptom_checks_without_result" and x.get("item"):
+        names = ", ".join(_plain_ko(r) for r in str(x["item"]).split(",") if r)
+        return f"결론을 내지 못한 증상별 추가 검사 ({names})"
+    return str(x.get("label_ko" if ko else "label") or x.get("item"))
+
+
+def display_what(x: Dict[str, Any], ko: bool) -> str:
+    """What a ``checked`` item of a ``healthy_scope`` cleared; Korean from the check's registered label when there is one."""
+    if ko:
+        lab = BASELINE_SCOPE_LABELS.get(str(x.get("recipe_id"))) or _registered_scope_label(str(x.get("recipe_id")))
+        if lab:
+            return lab[1]
+    return str(x.get("what_ko" if ko else "what"))
 
 
 def not_healthy_scope(not_covered: List[Dict[str, Any]], why: str) -> Dict[str, Any]:
@@ -321,7 +352,7 @@ def not_healthy_scope(not_covered: List[Dict[str, Any]], why: str) -> Dict[str, 
 def summary_sentence(scope: Dict[str, Any], n_baseline: int, lang: str = "en", max_items: int = 3) -> str:
     """First sentence of a HEALTHY summary: healthy within scope + what was not checked."""
     ko = lang == "ko"
-    items = [x.get("label_ko" if ko else "label") or x.get("item") for x in scope.get("not_checked") or []]
+    items = [display_label(x, ko) for x in scope.get("not_checked") or []]
     shown = items[:max_items]
     more = len(items) - len(shown)
     if ko:

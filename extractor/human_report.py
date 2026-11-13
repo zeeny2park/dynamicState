@@ -745,18 +745,18 @@ def _incon_reason(ctx: _Ctx, res: Dict[str, Any]) -> str:
                 continue
             raw = str(n.get("reason") or "")
             if kind in ("target_unreachable", "invalid_target"):
-                return ctx.t("r_unreach", raw=_c(raw))
+                return ctx.t("r_unreach", raw=_c(ko_text(raw, ctx.i)))
             if kind == "target_unreadable":
                 if "does not exist" in raw or "invalid PID" in raw:
                     return ctx.t("r_nopid", pid=pid)
-                return ctx.t("r_unread", raw=_c(raw))
+                return ctx.t("r_unread", raw=_c(ko_text(raw, ctx.i)))
             if kind == "missing_debug_image":
                 if (res.get("target") or {}).get("transport") == "ssh":
                     return ctx.t("r_noimg_remote")
                 return ctx.t("r_noimg", item=_c(n.get("item")))
             if kind in ("stage_failed", "unexpected_error"):
-                return ctx.t("r_stage", item=_c(n.get("item")), raw=_c(raw))
-            return ctx.t("r_noexec", raw=_c(raw))
+                return ctx.t("r_stage", item=_c(n.get("item")), raw=_c(ko_text(raw, ctx.i)))
+            return ctx.t("r_noexec", raw=_c(ko_text(raw, ctx.i)))
     checks = res.get("checks_run") or []
     if checks:
         dec = sum(1 for c in checks if c.get("status") in ("PASS", "FAIL"))
@@ -768,7 +768,8 @@ def _healthy_sentence(ctx: _Ctx, who: str, res: Dict[str, Any]) -> str:
     scope = res.get("healthy_scope") if isinstance(res.get("healthy_scope"), dict) else {}
     if not scope.get("healthy"):
         return ctx.t("c_healthy_noscope", who=who)
-    labels = [str(x.get("label_ko" if ctx.i else "label") or x.get("item")) for x in scope.get("not_checked") or []]
+    from .healthy_verdict import display_label
+    labels = [display_label(x, bool(ctx.i)) for x in scope.get("not_checked") or []]
     shown = "; ".join(labels[:3]) or "-"
     if len(labels) > 3:
         shown += ctx.t("c_healthy_more", n=len(labels) - 3)
@@ -934,7 +935,8 @@ def _section4(ctx: _Ctx, res: Dict[str, Any]) -> List[str]:
     scope = res.get("healthy_scope") if isinstance(res.get("healthy_scope"), dict) else {}
     if v == "HEALTHY" and scope.get("healthy") and scope.get("checked"):
         out += ["", ctx.t("k_checked")]
-        out += [f"- {x.get('what_ko' if ctx.i else 'what')} ({_c(x.get('recipe_id'))})" for x in scope["checked"]]
+        from .healthy_verdict import display_what
+        out += [f"- {display_what(x, bool(ctx.i))} ({_c(x.get('recipe_id'))})" for x in scope["checked"]]
     nc = res.get("not_covered") or []
     if not nc:
         out.append(ctx.t("k_none"))
@@ -949,14 +951,14 @@ def _section4(ctx: _Ctx, res: Dict[str, Any]) -> List[str]:
         raws = [str(n.get("reason") or "") for n in items if n.get("reason")]
         if kind == "target_unreadable":
             gone = any("does not exist" in r or "invalid PID" in r for r in raws)
-            line = ctx.t("nc_target_unreadable", items=ctx.t("nc_pid_gone") if gone else _join([_c(r) for r in raws]))
+            line = ctx.t("nc_target_unreadable", items=ctx.t("nc_pid_gone") if gone else _join([_c(ko_text(r, ctx.i)) for r in raws]))
         elif kind == "missing_debug_image":
             line = ctx.t("nc_missing_debug_image_remote" if (res.get("target") or {}).get("transport") == "ssh"
                          else "nc_missing_debug_image", items=_join(names))
         elif kind in ("target_unreachable", "invalid_target"):
-            line = ctx.t(f"nc_{kind}", items=_join([_c(r) for r in raws] or names))
+            line = ctx.t(f"nc_{kind}", items=_join([_c(ko_text(r, ctx.i)) for r in raws] or names))
         elif kind == "remote_limitation":
-            line = ctx.t("nc_remote_limitation", items="; ".join(_c(r) for r in raws) or _join(names))
+            line = ctx.t("nc_remote_limitation", items="; ".join(_c(ko_text(r, ctx.i)) for r in raws) or _join(names))
         elif kind == "unsupported_on_target":
             line = ctx.t("nc_unsupported_on_target", abi=_abi_text(res), items=_join(names))
         elif kind.startswith("check_"):
@@ -971,7 +973,7 @@ def _section4(ctx: _Ctx, res: Dict[str, Any]) -> List[str]:
         elif kind in ("unattributed_finding", "stage_failed", "unexpected_error"):
             line = ctx.t(f"nc_{kind}", items=_join(names))
         elif kind == "limitation":
-            line = ctx.t("nc_limitation") + " " + "; ".join(_c(r) for r in raws)
+            line = ctx.t("nc_limitation") + " " + "; ".join(_c(ko_text(r, ctx.i)) for r in raws)
         elif kind in T and f"nc_{kind}" in T:
             line = ctx.t(f"nc_{kind}")
         elif f"nc_{kind}" in T:
@@ -980,7 +982,7 @@ def _section4(ctx: _Ctx, res: Dict[str, Any]) -> List[str]:
             line = ctx.t("nc_other", kind=_c(kind)) + " " + _join(names)
         if (f"nc_{kind}" in T and kind in ("budget_exhausted", "leak_owner_limited", "abi_detection_failed",
                                           "report_not_saved", "not_executed")) and raws:
-            line += ctx.t("nc_orig", raw=_c(raws[0]))
+            line += ctx.t("nc_orig", raw=_c(ko_text(raws[0], ctx.i)))
         elif kind in ("unsupported_on_target",) or kind.startswith("check_"):
             pass
         out.append(f"- {line}")
@@ -1091,7 +1093,7 @@ def render_human_report(result: Dict[str, Any], report: Optional[Dict[str, Any]]
                 if vals:
                     lines.append("- " + ctx.t(kk, x=_join([fmt(v) for v in vals])))
             for obs in (f.get("observed") or [])[:3]:
-                lines.append("- " + ctx.t("w_obs", x=str(obs)))
+                lines.append("- " + ctx.t("w_obs", x=ko_text(obs, ctx.i)))
             r = {"lines": lines, "kinds": kinds}
         renders.append(r)
 
@@ -1212,6 +1214,320 @@ def markdown_to_html(md: str, heading_offset: int = 0) -> str:
     flush_para()
     close_list()
     return "\n".join(out)
+
+
+# ---------------------------------------------------------------------------------------------- engine text, Korean
+# The engine writes its evidence / interpretation / limitation sentences in English, and some verdict rules read those
+# strings, so they are never reworded where they are created.  The Korean report translates them here, at render time,
+# the same way double_free renders the walker's list names (``_LIST_KO``): a table of full-match patterns, one per
+# sentence shape, with the numbers and identifiers captured and copied.  A sentence that matches no pattern is shown
+# unchanged (never guessed); tests/test_korean_report_language.py fails when a representative report still shows one.
+# Long sentences are written by the engine as fragments joined with "; "; each fragment is matched on its own.
+_KN = r"([+-]?\d+)"
+_KF = r"([+-]?[\d.]+)"
+
+
+def _split_top(s: str, sep: str = "; ") -> List[str]:
+    """Split ``s`` at ``sep`` outside parentheses."""
+    out, depth, start, k = [], 0, 0, 0
+    while k < len(s):
+        ch = s[k]
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth = max(0, depth - 1)
+        elif depth == 0 and s.startswith(sep, k):
+            out.append(s[start:k])
+            start = k + len(sep)
+            k += len(sep) - 1
+        k += 1
+    out.append(s[start:])
+    return out
+
+
+def _ko_free_list(name: str) -> str:
+    """The free-list name the heap walker wrote, in Korean when it is one of the known shapes."""
+    try:
+        from .recipe_plugins.double_free import _list_name
+    except Exception:  # noqa: BLE001 - the plugin package is optional for rendering
+        return name
+    m = re.match(r"^(.*), entry (\d+) of (\d+)$", name)
+    base, tail = (m.group(1), ", 항목 %s (전체 %s개)" % (m.group(2), m.group(3))) if m else (name, "")
+    return _list_name(base, 1) + tail
+
+
+def _ko_where(s: str) -> str:
+    """The ``where`` part of the double-free sentence: lists joined by ' and on '."""
+    outp = []
+    for part in s.split(" and on "):
+        m = re.match(r"^(.*) twice \(entries (\d+) and (\d+): the list returns to it\)$", part)
+        if m:
+            outp.append("%s에 두 번 (항목 %s과 %s: 목록이 이 블록으로 되돌아옴)" % (_ko_free_list(m.group(1)), m.group(2), m.group(3)))
+            continue
+        m = re.match(r"^(.*) \(entry (\d+)\)$", part)
+        if m:
+            outp.append("%s에 (항목 %s)" % (_ko_free_list(m.group(1)), m.group(2)))
+            continue
+        m = re.match(r"^(.*?) \((next chunk's PREV_INUSE.*)\)$", part)
+        if m:
+            try:
+                from .recipe_plugins.double_free import _evidence_text
+                outp.append("%s에 (%s)" % (_ko_free_list(m.group(1)), _evidence_text(m.group(2), 1)))
+                continue
+            except Exception:  # noqa: BLE001
+                pass
+        outp.append(part)
+    return " 그리고 ".join(outp)
+
+
+def _ko_damage_reason(s: str) -> str:
+    parts = []
+    for p in _split_top(s):
+        for rx, tpl in (
+                (r"invalid chunk size (0x[0-9a-f]+)", "올바르지 않은 청크 크기 {0}"),
+                (r"top chunk size (0x[0-9a-f]+) runs (\d+) bytes past the end of its heap segment",
+                 "top 청크 크기 {0}이(가) 힙 세그먼트 끝을 {1}바이트 넘어감"),
+                (r"IS_MMAPPED flag set on the top chunk", "top 청크에 IS_MMAPPED 플래그가 켜져 있음"),
+                (r"runs past segment end", "세그먼트 끝을 넘어감"), (r"IS_MMAPPED set", "IS_MMAPPED가 켜져 있음"),
+                (r"chunk header beyond segment", "청크 헤더가 세그먼트 밖에 있음")):
+            m = re.fullmatch(rx, p)
+            if m:
+                parts.append(tpl.format(*m.groups()))
+                break
+        else:
+            parts.append(p)
+    return "; ".join(parts)
+
+
+def _ko_write_basis(s: str) -> str:
+    parts = []
+    for p in _split_top(s):
+        m = re.fullmatch(r"repeated byte (0x[0-9a-fA-F]+) written over the size field and beyond", p)
+        if re.fullmatch(r"repeated byte 0x[0-9a-fA-F]+", p):
+            parts.append(p.replace("repeated byte", "반복되는 바이트"))
+        elif m:
+            parts.append("반복되는 바이트 %s이(가) size 필드와 그 뒤까지 덮어씀" % m.group(1))
+        elif p == "printable text written over the size field and beyond":
+            parts.append("출력 가능한 문자가 size 필드와 그 뒤까지 덮어씀")
+        elif p == "the buffer's last usable bytes hold the same pattern":
+            parts.append("버퍼의 마지막 사용 가능 바이트도 같은 패턴임")
+        else:
+            parts.append(p)
+    return "; ".join(parts)
+
+
+def _ko_write_evidence(s: str) -> str:
+    m = re.fullmatch(r"payload beyond the allocator metadata changed in (\d+) of (\d+) re-reads \((\d+) distinct contents\) "
+                     r"while the chunk stayed free on the same list", s)
+    if m:
+        return "할당자 관리 정보 뒤의 내용이 다시 읽은 %s번 중 %s번 바뀜 (서로 다른 내용 %s가지). 그동안 블록은 같은 해제 목록에 있었음" % (
+            m.group(2), m.group(1), m.group(3))
+    m = re.fullmatch(r"allocator metadata of the free chunk overwritten \((.*)\), stable across (\S+) re-reads", s)
+    if m:
+        return "해제된 청크의 할당자 관리 정보가 덮어쓰임 (%s), %s번 다시 읽어도 같음" % (_ko_damage_reason(m.group(1)), m.group(2))
+    return s
+
+
+_LONG_WAIT_KO = "오래 기다림을 관측했으나 정상 여부는 판단할 수 없음"
+
+# (full-match pattern, Korean template with {0}.. for the groups, or a function of the match)
+_KO_ENGINE: List[Tuple["re.Pattern[str]", Any]] = [(re.compile(p, re.S), t) for p, t in (
+    # --- remediation steps of the detailed report (section I), fixed engine wording
+    (r"Audit pointer dereference bounds and verify memory mapping permissions before dereference\.",
+     "포인터를 역참조하기 전에 경계를 점검하고 메모리 매핑 권한을 확인하세요."),
+    (r"Enable AddressSanitizer \(ASan\) during build: `-fsanitize=address -g`\.",
+     "빌드할 때 AddressSanitizer(ASan)를 켜세요: `-fsanitize=address -g`."),
+    (r"Remediate verified fault invariant violations immediately\.", "확인된 결함의 불변식 위반을 즉시 고치세요."),
+    (r"Review code locations identified in source correlation\.", "소스 대응에서 찾은 코드 위치를 검토하세요."),
+    (r"Execute discriminating recipes to isolate probable causes\.", "가능성 높은 원인을 가려내기 위해 구분용 검사를 실행하세요."),
+    (r"Acquire additional independent authoritative runtime observations for definitive confirmation\.",
+     "확정하려면 독립적이고 신뢰할 수 있는 실행 중 관측을 더 확보하세요."),
+    (r"Enforce strict global lock acquisition ordering hierarchy across all threads\.", "모든 스레드가 엄격한 전역 락 획득 순서를 따르게 하세요."),
+    (r"Consider replacing nested mutexes with lock-free structures or fine-grained atomics\.",
+     "중첩된 뮤텍스를 락 없는 구조나 세분화된 원자 연산으로 바꾸는 것을 고려하세요."),
+    (r"Acquire additional targeted runtime observations for unverified domains\.", "확인되지 않은 영역에 대해 목적에 맞는 실행 중 관측을 더 확보하세요."),
+    (r"Inspect reported limitations to resolve missing capabilities or irregular sampling\.",
+     "보고된 제한 사항을 살펴 부족한 기능이나 불규칙한 샘플링을 해결하세요."),
+    (r"Review state transition logic and enforce assertions for valid enum state transitions\.",
+     "상태 전이 로직을 검토하고 올바른 enum 상태 전이에 대한 단언을 강제하세요."),
+    (r"Investigation inconclusive due to insufficient evidence or collection failures", "증거가 부족하거나 수집에 실패해 조사가 판단 불가로 끝났습니다"),
+    (r"verify target permissions, debug symbols, and process accessibility before re-running\.",
+     "다시 실행하기 전에 대상 권한, 디버그 심볼, 프로세스 접근 가능 여부를 확인하세요."),
+    # --- outcomes of the checks
+    (r"Check executed", "검사를 실행함"),
+    (r"Check was not executed before investigation concluded\.", "조사가 끝날 때까지 실행되지 않은 검사입니다."),
+    (r"Check was skipped after earlier discriminating step resolved scope\.", "앞선 판별 단계에서 범위가 좁혀져 건너뛴 검사입니다."),
+    (r"baseline check not executed: investigation ended with (\S+) \(step status (\S+)\)",
+     "기본 검사가 실행되지 않음: 조사가 {0} 상태로 끝남 (단계 상태 {1})"),
+    (r"EXCEEDED_WALL_CLOCK: elapsed " + _KF + r"ms >= max " + _KF + r"ms", "경과 시간 한도 초과 (EXCEEDED_WALL_CLOCK): 경과 {0}ms >= 상한 {1}ms"),
+    (r"All threads in normal state", "모든 스레드가 정상 상태"),
+    (r"Lock ownership verified clean", "락 소유 관계에 이상이 없음을 확인"),
+    (r"Suspicious/circular mutex ownership detected", "의심스럽거나 고리를 이루는 뮤텍스 소유 관계를 발견"),
+    (r"Wait-for graph is complete and acyclic", "대기 관계 그래프가 완전하며 고리가 없음"),
+    (r"Cycle verified persistent across threads", "스레드 사이의 대기 고리가 계속 유지됨을 확인"),
+    (r"Threads are blocked on mutex, but complete lock graph contains zero circular wait cycles\.",
+     "스레드들이 뮤텍스에서 멈춰 있지만, 전체 락 그래프에 순환 대기 고리는 없습니다."),
+    (r"Zero blocked threads observed", "멈춘 스레드가 관측되지 않음"),
+    (r"Blocked threads: " + _KN, "멈춘 스레드 {0}개"),
+    (r"Thread state anomaly observed", "스레드 상태 이상을 관측함"),
+    (r"no lock wait without owner progress in the sampling window", "샘플링 구간에서 소유자가 진행하지 않는데 락을 기다리는 스레드는 없음"),
+    (_KN + r" mutex\(es\) inspected in " + _KN + r" samples: every locked one is owned by a live thread",
+     "뮤텍스 {0}개를 샘플 {1}회에서 검사: 잠긴 뮤텍스는 모두 살아 있는 스레드가 소유함"),
+    (_KN + r" mutex\(es\) inspected in " + _KN + r" samples: no thread waits for a mutex it owns itself",
+     "뮤텍스 {0}개를 샘플 {1}회에서 검사: 자기가 소유한 뮤텍스를 기다리는 스레드는 없음"),
+    (_KN + r" samples over " + _KF + r" s: no mutex had " + _KN + r" or more threads waiting in more than " + _KN + r" ?% of them",
+     "{1}초 동안 샘플 {0}회: 스레드 {2}개 이상이 기다린 샘플이 {3}%를 넘는 뮤텍스는 없음"),
+    (r"Heap stable \(delta=" + _KN + r" bytes\)", "힙 크기가 안정적임 (변화량 {0}바이트)"),
+    # --- threads
+    (r"Thread '(.*)' \(tid (\d+)\) stayed in (.+?) for the whole " + _KF + r"s window with no CPU time and no context "
+     r"switch: long wait observed, cannot determine whether expected\.?",
+     "스레드 '{0}' (tid {1})이(가) {3}초 구간 내내 {2}에서 머물렀고 CPU 시간도 문맥 전환도 없었음: " + _LONG_WAIT_KO),
+    (r"long wait observed, cannot determine whether expected", _LONG_WAIT_KO),
+    (r"waited in (.+?) for the whole " + _KF + r" s window: an idle wait and a stall look the same from outside, so whether "
+     r"this wait is expected was not judged",
+     "{1}초 구간 내내 {0}에서 기다림: 밖에서는 유휴 대기와 멈춤이 같아 보여 이 대기가 정상인지는 판단하지 않음"),
+    (r"Thread '(.*)' \(tid (\d+)\) was runnable (\S+) of the " + _KF + r"s window and received (\S+) of a CPU( \(machine contended\))?, "
+     r"with no voluntary context switch, no read/write syscall, and the same top frame `(.*)` in most samples \((\S+)\): "
+     r"CPU monopoly without observable progress\.?",
+     lambda m: "스레드 '%s' (tid %s)이(가) %s초 구간의 %s 동안 실행 가능 상태였고 CPU를 %s 받음%s. 자발적 문맥 전환과 읽기/쓰기 시스템 콜이 없었고 "
+               "대부분의 샘플(%s)에서 같은 최상위 프레임 `%s`에 있었음: 진행 없이 CPU를 독점"
+               % (m.group(1), m.group(2), m.group(4), m.group(3), m.group(5), " (머신이 경합 중)" if m.group(6) else "", m.group(8), m.group(7))),
+    (r"Thread '(.*)' \(tid (\d+)\) stayed a zombie for the whole window\.", "스레드 '{0}' (tid {1})이(가) 구간 내내 좀비 상태였음."),
+    (r"Thread '(.*)' \(tid (\d+)\) stayed in uninterruptible sleep \(D\) for " + _KF + r"s\.",
+     "스레드 '{0}' (tid {1})이(가) {2}초 동안 중단 불가 대기(D) 상태였음."),
+    (r"thread '(.*)' \(tid (\d+)\) waits for mutex '(.*)', which it holds itself \(same wait in (\d+) samples\)( at (.+))?",
+     lambda m: "스레드 '%s' (tid %s)이(가) 자기가 잡고 있는 뮤텍스 '%s'을(를) 기다림 (샘플 %s회 동안 같은 대기)%s"
+               % (m.group(1), m.group(2), m.group(3), m.group(4), (" - 위치 " + m.group(6)) if m.group(6) else "")),
+    (r"mutex '(.*)' is locked by tid (\d+), which is not a thread of the process \(no /proc/(\d+)\), in (\d+) samples",
+     "뮤텍스 '{0}'을(를) tid {1}이(가) 잡고 있는데, 이 tid는 프로세스의 스레드가 아님 (/proc/{2} 없음), 샘플 {3}회 동안 같음"),
+    (r"(\d+) thread\(s\) wait for it: (.*)", "스레드 {0}개가 이 뮤텍스를 기다림: {1}"),
+    (r"mutex '(.*)' is queued on but its owner is not a thread of the process",
+     "뮤텍스 '{0}'을(를) 기다리는 스레드가 있으나 그 소유자는 프로세스의 스레드가 아님"),
+    (r"mutex '(.*)': >= (\d+) threads waiting in (\d+) of (\d+) samples \(up to (\d+), mean ([\d.]+)\)",
+     "뮤텍스 '{0}': 샘플 {3}회 중 {2}회에서 스레드 {1}개 이상이 기다림 (최대 {4}개, 평균 {5}개)"),
+    (r"the owner changed between samples \((\d+) different owners\)", "샘플 사이에 소유자가 바뀜 (서로 다른 소유자 {0}명)"),
+    (_KN + r" samples over " + _KF + r" s, one lock inspection each", "{1}초 동안 샘플 {0}회, 샘플마다 락을 한 번씩 검사"),
+    # --- resources
+    (r"open fds (.+?) over " + _KF + r" s \((\S+), (\S+)/s\)(?:, limit (\d+))?",
+     lambda m: "열린 fd %s, %s초 동안 (%s, %s/초)%s" % (m.group(1), m.group(2), m.group(3), m.group(4), (", 한도 " + m.group(5)) if m.group(5) else "")),
+    (r"threads (.+?) over " + _KF + r" s \((\S+), (\S+)/s\)", "스레드 수 {0}, {1}초 동안 ({2}, {3}/초)"),
+    # --- heap
+    (r"heap metadata intact: " + _KN + r" chunks walked, top chunk\(s\), free lists and bin links consistent",
+     "힙 메타데이터에 이상 없음: 청크 {0}개를 훑었고 top 청크, 해제 목록, bin 연결이 모두 일관됨"),
+    (_KN + r" inconsistent read\(s\) changed between re-reads \(target mutating the heap\), not evidence",
+     "다시 읽는 사이 값이 바뀐 읽기 {0}건 (대상이 힙을 바꾸는 중)은 증거로 쓰지 않음"),
+    (r"every free list walked completely and no block is listed twice: " + _KN + r" tcache bin lists \(" + _KN
+     + r" tcache structs\) and " + _KN + r" fastbin lists, " + _KN + r" entries",
+     "모든 해제 목록을 끝까지 따라갔고 두 번 올라 있는 블록은 없음: tcache bin 목록 {0}개 (tcache 구조체 {1}개), fastbin 목록 {2}개, 항목 {3}개"),
+    (_KN + r" transient repeat\(s\) did not hold on re-read \(not evidence\)", "다시 읽었을 때 유지되지 않은 일시적 반복 {0}건 (증거 아님)"),
+    (r"no typed pointer refers to a free chunk and no free chunk was written: " + _KN + r" free chunks tracked, " + _KN
+     + r" payloads hashed over " + _KF + r" s \(" + _KN + r" re-reads\)",
+     "해제된 청크를 가리키는 타입 있는 포인터도 쓰기가 일어난 해제 청크도 없음: 해제 청크 {0}개 추적, {2}초 동안 내용 {1}개 해시 (다시 읽기 {3}회)"),
+    (r"use-after-free: " + _KN + r" of " + _KN + r" free chunks tracked \(cap " + _KN
+     + r" chunks\): the others were not checked for dangling references or writes",
+     "해제 후 사용: 해제 청크 {1}개 중 {0}개만 추적함 (상한 {2}개). 나머지는 매달린 참조와 쓰기를 확인하지 않음"),
+    (r"use-after-free: payload of " + _KN + r" free chunk\(s\) not hashed \(caps: " + _KN + r" chunks, " + _KN
+     + r" bytes\): writes into them were not checked",
+     "해제 후 사용: 해제 청크 {0}개의 내용은 해시하지 않음 (상한: 청크 {1}개, {2}바이트). 이들에 대한 쓰기는 확인하지 않음"),
+    (r"use-after-free: fewer than " + _KN + r" re-reads of the free chunks could be made", "해제 후 사용: 해제 청크를 {0}번 미만만 다시 읽을 수 있었음"),
+    (r"(heap|top) chunk header damaged at (0x[0-9a-f]+) \((.*)\), stable across (\d+) re-reads",
+     lambda m: "%s 청크 헤더가 손상됨 (위치 %s, %s), %s번 다시 읽어도 같음"
+               % ("힙" if m.group(1) == "heap" else "top", m.group(2), _ko_damage_reason(m.group(3)), m.group(4))),
+    (r"overflowing buffer: (\S+) \(block (0x[0-9a-f]+), usable " + _KN + r" bytes\)", "넘친 버퍼: {0} (블록 {1}, 사용 가능 {2}바이트)"),
+    (r"overflowing buffer: owner unknown \((.*)\)",
+     lambda m: "넘친 버퍼: 소유자를 알 수 없음 (%s)" % ("소유자를 찾지 못함" if m.group(1) == "no owner found" else m.group(1))),
+    (r"the write reached " + _KN + r" bytes past its usable end \((.*)\)",
+     lambda m: "쓰기는 사용 가능 끝을 %s바이트 넘어감 (%s)" % (m.group(1), _ko_write_basis(m.group(2)))),
+    (r"damaged block belongs to (\S+)", "손상된 블록은 {0}의 것"),
+    (r"damaged: top chunk of arena (\d+) \(unallocated, no owner\)", "손상된 곳: 아레나 {0}의 top 청크 (미할당, 소유자 없음)"),
+    # --- use after free
+    (r"dangling pointer: (\S+) points to freed chunk (0x[0-9a-f]+) \(size (\d+), (.*)\), stable over " + _KF + r" s",
+     lambda m: "매달린 포인터: %s이(가) 해제된 청크 %s (크기 %s, %s)를 가리킴, %s초 동안 같은 상태"
+               % (m.group(1), m.group(2), m.group(3), _ko_free_list(m.group(4)), m.group(5))),
+    (r"no write into it was observed \(candidate: a use is not proven\)", "쓰기는 관측되지 않음 (후보: 실제 사용은 입증되지 않음)"),
+    (r"use after free: (\S+) still points to freed chunk (0x[0-9a-f]+) \(size (\d+), (.*?)\) and the chunk was written while free \((.*)\)",
+     lambda m: "해제 후 사용: %s이(가) 해제된 청크 %s (크기 %s, %s)를 아직 가리키고, 청크가 해제된 동안 쓰임 (%s)"
+               % (m.group(1), m.group(2), m.group(3), _ko_free_list(m.group(4)), _ko_write_evidence(m.group(5)))),
+    (r"use after free: (\S+) still points to freed chunk (0x[0-9a-f]+) and the chunk's free-list metadata was written while free \((.*)\)",
+     lambda m: "해제 후 사용: %s이(가) 해제된 청크 %s를 아직 가리키고, 청크의 해제 목록 관리 정보가 해제된 동안 쓰임 (%s)"
+               % (m.group(1), m.group(2), _ko_damage_reason(m.group(3)))),
+    (r"freed chunk (0x[0-9a-f]+) \(size (\d+), (.*?)\) was written while free \((.*)\)",
+     lambda m: "해제된 청크 %s (크기 %s, %s)가 해제된 동안 쓰임 (%s)"
+               % (m.group(1), m.group(2), _ko_free_list(m.group(3)), _ko_write_evidence(m.group(4)))),
+    (r"owner unknown: no reference remains", "소유자를 알 수 없음: 남아 있는 참조가 없음"),
+    # --- double free
+    (r"block (0x[0-9a-f]+) \(chunk (0x[0-9a-f]+), size (\d+)\) is listed as free (.*), stable across (\d+) re-reads: it was freed twice",
+     lambda m: "블록 %s (청크 %s, 크기 %s)이 해제된 블록으로 %s 올라 있고, %s번 다시 읽어도 같음: 두 번 해제되었음"
+               % (m.group(1), m.group(2), m.group(3), _ko_where(m.group(4)[3:] if m.group(4).startswith("on ") else m.group(4)), m.group(5))),
+    (r"its tcache count is (\d+) but the list holds (\d+) distinct blocks", "tcache 카운트는 {0}인데 목록에는 서로 다른 블록이 {1}개 있음"),
+    (r"two later allocations of this size can both receive address (0x[0-9a-f]+): two owners would then share one block",
+     "이후 같은 크기의 할당 두 번이 모두 주소 {0}을(를) 받을 수 있음: 그러면 두 소유자가 한 블록을 나눠 쓰게 됨"),
+    (r"still referenced by (.*) \(the pointer that was freed twice, or a copy of it\)", "아직 {0}이(가) 이 블록을 가리킴 (두 번 해제된 포인터이거나 그 사본)"),
+    (r"owner unknown \((.*)\)",
+     lambda m: "소유자를 알 수 없음 (%s)" % ("남아 있는 참조 없음" if m.group(1).startswith("no reference remains") else m.group(1))),
+    (r"which code called free\(\) twice is not observable \(free calls are not traced\)",
+     "어느 코드가 free()를 두 번 불렀는지는 관측할 수 없음 (free 호출은 추적하지 않음)"),
+    # --- memory growth
+    (r"no growth trend \(RSS " + _KN + r" KB over " + _KF + r" s, " + _KN + r" samples\): heap walks not needed",
+     "증가 추세 없음 (RSS {0} KB, {1}초 동안 샘플 {2}개): 힙 순회는 필요 없음"),
+    (r"only " + _KN + r" usable heap walk\(s\)", "쓸 수 있는 힙 순회가 {0}회뿐임"),
+    (_KN + r" are needed to establish a trend", "추세를 판단하려면 {0}회가 필요함"),
+    (r"heap walk " + _KN + r": (\S+) observation budget exhausted during (heap walk|reachability): (\S+): current " + _KN
+     + r"B \+ reserved " + _KN + r"B \+ estimated " + _KN + r"B > max " + _KN + r"B",
+     lambda m: "힙 순회 %s: %s 관측 예산이 %s 도중 소진됨: %s: 현재 %sB + 예약 %sB + 추정 %sB > 상한 %sB"
+               % (m.group(1), m.group(2), "힙 순회" if m.group(3) == "heap walk" else "도달 가능성 분석", *m.groups()[3:])),
+    (r"growth observed, not established as a leak: RSS " + _KN + r" KB but in-use heap " + _KN
+     + r" KB over the walks \(fragmentation, file / anonymous mappings outside malloc, or allocator caching\)",
+     "증가는 관측했으나 누수로 확정되지 않음: RSS는 {0} KB이지만 순회 동안 사용 중인 힙은 {1} KB "
+     "(단편화, malloc 밖의 파일·익명 매핑, 또는 할당자 캐싱일 수 있음)"),
+    (r"in-use heap grew \+" + _KN + r" KB \(\+" + _KN + r" blocks\) across " + _KN + r" heap walks over " + _KF + r" s, without a drop",
+     "사용 중인 힙이 힙 순회 {2}회, {3}초에 걸쳐 +{0} KB (블록 +{1}개) 늘었고 줄어든 적이 없음"),
+    (_KN + r" in-use blocks of size class " + _KN + r" B \(usable " + _KN + r" B\) with no reachable path, \+" + _KN + r" \(\+" + _KN
+     + r" KB\) over " + _KF + r" s",
+     "도달 가능한 경로가 없는 크기 등급 {1} B (사용 가능 {2} B)의 사용 중 블록 {0}개, {5}초 동안 +{3}개 (+{4} KB)"),
+    (r"allocated in arena (\d+), whose only attached thread is (.+) \(tid (\d+)\)", "아레나 {0}에서 할당됨, 이 아레나에 붙은 스레드는 {1} (tid {2}) 하나뿐"),
+    (r"the only DWARF type of the executable that fits this size class is (.+)", "이 크기 등급에 맞는 실행 파일의 DWARF 타입은 {0} 하나뿐"),
+    (r"(memory grows|no growth) outside malloc: anonymous memory outside malloc " + _KN + r" KB over " + _KF
+     + r" s \(per step ([+\-\d/]+) KB\), RSS " + _KN + r" KB, malloc heap mappings " + _KN + r" KB",
+     lambda m: "%s: malloc 밖의 익명 메모리 %s KB, %s초 동안 (단계별 %s KB), RSS %s KB, malloc 힙 매핑 %s KB"
+               % ("malloc 밖에서 메모리가 늘고 있음" if m.group(1) == "memory grows" else "malloc 밖에서 증가 없음",
+                  m.group(2), m.group(3), m.group(4), m.group(5), m.group(6))),
+    (r"grown or new anonymous mappings: " + _KN + r" \(" + _KN + r" newly appeared\)", "늘었거나 새로 생긴 익명 매핑: {0}개 (새로 나타난 것 {1}개)"),
+    (r"largest (0x[0-9a-f]+-0x[0-9a-f]+) " + _KN + r" KB \(" + _KN + r" KB\)", "가장 큰 매핑 {0}, {1} KB ({2} KB)"),
+    (_KN + r" pointer\(s\) in static variable (\S+) point into the new mappings", "정적 변수 {1}의 포인터 {0}개가 새 매핑을 가리킴"),
+    (r"heap in-use " + _KN + r" KB across " + _KN + r" heap walks", "힙 순회 {1}회 동안 사용 중인 힙 {0} KB"),
+    (r"memory held by the heap but not in use: arenas hold " + _KF + r" MiB from the system: " + _KF + r" MiB in use, " + _KF
+     + r" MiB free in " + _KN + r" free chunks \(" + _KN + r" ?%\), top (.+)",
+     "힙이 쥐고 있지만 쓰지 않는 메모리: 아레나가 시스템에서 {0} MiB를 받았고 {1} MiB 사용 중, {2} MiB는 해제 청크 {3}개에 있음 ({4}%), top {5}"),
+    (r"heap mappings and RSS flat over " + _KF + r" s \(" + _KN + r" samples\)", "{0}초 동안 힙 매핑과 RSS가 변하지 않음 (샘플 {1}개)"),
+    (r"most free memory in arena (\d+) \((\S+)\): " + _KF + r" MiB free in " + _KN + r" chunks, largest free chunk (.+)",
+     "해제 메모리 대부분은 아레나 {0} ({1})에 있음: 청크 {3}개에 {2} MiB, 가장 큰 해제 청크 {4}"),
+    (r"observation budget exhausted during (heap walk|reachability): (.*)",
+     lambda m: "%s 도중 관측 예산이 소진됨: %s" % ("힙 순회" if m.group(1) == "heap walk" else "도달 가능성 분석", m.group(2))),
+)]
+_KO_PREFIX = re.compile(r"^Runtime anomaly in (\S+): observed (\d+) corroborating indicators\.(?: (.*))?$", re.S)
+
+
+def _ko_fragment(frag: str) -> str:
+    core = frag.strip()
+    for rx, tpl in _KO_ENGINE:
+        m = rx.fullmatch(core)
+        if m:
+            out = tpl(m) if callable(tpl) else tpl.format(*m.groups())
+            return frag.replace(core, out, 1)
+    return frag
+
+
+def ko_text(s: Any, i: int) -> str:
+    """The engine's English evidence / interpretation sentence ``s`` in Korean when ``i`` is 1; unmatched text is unchanged."""
+    s = str(s)
+    if i != 1 or not s.strip():
+        return s
+    m = _KO_PREFIX.match(s)
+    if m:
+        return ("%s 범주의 실행 중 이상: 보조 지표 %s개를 관측함." % (m.group(1), m.group(2))
+                + (" " + ko_text(m.group(3), i) if m.group(3) else ""))
+    return "; ".join(_ko_fragment(p) for p in _split_top(s))
 
 
 def conclusion_sentence(summary_md: str) -> str:
