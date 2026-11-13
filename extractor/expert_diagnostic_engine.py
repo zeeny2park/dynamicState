@@ -2556,15 +2556,17 @@ class AdaptiveInvestigationSession:
                     consumed_ids.append(clean_ev.get("evidence_id", ""))
                     rationale = "Memory slice verified intact with zero corruption or poison patterns."
                 else:
-                    # Check if memory was actually read and verified
-                    mem_ev = first(both, lambda t: t.has_observation)
-                    if mem_ev:
-                        outcome = "PASS"
-                        consumed_ids.append(mem_ev.get("evidence_id", ""))
-                        rationale = "Memory slice audited clean without poison markers."
+                    # Verification scope (stage 1): an observed value is not a reading of the memory's bytes.  Only
+                    # a rule that read the bytes (canaries, magic, heap headers) and found them intact clears this.
+                    outcome = "INCONCLUSIVE"
+                    missing_ev.append("memory_slice_read")
+                    cut = first(contra, lambda t: t.claims_hold_without_scope(inv))
+                    if cut is not None:
+                        consumed_ids.append(cut.get("evidence_id", ""))
+                        rationale = ("The memory was reported intact, but the observation did not cover it: "
+                                     + ", ".join(typed_evidence_of(cut).incomplete_reasons) + ".")
                     else:
-                        outcome = "INCONCLUSIVE"
-                        missing_ev.append("memory_slice_read")
+                        rationale = "No rule read the memory's bytes (canaries / magic / heap headers) for this hypothesis."
 
             # 3. Memory growth / leak check
             elif cid in ("CRIT_RSS_GROWTH_STABLE", "CRIT_CHUNK_RECLAMATION"):
@@ -2618,15 +2620,14 @@ class AdaptiveInvestigationSession:
                     consumed_ids.append(valid_trans_ev.get("evidence_id", ""))
                     rationale = "Observed state transitions conform to valid specification."
                 else:
-                    # Check if state variable was actually observed
+                    # Verification scope (stage 1): reading a variable is not checking it against its domain or its
+                    # transitions; without a rule that decided the invariant the criterion stays open.
+                    outcome = "INCONCLUSIVE"
+                    missing_ev.append("state_variable_value_checked_against_domain")
                     state_obs_ev = first(both, lambda t: bool(t.subject))
-                    if state_obs_ev:
-                        outcome = "PASS"
-                        consumed_ids.append(state_obs_ev.get("evidence_id", ""))
-                        rationale = f"Observed variable '{state_obs_ev.get('symbol')}' conforms to normal operational state."
-                    else:
-                        outcome = "INCONCLUSIVE"
-                        missing_ev.append("state_variable_value")
+                    rationale = (f"Variable '{state_obs_ev.get('symbol')}' was read, but no rule checked it against its "
+                                 "domain or transitions." if state_obs_ev else
+                                 "No state variable was checked against its domain or transitions.")
 
             # 6. Clean check
             elif cid == "CRIT_ZERO_ANOMALIES":
