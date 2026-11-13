@@ -22,18 +22,27 @@ from extractor.human_report import T, diagnose_with_summary, render_human_report
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 FIXTURES = os.path.join(ROOT, "tests", "fixtures", "real_runtime")
-HEADERS_EN = ["1. Conclusion", "2. What is wrong", "3. Why we concluded this",
-              "4. How certain, and what was not examined", "5. What to do next",
-              "6. Impact of the collection on the target", "Glossary"]
-HEADERS_KO = ["1. 결론", "2. 무엇이 문제인가", "3. 왜 그렇게 판단했는가", "4. 얼마나 확실한가, 그리고 확인하지 못한 것",
-              "5. 다음에 할 일", "6. 수집이 대상에 준 영향", "용어 풀이"]
+# the common outline (human_report.compose); a fault report has every section, so these are its numbers
+HEADERS_EN = ["1. Conclusion", "2. What was found", "3. What to do next", "4. What was checked",
+              "5. How the diagnosis was done and what it cost the target", "6. Reference"]
+HEADERS_KO = ["1. 결론", "2. 발견한 문제", "3. 다음에 할 일", "4. 검사 범위", "5. 진단 방법과 대상에 준 영향", "6. 참고 자료"]
+TITLES = {"findings": ("What was found", "발견한 문제"), "next": ("What to do next", "다음에 할 일"),
+          "scope": ("What was checked", "검사 범위"),
+          "method": ("How the diagnosis was done and what it cost the target", "진단 방법과 대상에 준 영향")}
+
+
+def _section(text, key, lang="en"):
+    """Body of the section titled TITLES[key] (whatever its number)."""
+    title = TITLES[key][0 if lang == "en" else 1]
+    m = re.search(r"^## \d+\. " + re.escape(title) + r"\n(.*?)(?=^## |\Z)", text, re.S | re.M)
+    return m.group(1) if m else ""
 MEMORY_SYMPTOM = "memory usage of this process keeps growing"
 
 
 def _first_sentence_block(text):
     """Text of section 1 (the conclusion)."""
     m = re.search(r"## 1\.[^\n]*\n+(.*?)\n+## 2\.", text, re.S)
-    return m.group(1).strip()
+    return m.group(1).strip().split("\n\n", 1)[-1]   # after the verdict line
 
 
 def _ascii_word_runs(text):
@@ -125,7 +134,7 @@ class TestHumanReportReal(unittest.TestCase):
         self.assertEqual(set(lines), {"worker_1", "worker_2"})
         for lang, headers in (("en", HEADERS_EN), ("ko", HEADERS_KO)):
             text = render_human_report(res, res["report"], lang=lang)
-            first_screen = text.split("## 3.")[0]
+            first_screen = text.split("## 3.")[0]   # conclusion and findings
             for name in ("g_mutex_a", "g_mutex_b", "worker_1", "worker_2"):
                 self.assertIn(name, first_screen, (lang, name))
             for fn, ln in lines.items():
@@ -136,7 +145,7 @@ class TestHumanReportReal(unittest.TestCase):
             pos = [text.index("## " + h) for h in headers]
             self.assertEqual(pos, sorted(pos), (lang, "section order"))
             # next-step names both functions with their lines
-            nxt = text.split("## 5.")[1].split("## 6.")[0]
+            nxt = _section(text, "next", lang)
             self.assertIn("worker_1", nxt)
             self.assertIn("worker_2", nxt)
 
@@ -157,10 +166,12 @@ class TestHumanReportReal(unittest.TestCase):
         ci = res["collection_impact"]
         for lang in ("en", "ko"):
             text = render_human_report(res, res["report"], lang=lang)
-            sec6 = text.split("## 6.")[1].split("\n## ")[0]
-            self.assertIn(str(ci["measured_stop_ms"]), sec6)
-            self.assertIn(str(ci["bytes_read"]), sec6)
-            self.assertIn(str(ci["wall_clock_ms"]), sec6)
+            sec6 = _section(text, "method", lang)
+            # the result's numbers in sensible units (rounded, never invented)
+            self.assertIn(f"{ci['measured_stop_ms']:.0f} ms", sec6)
+            self.assertIn(f"{ci['bytes_read'] / 1024:.0f} KB", sec6)
+            wall = ci["wall_clock_ms"]
+            self.assertIn(f"{wall:.0f} ms" if wall < 1000 else f"{wall / 1000:.1f}", sec6)
             self.assertIn(ci["capture_mode"], sec6)
 
     def test_result_without_inline_report_still_names_locks_and_functions(self):
@@ -189,9 +200,9 @@ class TestHumanReportReal(unittest.TestCase):
         self.assertIn("## 1. 결론", out["human_summary"])
         self.assertIn(out["verdict"], ("CONFIRMED_FAULT", "PROBABLE_FAULT", "FAULT"))
         self.assertIsNone(out["report"])
-        # the summary's numbers are the numbers of this very result
-        self.assertIn(str(out["collection_impact"]["bytes_read"]), out["human_summary"])
-        self.assertIn(str(out["collection_impact"]["measured_stop_ms"]), out["human_summary"])
+        # the summary's numbers are the numbers of this very result (in KB / ms)
+        self.assertIn(f"{out['collection_impact']['bytes_read'] / 1024:.0f} KB", out["human_summary"])
+        self.assertIn(f"{out['collection_impact']['measured_stop_ms']:.0f} ms", out["human_summary"])
 
     def test_mcp_attaches_human_summary_in_requested_language(self):
         proc, binary = self._launch("proc_thread_circular_deadlock.c")
@@ -213,12 +224,12 @@ class TestHumanReportReal(unittest.TestCase):
         self.assertTrue(m, leaks[0]["description"])
         for lang in ("en", "ko"):
             text = render_human_report(res, res["report"], lang=lang)
-            sec12 = text.split("## 3.")[0]
+            sec12 = text.split("## 3.")[0]   # conclusion and findings
             self.assertIn(path, sec12)
             self.assertIn("+%s" % m.group(1), sec12)
             win = float(re.search(r"(\d+\.\d+) ?(?:s\b|초)", sec12).group(1))
             self.assertAlmostEqual(win, float(m.group(3)), delta=0.02)
-            self.assertIn("g_pending_items", text.split("## 5.")[1].split("## 6.")[0])
+            self.assertIn("g_pending_items", _section(text, "next", lang))
         self.assertEqual(_ascii_word_runs(render_human_report(res, res["report"], lang="ko")), [])
 
     # ------------------------------------------------------------------ nonexistent pid / healthy
@@ -240,7 +251,7 @@ class TestHumanReportReal(unittest.TestCase):
             self.assertNotIn("no problem", text.lower())
             self.assertNotIn("정상", text)
         self.assertEqual(_ascii_word_runs(ko), [])
-        self.assertIn("## 6.", en)
+        self.assertTrue(_section(en, "method"))
 
     def test_missing_debug_image_first_sentence_gives_the_reason(self):
         proc, _binary = self._launch("proc_scenario_a_healthy.c")
@@ -266,8 +277,9 @@ class TestHumanReportReal(unittest.TestCase):
                 self.assertTrue("Not checked:" in first or "점검하지 못한 것:" in first, first)
             else:
                 self.assertTrue(res["findings"], "a fault verdict needs a named finding")
-            pos = [text.index("## " + h) for h in (HEADERS_EN if lang == "en" else HEADERS_KO)[:6]]
-            self.assertEqual(pos, sorted(pos))
+            heads = re.findall(r"^## \d+\. (.+)$", text, re.M)
+            order = [h.split(". ", 1)[1] for h in (HEADERS_EN if lang == "en" else HEADERS_KO)]
+            self.assertEqual(heads, [h for h in order if h in heads])
 
     def test_diagnose_with_summary_drops_inline_report(self):
         proc, binary = self._launch("proc_scenario_a_healthy.c")
@@ -300,7 +312,7 @@ class TestHumanReportRules(unittest.TestCase):
             {"kind": "check_inconclusive", "item": "RECIPE_Y", "reason": "Check executed"},
             {"kind": "unsupported_on_target", "item": "tcb_scan", "reason": "NOT_SUPPORTED"}])
         text = render_human_report(res, lang="en")
-        sec4 = text.split("## 4.")[1].split("## 5.")[0]
+        sec4 = _section(text, "scope")
         self.assertIn("heap larger than baseline cap", sec4)
         self.assertEqual(sec4.count("could not decide") >= 0, True)
         self.assertRegex(sec4, r"`RECIPE_X`, `RECIPE_Y`")
@@ -311,7 +323,7 @@ class TestHumanReportRules(unittest.TestCase):
                    not_covered=[{"kind": "check_inconclusive", "item": "R", "reason": "x"}])
         for lang in ("en", "ko"):
             text = render_human_report(res, lang=lang)
-            sec5 = text.split("## 5.")[1].split("## 6.")[0]
+            sec5 = _section(text, "next", lang)
             self.assertIn("--debug-image", sec5)
             self.assertNotIn("no problem", text.lower())
             self.assertNotIn("정상", text)

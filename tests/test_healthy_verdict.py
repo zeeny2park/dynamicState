@@ -149,7 +149,7 @@ class TestHealthyVerdictRealProcesses(unittest.TestCase):
                 ("en", "is healthy within the checked scope", "Not checked:", "healthy = every baseline check"),
                 ("ko", "점검한 범위 안에서 정상입니다", "점검하지 못한 것:", "정상 = 모든 기본")):
             text = render_human_report(d, d.get("report"), lang=lang)
-            first = text.split("\n## ", 2)[1].split("\n\n", 1)[1].split("\n")[0]
+            first = text.split("\n## ", 2)[1].split("\n\n")[2].split("\n")[0]   # after the verdict line
             self.assertIn(healthy_txt, first, text)
             self.assertIn(nc_txt, first)
             self.assertIn("acceptor", first)

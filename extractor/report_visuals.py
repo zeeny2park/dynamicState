@@ -1080,11 +1080,11 @@ def _finding_card(lx: _Lx, i: int, f: Dict[str, Any], report: Optional[Dict[str,
     elif chips:
         parts.append(f'<p class="dsv-note">{E(lx.t("subjects"))}: {" ".join(chips)}</p>')
     parts.append(viz)
-    if block is not None and block["body"] and viz:
-        # the picture states the same facts; the text stays one click away (said once on screen)
+    if block is not None and (block["body"] or block["diagram"]) and viz:
+        # the picture states the same facts; the text (and the text diagram) stays one click away
         parts.append(f'<details class="dsv-ck dsv-s-SKIPPED dsv-astext"><summary><span class="dsv-ck-name">'
                      f'{E(lx.t("as_text"))}</span></summary><div class="dsv-text" style="padding:0 14px 8px">'
-                     f'{_md_html(block["body"])}</div></details>')
+                     f'{_md_html(block["body"] + [""] + block["diagram"])}</div></details>')
     if block is not None and block["diagram"] and not viz:
         parts.append(_md_html(block["diagram"]))
     if block is not None and block["why"]:

@@ -415,6 +415,7 @@ class TestPresentation(unittest.TestCase):
             for lang, s in (("en", "Which code called free() the second time was not observed"),
                             ("ko", "어느 코드가 두 번째로 free()를 불렀는지는 관측되지 않았습니다")):
                 h = build_visual_summary(res, res["report"], lang)
+                h = re.sub(r'(?s)<details class="dsv-ck dsv-s-SKIPPED dsv-astext">.*?</details>', "", h)
                 self.assertEqual(h.count(s), 1, (fs[0]["kind"], lang))
                 self.assertIn("dsv-chip-no", h)
 

@@ -37,7 +37,7 @@ class TestReportRegistry(unittest.TestCase):
         res = _result()
         self.assertIn("`TEST_ONLY_CATEGORY`", render_human_report(res, res["report"], "en"))
         h = build_visual_summary(res, res["report"], "en")
-        self.assertIn("Finding 1: TEST_ONLY_CATEGORY", h)
+        self.assertIn("Finding 1: <code>TEST_ONLY_CATEGORY</code>", h)   # unnamed category: its id, in code font
         self.assertIn("Test only", h)                                   # check name from the record
 
     def test_registered_presentation_is_used_in_summary_checklist_and_picture(self):
@@ -47,7 +47,7 @@ class TestReportRegistry(unittest.TestCase):
         rr.register_finding_viz(CAT, lambda lx, f, report, uid: f'<p class="x-viz">{esc(f["observed"][0])} {code(uid)}</p>')
         res = _result()
         ko = render_human_report(res, res["report"], "ko")
-        self.assertIn("시험용 문제 [TEST_ONLY_CATEGORY]", ko)
+        self.assertIn("시험용 문제 (`TEST_ONLY_CATEGORY`)", ko)          # the name, then the id in code font
         self.assertIn("맞춤 문장", ko)
         h = build_visual_summary(res, res["report"], "ko")
         self.assertIn("시험용 문제", h)

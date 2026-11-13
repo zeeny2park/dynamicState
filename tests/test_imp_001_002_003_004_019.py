@@ -203,7 +203,9 @@ class TestImp001CollectionFailureIsInconclusive(_ImpTestBase):
         self.assertLessEqual(rj["confidence"], 0.2)
         for item in rep["remediation_checklist"]:
             self.assertNotIn(self.HEALTHY_REMEDIATION, item)
-        self.assertIn("N/A", re.search(r"\*\*Overall Status\*\*.*", rep["report_markdown"]).group(0))
+        # an unexamined process has no score, and the report says "could not decide" first (never a score)
+        self.assertNotIn("Health Score", rep["report_markdown"])
+        self.assertIn("**Verdict: could not decide** (`INCONCLUSIVE`)", rep["report_markdown"])
         self.assertNotIn("Health Score: 100", rep["llm_next_step_hint"])
 
     def test_triage_exception_yields_inconclusive_report(self) -> None:

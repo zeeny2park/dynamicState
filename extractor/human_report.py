@@ -63,10 +63,8 @@ T: Dict[str, Tuple[str, str]] = {
                 "디버그 이미지 {item}을(를) 찾을 수 없어 심볼을 해석할 수 없습니다"),
     "r_stage": ("the diagnosis stopped with an error ({item}): {raw}", "진단이 오류로 중단되었습니다 ({item}): {raw}"),
     "r_noexec": ("no check was executed ({raw})", "실행된 검사가 없습니다 ({raw})"),
-    "r_nofinding": ("{ran} check(s) ran, {dec} of them decided, and none produced a finding that names a cause; "
-                    "{nc} item(s) could not be examined",
-                    "검사 {ran}개가 실행되어 그중 {dec}개가 결론을 냈지만 원인을 가리키는 발견은 없었고, "
-                    "{nc}개 항목은 확인하지 못했습니다"),
+    "r_nofinding": ("{ran} check(s) ran, {dec} of them decided, and none produced a finding that names a cause",
+                    "검사 {ran}개가 실행되어 그중 {dec}개가 결론을 냈지만 원인을 가리키는 발견은 없었습니다"),
     "r_unspecified": ("the engine gave no further reason", "엔진이 더 이상의 이유를 알려주지 않았습니다"),
     "r_baseline_open": ("; it is not called healthy because the baseline check for {what} ({rid}) could not decide: "
                         "{raw}",
@@ -397,7 +395,7 @@ T: Dict[str, Tuple[str, str]] = {
     "s_counts": ("{run} checks ran: {found} found a problem, {clean} came back clean and {undecided} could not judge.",
                  "검사 {run}개를 실행했습니다. 이상 발견 {found}개, 이상 없음 {clean}개, 판단하지 못함 {undecided}개입니다."),
     "s_counts_none": ("No check ran.", "실행된 검사가 없습니다."),
-    "s_notrun": (" {n} more check(s) were not run.", " 실행하지 않은 검사가 {n}개 더 있습니다."),
+    "s_notrun": (" Another {n} were not run.", " 실행하지 않은 검사가 {n}개 더 있습니다."),
     "s_caveat": ("A check that could not judge, or was not run, is not evidence that the process is fine.",
                  "판단하지 못했거나 실행하지 않은 검사는 문제가 없다는 근거가 아닙니다."),
     "s_healthy": ("What the healthy verdict covers: the {n} baseline checks ran to completion and found nothing. "
@@ -416,12 +414,13 @@ T: Dict[str, Tuple[str, str]] = {
     "g_extra": ("Other checks ({n})", "그 밖의 검사 ({n}개)"),
     "g_why_cap": ("needs a capability that is not available here ({cap})", "여기서 쓸 수 없는 기능({cap})이 필요함"),
     "g_why_none": ("the check recorded no reason", "검사가 이유를 기록하지 않음"),
-    "g_why_status": ("ended as {st}", "결과가 {st}임"),
+    "g_why_status": ("{st}", "{st}"),
     "g_not_planned": ("not selected for this symptom", "이번 증상에 선택되지 않음"),
     "g_not_executed": ("planned but not executed before the investigation ended", "계획했지만 조사가 끝날 때까지 실행되지 않음"),
-    "st_NOT_APPLICABLE": ("not applicable", "해당 없음"), "st_ERROR": ("error", "오류"),
-    "st_UNSUPPORTED": ("unsupported", "지원 안 됨"), "st_TIMEOUT": ("timed out", "시간 초과"),
-    "st_INCONCLUSIVE": ("inconclusive", "판단 불가"),
+    "st_NOT_APPLICABLE": ("the check does not apply to this target", "이 대상에는 적용되지 않는 검사"),
+    "st_ERROR": ("the check itself ended with an error", "검사 자체가 오류로 끝남"),
+    "st_UNSUPPORTED": ("not supported on this target", "이 대상에서 지원되지 않음"),
+    "st_TIMEOUT": ("the check ran out of time", "검사 시간이 초과됨"),
     # method and cost
     "m_target": ("Target: {who}{abi}, debug image {img}.", "대상: {who}{abi}, 디버그 이미지 {img}."),
     "m_target_noimg": ("Target: {who}{abi}, no debug image was used.", "대상: {who}{abi}, 디버그 이미지 없음."),
@@ -952,9 +951,7 @@ def _healthy_sentence(ctx: _Ctx, who: str, res: Dict[str, Any]) -> str:
     for x in scope.get("not_checked") or []:
         kind = x.get("kind")
         items = [s for s in str(x.get("item") or "").split(",") if s]
-        if kind == "long_wait_not_judged":
-            shown.append(ctx.t("nc_short_long_wait", n=len(items) or 1))
-        elif kind == "symptom_checks_without_result":
+        if kind == "symptom_checks_without_result":
             shown.append(ctx.t("nc_short_symptom", n=len(items) or 1))
         elif kind == "outside_baseline":
             shown.append(ctx.t("nc_short_outside"))
@@ -1073,6 +1070,13 @@ def check_rows(res: Dict[str, Any], report: Optional[Dict[str, Any]]) -> List[Di
                      "dur": c.get("duration_seconds", c.get("duration_s")), "check_id": c.get("check_id"),
                      "required": c.get("is_required"), "n_ev": len(c.get("supporting_evidence_ids") or []),
                      "cap": obs.get("missing_capability"), "err": c.get("error_details"), "planned": True})
+    for n in res.get("not_covered") or []:
+        kind = str(n.get("kind") or "") if isinstance(n, dict) else ""
+        rid = str(n.get("item") or "") if kind.startswith("check_") else ""
+        if rid and rid not in seen:     # a check reported only as "ran but ended <status>"
+            seen.add(rid)
+            raw = kind[6:].upper()
+            rows.append({"rid": rid, "status": check_group(raw), "raw_status": raw, "planned": True, "limits": []})
     for n in res.get("not_covered") or []:
         if isinstance(n, dict) and n.get("kind") == "recipes_not_planned":
             for rid in str(n.get("item") or "").split(","):
@@ -1244,7 +1248,8 @@ def _not_examined_lines(ctx: _Ctx, res: Dict[str, Any]) -> List[str]:
     for n in nc:
         groups.setdefault(str(n.get("kind")), []).append(n)
     for kind, items in groups.items():
-        names = [_c(n.get("item")) for n in items]
+        names = [check_label(str(n.get("item")), ctx.i) if str(n.get("item") or "").startswith("RECIPE_")
+                 else _c(n.get("item")) for n in items]
         raws = [str(n.get("reason") or "") for n in items if n.get("reason")]
         if kind == "target_unreadable":
             gone = any("does not exist" in r or "invalid PID" in r for r in raws)

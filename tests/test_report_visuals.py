@@ -192,11 +192,11 @@ class TestVisualSummary(unittest.TestCase):
     def test_checklist_groups_reasons_and_links(self):
         h = self._html(deadlock_result())
         for status, n in (("FAIL", 1), ("PASS", 1), ("INCONCLUSIVE", 1), ("SKIPPED", 3)):
-            self.assertEqual(h.count(f'<details class="dsv-ck dsv-s-{status}" data-status="{status}">'), n, status)
+            self.assertEqual(h.count(f'<details class="dsv-ck dsv-s-{status}" data-status="{status}"'), n, status)
         self.assertIn("DYNAMIC_EVENT_TRACING", h)                                    # why the check gave no answer
-        self.assertIn("Not selected for this symptom.", h)
-        self.assertIn('href="#dsv-finding-1"', h)                                    # failing check -> its finding
-        self.assertIn("not evidence of health", h)
+        self.assertIn("not selected for this symptom", h)
+        self.assertIn('href="#finding-1"', h)                                        # failing check -> its finding
+        self.assertIn("not evidence that the process is fine", h)
         self.assertIn("Also not examined", h)
 
     def test_result_status_wins_over_report_status(self):
@@ -220,10 +220,12 @@ class TestVisualSummary(unittest.TestCase):
 
     def test_no_finding_texts(self):
         healthy = _result("HEALTHY", [], [_check("RECIPE_FD_LEAK", "PASS")])
-        self.assertIn("No problem was found within the checked scope", self._html(healthy))
+        h = self._html(healthy)
+        self.assertIn("healthy within the checked scope", h)                        # the verdict, in words
+        self.assertNotIn('id="dsv-findings"', h)                                    # no section only to say "nothing"
         incon = _result("INCONCLUSIVE", [], [])
         h = self._html(incon)
-        self.assertIn("not a statement that the process is healthy", h)
+        self.assertIn("this does not mean the process is fine", h)
         self.assertIn("No check record is available", h)
 
     def test_everything_from_the_target_is_escaped(self):

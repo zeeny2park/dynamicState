@@ -126,7 +126,8 @@ class TestCliAdaptiveReportIntegration(unittest.TestCase):
             md_text = f.read()
 
         self.assertIn("# dynamicState Zero-Stop Runtime Incident Report", md_text)
-        self.assertIn("## 1. Target Identity", md_text)
+        self.assertIn("## 1. Conclusion", md_text)
+        self.assertRegex(md_text, r"(?m)^## \d+\. How the diagnosis was done and what it cost the target$")
 
         data = json.loads(res.stdout)
         self.assertEqual(data.get("saved_path"), os.path.abspath(md_out))

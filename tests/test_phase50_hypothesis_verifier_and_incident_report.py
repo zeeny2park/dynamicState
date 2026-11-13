@@ -1,4 +1,5 @@
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -209,10 +210,18 @@ class TestPhase50HypothesisVerifierAndIncidentReport(unittest.TestCase):
         rep_data = er_resp["data"]
         self.assertEqual(rep_data["stop_duration_ms"], 0.0)
         self.assertTrue(os.path.isfile(report_file))
-        self.assertIn("## 1. Target Identity & Zero-Stop Telemetry", rep_data["report_markdown"])
-        self.assertIn("## 2. Root-Cause Findings", rep_data["report_markdown"])
-        self.assertIn("## 3. Hypothesis Verification (`CONFIRMED`", rep_data["report_markdown"])
-        self.assertIn("## 5. Remediation Checklist", rep_data["report_markdown"])
+        md = rep_data["report_markdown"]
+        # the common outline: conclusion first, the requested hypothesis check in its own section, next steps,
+        # and the target identity / zero-stop statement in the method section
+        self.assertIn("## 1. Conclusion", md)
+        hyp = re.search(r"^## \d+\. The hypothesis you asked to check\n(.*?)(?=^## )", md, re.S | re.M)
+        self.assertTrue(hyp, md)
+        self.assertIn("`CONFIRMED`", hyp.group(1))
+        self.assertRegex(md, r"(?m)^## \d+\. What to do next$")
+        method = re.search(r"^## \d+\. How the diagnosis was done and what it cost the target\n(.*?)(?=^## )", md,
+                           re.S | re.M).group(1)
+        self.assertIn("pid %d" % self.proc.pid, method)
+        self.assertIn("never paused", method)
 
 
 if __name__ == "__main__":

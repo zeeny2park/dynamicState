@@ -126,7 +126,7 @@ class TestThreadLeakPresentation(unittest.TestCase):
     def test_korean(self):
         res = _result([25, 28, 30, 31, 33], GROUP, nproc=1000)
         ko = render_human_report(res, res["report"], "ko")
-        self.assertIn("스레드 누수 [THREAD_LEAK]", ko)
+        self.assertIn("스레드 누수 (`THREAD_LEAK`)", ko)
         self.assertIn("idle_worker", ko)
         self.assertIn("스레드", build_visual_summary(res, res["report"], "ko"))
 
