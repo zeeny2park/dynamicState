@@ -377,6 +377,8 @@ class TestImp002ZeroStopDefault(_ImpTestBase):
         hits: List[str] = []
         for top in ("extractor", "scripts"):
             for dirpath, _dirs, files in os.walk(os.path.join(REPO_ROOT, top)):
+                if os.path.relpath(dirpath, REPO_ROOT).startswith(os.path.join("extractor", "web", "ui", "replay")):
+                    continue   # recorded diagnoses for the UI's replay mode: data, not source
                 for name in files:
                     if not name.endswith((".py", ".js", ".html")):
                         continue

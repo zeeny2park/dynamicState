@@ -675,7 +675,7 @@ class TestPhase28MemoryExplorerUX(unittest.TestCase):
         self.assertIn("investigation_id", inv_res["data"])
 
         # 10. Verify static web UI assets contain Phase 28 workflow markup and scripts
-        req_index = urllib.request.Request(f"http://127.0.0.1:{self.server_port}/")
+        req_index = urllib.request.Request(f"http://127.0.0.1:{self.server_port}/legacy/")
         with urllib.request.urlopen(req_index, timeout=5.0) as resp:
             html = resp.read().decode("utf-8")
         self.assertIn("tab-target-setup", html)

@@ -355,7 +355,7 @@ class TestPhase22ZeroConfigLiveCapture(unittest.TestCase):
 
     def test_html_contains_basic_three_areas_and_expert_preservation(self):
         """Index HTML defines the 3 basic areas and preserves advanced elements under .advanced-only."""
-        html = self._get_raw("/")
+        html = self._get_raw("/legacy/")
 
         # Area 1: TARGET
         self.assertIn('id="basic-target-area"', html)
@@ -389,11 +389,11 @@ class TestPhase22ZeroConfigLiveCapture(unittest.TestCase):
 
     def test_css_and_js_assets_serve_successfully(self):
         """App CSS and JS assets load without 404 and contain Phase 22 rules."""
-        css = self._get_raw("/app.css")
+        css = self._get_raw("/legacy/app.css")
         self.assertIn("basic-progress-sequence", css)
         self.assertIn(".basic-card", css)
 
-        js = self._get_raw("/app.js")
+        js = self._get_raw("/legacy/app.js")
         self.assertIn("handleBasicConnectAndAnalyze", js)
         self.assertIn("renderBasicInvestigationView", js)
         self.assertIn("btn_basic_connect_analyze", js)

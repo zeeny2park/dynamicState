@@ -125,7 +125,7 @@ class TestInvestigationUI(unittest.TestCase):
     def test_ui_static_assets_contain_investigation_views(self):
         """Verify HTML, CSS, and JS provide complete investigation overview UI elements."""
         # 1. HTML
-        status, _, body = self._get_raw("/")
+        status, _, body = self._get_raw("/legacy/")
         self.assertEqual(status, 200)
         html = body.decode("utf-8")
         self.assertIn("tab-investigation-overview", html)
@@ -289,7 +289,7 @@ class TestInvestigationUI(unittest.TestCase):
 
     def test_two_level_header_and_launchpad_ui_elements(self):
         """Verify Level 1 primary status bar, Level 2 technical bar, and Launchpad UI elements."""
-        status, _, body = self._get_raw("/")
+        status, _, body = self._get_raw("/legacy/")
         self.assertEqual(status, 200)
         html = body.decode("utf-8")
 
@@ -496,7 +496,7 @@ class TestInvestigationUI(unittest.TestCase):
     def test_capture_method_and_consistency_descriptions(self):
         """Verify UI copy and metadata accurately describe capture methods, suspension, and NON_ATOMIC warnings."""
         # 1. Verify index.html copy
-        status, _, body = self._get_raw("/")
+        status, _, body = self._get_raw("/legacy/")
         self.assertEqual(status, 200)
         html = body.decode("utf-8")
         self.assertIn("Live Target PID:", html)

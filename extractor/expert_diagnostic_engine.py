@@ -975,6 +975,12 @@ class EvidenceToSourceCorrelator:
     def __init__(self, companion_elf: Optional[str] = None, adapter: Optional[Any] = None):
         self.companion_elf = companion_elf
         self.adapter = adapter   # a remote adapter supplies /proc/<pid>/maps (a local file would be another host's)
+        self._remote_maps: Dict[int, List[Dict[str, Any]]] = {}   # per pid: the load bias does not change mid-diagnosis
+
+    def _remote_proc_maps(self, pid: int) -> List[Dict[str, Any]]:
+        if pid not in self._remote_maps:
+            self._remote_maps[pid] = list(self.adapter.get_proc_maps(pid) or [])
+        return self._remote_maps[pid]
 
     def correlate(
         self,
@@ -1032,7 +1038,7 @@ class EvidenceToSourceCorrelator:
                             elf_base = os.path.basename(self.companion_elf)
                             mappings = []
                             if remote:
-                                for m in self.adapter.get_proc_maps(target_pid) or []:
+                                for m in self._remote_proc_maps(target_pid):
                                     if elf_base in str(m.get("pathname") or ""):
                                         mappings.append({
                                             "start": m["start_int"], "end": m["end_int"],
