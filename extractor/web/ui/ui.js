@@ -579,7 +579,7 @@
     if (!s.plan && !s.verdict) return "";
     var lang = ui.lang, V = viewOf(s, lang), P = V && V.profile, body, desc = "";
     if (P && P.available) {
-      body = P.html;
+      body = '<div class="pbody dsv" lang="' + lang + '">' + P.html + "</div>";
     } else if (P) {
       body = '<p class="empty">' + esc(tr(lang, "profile_none")) + "</p>";
     } else {

@@ -320,7 +320,7 @@ def _memory_section(ev: _Evidence) -> Optional[Dict[str, Any]]:
     # integrity
     mi = ev.first("memory_integrity", _is_dict) or {}
     hp = mi.get("heap") if isinstance(mi.get("heap"), dict) else {}
-    if hp.get("status"):
+    if hp.get("status") == "COMPLETED":
         chk = hp.get("checked") if isinstance(hp.get("checked"), dict) else {}
         stacks = mi.get("stacks") if isinstance(mi.get("stacks"), dict) else {}
         used = [t.get("used_bytes") for t in stacks.get("threads") or [] if isinstance(t, dict) and _num(t.get("used_bytes")) is not None]

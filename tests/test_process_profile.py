@@ -118,6 +118,16 @@ class TestModel(unittest.TestCase):
         self.assertLessEqual(len(md.splitlines()), 20)
         self.assertIn("×", md)
 
+    def test_real_301_thread_process_is_two_rows(self):
+        p = prof("request_threads300")
+        th = p["threads"]
+        self.assertGreaterEqual(th["count"]["v"], 300)
+        self.assertEqual({r["name"] for r in th["rows"]}, {"request_threads", "req_handler"})
+        self.assertEqual(max(r["count"] for r in th["rows"]), th["count"]["v"] - 1)
+        self.assertEqual(p["memory"]["address_space"]["categories"][1]["key"], "thread_stacks")
+        self.assertEqual(p["memory"]["address_space"]["categories"][1]["count"], th["count"]["v"] - 1)
+        self.assertLessEqual(len(profile_lines(p, "ko")), 16)
+
     def test_trimmed_fixture_shows_only_what_survived(self):
         d = load("ok_idle_server", KO)
         p = build_process_profile(d, d["report"])

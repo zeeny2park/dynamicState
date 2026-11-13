@@ -460,7 +460,7 @@ details.dsv-ck > summary:hover { background: var(--accent); }
 }
 </style>
 <div class="dsv" lang="ko">
-<header class="card masthead" id="sec-masthead"><h1>dynamicState 무정지 런타임 인시던트 보고서</h1><div class="meta"><code>request_threads</code><span>·</span><span>pid 3735613</span><span>·</span><span>aarch64</span><span>·</span><span>보고서 생성 시각: 2026-11-13 14:08:05 UTC</span></div><nav><a href="#sec-target">대상</a><a href="#dsv-checks">검사</a><a href="#sec-not-examined">확인하지 못한 것</a><a href="#sec-next">다음에 할 일</a><a href="#sec-method">진단 방법과 대상에 준 영향</a><a href="#reproducibility">재현 정보</a><a href="#sec-reference">참고 자료</a></nav></header>
+<header class="card masthead" id="sec-masthead"><h1>dynamicState 무정지 런타임 인시던트 보고서</h1><div class="meta"><code>request_threads</code><span>·</span><span>pid 3735613</span><span>·</span><span>aarch64</span><span>·</span><span>보고서 생성 시각: 2026-11-13 14:15:24 UTC</span></div><nav><a href="#sec-target">대상</a><a href="#dsv-checks">검사</a><a href="#sec-not-examined">확인하지 못한 것</a><a href="#sec-next">다음에 할 일</a><a href="#sec-method">진단 방법과 대상에 준 영향</a><a href="#reproducibility">재현 정보</a><a href="#sec-reference">참고 자료</a></nav></header>
 <section class="card card-tone banner tone-skip" id="sec-conclusion"><div class="card-content"><h2 class="sr-only">결론</h2><div class="line1"><span class="badge badge-tone badge-lg">판정: 판단 불가</span><code>INCONCLUSIVE</code><span class="text-muted">검사가 답을 내지 못했습니다. 문제가 없다는 뜻이 아닙니다.</span></div><p class="sum"><code>request_threads</code> (pid 3735613)의 진단은 판단 불가입니다. 이유: 검사 10개가 실행되어 그중 8개가 결론을 냈지만 원인을 가리키는 발견은 없었습니다; 기본 검사 &#x27;관측 구간의 메모리 증가·누수&#x27;(<code>RECIPE_PROCESS_MEMORY_GROWTH</code>)이(가) 결론을 내지 못해 정상으로 판정하지 않았습니다 (엔진 원문: <code>growth observed, not established as a leak: RSS +124 KB but in-use heap +2 KB over the walks (fragmentation, file / anonymous mappings outside malloc, or allocator caching)</code>).</p><details class="collapsible dsv-detail" id="verdict-detail"><summary>판정 근거 상세 (상세 기록, 영문)</summary><div class="dsv-detail-body in" lang="en"><h4>A. Executive Summary</h4>
 <p><strong>Overall Result:</strong> <span class="badge badge-tone tone-warn mono">INCONCLUSIVE</span> &nbsp;&nbsp; <strong>Target:</strong> PID 3735613 (/tmp/cap_kkqim69j/request_threads)</p>
 <p><strong>Problem Statement:</strong> the thread count of this process is going up all the time</p>
@@ -592,7 +592,7 @@ collector_max_rss_kb: None
 impact_notes: [&quot;local target: attributable_cpu_ms is the diagnosing process&#x27;s CPU in the window (upper bound of the read cost, includes analysis)&quot;, &quot;target.* is the target&#x27;s own activity during the window (delta); it is not caused by the diagnosis, which never stops the target in zero-stop mode. Cost of the diagnosis is under diagnosis_attributable.&quot;]</pre></div><!--/dsv-detail-body--></details></div></section>
 <section class="card" id="reproducibility"><div class="card-header"><h2 class="card-title">재현 정보</h2></div><div class="card-content"><p>이 진단을 다시 설명하는 데 필요한 정보입니다. 엔진이 기록하지 못한 값은 알 수 없음으로 표시합니다.</p>
 <ul>
-<li>dynamicState 버전 / 커밋: <code>0.1.0 / bf236d518db6</code></li>
+<li>dynamicState 버전 / 커밋: <code>0.1.0 / 97e4a14ea0fa</code></li>
 <li>관측 구간: 2026-11-13 07:01:00 UTC ~ 2026-11-13 07:01:21 UTC, 표본 간격 0.05초, 계획한 관측 시간 1.0초</li>
 <li>실행한 검사와 레시피 버전: 10개 (9개는 <code>1.0.0</code>; <code>2.0.0</code>: 이중 해제 (<code>RECIPE_DOUBLE_FREE</code>))</li>
 <li>검사별 실행 순서, 레시피 버전, 시작 시각, 걸린 시간은 HTML 보고서의 상세 블록과 JSON (<code>reproducibility.recipes</code>)에 있습니다.</li>

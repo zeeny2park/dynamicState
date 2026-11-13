@@ -498,7 +498,7 @@ def profile_html(prof: Dict[str, Any], lang: str, uid: str = "profile") -> str:
         ml = memory_lines(lx, mem)
         inner = bullets(ml)
         rss = mem.get("rss") or {}
-        if len(rss.get("series") or []) >= 2:
+        if len(rss.get("series") or []) >= 2 and min(rss["series"]) != max(rss["series"]):   # a flat line says nothing
             inner += _chart(lx, rss["series"], "m_chart", "m_chart_x", "m_chart_y", " KB")
         asp = mem.get("address_space")
         if asp:
