@@ -14,6 +14,11 @@ Rules:
 
 - `baseline=True` runs the check in every diagnosis: it must be cheap, read-only and zero-stop, and it must be able
   to return CONTRADICTED on a healthy process, because a baseline check that cannot decide blocks a HEALTHY verdict.
+- A recipe whose rule reads values that no collector of a zero-stop diagnosis fills in (a malloc/free history, a caller's
+  value range, a consistent snapshot of running threads) declares `requires_capabilities=(CAP_...,)` and an
+  `unsupported_question`; the planner then leaves it out and the report lists the question as "not examined"
+  (`unsupported_in_mode`). A baseline recipe cannot declare one. `tests/test_unsupported_recipes.py` fails when a plannable
+  recipe is inconclusive on every live fixture, or when a declared one gains a producer for its decisive inputs.
 - A rule decides only from what was observed. Not enough evidence is INSUFFICIENT_EVIDENCE, never CONTRADICTED.
 - A SUPPORTED result is a fault finding unless its details say otherwise: `certainty_cap: "PROBABLE"` caps it at
   probable, `finding_severity: "WARNING"` makes it a warning, and `finding_severity: "INFO"` marks a degradation that is

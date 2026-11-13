@@ -27,7 +27,8 @@ A diagnosis is HEALTHY only if ALL of the following hold:
    features unsupported on the target ABI that no baseline check needed (``unsupported_on_target``), the heap cap
    above, long waits in syscalls whose expectedness cannot be judged from outside (``long_wait_not_judged``),
    leak-owner attribution limits when the leak check itself cleared, remote-target limits, symptom-specific
-   (non-baseline) checks that reached no result, and recipes not planned for the symptom.
+   (non-baseline) checks that reached no result, recipes not planned for the symptom, and the questions of recipes
+   this mode cannot execute (``unsupported_in_mode``: declared ``requires_capabilities``, left out of the plan).
 
 Symptom-specific checks never gate HEALTHY (a FAIL still does, through rule 2): their scope is the symptom, the
 HEALTHY scope is the baseline.  Defect classes no baseline check looks for (data races, logic errors) and the
