@@ -5338,7 +5338,13 @@ class DynamicStateRequestHandler(http.server.BaseHTTPRequestHandler):
         # The root UI: extractor/web/ui/ by default, or the directory the server was started with.
         rel_path = "index.html" if not path or path == "/" else (
             path[len("/static/"):] if path.startswith("/static/") else path.lstrip("/"))
+        if not explicit and os.path.splitext(rel_path)[1].lower() not in self._UI_STATIC_TYPES:
+            # extractor/web/ui/ also holds the server-side view builder (view.py) and its caches: only page assets
+            self.send_error(404, "File not found")
+            return
         self._send_static_file(self.server.static_dir, rel_path, spa_fallback=explicit)
+
+    _UI_STATIC_TYPES = frozenset({".html", ".css", ".js", ".json", ".svg", ".png", ".ico"})
 
     def _send_static_file(self, static_dir: str, rel_path: str, spa_fallback: bool = False) -> None:
         tok = getattr(self.server, "session_token", "")
