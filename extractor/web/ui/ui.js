@@ -25,7 +25,7 @@
       elf_label: "디버그 ELF", elf_ph: "디버그 ELF 경로 (선택 · 기본 /proc/PID/exe)",
       host_ph: "호스트 (예: 192.168.1.50)", user_ph: "사용자 (선택)", port_ph: "포트 (22)",
       key_ph: "SSH 키 파일 경로 (선택)",
-      opt_line: "읽기 전용 · 대상 정지 없음 · 기본 시간 예산 20 s", advanced: "고급 옵션", budget_label: "시간 예산 (초)",
+      opt_line: "읽기 전용 · 대상 정지 없음 · 기본 시간 예산 20초", advanced: "고급 옵션", budget_label: "시간 예산 (초)",
       need_target: "PID 또는 프로세스 이름을 입력하세요.", need_host: "SSH 호스트를 입력하세요.",
       recent_h: "최근 진단", examples_h: "예시 진단 (저장된 결과 재생)", recent_none: "아직 진단한 기록이 없습니다.",
       recent_unreachable: "서버에 연결할 수 없어 최근 진단을 불러오지 못했습니다.",
@@ -39,7 +39,7 @@
       so_far_clean: "검사를 마쳤습니다. 판정을 정리하는 중…",
       verdict_prefix: "판정", verdict_detail: "판정 근거 상세 기록",
       tile_checks: "검사", tile_stop: "대상 정지 시간", tile_bytes: "읽은 데이터", tile_time: "소요 시간",
-      after_plan: "계획 후 표시", never_stopped: "한 번도 멈추지 않음", budget: "예산 {s} s",
+      after_plan: "계획 후 표시", never_stopped: "한 번도 멈추지 않음", budget: "예산 {s}초",
       target_h: "대상", target_desc: "연결됨 · 읽기 전용",
       k_proc: "프로세스", k_arch: "아키텍처", k_exe: "실행 파일", k_build: "Build ID", k_debug: "디버그 정보",
       k_transport: "전송", match: "일치", mismatch: "불일치", debug_none: "없음 (심볼만 사용)",
@@ -66,7 +66,7 @@
       impact: "수집이 대상에 준 영향: 정지 {stop} · 읽기 {bytes} · {time} · 쓰기 없음", method_detail: "수집 방법 상세 기록",
       no_report: "보고서 파일이 없습니다.",
       err_TARGET_NOT_FOUND: "프로세스를 찾을 수 없습니다: {target}. PID나 프로세스 이름을 확인하세요.",
-      err_AMBIGUOUS_TARGET: "이름이 같은 프로세스가 여럿입니다: {target}. PID로 지정하세요.",
+      err_AMBIGUOUS_TARGET: "‘{target}’에 맞는 프로세스가 여럿입니다 ({message}). PID로 지정하세요.",
       err_PERMISSION_DENIED: "이 프로세스를 읽을 권한이 없습니다. 대상과 같은 사용자로 서버를 실행하거나 ptrace 권한(CAP_SYS_PTRACE, ptrace_scope)을 확인하세요.",
       err_TARGET_EXITED: "진단 중에 대상 프로세스가 종료되었습니다. 그때까지 읽은 결과만 남습니다.",
       err_BUSY: "이미 다른 진단이 실행 중입니다. 끝난 뒤 다시 시도하세요.",
@@ -79,7 +79,12 @@
       conn_lost: "서버와 연결이 끊겼습니다. 진단은 서버에서 계속되고 있을 수 있습니다.", reconnect: "다시 연결",
       replay_label: "재생", replay_again: "다시 재생", replay_note: "저장된 진단 결과를 재생 중 (실제 프로세스가 아님)",
       ago_now: "방금", ago_min: "{n}분 전", ago_hour: "{n}시간 전", ago_day: "어제", ago_days: "{n}일 전",
-      live_phase: "{phase} 단계", live_finding: "발견 {n}: {label} 의심", live_verdict: "판정: {word}"
+      live_phase: "{phase} 단계", live_finding: "발견 {n}: {label} 의심", live_verdict: "판정: {word}",
+      refuted: "반박된 경쟁 가설:", err_TOO_MANY_JOBS: "동시에 실행할 수 있는 진단 수(4)를 넘었습니다. 하나가 끝난 뒤 다시 시도하세요.",
+      /* verdict words for places that have no view (recent list, a verdict without a view): the report's words
+         (human_report.T v_*), kept equal by tests/test_web_ui_static.py */
+      v_CONFIRMED_FAULT: "확인된 결함", v_PROBABLE_FAULT: "결함 추정", v_FAULT: "결함 추정", v_DEGRADED: "성능 저하 (결함 아님)",
+      v_HEALTHY: "점검한 범위 안에서 정상", v_INCONCLUSIVE: "판단 불가", v_ABORTED: "중단됨"
     },
     en: {
       title: "dynamicState · Diagnose", brand_sub: "diagnose", skip: "Skip to content",
@@ -137,7 +142,7 @@
       impact: "Impact of the collection on the target: stopped {stop} · read {bytes} · {time} · no writes",
       method_detail: "Detailed records of the method", no_report: "No report file.",
       err_TARGET_NOT_FOUND: "No such process: {target}. Check the PID or the process name.",
-      err_AMBIGUOUS_TARGET: "Several processes have that name: {target}. Give a PID.",
+      err_AMBIGUOUS_TARGET: "Several processes match ‘{target}’ ({message}). Give a PID.",
       err_PERMISSION_DENIED: "Not allowed to read this process. Run the server as the target's user, or check the ptrace permission (CAP_SYS_PTRACE, ptrace_scope).",
       err_TARGET_EXITED: "The target process exited during the diagnosis. Only what was read until then remains.",
       err_BUSY: "Another diagnosis is already running. Try again when it ends.",
@@ -150,7 +155,11 @@
       conn_lost: "Lost the connection to the server. The diagnosis may still be running there.", reconnect: "Reconnect",
       replay_label: "Replay", replay_again: "Play again", replay_note: "Replaying a saved diagnosis (not a live process)",
       ago_now: "just now", ago_min: "{n} min ago", ago_hour: "{n} h ago", ago_day: "yesterday", ago_days: "{n} days ago",
-      live_phase: "{phase}", live_finding: "Finding {n}: {label} suspected", live_verdict: "Verdict: {word}"
+      live_phase: "{phase}", live_finding: "Finding {n}: {label} suspected", live_verdict: "Verdict: {word}",
+      refuted: "Competing hypotheses refuted:", err_TOO_MANY_JOBS: "Too many diagnoses at once (limit 4). Try again when one ends.",
+      v_CONFIRMED_FAULT: "confirmed fault", v_PROBABLE_FAULT: "probable fault", v_FAULT: "probable fault",
+      v_DEGRADED: "degraded, not a fault", v_HEALTHY: "healthy within the checked scope", v_INCONCLUSIVE: "could not decide",
+      v_ABORTED: "aborted"
     }
   };
   var ICON = { FAIL: "✖", INCONCLUSIVE: "?", PASS: "✔", SKIPPED: "–", RUNNING: "", PENDING: "" };
@@ -217,10 +226,50 @@
     return out.map(function (x) { return x.e; });
   }
 
+  /* one event, whatever its wire shape: the server's envelope {seq, ts, type, data:{...}} (API_CONTRACT.md 3) or a flat
+     object (replay files); field names of the contract are mapped onto the names the renderer uses */
+  function norm(e) {
+    var d = e.data && typeof e.data === "object" && !Array.isArray(e.data) ? e.data : null;
+    var x = {}, k;
+    if (d) for (k in d) x[k] = d[k];
+    for (k in e) if (k !== "data" || !d) x[k] = e[k];
+    if (x.recipe_id && !x.rid) x.rid = x.recipe_id;
+    switch (x.type) {
+      case "target":
+        x.architecture = x.architecture || (x.abi && x.abi.architecture) || x.arch || null;
+        x.libc = x.libc || (x.abi && x.abi.libc) || null;
+        x.libc_version = x.libc_version || (x.abi && x.abi.libc_version) || null;
+        if (x.threads == null) x.threads = x.thread_count;
+        x.debug_image = x.debug_image || x.companion_elf_path || null;
+        if (x.debug_info == null && x.dwarf_available != null) x.debug_info = x.dwarf_available;
+        if (x.remote_host == null && x.transport === "ssh") x.remote_host = x.target_host;
+        break;
+      case "classified":
+        x.symptom = x.symptom || x.problem_statement || null;
+        if (x.hypotheses == null) x.hypotheses = x.competing_hypotheses_count;
+        break;
+      case "plan":
+        if (!x.checks && x.steps) x.checks = x.steps.map(function (st) {
+          return { rid: st.recipe_id, name: st.label || st.name, domain: st.domain, domain_label: st.domain_label };
+        });
+        break;
+      case "check_done":
+        if (x.line == null && x.summary != null) x.line = x.summary;
+        break;
+      case "verdict":
+        if (!x.report_url && x.report_urls && x.report_urls.html) x.report_url = x.report_urls.html + "&lang={lang}";
+        if (!x.human_summary && x.result && x.result.human_summary) x.human_summary = x.result.human_summary;
+        break;
+      default: break;
+    }
+    return x;
+  }
+
   function reduce(events, request) {
     var s = { request: request || null, target: null, classified: null, plan: null, order: [], checks: {},
-      skipped: { not_planned: [], not_in_mode: [] }, findings: [], verified: false, verdict: null, error: null,
-      lastSeq: 0, t: 0, bytes: null, count: 0 };
+      skipped: { not_planned: [], not_in_mode: [] }, findings: [], refuted: [], verified: false, verdict: null, error: null,
+      lastSeq: 0, t: 0, ts0: null, bytes: null, count: 0 };
+    var keys = [];                                   // provisional findings without a number: numbered by first sight
     function check(rid) {
       if (!s.checks[rid]) { s.checks[rid] = { rid: rid, status: "PENDING" }; s.order.push(rid); }
       return s.checks[rid];
@@ -232,10 +281,13 @@
       s.findings.sort(function (a, b) { return a.n - b.n; });
       return f;
     }
-    sortEvents(events).forEach(function (e) {
+    sortEvents(events).forEach(function (raw) {
+      var e = norm(raw);
       s.count++;
       if (e.seq != null && e.seq > s.lastSeq) s.lastSeq = e.seq;
-      if (typeof e.t === "number" && e.t > s.t) s.t = e.t;
+      var tt = typeof e.t === "number" ? e.t : null;
+      if (tt == null && e.ts) { var ms = Date.parse(e.ts); if (isFinite(ms)) { if (s.ts0 == null) s.ts0 = ms; tt = ms - s.ts0; } }
+      if (tt != null && tt > s.t) s.t = tt;
       if (typeof e.bytes_read === "number") s.bytes = Math.max(s.bytes || 0, e.bytes_read);
       switch (e.type) {
         case "target": s.target = e; break;
@@ -245,43 +297,58 @@
           var before = s.order.slice();      // checks heard of before the plan keep their place after the plan's
           s.order = [];
           (e.checks || []).forEach(function (c) {
+            if (!c.rid || s.order.indexOf(c.rid) >= 0) return;
             var k = s.checks[c.rid] || (s.checks[c.rid] = { rid: c.rid, status: "PENDING" });
             k.name = c.name; k.domain_label = c.domain_label; k.domain = c.domain;
             s.order.push(c.rid);
           });
           before.forEach(function (rid) { if (s.order.indexOf(rid) < 0) s.order.push(rid); });
-          s.skipped = { not_planned: e.not_planned || [], not_in_mode: e.not_in_mode || [] };
+          var withRid = function (c) { return c.rid ? c : Object.assign({ rid: c.recipe_id }, c); };
+          s.skipped = { not_planned: (e.not_planned || []).map(withRid), not_in_mode: (e.not_in_mode || []).map(withRid) };
           break;
         case "check_start": {
+          if (!e.rid) break;
           var c1 = check(e.rid);
           if (c1.status === "PENDING") c1.status = "RUNNING";
+          if (!c1.name && e.name) c1.name = e.name;
           break;
         }
         case "check_done": {
+          if (!e.rid) break;
           var c2 = check(e.rid);
           c2.status = groupOf(e.status); c2.raw = e.status;
           if (e.duration_ms != null) c2.ms = e.duration_ms;
           if (e.line != null) c2.line = e.line;
+          if (!c2.name && e.name) c2.name = e.name;
           break;
         }
         case "finding_provisional": {
-          var f = finding(e.n);
-          f.category = e.category; f.label = e.label; f.severity = e.severity; f.recipe_ids = e.recipe_ids || [];
+          var key = e.n != null ? "n" + e.n : String(e.key || e.category || "");
+          if (keys.indexOf(key) < 0) keys.push(key);
+          var f = finding(e.n != null ? e.n : keys.indexOf(key) + 1);
+          f.category = e.category; f.label = e.label || e.category_label; f.severity = e.severity;
+          f.recipe_ids = e.recipe_ids || (e.recipe_id ? [e.recipe_id] : []);
           break;
         }
         case "verified":
           s.verified = true;
           (e.findings || []).forEach(function (x) { var g = finding(x.n); g.verified = true; g.status = x.status; });
+          (e.hypotheses || []).forEach(function (h) {
+            s.findings.forEach(function (g) {
+              if (g.category === h.category) { g.verified = true; g.status = h.status === "CONFIRMED" ? "CONFIRMED_ROOT_CAUSE" : "PROBABLE_CAUSE"; }
+            });
+          });
+          s.refuted = (e.rejected || []).map(function (h) { return h.category; }).filter(Boolean);
           break;
         case "verdict": s.verdict = e; break;
         case "error": s.error = e; break;
         default: break;
       }
     });
-    /* the verdict is authoritative for every check's outcome */
-    var V = s.verdict;
-    if (V && V.result && V.result.checks_run) {
-      V.result.checks_run.forEach(function (c) {
+    /* the verdict is authoritative for every check's outcome and for the findings */
+    var V = s.verdict, R = V && V.result;
+    if (R && R.checks_run) {
+      R.checks_run.forEach(function (c) {
         if (!c.recipe_id) return;
         var k = check(c.recipe_id);
         k.status = groupOf(c.status); k.raw = c.status;
@@ -295,8 +362,19 @@
       (anyView.checks || []).forEach(function (c) {
         if (c.kind === "not_executed" && s.checks[c.rid]) s.checks[c.rid].status = "SKIPPED";
       });
-      (anyView.findings || []).forEach(function (vf) {
-        var f = finding(vf.n); f.category = f.category || vf.category; f.status = vf.status; f.verified = true;
+    } else if (R && R.not_covered && !s.skipped.not_planned.length && !s.skipped.not_in_mode.length) {
+      R.not_covered.forEach(function (n) {                   // no view: the not-run groups straight from not_covered
+        var ids = String(n.item || "").split(",").map(function (x) { return x.trim(); }).filter(Boolean);
+        if (n.kind === "recipes_not_planned") ids.forEach(function (r) { if (!s.checks[r]) s.skipped.not_planned.push({ rid: r }); });
+        if (n.kind === "unsupported_in_mode") ids.forEach(function (r) { if (!s.checks[r]) s.skipped.not_in_mode.push({ rid: r, capability: n.capability }); });
+      });
+    }
+    if (R && Array.isArray(R.findings)) {
+      var prov = s.findings;
+      s.findings = R.findings.map(function (rf, i) {
+        var p = prov.filter(function (x) { return x.category === rf.category; })[0] || {};
+        return { n: i + 1, category: rf.category, status: rf.status, severity: rf.severity, verified: true, label: p.label,
+          recipe_ids: rf.recipe_ids || p.recipe_ids || [], description: rf.description, observed: rf.observed || [] };
       });
     }
     s.phase = phaseOf(s);
@@ -351,17 +429,47 @@
     return L(f.label, lang) || f.category || "";
   }
 
+  var VTONE = { CONFIRMED_FAULT: "fail", FAULT: "fail", PROBABLE_FAULT: "warn", DEGRADED: "warn", HEALTHY: "pass" };
+  function verdictWord(code, lang) {
+    var w = tr(lang, "v_" + code);
+    return w === "v_" + code ? code : w;
+  }
+  function mdInline(t) {
+    return esc(t).replace(/`([^`]+)`/g, "<code>$1</code>").replace(/\*\*([^*]+)\*\*/g, "<b>$1</b>");
+  }
+  /* without a view: the conclusion sentence of the human summary (Markdown: verdict line, blank, conclusion) */
+  function conclusionFromSummary(v) {
+    var md = typeof v.human_summary === "string" ? v.human_summary : "";
+    var lines = md.split("\n"), i = 0;
+    while (i < lines.length && !/^\*\*/.test(lines[i])) i++;
+    for (i++; i < lines.length; i++) if (lines[i].trim()) return /^#/.test(lines[i]) ? "" : mdInline(lines[i].trim());
+    return "";
+  }
+  /* the four tiles' final values: the view's, else computed from the result */
+  function tilesOf(s, lang) {
+    var V = viewOf(s, lang);
+    if (V) return V.tiles;
+    var R = s.verdict && s.verdict.result;
+    if (!R) return {};
+    var ci = R.collection_impact || {}, out = {};
+    if (typeof ci.measured_stop_ms === "number") out.stop = { value: fmtMs(ci.measured_stop_ms, lang), note: ci.measured_stop_ms === 0 && ci.zero_stop ? tr(lang, "never_stopped") : "" };
+    if (typeof ci.bytes_read === "number") out.bytes = { value: fmtBytes(ci.bytes_read), note: ci.impact_transport || "" };
+    if (typeof R.duration_s === "number") out.duration = { value: fmtMs(R.duration_s * 1000, lang) };
+    return out;
+  }
+
   function renderBanner(s, ui) {
     var lang = ui.lang, V = viewOf(s, lang), v = s.verdict, idx = PHASES.indexOf(s.phase), n = counts(s);
     var html, tone;
     if (v) {
-      tone = V ? V.tone : "skip";
       var code = v.result && v.result.verdict || (V && V.verdict) || "";
+      tone = V ? V.tone : VTONE[code] || "skip";
+      var T0 = tilesOf(s, lang);
       html = '<div class="line1"><span class="badge badge-tone badge-lg">' + esc(tr(lang, "verdict_prefix")) + ": " +
-        esc(V ? V.verdict_word : code) + "</span>" + '<span class="phase"><code>' + esc(code) + "</code>" +
+        esc(V ? V.verdict_word : verdictWord(code, lang)) + "</span>" + '<span class="phase"><code>' + esc(code) + "</code>" +
         (V ? " · " + esc(V.verdict_meaning) : "") + "</span>" +
-        '<span class="elapsed">' + esc(V && V.tiles.duration ? V.tiles.duration.value : fmtMs(ui.elapsed, lang)) + "</span></div>" +
-        '<p class="sum">' + (V ? V.conclusion_html : esc(v.result && v.result.summary || "")) + "</p>" +
+        '<span class="elapsed">' + esc(T0.duration ? T0.duration.value : fmtMs(ui.elapsed, lang)) + "</span></div>" +
+        '<p class="sum">' + (V ? V.conclusion_html : conclusionFromSummary(v) || esc(v.result && v.result.summary || "")) + "</p>" +
         (V && V.symptom_html.length ? V.symptom_html.map(function (x) { return '<p class="note">' + x + "</p>"; }).join("") : "") +
         link(reportHref(s, ui, "verdict-detail"), tr(lang, "verdict_detail"));
     } else {
@@ -416,23 +524,25 @@
       "</div>" + (extra || "") + '<div class="s">' + sub + "</div></div>";
   }
   function renderTiles(s, ui) {
-    var lang = ui.lang, V = viewOf(s, lang), n = counts(s), T = V && V.tiles;
-    var ran = T ? T.checks.value : s.plan ? n.total : null;
-    var cnt = T ? { FAIL: T.checks.counts.found, INCONCLUSIVE: T.checks.counts.undecided, PASS: T.checks.counts.clean,
+    var lang = ui.lang, n = counts(s), T = tilesOf(s, lang);
+    if (!T.checks) T = { checks: null, stop: T.stop, bytes: T.bytes, duration: T.duration };
+    var ran = T.checks ? T.checks.value : (s.plan || s.verdict) ? n.total : null;
+    var cnt = T.checks ? { FAIL: T.checks.counts.found, INCONCLUSIVE: T.checks.counts.undecided, PASS: T.checks.counts.clean,
       notrun: T.checks.counts.not_run } : n;
-    var denom = Math.max(1, (T ? T.checks.counts.run : n.total));
-    var bar = (s.plan || T) ? '<div class="progress-stack" aria-hidden="true">' + ["FAIL", "INCONCLUSIVE", "PASS"].map(function (st) {
+    var denom = Math.max(1, (T.checks ? T.checks.counts.run : n.total - n.SKIPPED));
+    if (!T.checks && s.verdict) ran = n.total - n.SKIPPED;
+    var bar = ran != null ? '<div class="progress-stack" aria-hidden="true">' + ["FAIL", "INCONCLUSIVE", "PASS"].map(function (st) {
       return '<i class="s-' + st + '" style="width:' + (100 * cnt[st] / denom).toFixed(1) + '%"></i>';
     }).join("") + "</div>" : "";
-    var sub1 = (s.plan || T) ? '<span title="' + esc(tr(lang, "st_FAIL")) + '">✖ ' + cnt.FAIL + '</span> · <span title="' + esc(tr(lang, "st_INCONCLUSIVE")) + '">? ' + cnt.INCONCLUSIVE +
+    var sub1 = ran != null ? '<span title="' + esc(tr(lang, "st_FAIL")) + '">✖ ' + cnt.FAIL + '</span> · <span title="' + esc(tr(lang, "st_INCONCLUSIVE")) + '">? ' + cnt.INCONCLUSIVE +
       '</span> · <span title="' + esc(tr(lang, "st_PASS")) + '">✔ ' + cnt.PASS + '</span> · <span title="' + esc(tr(lang, "st_SKIPPED")) + '">– ' + cnt.notrun + "</span>"
       : esc(tr(lang, "after_plan"));
     var tg = s.target;
-    var stopV = T && T.stop ? T.stop.value : tg && typeof tg.stop_ms === "number" ? fmtMs(tg.stop_ms, lang) : tg && tg.zero_stop ? "0 ms" : "—";
-    var stopS = T && T.stop ? T.stop.note : tg && (tg.zero_stop || tg.stop_ms === 0) ? tr(lang, "never_stopped") : "";
-    var bytesV = T && T.bytes ? T.bytes.value : s.bytes != null ? fmtBytes(s.bytes) : "—";
+    var stopV = T.stop ? T.stop.value : tg && typeof tg.stop_ms === "number" ? fmtMs(tg.stop_ms, lang) : tg && tg.zero_stop ? "0 ms" : "—";
+    var stopS = T.stop ? T.stop.note : tg && (tg.zero_stop || tg.stop_ms === 0) ? tr(lang, "never_stopped") : "";
+    var bytesV = T.bytes ? T.bytes.value : s.bytes != null ? fmtBytes(s.bytes) : "—";
     var tp = tg && tg.transport ? (tg.transport === "ssh" ? tr(lang, "transport_ssh") : tg.transport === "local" ? tr(lang, "transport_local") : tg.transport) : "";
-    var timeV = T && T.duration ? T.duration.value : (s.count || ui.started) ? fmtMs(ui.elapsed, lang) : "—";
+    var timeV = T.duration ? T.duration.value : (s.count || ui.started) ? fmtMs(ui.elapsed, lang) : "—";
     var budget = s.plan && s.plan.budget_s ? tr(lang, "budget", { s: s.plan.budget_s }) : "";
     return '<div class="tiles" id="tiles">' +
       tile(tr(lang, "tile_checks"), ran == null ? "—" : ran, sub1, bar, ran == null) +
@@ -484,6 +594,10 @@
       if (vf) {
         inner = '<div class="fbody dsv" lang="' + lang + '" data-static="f' + f.n + "-" + lang + '">' + vf.body_html + "</div>" +
           link(reportHref(s, ui, vf.anchor), tr(lang, "f_detail"));
+      } else if (s.verdict) {          // no view from the server: the result's own words (engine English)
+        inner = '<div class="prose" lang="en">' + (f.description ? "<p>" + esc(f.description) + "</p>" : "") +
+          (f.observed.length ? '<ul>' + f.observed.slice(0, 4).map(function (o) { return "<li>" + esc(o) + "</li>"; }).join("") + "</ul>" : "") + "</div>" +
+          link(reportHref(s, ui, "finding-" + f.n + "-detail"), tr(lang, "f_detail"));
       } else {
         var by = (f.recipe_ids || []).filter(function (r) { return s.checks[r] && s.checks[r].status === "FAIL"; });
         inner = '<div class="fpend"><div class="skeleton" aria-hidden="true"></div><div><p>' + esc(tr(lang, "f_pending")) + "</p>" +
@@ -493,8 +607,13 @@
       }
       body += '<article class="finding" id="finding-' + f.n + '"><div class="fhead"><h3>' + head + "</h3>" + badge +
         (sev ? '<span class="badge badge-outline">' + esc(tr(lang, "sev", { s: sev })) + "</span>" : "") +
-        (f.category ? '<span class="badge badge-outline mono">' + esc(f.category) + "</span>" : "") + "</div>" + inner + "</article>";
+        (f.category && !vf ? '<span class="badge badge-outline mono">' + esc(f.category) + "</span>" : "") + "</div>" + inner + "</article>";
     });
+    if (s.refuted.length && list.length) {
+      body += '<p class="text-xs text-muted" style="margin:10px 0 0">' + esc(tr(lang, "refuted")) + " " + s.refuted.map(function (c) {
+        return '<span class="badge badge-outline mono">' + esc(c) + "</span>";
+      }).join(" ") + "</p>";
+    }
     return '<section class="card" id="findings" aria-labelledby="h-findings"><div class="card-header"><h2 class="card-title" id="h-findings">' +
       esc(tr(lang, "findings_h")) + '</h2><span class="card-description">' + (list.length || (s.verdict ? "0" : "—")) + "</span></div>" +
       '<div class="card-content">' + body + "</div></section>";
@@ -561,21 +680,34 @@
     var ns = (und.length ? '<ul class="ul">' + und.map(function (r) {
       var line = vmap[r] ? vmap[r].line : L(s.checks[r].line, lang);
       return "<li>" + esc(checkName(s, r, lang)) + (line ? ' <span class="why">— ' + esc(line) + "</span>" : "") + "</li>";
-    }).join("") + "</ul>" : "") + (V && V.not_examined_html ? '<div class="prose">' + V.not_examined_html + "</div>" : "");
-    var nsCount = und.length + (V && V.not_examined_html ? (V.not_examined_html.match(/<li>/g) || []).length : 0);
+    }).join("") + "</ul>" : "");
+    var other = V ? V.not_examined_html || "" : "";
+    if (!V && v.result && v.result.not_covered) {        // no view: the result's not_covered entries that are not about one check
+      var rest = v.result.not_covered.filter(function (n) {
+        var k = String(n.kind || "");
+        return k.indexOf("check_") !== 0 && k !== "recipes_not_planned" && k !== "unsupported_in_mode";
+      });
+      if (rest.length) other = '<ul lang="en">' + rest.map(function (n) { return "<li><code>" + esc(n.kind) + "</code> " + esc(n.reason || n.item || "") + "</li>"; }).join("") + "</ul>";
+    }
+    if (other) ns += '<div class="prose">' + other + "</div>";
+    var nsCount = und.length + (other.match(/<li>/g) || []).length;
     var out = '<section class="card" id="notseen" aria-labelledby="h-notseen"><div class="card-header"><h2 class="card-title" id="h-notseen">' +
       esc(tr(lang, "notseen_h")) + '</h2><span class="card-description">' + nsCount + '</span><span class="right">' + esc(tr(lang, "notseen_right")) +
       '</span></div><div class="card-content">' + (ns || '<p class="empty">' + esc(tr(lang, "notseen_none")) + "</p>") + "</div></section>";
     out += '<section class="card" id="next" aria-labelledby="h-next"><div class="card-header"><h2 class="card-title" id="h-next">' + esc(tr(lang, "next_h")) +
       '</h2></div><div class="card-content">' + (V && V.next_html ? '<div class="prose">' + V.next_html + "</div>" : '<p class="empty">' + esc(tr(lang, "next_none")) + "</p>") + "</div></section>";
-    var T = V && V.tiles, href = reportHref(s, ui, "");
-    var md = v.human_summary && (L(v.human_summary, lang)), js = !!v.result;
+    var T = tilesOf(s, lang), href = reportHref(s, ui, "");
+    var urls = v.report_urls || {};
+    var mdHref = urls.md ? urls.md + "&lang=" + lang : "", jsHref = urls.json || "";
+    var md = mdHref || (v.human_summary && L(v.human_summary, lang)), js = jsHref || !!v.result;
     out += '<section class="card" id="report" aria-labelledby="h-report"><div class="card-header"><h2 class="card-title" id="h-report">' + esc(tr(lang, "report_h")) +
       '</h2><span class="card-description">' + esc(tr(lang, "report_desc")) + '</span></div><div class="card-footer" style="padding-top:12px">' +
       (href ? '<a class="btn" href="' + esc(href) + '" target="_blank" rel="noopener" style="text-decoration:none">' + esc(tr(lang, "open_html")) + "</a>"
         : '<button type="button" class="btn" disabled>' + esc(tr(lang, "open_html")) + "</button>") +
-      (md ? '<button type="button" class="btn btn-outline" data-act="md">' + esc(tr(lang, "md")) + "</button>" : "") +
-      (js ? '<button type="button" class="btn btn-outline" data-act="json">' + tr(lang, "json") + "</button>" : "") +
+      (mdHref ? '<a class="btn btn-outline" href="' + esc(mdHref) + '" target="_blank" rel="noopener" style="text-decoration:none">' + esc(tr(lang, "md")) + "</a>"
+        : md ? '<button type="button" class="btn btn-outline" data-act="md">' + esc(tr(lang, "md")) + "</button>" : "") +
+      (jsHref ? '<a class="btn btn-outline" href="' + esc(jsHref) + '" target="_blank" rel="noopener" style="text-decoration:none">' + tr(lang, "json") + "</a>"
+        : js ? '<button type="button" class="btn btn-outline" data-act="json">' + tr(lang, "json") + "</button>" : "") +
       '<button type="button" class="btn btn-outline" data-act="copy">' + esc(tr(lang, "copy")) + "</button>" +
       (s.request ? '<button type="button" class="btn btn-ghost" data-act="again">' + esc(tr(lang, "again")) + "</button>" : "") +
       '</div><div class="card-content" style="padding-top:0"><p class="impact">' +
@@ -615,8 +747,6 @@
     var d = Math.round(h / 24);
     return d <= 1 ? tr(lang, "ago_day") : tr(lang, "ago_days", { n: d });
   }
-  var VTONE = { CONFIRMED_FAULT: "fail", FAULT: "fail", PROBABLE_FAULT: "warn", DEGRADED: "warn", HEALTHY: "pass" };
-
   /* idle: the title line, the form, the recent diagnoses (or the examples when there is no server) */
   function renderIdle(ui) {
     var lang = ui.lang, f = ui.form || {}, ssh = f.mode === "ssh";
@@ -628,8 +758,9 @@
     var jobs = ui.jobs || [];
     if (jobs.length) {
       recent = "<h3>" + esc(tr(lang, "recent_h")) + "</h3>" + jobs.map(function (j) {
-        var tg = j.target || {};
-        var word = L(j.verdict_word, lang) || (j.state === "running" ? tr(lang, "running") : j.verdict || j.state || "");
+        var tg = j.target || { pid: j.pid, process_name: j.target_name, remote_host: j.remote_host };
+        var word = L(j.verdict_word, lang) || (j.state === "running" ? tr(lang, "running") : j.verdict ? verdictWord(j.verdict, lang)
+          : j.state === "error" ? tr(lang, "aborted") : j.state || "");
         var tone = j.state === "running" ? "info" : VTONE[j.verdict] || "skip";
         return '<a class="card it" href="?job=' + encodeURIComponent(j.job_id) + '" data-act="open-job" data-job="' + esc(j.job_id) + '">' +
           '<span class="badge badge-tone tone-' + tone + '">' + esc(word) + '</span><span class="n">' + esc(tg.process_name || tg.pid || "?") +
@@ -717,16 +848,16 @@
   /* morph: bring the live node `a` to the new node `b` in place, so what is on screen keeps its node (focus, the
      picture's step radios, a <details> the reader opened); new children are inserted where they belong */
   function keyOf(n) { return n.nodeType === 1 ? (n.id || n.getAttribute("data-k") || "") : ""; }
-  function morph(a, b) {
+  function morph(a, b, childrenOnly) {
     if (a.nodeType === 3 || a.nodeType === 8) { if (a.nodeValue !== b.nodeValue) a.nodeValue = b.nodeValue; return; }
     var st = b.getAttribute && b.getAttribute("data-static");
     if (st && a.getAttribute("data-static") === st) return;
     var i, at;
-    for (i = a.attributes.length - 1; i >= 0; i--) {
+    if (!childrenOnly) for (i = a.attributes.length - 1; i >= 0; i--) {
       at = a.attributes[i].name;
       if (!b.hasAttribute(at) && !(a.nodeName === "DETAILS" && at === "open")) a.removeAttribute(at);
     }
-    for (i = 0; i < b.attributes.length; i++) {
+    if (!childrenOnly) for (i = 0; i < b.attributes.length; i++) {
       at = b.attributes[i];
       if (a.nodeName === "DETAILS" && at.name === "open") continue;
       if (a.getAttribute(at.name) !== at.value) a.setAttribute(at.name, at.value);
@@ -748,7 +879,7 @@
   function patch(node, html) {
     var tpl = document.createElement(node.nodeName === "MAIN" ? "main" : "div");
     tpl.innerHTML = html;
-    morph(node, tpl);
+    morph(node, tpl, true);
   }
 
   function state() { return reduce(events, request); }
@@ -812,6 +943,7 @@
   }
 
   /* ---- server: start, SSE, polling fallback, reconnect from the last seq ---- */
+  function jobState(b) { return (b.job && b.job.state) || b.state || ""; }
   function getJSON(url, opt) {
     return fetch(url, opt).then(function (r) {
       return r.json().catch(function () { return {}; }).then(function (b) { b.__status = r.status; return b; });
@@ -828,7 +960,7 @@
     var my = gen, s0 = state();
     if (s0.verdict || s0.error || !window.EventSource) { if (!s0.verdict && !s0.error) poll(); return; }
     var got = false;
-    es = new EventSource("api/diagnose/" + encodeURIComponent(job) + "/events?since=" + s0.lastSeq);
+    es = new EventSource("api/diagnose/" + encodeURIComponent(job) + "/events?after=" + s0.lastSeq);
     var on = function (m) {
       if (my !== gen) return;
       got = true; retries = 0;
@@ -854,14 +986,14 @@
     var my = gen, failures = 0;
     (function once() {
       if (my !== gen) return;
-      getJSON("api/diagnose/" + encodeURIComponent(job) + "/status?since=" + state().lastSeq).then(function (b) {
+      getJSON("api/diagnose/" + encodeURIComponent(job) + "/status?after=" + state().lastSeq).then(function (b) {
         if (my !== gen) return;
         if (b.__status === 404) { push({ type: "error", code: "JOB_NOT_FOUND", seq: 1e9 }); return; }
         failures = 0;
         (b.events || []).forEach(push);
         var s = state();
         if (ui.conn === "lost") ui.conn = "poll";
-        if (!s.verdict && !s.error && b.state !== "done" && b.state !== "error") pollTimer = setTimeout(once, 1000);
+        if (!s.verdict && !s.error && jobState(b) !== "done" && jobState(b) !== "error") pollTimer = setTimeout(once, 1000);
         else draw();
       }).catch(function () {
         if (my !== gen) return;
@@ -890,13 +1022,16 @@
     ui.formError = ""; ui.starting = true; draw();
     var body = { language: ui.lang, symptom: req.symptom || undefined, debug_image: req.debug_image || undefined,
       time_limit_s: req.time_limit_s ? Number(req.time_limit_s) : undefined };
-    if (/^\d+$/.test(req.target)) body.pid = Number(req.target); else body.process_name = req.target;
     if (req.mode === "ssh") {
       body.remote_host = req.remote_host; body.ssh_user = req.ssh_user || undefined;
       body.ssh_port = req.ssh_port ? Number(req.ssh_port) : undefined; body.ssh_key = req.ssh_key || undefined;
     }
-    getJSON("api/diagnose/start", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) })
-      .then(function (b) {
+    var fail = function (code, message) { ui.starting = false; ui.formError = errorText({ code: code, message: message }, ui.lang, req); draw(); };
+    resolvePid(req).then(function (pid) {
+      body.pid = pid;
+      return getJSON("api/diagnose/start", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+    }).then(function (b) {
+        if (!b) return;
         ui.starting = false;
         if (b.success === false || !b.job_id) {
           var err = b.error || { code: "INTERNAL", message: "HTTP " + b.__status };
@@ -907,7 +1042,25 @@
         history.pushState(null, "", "?job=" + encodeURIComponent(b.job_id));
         openJob(b.job_id, req);
       })
-      .catch(function () { ui.starting = false; ui.formError = tr(ui.lang, "err_UNREACHABLE"); draw(); });
+      .catch(function (err) {
+        if (err && err.code) fail(err.code, err.message);
+        else fail("UNREACHABLE", "");
+      });
+  }
+  /* a process name becomes a pid through the process listing (API_CONTRACT.md 1: start takes a pid only) */
+  function resolvePid(req) {
+    if (/^\d+$/.test(req.target)) return Promise.resolve(Number(req.target));
+    var q = "process_name=" + encodeURIComponent(req.target);
+    if (req.mode === "ssh") ["remote_host", "ssh_user", "ssh_port", "ssh_key"].forEach(function (k) { if (req[k]) q += "&" + k + "=" + encodeURIComponent(req[k]); });
+    return getJSON("api/target/processes?" + q).then(function (b) {
+      if (b.success === false) throw { code: (b.error || {}).code || "FIND_PROCESSES_ERROR", message: (b.error || {}).message || "" };
+      var all = ((b.data || {}).processes || []);
+      var exact = all.filter(function (p) { return p.exact_name_match; });
+      var pick = exact.length ? exact : all;
+      if (!pick.length) throw { code: "TARGET_NOT_FOUND" };
+      if (pick.length > 1) throw { code: "AMBIGUOUS_TARGET", message: pick.slice(0, 5).map(function (p) { return p.name + " " + p.pid; }).join(", ") };
+      return pick[0].pid;
+    });
   }
 
   /* ---- replay: a recorded event sequence played at ?speed=, stopped at ?stage= ---- */
@@ -928,7 +1081,8 @@
         ui.replayClock = upto ? evs[upto - 1].t || 0 : 0;
         if (Number(stage) === 3) {                 // show the next check as running, as the mock does
           var s = reduce(events, request), nextRid = s.order.filter(function (r) { return s.checks[r].status === "PENDING"; })[0];
-          if (nextRid) events.push({ type: "check_start", rid: nextRid, seq: (s.lastSeq || 0) + 0.5, t: ui.replayClock });
+          var busy = s.order.some(function (r) { return s.checks[r].status === "RUNNING"; });
+          if (nextRid && !busy) events.push({ type: "check_start", rid: nextRid, seq: (s.lastSeq || 0) + 0.5, t: ui.replayClock });
         }
         draw();
         return;

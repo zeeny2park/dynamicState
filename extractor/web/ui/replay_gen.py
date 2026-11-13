@@ -82,9 +82,26 @@ def events_from_result(res: Dict[str, Any], request: Optional[Dict[str, Any]] = 
     t = 0
 
     def push(e: Dict[str, Any], dt: int) -> None:
+        """Append one event in the server's wire shape (API_CONTRACT.md: envelope, contract field names) with the
+        fields the UI asks the contract to add (UI_EVENTS.md); ``t`` (ms) is the replay clock."""
         nonlocal t
         t += dt
-        ev.append(dict(e, seq=len(ev) + 1, t=t))
+        data = {k: v for k, v in e.items() if k != "type"}
+        if "rid" in data:
+            data["recipe_id"] = data.pop("rid")
+        if e["type"] == "plan":
+            data["steps"] = [{"recipe_id": c["rid"], "name": c["name"]["en"], "label": c["name"], "domain": c["domain"],
+                              "domain_label": c["domain_label"]} for c in data.pop("checks")]
+            data["total_steps"] = len(data["steps"])
+            for key in ("not_planned", "not_in_mode"):
+                data[key] = [dict({k: v for k, v in c.items() if k != "rid"}, recipe_id=c["rid"]) for c in data[key]]
+        if e["type"] == "check_done":
+            data["summary"] = data["line"]["en"]
+        if e["type"] == "finding_provisional":
+            data["key"] = data.get("category")
+            data["category_label"] = data.pop("label")
+        ts = "2026-11-13T00:00:%06.3fZ" % (t / 1000.0) if t < 60000 else "2026-11-13T00:%02d:%06.3fZ" % (t // 60000, (t % 60000) / 1000.0)
+        ev.append({"seq": len(ev) + 1, "ts": ts, "t": t, "type": e["type"], "data": data})
 
     tg = res.get("target") or {}
     abi = tg.get("abi") or {}
@@ -182,7 +199,7 @@ def main() -> None:
                "events": events_from_result(res, request, report_url=f"replay/{name}.report.{{lang}}.html")}
         with open(os.path.join(OUT, f"{name}.json"), "w", encoding="utf-8") as fh:
             json.dump(doc, fh, ensure_ascii=False, separators=(",", ":"))
-        views = next(e["view"] for e in doc["events"] if e["type"] == "verdict")
+        views = next(e["data"]["view"] for e in doc["events"] if e["type"] == "verdict")
         index.append({"name": name, "about": what, "verdict": res.get("verdict"),
                       "verdict_word": {k: v["verdict_word"] for k, v in views.items()},
                       "process_name": tg.get("process_name"), "pid": tg.get("pid")})
