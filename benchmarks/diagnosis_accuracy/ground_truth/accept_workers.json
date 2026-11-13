@@ -1,0 +1,30 @@
+{
+  "id": "accept_workers",
+  "origin": "new",
+  "naming": "neutral",
+  "kind": "thread_growth",
+  "source": "benchmarks/diagnosis_accuracy/targets/accept_workers.c",
+  "language": "c",
+  "symptom": "the number of threads of this process keeps increasing",
+  "ready": {
+    "mode": "stdout_marker"
+  },
+  "causes": {
+    "variables": [],
+    "locks": [],
+    "threads": [
+      "conn_worker"
+    ],
+    "functions": [
+      "idle_worker"
+    ]
+  },
+  "locations": [
+    {
+      "file": "benchmarks/diagnosis_accuracy/targets/accept_workers.c",
+      "line": 22,
+      "text": "pthread_create(&t, NULL, idle_worker, NULL)"
+    }
+  ],
+  "notes": "one thread per 100 ms that then sleeps forever and is never joined; capped at 400 threads so the host is not exhausted"
+}

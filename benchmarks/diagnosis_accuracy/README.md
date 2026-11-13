@@ -21,8 +21,9 @@ the symptom text, `origin` (`project_fixture`, `external_style`, `new`) and `nam
 New programs print `READY` once in the faulty steady state and stay alive; reused fixtures use a fixed settle time.
 Heap-corruption targets do the bad write once, then idle without calling malloc/free again.
 
-17 scored defect targets (memory_leak 3, heap_overflow 2, use_after_free 2, deadlock 2, busy_wait 2, mapping_growth 2:
-`mapgrow_slabs` mmap()s without munmap, `mapgrow_pool` a custom region pool; orphan_lock 2, self_deadlock 2), 4 unscored
+19 scored defect targets (memory_leak 3, heap_overflow 2, use_after_free 2, deadlock 2, busy_wait 2, mapping_growth 2:
+`mapgrow_slabs` mmap()s without munmap, `mapgrow_pool` a custom region pool; orphan_lock 2, self_deadlock 2,
+thread_growth 2: `accept_workers`, `request_threads`), 4 unscored
 targets (`long_stall`: `stall_pipe`, `stall_sleep`; `heap_retention`: `frag_sparse`, `frag_worker`), 8 healthy controls, 3 `external_style` (small LRU cache, ring buffer, job queue written in a neutral style).
 
 ## Scoring (per target, one `diagnose` call)

@@ -46,6 +46,7 @@ KIND_CATEGORIES: Dict[str, frozenset] = {
     "use_after_free": frozenset({"USE_AFTER_FREE"}),
     "deadlock": frozenset({"DEADLOCK_INDICATORS"}),
     "busy_wait": frozenset({"PROCESS_INSTABILITY", "RESOURCE_EXHAUSTION"}),
+    "thread_growth": frozenset({"THREAD_LEAK"}),
     "long_stall": frozenset({"PROCESS_INSTABILITY"}),
     "mapping_growth": frozenset({"MAPPING_GROWTH"}),   # memory growth outside malloc (mmap, custom pool)
     "heap_retention": frozenset({"HEAP_RETENTION"}),   # fragmentation: a degradation, its targets are unscored
