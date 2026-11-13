@@ -26,13 +26,14 @@ from extractor.expert_diagnostic_engine import (
     ExpertDiagnosticEngine,
 )
 from tests.support.fixture_process import fixture_popen
+from tests.support.tmpdirs import temp_dir
 
 
 class TestPhase21AdaptiveInvestigationLifecycle(unittest.TestCase):
     """Test suite for investigation state machine, stepping, and resumption."""
 
     def setUp(self):
-        self.engine = ExpertDiagnosticEngine(corpus_dir="/tmp/phase2_1_test_corpus")
+        self.engine = ExpertDiagnosticEngine(corpus_dir=temp_dir(self, "corpus_"))
 
     def _spawn_healthy_target(self) -> int:
         # IMP-001: an investigation only reaches COMPLETED when checks really pass, so the full

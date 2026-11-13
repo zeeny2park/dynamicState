@@ -26,6 +26,7 @@ from extractor.expert_diagnostic_engine import (
     ExpertDiagnosticEngine,
 )
 from tests.support.fixture_process import fixture_popen
+from tests.support.tmpdirs import temp_dir
 
 
 class TestPhase21RealCppDiagnosticScenarios(unittest.TestCase):
@@ -38,7 +39,7 @@ class TestPhase21RealCppDiagnosticScenarios(unittest.TestCase):
         ensure_expert_diagnostic_fixture()
 
     def setUp(self):
-        self.engine = ExpertDiagnosticEngine(corpus_dir="/tmp/phase2_1_scenario_corpus")
+        self.engine = ExpertDiagnosticEngine(corpus_dir=temp_dir(self, "corpus_"))
         self.procs = []
 
     def tearDown(self):

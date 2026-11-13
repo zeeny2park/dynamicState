@@ -92,6 +92,7 @@ from extractor.expert_diagnostic_engine import (
 )
 from extractor.target_adapter import TargetExecutionAdapter, LocalTargetAdapter
 from tests.support.fixture_process import fixture_popen
+from tests.support.tmpdirs import temp_dir
 
 
 # =============================================================================
@@ -659,8 +660,9 @@ class TestIntegrationParity(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.fixture_src = "/tmp/phase214_test_fixture.cpp"
-        cls.fixture_bin = "/tmp/phase214_test_fixture.elf"
+        _work = temp_dir(cls, "phase214_")
+        cls.fixture_src = os.path.join(_work, "phase214_test_fixture.cpp")
+        cls.fixture_bin = os.path.join(_work, "phase214_test_fixture.elf")
         cpp_code = """
         #include <iostream>
         #include <vector>

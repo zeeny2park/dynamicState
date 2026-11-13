@@ -7,6 +7,7 @@ within the grace period is treated as in use (a running session rewrites its fil
 filesystem step tolerates entries that vanish concurrently (several processes share the default location).
 
 Environment:
+  DYNAMICSTATE_CORPUS_DIR            default location override (never pruned; the test suite points it at a temp dir)
   DYNAMICSTATE_CORPUS_MAX_AGE_DAYS   default 7    entries older than this are removed (0 = no age limit)
   DYNAMICSTATE_CORPUS_MAX_MB         default 1024 total size cap, oldest entries removed first (0 = no size cap)
   DYNAMICSTATE_CORPUS_GRACE_SECONDS  default 3600 entries touched more recently than this are never removed
@@ -32,7 +33,8 @@ _last_run_lock = threading.Lock()
 
 
 def default_corpus_dir() -> str:
-    return os.path.join("/tmp", DEFAULT_CORPUS_NAME)
+    """$DYNAMICSTATE_CORPUS_DIR if set (a location the user chose: never pruned), else /tmp/dynamicstate_corpus."""
+    return os.environ.get("DYNAMICSTATE_CORPUS_DIR") or os.path.join("/tmp", DEFAULT_CORPUS_NAME)
 
 
 def _env_float(name: str, default: float) -> float:
@@ -121,6 +123,8 @@ def resolve_corpus_dir(corpus_dir: Optional[str]) -> str:
     if corpus_dir:
         return corpus_dir
     default = default_corpus_dir()
+    if os.environ.get("DYNAMICSTATE_CORPUS_DIR"):
+        return default
     now = time.monotonic()
     with _last_run_lock:
         if now - _last_run.get(default, -1e9) < _THROTTLE_SECONDS:

@@ -34,13 +34,14 @@ from extractor.agent_runtime import AgentRuntime
 from extractor.web.server import WebApiAdapter
 import scripts.mcp_server as mcp_srv
 from tests.support.fixture_process import fixture_popen
+from tests.support.tmpdirs import temp_dir
 
 
 class TestPhase21McpAndUiIntegration(unittest.TestCase):
     """Test suite for MCP tools and Web REST API integration."""
 
     def setUp(self):
-        self.runtime = AgentRuntime(corpus_dir="/tmp/phase2_1_mcp_corpus")
+        self.runtime = AgentRuntime(corpus_dir=temp_dir(self, "corpus_"))
         self.web_adapter = WebApiAdapter(self.runtime)
         self.companion_elf, _ = ensure_expert_diagnostic_fixture(need_stripped=False)
         self.proc = fixture_popen([self.companion_elf, "healthy"], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
@@ -134,7 +135,7 @@ class TestPhase21McpAndUiIntegration(unittest.TestCase):
         self.assertIn("primary_finding", res_concl["conclusion"])
 
         # 9. runtime_export_incident_report (Markdown)
-        out_md_path = "/tmp/phase2_1_incident_report.md"
+        out_md_path = os.path.join(temp_dir(self, "report_"), "incident_report.md")
         raw_exp = mcp_srv.runtime_export_incident_report(
             investigation_id=inv_id,
             format="markdown",

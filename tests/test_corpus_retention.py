@@ -57,8 +57,16 @@ class CorpusRetentionTests(unittest.TestCase):
         pr.assert_not_called()
         self.assertTrue(os.path.exists(old))
 
+    def test_env_override_location_is_never_pruned(self):
+        with mock.patch.dict(os.environ, {"DYNAMICSTATE_CORPUS_DIR": self.root}), \
+                mock.patch.object(cr, "prune_corpus") as pr:
+            self.assertEqual(cr.resolve_corpus_dir(None), self.root)
+        pr.assert_not_called()
+
     def test_default_dir_is_pruned_once_per_throttle_window(self):
-        with mock.patch.object(cr, "default_corpus_dir", return_value=self.root), \
+        env = {k: v for k, v in os.environ.items() if k != "DYNAMICSTATE_CORPUS_DIR"}
+        with mock.patch.dict(os.environ, env, clear=True), \
+                mock.patch.object(cr, "default_corpus_dir", return_value=self.root), \
                 mock.patch.object(cr, "prune_corpus") as pr, mock.patch.dict(cr._last_run, clear=True):
             self.assertEqual(cr.resolve_corpus_dir(None), self.root)
             cr.resolve_corpus_dir(None)
