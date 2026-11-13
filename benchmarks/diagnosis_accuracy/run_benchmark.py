@@ -229,6 +229,9 @@ def score_result(gt: Dict[str, Any], result: Optional[Dict[str, Any]], error: Op
     # the best (lowest) rank among the matching findings' candidates that lies within the same tolerance.
     row["location_candidate_rank"] = candidate_rank(gt, matching)
     row["location_candidate_hit"] = row["location_candidate_rank"] is not None
+    # time the engine spent deriving them (all findings; part of diagnose_s)
+    row["location_candidates_s"] = round(sum(float((f.get("location_candidates") or {}).get("elapsed_s") or 0.0)
+                                             for f in findings if isinstance(f.get("location_candidates"), dict)), 3)
     return row
 
 
