@@ -62,6 +62,8 @@ import threading
 import time
 from typing import Any, Dict, Iterator, Optional, Tuple
 
+_REAL_POPEN = subprocess.Popen  # tests that patch subprocess.Popen must not affect the launcher itself
+
 DEFAULT_MAX_RSS_MIB = 1536
 DEFAULT_MAX_LIFETIME_S = 600.0
 WATCHDOG_TICK_S = 0.1
@@ -273,7 +275,7 @@ class FixtureProcess(subprocess.Popen):
     _fx_violation: Optional[FixtureLimitExceeded] = None
     _fx_hold: Optional[int] = None
     _fx_res: Optional[int] = None
-    _fx_wd: Optional[subprocess.Popen] = None
+    _fx_wd: Optional[Any] = None
 
     def __init__(self, args, *, max_rss_mib=None, max_lifetime_s=None, name=None, **kw):
         user_preexec = kw.pop("preexec_fn", None)
@@ -300,7 +302,7 @@ class FixtureProcess(subprocess.Popen):
             cmd = [sys.executable, "-I", "-S", "-c", _WATCHDOG_SRC, str(self.pid), str(pr), str(rw),
                    str(int(self.max_rss_mib * 1048576)), repr(time.monotonic() + self.max_lifetime_s),
                    repr(WATCHDOG_TICK_S), self.fixture_name]
-            self._fx_wd = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+            self._fx_wd = _REAL_POPEN(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                                            stderr=subprocess.DEVNULL, pass_fds=(pr, rw),
                                            start_new_session=True)
         except BaseException:
@@ -375,7 +377,7 @@ class FixtureProcess(subprocess.Popen):
         """SIGKILL the whole process group and reap the leader (never raises the limit error)."""
         _kill_group(self.pid)
         with contextlib.suppress(Exception):
-            subprocess.Popen.wait(self, timeout=10)
+            _REAL_POPEN.wait(self, timeout=10)
 
 
 def _kill_group(pid: int) -> None:
@@ -417,7 +419,7 @@ def kill_all_fixtures() -> int:
         _kill_group(p.pid)
     for p in procs:
         with contextlib.suppress(Exception):
-            subprocess.Popen.wait(p, timeout=5)
+            _REAL_POPEN.wait(p, timeout=5)
     return len(procs)
 
 
