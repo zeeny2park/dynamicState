@@ -22,7 +22,7 @@ the runner crashes. Tests of the machinery (not of accuracy): `python3 -m unitte
   `checks_run[].duration_s` (no engine change). Top level `timing`: `diagnose_s` {mean, max, n} and `per_check`
   {check_id: {name, mean_s, max_s, n}} sorted slowest first; `host_loadavg` is `os.getloadavg()` at the end of the run.
   Only the checks that ran for a target appear, so `n` differs per check; with `--symptom generic` only the always-run
-  default checks (14-15 per target) appear, which is the cleanest view of their cost. Timings depend on host load:
+  default checks (17-18 per target; checks that need tracing, a stopped snapshot or a caller specification are not planned) appear, which is the cleanest view of their cost. Timings depend on host load:
   results files made on a shared host say so in the commit/report, and `host_loadavg` is recorded for that purpose.
 - `--repeat N` (default 1 = off, normal run costs the same): the target is built and launched once and `diagnose` is
   called N times against the same live process, one after another. The row is scored from the first run only. Rows then
