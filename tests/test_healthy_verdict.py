@@ -311,6 +311,35 @@ class TestHealthyRule(unittest.TestCase):
         self.assertEqual(kinds.count("integrity_not_checked"), 1)
         self.assertIn("64.0 MiB", s["not_checked"][0]["label"])
 
+    def test_double_free_check_skipped_for_the_heap_cap_is_a_scope_limit(self):
+        self.assertIn("RECIPE_DOUBLE_FREE", BASELINE_RECIPE_IDS)
+        base = [_chk(r) for r in BASELINE_RECIPE_IDS if r != "RECIPE_DOUBLE_FREE"]
+        capped = {"free_list_repeats": {"status": "NOT_CHECKED", "findings": [],
+                                        "heap_not_checked_reason": "above_baseline_cap"}}
+        s = self._eval(checks=base + [_chk("RECIPE_DOUBLE_FREE", "INCONCLUSIVE", capped)])
+        self.assertTrue(s["healthy"], s["blocking"])
+        item = [x for x in s["not_checked"] if x["kind"] == "double_free_not_checked"]
+        self.assertTrue(item and "baseline walk cap" in item[0]["label"], s["not_checked"])
+        for name, obs in (("byte budget", {"free_list_repeats": {"status": "NOT_CHECKED", "findings": [],
+                                                                 "heap_not_checked_reason": "byte_budget"}}),
+                          ("lists not walked completely", {"free_list_repeats": {"status": "INCOMPLETE",
+                                                                                "findings": []}}),
+                          ("unsupported allocator", {"free_list_repeats": {"status": "UNSUPPORTED", "findings": []}})):
+            with self.subTest(name):
+                s = self._eval(checks=base + [_chk("RECIPE_DOUBLE_FREE", "INCONCLUSIVE", obs)])
+                self.assertFalse(s["healthy"])
+                self.assertEqual(s["blocking"][0]["item"], "RECIPE_DOUBLE_FREE")
+
+    def test_outside_baseline_says_what_the_heap_walk_cannot_see(self):
+        # use-after-free and double free are looked for by baseline checks now (RECIPE_FREED_MEMORY_USE,
+        # RECIPE_DOUBLE_FREE); the label must not claim they are not looked for
+        en, ko = hv.OUTSIDE_BASELINE
+        self.assertNotIn("use-after-free, double free, data races", en)
+        self.assertIn("data races and program-logic errors", en)
+        self.assertIn("re-allocated in between", en)
+        self.assertNotRegex(en, "[가-힣]")
+        self.assertIn("데이터 레이스", ko)
+
     def test_unsupported_feature_of_a_baseline_check_blocks(self):
         base = [_chk(r) for r in BASELINE_RECIPE_IDS if r != "RECIPE_POTENTIAL_DEADLOCK_PATTERNS"]
         s = self._eval(checks=base + [_chk("RECIPE_POTENTIAL_DEADLOCK_PATTERNS", "INCONCLUSIVE")],
