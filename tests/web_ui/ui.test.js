@@ -286,3 +286,17 @@ test("server fragments are placed in their slot only when the row is open; the s
 test("the exploration string table is complete in both languages", () => {
   assert.deepStrictEqual(Object.keys(XP.XSTR.ko).sort(), Object.keys(XP.XSTR.en).sort());
 });
+
+test("a pool that is only a part of a larger array says so in the card (ko and en)", () => {
+  const d = load(NAMES[0]);
+  const s = UI.reduce(d.events, d.request);
+  const pool = { expr: "g_slots", count: 5459, total: 100000, truncated: true, elem_size: 48, elem_type: "slot", field: "state", per_cell: 2,
+    bytes: 262032, legend: [{ cls: 0, value: 0, name: "FREE", count: 5000, delta: 0 }], cells: "0".repeat(2730), changed: 0, sel: null, sel_view: null, members: [] };
+  const draw = (lang, p) => UI.render(s, UIS(lang, { started: true, open: {}, x: Object.assign(XP.xs({}), {
+    cfg: { items: [], pool: { expr: "g_slots" }, interval_s: 1, running: true }, watch: watchState({ items: [], compare: null, pool: p }) }) }));
+  for (const [lang, want] of [["en", /the array has 100,000 elements; only the first 5,459 are read/], ["ko", /배열은 원소 100,000개이고 앞의 5,459개만 읽습니다/]]) {
+    const html = draw(lang, pool);
+    assert.match(html.slice(html.indexOf('id="pool-sec"')), want);
+  }
+  assert.doesNotMatch(draw("en", Object.assign({}, pool, { count: 4096, total: 4096, truncated: false })), /only the first/);
+});

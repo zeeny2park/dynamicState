@@ -43,6 +43,7 @@ MAX_LIFETIME_S = 30 * 60.0
 HISTORY = 120                          # samples kept per item (the UI draws the last 30)
 SPARK_N = 30
 POOL_CELLS = 4096
+POOL_RESERVE_ELEMS = 2                 # one element read to locate the array, one for the selected element
 MAX_ACTIVE_WATCHES = 4
 
 _IDENT = r"[A-Za-z_][A-Za-z0-9_]{0,127}"
@@ -255,6 +256,7 @@ class JobExplorer:
         self.target = JobTarget(job, corpus_dir)
         self.watch: Optional["WatchSession"] = None
         self.watch_lock = threading.Lock()
+        self._dwarf_seen: Dict[str, bool] = {}
 
     # -- helpers
     def _need_elf(self) -> str:
@@ -265,17 +267,30 @@ class JobExplorer:
 
     def _index(self) -> Any:
         from extractor.dwarf_indexer import DwarfIndexer
-        return DwarfIndexer.get_index(self._need_elf())
+        elf = self._need_elf()
+        self._need_dwarf()
+        return DwarfIndexer.get_index(elf)
+
+    def _need_dwarf(self) -> None:
+        """Everything that names a variable, a type or a lock needs DWARF: say so plainly instead of "symbol not found"."""
+        self._need_elf()
+        if not self.has_dwarf():
+            raise ExploreError("NO_DEBUG_INFO", "the executable has no DWARF debug information", 409)
 
     def has_dwarf(self) -> bool:
         elf = self.target.elf()
         if not elf:
             return False
+        hit = self._dwarf_seen.get(elf)
+        if hit is not None:
+            return hit
         try:
             from extractor.debug_image import inspect_elf
-            return bool(inspect_elf(elf).has_debug_info)
+            ok = bool(inspect_elf(elf).has_debug_info)
         except Exception:  # noqa: BLE001
             return False
+        self._dwarf_seen[elf] = ok
+        return ok
 
     # -- threads
     def thread(self, tid: int) -> Dict[str, Any]:
@@ -290,6 +305,8 @@ class JobExplorer:
                                                            **t.remote_kw())
             lo = None
             try:
+                if not self.has_dwarf():
+                    raise ValueError("no DWARF debug information")
                 lo = t.mgr.inspect_thread_locals_and_frame_vars(pid=t.pid, companion_elf_path=elf, tid=tid,
                                                                 max_frames=MAX_FRAMES, **t.remote_kw())
             except Exception as exc:  # noqa: BLE001 - locals are optional (no DWARF, remote)
@@ -346,7 +363,7 @@ class JobExplorer:
     # -- memory
     def memory_maps(self) -> Dict[str, Any]:
         t = self.target
-        elf = t.elf()
+        elf = t.elf() if self.has_dwarf() else None          # the maps do not need DWARF; a stripped image must not fail them
         raw, cost = t.run(lambda: t.mgr.get_memory_map_and_threads(pid=t.pid, companion_elf_path=elf, max_discoverable_vars=0,
                                                                    **t.remote_kw()))
         maps = [{"start": m.get("start"), "end": m.get("end"), "size": m.get("size"), "perm": m.get("permissions"),
@@ -509,13 +526,21 @@ class JobExplorer:
             geo = pool_geometry(self._index(), sym.get("name"), None)
         except ExploreError:
             return None
-        return {"expr": sym.get("name"), "count": geo["count"], "field": geo["field"]} if geo.get("field") else None
+        if not geo.get("field"):
+            return None
+        fit = pool_fit_count(geo["elem_size"])
+        # a pool the sample budget cannot cover is offered as its first ``fit`` elements (``total`` says how many exist)
+        return {"expr": sym.get("name"), "count": min(geo["count"], fit), "total": geo["count"], "field": geo["field"]}
 
     def value(self, expr: str) -> Dict[str, Any]:
         t = self.target
         elf = self._need_elf()
-        raw, cost = t.run(lambda: t.mgr.evaluate_symbol_paths(pid=t.pid, companion_elf_path=elf, expressions=[expr],
-                                                              **t.remote_kw()))
+
+        def read() -> Any:
+            self._need_dwarf()                      # after the liveness check of ``run``: a gone target is 410 first
+            return t.mgr.evaluate_symbol_paths(pid=t.pid, companion_elf_path=elf, expressions=[expr], **t.remote_kw())
+
+        raw, cost = t.run(read)
         r = (raw.get("results") or [{}])[0]
         return {"expr": expr, "status": r.get("status"), "error": r.get("error"), "type": r.get("type_name"), "size": r.get("size"),
                 "addr": r.get("runtime_address"), "value": r.get("value"), "decl": r.get("source_location"),
@@ -526,8 +551,13 @@ class JobExplorer:
         t = self.target
         elf = t.elf() or ""
         exprs = [name] if _EXPR_RE.match(name) else None
-        raw, cost = t.run(lambda: t.mgr.inspect_thread_callstacks_and_locks(pid=t.pid, companion_elf_path=elf, tid=None,
-                                                                            lock_expressions=exprs, max_frames=8, **t.remote_kw()))
+
+        def read() -> Any:
+            self._need_dwarf()                      # after the liveness check of ``run``: a gone target is 410 first
+            return t.mgr.inspect_thread_callstacks_and_locks(pid=t.pid, companion_elf_path=elf, tid=None,
+                                                             lock_expressions=exprs, max_frames=8, **t.remote_kw())
+
+        raw, cost = t.run(read)
         lk = next((x for x in raw.get("locks") or [] if x.get("name") == name), None)
         if lk is None:
             raise ExploreError("NOT_FOUND", f"no mutex named {name} was found", 404)
@@ -771,6 +801,15 @@ def pool_geometry(idx: Any, name: Any, field: Optional[str]) -> Dict[str, Any]:
     return out
 
 
+def pool_fit_count(elem_size: int, spent: int = 0, interval: Optional[float] = None) -> int:
+    """The most elements of ``elem_size`` bytes one pool read may cover within the per-sample (and, given the interval,
+    the per-second) byte budget after ``spent`` bytes of tracked items, reserve included."""
+    room = SAMPLE_BYTES_MAX - spent
+    if interval:
+        room = min(room, int(BYTES_PER_S_MAX * interval) - spent)
+    return max(0, room // max(1, elem_size) - POOL_RESERVE_ELEMS)
+
+
 # ---------------------------------------------------------------------------------------------------- observation
 def _flatten(value: Any, prefix: str = "", out: Optional[Dict[str, Any]] = None, depth: int = 0) -> Dict[str, Any]:
     out = {} if out is None else out
@@ -889,12 +928,22 @@ class WatchSession:
         # budget check before anything changes
         bytes_items = sum(s["size"] for s in specs) if specs is not None else sum(t.size for t in self.items)
         bytes_pool = pool_spec["bytes"] if pool_spec else (self.pool["bytes"] if self.pool and pool_in == "keep" else 0)
-        per_sample = bytes_items + bytes_pool
+        pool_src = pool_spec if pool_spec else (self.pool if self.pool and pool_in == "keep" else None)
+        per_sample = bytes_items + (pool_src["reserved"] if pool_src else bytes_pool)
+        pool_geo = pool_spec["geo"] if pool_spec else (self.pool["geo"] if self.pool and pool_in == "keep" else None)
+
+        def fit_hint() -> str:
+            if not pool_geo:
+                return ""
+            n = pool_fit_count(pool_geo["elem_size"], bytes_items, interval)
+            return (f"; this pool ({pool_geo['count']} elements of {pool_geo['elem_size']} B) can be observed up to its first "
+                    f"{n} elements at this interval: give count {n} or less" if n else "")
+
         if per_sample > SAMPLE_BYTES_MAX:
-            raise ExploreError("BUDGET", f"one sample would read {per_sample} bytes; the limit is {SAMPLE_BYTES_MAX}")
+            raise ExploreError("BUDGET", f"one sample would read {per_sample} bytes; the limit is {SAMPLE_BYTES_MAX}" + fit_hint())
         if per_sample / interval > BYTES_PER_S_MAX:
             raise ExploreError("BUDGET", f"{per_sample / interval:.0f} bytes per second at this interval; the limit is "
-                                         f"{BYTES_PER_S_MAX}: choose a longer interval")
+                                         f"{BYTES_PER_S_MAX}: choose a longer interval" + fit_hint())
         with self.cond:
             self.interval = interval
             if specs is not None:
@@ -983,8 +1032,9 @@ class WatchSession:
         if sel is not None and (isinstance(sel, bool) or not str(sel).isdigit() or int(sel) >= count):
             raise ExploreError("INVALID_PARAM", "sel must be an element index")
         nbytes = count * geo["elem_size"] + (geo["elem_size"] if sel is not None else 0)
+        reserved = (count + POOL_RESERVE_ELEMS) * geo["elem_size"]       # what the budget check charges: + locating read, + selected element
         per_cell = max(1, -(-count // POOL_CELLS))
-        return {"key": f"{expr}:{count}:{geo['field']}", "expr": expr, "count": count, "geo": geo, "bytes": nbytes,
+        return {"key": f"{expr}:{count}:{geo['field']}", "expr": expr, "count": count, "geo": geo, "bytes": nbytes, "reserved": reserved,
                 "sel": int(sel) if sel is not None else None, "per_cell": per_cell, "classes": None, "base_counts": None,
                 "prev_cells": None, "frame": None, "base": None, "sel_last_change": None, "sel_prev": None, "start_seq": None}
 
@@ -1226,7 +1276,7 @@ class WatchSession:
             pool = None
             if self.pool:
                 p, g = self.pool, self.pool["geo"]
-                pool = {"expr": p["expr"], "count": p["count"], "elem_size": g["elem_size"], "elem_type": g["elem_type"],
+                pool = {"expr": p["expr"], "count": p["count"], "total": g["count"], "truncated": p["count"] < g["count"], "elem_size": g["elem_size"], "elem_type": g["elem_type"],
                         "field": g["field"], "field_type": g.get("field_type"), "per_cell": p["per_cell"],
                         "bytes": p["count"] * g["elem_size"], "legend": self._legend(p) if p.get("frame") else [],
                         "cells": (p.get("frame") or {}).get("cells"), "changed": (p.get("frame") or {}).get("changed", 0),
