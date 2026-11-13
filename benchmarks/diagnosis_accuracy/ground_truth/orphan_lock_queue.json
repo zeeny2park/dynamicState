@@ -1,0 +1,38 @@
+{
+  "id": "orphan_lock_queue",
+  "origin": "new",
+  "naming": "neutral",
+  "kind": "orphan_lock",
+  "source": "benchmarks/diagnosis_accuracy/targets/orphan_lock_queue.c",
+  "language": "c",
+  "symptom": "the process hangs",
+  "ready": {
+    "mode": "stdout_marker"
+  },
+  "causes": {
+    "variables": [],
+    "locks": [
+      "q_mu"
+    ],
+    "threads": [
+      "drainer"
+    ],
+    "functions": [
+      "producer",
+      "drainer"
+    ]
+  },
+  "locations": [
+    {
+      "file": "benchmarks/diagnosis_accuracy/targets/orphan_lock_queue.c",
+      "line": 12,
+      "text": "pthread_mutex_lock(&q_mu)"
+    },
+    {
+      "file": "benchmarks/diagnosis_accuracy/targets/orphan_lock_queue.c",
+      "line": 24,
+      "text": "pthread_mutex_lock(&q_mu)"
+    }
+  ],
+  "notes": "a thread calls pthread_exit inside the critical section; a later thread blocks on the mutex"
+}

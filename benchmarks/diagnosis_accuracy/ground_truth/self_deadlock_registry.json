@@ -1,0 +1,38 @@
+{
+  "id": "self_deadlock_registry",
+  "origin": "new",
+  "naming": "neutral",
+  "kind": "self_deadlock",
+  "source": "benchmarks/diagnosis_accuracy/targets/self_deadlock_registry.c",
+  "language": "c",
+  "symptom": "the process hangs",
+  "ready": {
+    "mode": "stdout_marker"
+  },
+  "causes": {
+    "variables": [],
+    "locks": [
+      "reg_mu"
+    ],
+    "threads": [
+      "registrar"
+    ],
+    "functions": [
+      "count_entries",
+      "register_all"
+    ]
+  },
+  "locations": [
+    {
+      "file": "benchmarks/diagnosis_accuracy/targets/self_deadlock_registry.c",
+      "line": 11,
+      "text": "pthread_mutex_lock(&reg_mu)"
+    },
+    {
+      "file": "benchmarks/diagnosis_accuracy/targets/self_deadlock_registry.c",
+      "line": 21,
+      "text": "pthread_mutex_lock(&reg_mu)"
+    }
+  ],
+  "notes": "a thread holds a normal mutex and calls a helper that locks the same mutex"
+}
