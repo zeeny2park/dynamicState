@@ -304,6 +304,7 @@ class TestPresentation(unittest.TestCase):
         self.assertEqual(hr._mib(512), "512 B")
         self.assertEqual(hr._mib(2048), "2 KB")
         obs["arenas"][0].pop("largest_free")
+        obs["totals"].pop("largest_free")   # the process profile reads the walk's totals: no value there either
         for lang in ("en", "ko"):
             res = _result("HEAP_RETENTION", hr.RECIPE_HEAP_RETENTION, hr.OBS_HEAP_RETENTION, obs, "DEGRADED", "INFO", [])
             t = render_human_report(res, res["report"], lang)

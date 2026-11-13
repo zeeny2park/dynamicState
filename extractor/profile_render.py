@@ -68,8 +68,11 @@ W: Dict[str, Tuple[str, str]] = {
     "m_vsize": ("address space {x}", "가상 크기 {x}"),
     "m_heap_map": ("main heap (brk) mapping {x}", "주 힙(brk) 매핑 {x}"), "m_alloc": ("allocator: {x}", "할당자: {x}"),
     "al_glibc_ptmalloc": ("glibc ptmalloc", "glibc ptmalloc"),
-    "m_walk_full": ("heap walk: {u} in use, {f} free in {c} free chunks (largest free chunk {l}), {basis}",
-                    "힙 순회: 사용 중 {u}, 여유 {f}(여유 덩어리 {c}개, 가장 큰 것 {l}), {basis}"),
+    "m_walk_full": ("heap walk: {u} in use, {f} free{d}, {basis}", "힙 순회: 사용 중 {u}, 여유 {f}{d}, {basis}"),
+    # the detail clause states only what the walk recorded: a missing count or largest chunk is left out, never "0" or "?"
+    "m_walk_d_both": (" in {c} free chunks (largest free chunk {l})", "(여유 덩어리 {c}개, 가장 큰 것 {l})"),
+    "m_walk_d_count": (" in {c} free chunks", "(여유 덩어리 {c}개)"),
+    "m_walk_d_largest": (" (largest free chunk {l})", "(가장 큰 여유 덩어리 {l})"),
     "m_walk_use": ("heap walk: {u} in use{n}, {basis}", "힙 순회: 사용 중 {u}{n}, {basis}"),
     "m_walk_n": (" ({n} blocks)", "(블록 {n}개)"),
     "m_classes": ("growing size classes: {x}", "늘어나는 크기 등급: {x}"),
@@ -293,8 +296,16 @@ def memory_lines(lx: Lx, mem: Dict[str, Any]) -> List[str]:
     if walk:
         basis = basis_text(lx, walk["basis"])
         if "free_kb" in walk:
-            hb.append(lx.t("m_walk_full", u=_size(walk["in_use_kb"]), f=_size(walk["free_kb"]), c=walk.get("free_chunks", "?"),
-                           l=_bytes(walk.get("largest_free_b") or 0), basis=basis))
+            cnt, largest = walk.get("free_chunks"), walk.get("largest_free_b")
+            if cnt is not None and largest is not None:
+                detail = lx.t("m_walk_d_both", c=cnt, l=_bytes(largest))
+            elif cnt is not None:
+                detail = lx.t("m_walk_d_count", c=cnt)
+            elif largest is not None:
+                detail = lx.t("m_walk_d_largest", l=_bytes(largest))
+            else:
+                detail = ""
+            hb.append(lx.t("m_walk_full", u=_size(walk["in_use_kb"]), f=_size(walk["free_kb"]), d=detail, basis=basis))
         else:
             n = lx.t("m_walk_n", n=walk["in_use_count"]) if walk.get("in_use_count") else ""
             hb.append(lx.t("m_walk_use", u=_size(walk["in_use_kb"]), n=n, basis=basis))
