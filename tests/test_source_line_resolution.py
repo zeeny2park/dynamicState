@@ -19,6 +19,7 @@ from extractor.expert_diagnostic_engine import diagnose
 from extractor.human_report import render_human_report
 from extractor.watch_session import WatchSessionManager
 from tests.test_imp_011_cfi_unwinding import GROUND_TRUTH, REAL_MAIN_SRC, REAL_MID_SRC
+from tests.support.fixture_process import fixture_popen
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 FIXTURES = os.path.join(ROOT, "tests", "fixtures", "real_runtime")
@@ -57,7 +58,7 @@ class _Base(unittest.TestCase):
         return out
 
     def launch(self, binary, *args, settle=0.6):
-        proc = subprocess.Popen([binary, *args], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+        proc = fixture_popen([binary, *args], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                                 stderr=subprocess.DEVNULL)
 
         def _kill():
@@ -208,7 +209,7 @@ class TestDepth5CallLines(_Base):
     def test_every_caller_frame_line_is_the_call_to_the_next_callee(self):
         for tag, binary in self.bins.items():
             with self.subTest(build=tag):
-                p = subprocess.Popen([binary], stdout=subprocess.PIPE)
+                p = fixture_popen([binary], stdout=subprocess.PIPE)
                 self.addCleanup(p.stdout.close)
                 self.addCleanup(p.wait)
                 self.addCleanup(p.kill)

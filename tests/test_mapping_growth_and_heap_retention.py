@@ -29,6 +29,7 @@ from extractor.human_report import render_human_report  # noqa: E402
 from extractor.recipe_plugins import heap_retention as hr  # noqa: E402
 from extractor.recipe_plugins import mapping_growth as mg  # noqa: E402
 from extractor.report_visuals import build_visual_summary  # noqa: E402
+from tests.support.fixture_process import fixture_popen
 
 EVIL = "<script>alert(1)</script>"
 HANGUL = "[가-힣]"
@@ -340,7 +341,7 @@ class TestLiveTargets(unittest.TestCase):
         self.addCleanup(shutil.rmtree, tmp, True)
         exe = os.path.join(tmp, name)
         subprocess.run(["gcc", "-g", "-O0", "-pthread", os.path.join(TARGETS, name + ".c"), "-o", exe], check=True)
-        p = subprocess.Popen([exe], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        p = fixture_popen([exe], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
         self.addCleanup(p.wait)
         self.addCleanup(p.kill)
         self.assertEqual(p.stdout.readline().strip(), b"READY")

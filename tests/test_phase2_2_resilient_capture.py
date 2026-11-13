@@ -28,6 +28,7 @@ from extractor.capture_backend import (
     ProcessVmCaptureBackend,
 )
 from tests.test_capture_lifecycle_seam import MockProcessTargetAdapter
+from tests.support.fixture_process import fixture_popen
 
 
 class TestPhase22ResilientCapture(unittest.TestCase):
@@ -211,7 +212,7 @@ sys.stdout.flush()
 # Keep alive
 time.sleep(10)
 """
-        proc = subprocess.Popen([sys.executable, "-c", child_code], stdout=subprocess.PIPE, text=True)
+        proc = fixture_popen([sys.executable, "-c", child_code], stdout=subprocess.PIPE, text=True)
         try:
             line = proc.stdout.readline().strip()
             self.assertTrue(line.isdigit(), f"Invalid child output: {line}")

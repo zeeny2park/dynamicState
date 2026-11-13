@@ -20,6 +20,7 @@ from extractor.diagnostic_recipes import (
 )
 from extractor.expert_diagnostic_engine import ExpertDiagnosticEngine, diagnose
 from extractor.runtime_evidence_provider import RuntimeEvidenceProvider, register_observation_collector
+from tests.support.fixture_process import fixture_popen
 
 FD_LEAK_SRC = r"""
 #include <fcntl.h>
@@ -70,7 +71,7 @@ def _build(tmp, name, src):
 
 
 def _start(path):
-    p = subprocess.Popen([path], stdout=subprocess.PIPE)
+    p = fixture_popen([path], stdout=subprocess.PIPE)
     p.stdout.readline()
     time.sleep(0.3)
     return p

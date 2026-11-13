@@ -20,6 +20,7 @@ from extractor.agent_runtime import AgentRuntime
 from extractor.investigation import InvestigationManager
 from extractor.snapshot_consistency import NON_ATOMIC, STOPPED
 from extractor.web.server import run_server
+from tests.support.fixture_process import fixture_popen
 
 
 class TestInvestigationUI(unittest.TestCase):
@@ -380,7 +381,7 @@ class TestInvestigationUI(unittest.TestCase):
     def test_live_target_pid_propagation_and_validation(self):
         """Regression test for P1: Live target PID transmission, range checking, authorization, and capture."""
         # Spawn an isolated target child process for live capture testing
-        child_proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+        child_proc = fixture_popen([sys.executable, "-c", "import time; time.sleep(30)"])
         try:
             target_pid = child_proc.pid
 

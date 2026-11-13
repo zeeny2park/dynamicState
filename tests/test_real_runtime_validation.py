@@ -41,6 +41,7 @@ from extractor.capture_backend import (
     ProcfsCaptureBackend,
 )
 from extractor.capture_plan import CaptureMode, CapturePlan
+from tests.support.fixture_process import fixture_popen
 
 
 def _approved_full_plan() -> CapturePlan:
@@ -91,7 +92,7 @@ class TestRealRuntimeValidation(unittest.TestCase):
 
     def _start_target_process(self, binary_path: str):
         """Launch target process and wait for synchronized READY signal."""
-        proc = subprocess.Popen(
+        proc = fixture_popen(
             [binary_path],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,

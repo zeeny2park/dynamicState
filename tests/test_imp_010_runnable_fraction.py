@@ -11,6 +11,7 @@ from extractor.thread_sampler import (
     SCHEDSTAT_FALLBACK_NOTE, ThreadSamplingConfig, ThreadSeries, judge, read_thread_fields,
 )
 from tests.test_imp_010_thread_sampling import _RealProcessBase
+from tests.support.fixture_process import fixture_popen
 
 
 def _rec(tick, run_ms=None, wait_ms=None, state="R", vol=0, io=0, frame="loop", name="t"):
@@ -112,7 +113,7 @@ class TestDerivation(unittest.TestCase):
 
 class TestSpinUnderLoad(_RealProcessBase):
     def test_spinner_flagged_busy_worker_not_while_cpu_is_saturated(self):
-        burners = [subprocess.Popen([sys.executable, "-c", "while True: pass"])
+        burners = [fixture_popen([sys.executable, "-c", "while True: pass"])
                    for _ in range(2 * (os.cpu_count() or 2))]
 
         def _kill():

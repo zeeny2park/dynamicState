@@ -40,6 +40,7 @@ from extractor.heap_walker import HeapWalker
 from extractor.memory_integrity import IntegrityConfig, run_integrity
 from extractor.reachability import analyze_heap_ownership
 from extractor.target_adapter import LocalTargetAdapter
+from tests.support.fixture_process import fixture_popen
 
 FIXTURES = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures", "real_runtime")
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -100,7 +101,7 @@ class _Base(unittest.TestCase):
 
     def _launch(self, src, extra=()):
         binary = self._binary(src, extra)
-        proc = subprocess.Popen([binary], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL)
+        proc = fixture_popen([binary], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL)
         self.addCleanup(self._kill, proc)
         lines, buf = [], b""
         deadline = time.monotonic() + READY_TIMEOUT_S
@@ -301,7 +302,7 @@ class TestHealthy(_Base):
 
     def _settle(self, src):
         binary = self._binary(src)
-        proc = subprocess.Popen([binary], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL)
+        proc = fixture_popen([binary], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL)
         self.addCleanup(self._kill, proc)
         time.sleep(1.0)
         self.assertIsNone(proc.poll())
@@ -417,7 +418,7 @@ class TestSupportCostAndZeroStop(_Base):
         progress_addr = int([l for l in lines if l.startswith("PROGRESS")][0].split()[1], 16)
         stopf = os.path.join(self.tmp, "stop")
         outf = os.path.join(self.tmp, "poll.json")
-        poller = subprocess.Popen([sys.executable, "-c", _POLLER, str(proc.pid), stopf, outf])
+        poller = fixture_popen([sys.executable, "-c", _POLLER, str(proc.pid), stopf, outf])
         self.addCleanup(self._kill, poller)
         deadline = time.monotonic() + 30
         while not os.path.exists(outf + ".ready"):

@@ -70,6 +70,7 @@ from extractor.ebpf_tracer import (
     _safe_repr,
 )
 from extractor.observation_backends import EbpfObservationBackend, ObservationBackend
+from tests.support.fixture_process import fixture_popen
 
 
 class ProcessInspection:
@@ -3349,7 +3350,7 @@ class TestEbpfTracerUnit(unittest.TestCase):
                 f"    'import os, time; open(\"{token_file}\", \"w\").write(str(os.getpid())); time.sleep(30)'])\n"
                 f"time.sleep(30)\n"
             )
-            proc = subprocess.Popen(
+            proc = fixture_popen(
                 [sys.executable, "-c", script],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
@@ -4811,7 +4812,7 @@ class TestEbpfTracerUnit(unittest.TestCase):
                 f"    'import os, time; open(\"{target_ready_token}\", \"w\").write(str(os.getpid())); time.sleep(30)'])\n"
                 f"time.sleep(30)\n"
             )
-            target_proc = subprocess.Popen(
+            target_proc = fixture_popen(
                 [sys.executable, "-c", target_script],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
@@ -4825,7 +4826,7 @@ class TestEbpfTracerUnit(unittest.TestCase):
                 f"open(\"{bystander_ready_token}\", \"w\").write(str(os.getpid()))\n"
                 f"time.sleep(30)\n"
             )
-            bystander_proc = subprocess.Popen(
+            bystander_proc = fixture_popen(
                 [sys.executable, "-c", bystander_script],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
@@ -4939,7 +4940,7 @@ class TestEbpfTracerUnit(unittest.TestCase):
                 # 7. Unverified / non-session-leader protection:
                 # Real child spawned in caller's session (start_new_session=False).
                 # _terminate_probe_process MUST reap direct child but MUST NOT send os.killpg.
-                non_leader_proc = subprocess.Popen(
+                non_leader_proc = fixture_popen(
                     [sys.executable, "-c", "import time; time.sleep(30)"],
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,

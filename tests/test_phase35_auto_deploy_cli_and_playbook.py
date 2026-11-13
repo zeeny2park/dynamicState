@@ -22,6 +22,7 @@ from extractor.agent_runtime import AgentRuntime
 from extractor.target_adapter import RemoteSshTargetAdapter
 from extractor.web.server import WebApiAdapter
 import scripts.mcp_server as mcp_srv
+from tests.support.fixture_process import fixture_popen
 
 
 class TestPhase35AutoDeployCliAndPlaybook(unittest.TestCase):
@@ -76,7 +77,7 @@ __attribute__((constructor)) static void _enable_sibling_cli_ptracer() {
                         pass
 
     def _start_target(self, bin_path: str) -> subprocess.Popen:
-        p = subprocess.Popen(
+        p = fixture_popen(
             [bin_path],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,

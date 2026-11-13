@@ -54,6 +54,7 @@ from extractor.verdict_engine import (
     ZeroCdnReporter,
 )
 from extractor.watch_session import WatchSessionManager
+from tests.support.fixture_process import fixture_popen
 
 
 class TestAdaptiveInvestigationEngine(unittest.TestCase):
@@ -74,7 +75,7 @@ class TestAdaptiveInvestigationEngine(unittest.TestCase):
 
         if os.path.isfile(cls.target_bin):
             try:
-                cls.proc = subprocess.Popen([cls.target_bin], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+                cls.proc = fixture_popen([cls.target_bin], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
                 line = cls.proc.stdout.readline()  # Wait for READY
             except Exception:
                 cls.proc = None

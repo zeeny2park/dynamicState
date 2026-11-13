@@ -34,6 +34,7 @@ from extractor.target_adapter import (
     PIDReusedError,
     TargetIdentityChangedError,
 )
+from tests.support.fixture_process import fixture_popen
 
 
 class TestPhase20A312RealCppE2E(unittest.TestCase):
@@ -65,7 +66,7 @@ class TestPhase20A312RealCppE2E(unittest.TestCase):
         shutil.rmtree(cls.tmp_dir, ignore_errors=True)
 
     def _start_mutation_process(self) -> Tuple[subprocess.Popen, Dict[str, Any]]:
-        proc = subprocess.Popen(
+        proc = fixture_popen(
             [self.bin_mutation],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
@@ -90,7 +91,7 @@ class TestPhase20A312RealCppE2E(unittest.TestCase):
     # -------------------------------------------------------------------------
     def test_04_memory_growth_e2e(self):
         """Real process allocating heap memory across epochs is observed with LiveCaptureReceipt."""
-        proc = subprocess.Popen([self.bin_growing_mem])
+        proc = fixture_popen([self.bin_growing_mem])
         try:
             time.sleep(0.1)
             adapter = LocalTargetAdapter()
@@ -122,8 +123,8 @@ class TestPhase20A312RealCppE2E(unittest.TestCase):
     # -------------------------------------------------------------------------
     def test_05_live_target_transaction_isolation_e2e(self):
         """Two concurrent live processes have strictly isolated transactions, accounting, and digests."""
-        proc1 = subprocess.Popen([self.bin_healthy])
-        proc2 = subprocess.Popen([self.bin_healthy])
+        proc1 = fixture_popen([self.bin_healthy])
+        proc2 = fixture_popen([self.bin_healthy])
         try:
             time.sleep(0.1)
             adapter = LocalTargetAdapter()
@@ -260,7 +261,7 @@ class TestPhase20A312RealCppE2E(unittest.TestCase):
     # -------------------------------------------------------------------------
     def test_09_stop_time_sla_under_4_5ms_e2e(self):
         """Live physical memory read stop-time latency strictly satisfies < 4.5ms SLA."""
-        proc = subprocess.Popen([self.bin_healthy])
+        proc = fixture_popen([self.bin_healthy])
         try:
             time.sleep(0.1)
             adapter = LocalTargetAdapter()

@@ -19,6 +19,7 @@ from extractor import thread_sampler as ts  # noqa: E402
 from extractor.human_report import render_human_report  # noqa: E402
 from extractor.recipe_plugins import lock_contention as lc  # noqa: E402
 from extractor.report_visuals import build_visual_summary  # noqa: E402
+from tests.support.fixture_process import fixture_popen
 
 EVIL = "<img src=x onerror=alert(1)>"
 HANGUL = "[가-힣]"
@@ -236,7 +237,7 @@ class TestLiveTargets(unittest.TestCase):
         self.addCleanup(shutil.rmtree, tmp, True)
         exe = os.path.join(tmp, name)
         subprocess.run(["gcc", "-g", "-O0", "-pthread", os.path.join(TARGETS, name + ".c"), "-o", exe], check=True)
-        p = subprocess.Popen([exe], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        p = fixture_popen([exe], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
         self.addCleanup(p.wait)
         self.addCleanup(p.kill)
         self.assertEqual(p.stdout.readline().strip(), b"READY")

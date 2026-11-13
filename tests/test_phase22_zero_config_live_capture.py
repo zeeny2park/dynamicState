@@ -43,6 +43,7 @@ from extractor.investigation import InvestigationManager, InvestigationSession
 from extractor.llm_provider import DeterministicFallbackProvider, LLMProviderManager
 from extractor.snapshot_consistency import NON_ATOMIC, STOPPED
 from extractor.web.server import WebApiAdapter, run_server
+from tests.support.fixture_process import fixture_popen
 
 
 class TestPhase22ZeroConfigLiveCapture(unittest.TestCase):
@@ -76,7 +77,7 @@ class TestPhase22ZeroConfigLiveCapture(unittest.TestCase):
         ], check=True)
 
         # 4. Start live inferior target process
-        cls.inferior_proc = subprocess.Popen(
+        cls.inferior_proc = fixture_popen(
             [cls.debug_bin],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,

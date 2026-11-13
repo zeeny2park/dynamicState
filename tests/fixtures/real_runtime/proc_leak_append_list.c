@@ -33,6 +33,9 @@ static void *producer(void *arg)
         g_pending_tail = it;
         g_count++;
         usleep(500);
+        /* FIXTURE_CAP: ~0.36 MiB/s measured; stop appending at ~220 MiB (~10 min), stay alive. */
+        if (g_count >= 1000000u)
+            for (;;) pause();
     }
     return NULL;
 }

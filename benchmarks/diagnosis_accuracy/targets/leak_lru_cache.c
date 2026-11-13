@@ -67,6 +67,10 @@ static void *filler(void *arg)
         lru_put(&cache, k++);
         puts_done++;
         usleep(300);
+        /* FIXTURE_CAP: ~1.5 MiB/s measured; stop at ~500 MiB (~5.5 min), stay alive. */
+        if (puts_done >= 900000u)
+            for (;;)
+                pause();
     }
     return NULL;
 }

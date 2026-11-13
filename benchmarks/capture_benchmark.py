@@ -47,6 +47,7 @@ from extractor.capture_backend import (
 )
 from extractor.capture_plan import CaptureMode, CapturePlan
 from extractor.raw_snapshot import RawRuntimeSnapshot
+from tests.support.fixture_process import fixture_popen
 
 
 def get_cpu_model() -> str:
@@ -247,7 +248,7 @@ class RunningFixture:
         self.proc: Optional[subprocess.Popen] = None
 
     def __enter__(self) -> int:
-        self.proc = subprocess.Popen(
+        self.proc = fixture_popen(
             [self.binary_path],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,

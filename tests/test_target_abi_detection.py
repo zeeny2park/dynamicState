@@ -50,6 +50,7 @@ from extractor.target_abi import (
 )
 from extractor.target_adapter import LocalTargetAdapter, TargetExecutionAdapter
 from extractor.watch_session import WatchSessionManager
+from tests.support.fixture_process import fixture_popen
 
 FIXTURES = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures", "real_runtime")
 
@@ -379,7 +380,7 @@ class TestDetectionFromBinaries(unittest.TestCase):
         out = os.path.join(self.tmp, "native")
         subprocess.run(["gcc", self.src, "-o", out], check=True)
         # a still-running native process
-        sleeper = subprocess.Popen([out_sleep_free_path(self.tmp)])
+        sleeper = fixture_popen([out_sleep_free_path(self.tmp)])
         self.addCleanup(lambda: (sleeper.kill(), sleeper.wait()))
         # The dynamic loader maps libc shortly after exec; wait for it so detection is not racing process start-up.
         deadline = time.time() + 5.0
@@ -546,7 +547,7 @@ class TestRealProcessGating(unittest.TestCase):
         cls.mgr = WatchSessionManager(corpus_dir=os.path.join(cls.tmp, "corpus"))
 
     def _launch(self, path):
-        proc = subprocess.Popen([path], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        proc = fixture_popen([path], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
         self.addCleanup(lambda: (proc.kill(), proc.wait(), proc.stdout.close()))
         return proc
 

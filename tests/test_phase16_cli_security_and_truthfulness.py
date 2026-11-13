@@ -61,6 +61,7 @@ from extractor.llm_provider import (
 )
 from extractor.web.server import run_server
 from tests.fake_cli_tools import fake_cli_environment
+from tests.support.fixture_process import fixture_popen
 
 
 class TestCLISecurityDefaults(unittest.TestCase):
@@ -256,7 +257,7 @@ class TestCancellationAndProcessRegistry(unittest.TestCase):
         req_id = "test_cancel_req_001"
 
         script = "import time; time.sleep(10)"
-        proc = subprocess.Popen([sys.executable, "-c", script], start_new_session=True)
+        proc = fixture_popen([sys.executable, "-c", script], start_new_session=True)
         prov.register_process(req_id, proc)
 
         self.assertIsNone(proc.poll(), "Process should be running")
@@ -274,7 +275,7 @@ class TestCancellationAndProcessRegistry(unittest.TestCase):
         prov = mgr.get_provider("cli")
         req_id = "mgr_cancel_req_002"
 
-        proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(10)"], start_new_session=True)
+        proc = fixture_popen([sys.executable, "-c", "import time; time.sleep(10)"], start_new_session=True)
         prov.register_process(req_id, proc)
 
         res = mgr.cancel_request(req_id)

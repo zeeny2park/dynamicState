@@ -31,6 +31,7 @@ from extractor.diagnostic_recipes import (
     register_recipe,
 )
 from extractor.expert_diagnostic_engine import ExpertDiagnosticEngine, InvestigationPlanner, ProblemClassifier, diagnose
+from tests.support.fixture_process import fixture_popen
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -397,7 +398,7 @@ class TestLiveEveryPlannableRecipeConcludes(unittest.TestCase):
         shutil.rmtree(cls.tmp, ignore_errors=True)
 
     def _start(self, name):
-        p = subprocess.Popen([self.exe[name]], stdout=subprocess.PIPE)
+        p = fixture_popen([self.exe[name]], stdout=subprocess.PIPE)
         p.stdout.readline()
         time.sleep(0.3)
         self.addCleanup(lambda: (p.kill(), p.wait(timeout=5)))

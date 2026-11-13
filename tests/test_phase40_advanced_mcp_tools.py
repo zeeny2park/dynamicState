@@ -21,6 +21,7 @@ import unittest
 from extractor.agent_runtime import AgentRuntime
 from extractor.web.server import WebApiAdapter
 import scripts.mcp_server as mcp_srv
+from tests.support.fixture_process import fixture_popen
 
 
 class TestPhase40AdvancedMcpTools(unittest.TestCase):
@@ -205,7 +206,7 @@ int main(int argc, char** argv) {
             ["g++", "-g", "-O0", "-fno-omit-frame-pointer", "-pthread", cls.src_path, "-o", cls.bin_path],
             check=True,
         )
-        cls.proc = subprocess.Popen([cls.bin_path, cls.shm_file])
+        cls.proc = fixture_popen([cls.bin_path, cls.shm_file])
         time.sleep(0.35)
 
     @classmethod

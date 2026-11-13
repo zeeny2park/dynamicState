@@ -17,6 +17,7 @@ import unittest
 from extractor.target_abi import LIBC_GLIBC, TargetABI
 from extractor.target_adapter import LocalTargetAdapter
 from extractor.watch_session import WatchSessionManager
+from tests.support.fixture_process import fixture_popen
 
 _AARCH64 = platform.machine() in ("aarch64", "arm64")
 
@@ -89,7 +90,7 @@ class TestAarch64TcbDiscovery(unittest.TestCase):
     def _launch(self, align):
         exe = os.path.join(self.tmp, f"tp_{align}")
         subprocess.run(["gcc", "-g", "-O0", f"-DALIGN={align}", self.src, "-o", exe, "-pthread"], check=True)
-        proc = subprocess.Popen([exe], stdout=subprocess.PIPE, text=True)
+        proc = fixture_popen([exe], stdout=subprocess.PIPE, text=True)
         self.addCleanup(self._kill, proc)
         expected = {}
         for _ in range(4):

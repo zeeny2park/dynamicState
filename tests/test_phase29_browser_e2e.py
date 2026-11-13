@@ -23,6 +23,7 @@ from tests.playwright_support import skip_unless_browser_available, sync_playwri
 
 from extractor.agent_runtime import AgentRuntime
 from extractor.web.server import DynamicStateWebServer
+from tests.support.fixture_process import fixture_popen
 
 
 class TestPhase29BrowserE2E(unittest.TestCase):
@@ -91,7 +92,7 @@ class TestPhase29BrowserE2E(unittest.TestCase):
 
     @classmethod
     def _start_target_process(cls, bin_path: str) -> Tuple[subprocess.Popen, Dict[str, Any]]:
-        proc = subprocess.Popen(
+        proc = fixture_popen(
             [bin_path],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,

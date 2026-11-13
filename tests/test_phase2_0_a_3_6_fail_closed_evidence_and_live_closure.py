@@ -57,6 +57,7 @@ from extractor.hypothesis import (
 from extractor.investigation import InvestigationManager
 from extractor.target_adapter import LocalTargetAdapter
 from extractor.watch_session import WatchSessionManager
+from tests.support.fixture_process import fixture_popen
 
 
 class TestPhase20A36FailClosedEvidenceAndLiveClosure(unittest.TestCase):
@@ -462,7 +463,7 @@ class TestPhase20A36FailClosedEvidenceAndLiveClosure(unittest.TestCase):
                 '}\n'
             )
         subprocess.run(["g++", "-g", "-O0", "-Wl,--build-id=sha1", cpp_src, "-o", bin_path], check=True)
-        proc = subprocess.Popen([bin_path], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        proc = fixture_popen([bin_path], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         try:
             line = proc.stdout.readline().strip()
             self.assertTrue(line.startswith("READY"))

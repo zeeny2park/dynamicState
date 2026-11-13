@@ -40,6 +40,7 @@ from extractor.reachability import analyze_heap_ownership, get_cached_analysis
 from extractor.target_abi import TargetABI, detect_target_abi
 from extractor.target_adapter import LocalTargetAdapter
 from extractor.watch_session import WatchSessionManager, read_process_memory_slice
+from tests.support.fixture_process import fixture_popen
 
 FIXTURES = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures", "real_runtime")
 READY_TIMEOUT_S = 60.0
@@ -85,7 +86,7 @@ def _compile(src, out, cxx=False, extra=()):
 
 
 def _launch(testcase_or_cls, binary):
-    proc = subprocess.Popen([binary], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    proc = fixture_popen([binary], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
     lines = []
     buf = b""
     deadline = time.monotonic() + READY_TIMEOUT_S
@@ -551,7 +552,7 @@ class TestHeapWalk64MBNoStop(unittest.TestCase):
 
         stopf = os.path.join(tmp, "stop")
         outf = os.path.join(tmp, "poll.json")
-        poller = subprocess.Popen([sys.executable, "-c", _POLLER, str(proc.pid), stopf, outf])
+        poller = fixture_popen([sys.executable, "-c", _POLLER, str(proc.pid), stopf, outf])
         self.addCleanup(_kill, poller)
         deadline = time.monotonic() + 30
         while not os.path.exists(outf + ".ready"):

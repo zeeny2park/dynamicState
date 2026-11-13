@@ -96,6 +96,7 @@ from extractor.hypothesis import (
 )
 from extractor.investigation import InvestigationManager, TrustedCausalVerifier
 from extractor.raw_snapshot import RawRuntimeSnapshot
+from tests.support.fixture_process import fixture_popen
 
 
 def _approved_full_plan():
@@ -901,7 +902,7 @@ class TestRealWorldCppCrossProcessAcceptanceGate(unittest.TestCase):
 
     @staticmethod
     def _start_target_process(bin_path: str) -> subprocess.Popen:
-        proc = subprocess.Popen(
+        proc = fixture_popen(
             [bin_path],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,

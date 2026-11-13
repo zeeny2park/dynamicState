@@ -35,6 +35,7 @@ from extractor.allocator_inspector import (
 from extractor.target_adapter import LocalTargetAdapter
 from extractor.watch_session import WatchSessionManager
 from extractor.dwarf_indexer import DwarfIndexer
+from tests.support.fixture_process import fixture_popen
 
 
 REAL_ALLOCATOR_C_SRC = """
@@ -105,7 +106,7 @@ class TestPhase22RealAllocatorValidation(unittest.TestCase):
         shutil.rmtree(cls.tmpdir, ignore_errors=True)
 
     def setUp(self):
-        self.proc = subprocess.Popen([self.bin_path])
+        self.proc = fixture_popen([self.bin_path])
         time.sleep(0.15)
         self.adapter = LocalTargetAdapter()
         self.wm = WatchSessionManager(corpus_dir=self.tmpdir)

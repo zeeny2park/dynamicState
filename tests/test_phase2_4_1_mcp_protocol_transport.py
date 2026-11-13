@@ -32,6 +32,7 @@ from typing import Any, Dict, List, Optional
 from mcp.client.session import ClientSession
 from mcp.client.stdio import StdioServerParameters, stdio_client
 from mcp.shared.exceptions import MCPError
+from tests.support.fixture_process import fixture_popen
 
 
 class TestPhase241McpProtocolTransport(unittest.IsolatedAsyncioTestCase):
@@ -70,7 +71,7 @@ class TestPhase241McpProtocolTransport(unittest.IsolatedAsyncioTestCase):
             [cc, "-g", "-O0", "-no-pie", "-o", self.bin_file, self.src_file]
         )
 
-        self.proc = subprocess.Popen(
+        self.proc = fixture_popen(
             [self.bin_file],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,

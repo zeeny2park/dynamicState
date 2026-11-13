@@ -40,6 +40,7 @@ from scripts.mcp_server import (
     runtime_get_investigation_conclusion,
     runtime_export_incident_report,
 )
+from tests.support.fixture_process import fixture_popen
 
 
 MCP_WORKFLOW_TARGET_CPP = """
@@ -194,7 +195,7 @@ class TestPhase24RemoteAndMcpWorkflow(unittest.TestCase):
         6. runtime_get_investigation_conclusion -> extracts verdict
         7. runtime_export_incident_report -> generates markdown, json, html reports
         """
-        proc = subprocess.Popen([self.bin_path], stdout=subprocess.PIPE, text=True)
+        proc = fixture_popen([self.bin_path], stdout=subprocess.PIPE, text=True)
         try:
             line = proc.stdout.readline()
             self.assertIn("MCP_TARGET_READY", line)

@@ -24,6 +24,7 @@ from extractor.cpp_decoder import CppContainerDecoder, CppObjectDecoder
 from extractor.dwarf_indexer import DwarfIndexer
 from extractor.target_adapter import LocalTargetAdapter
 from extractor.watch_session import WatchSessionManager
+from tests.support.fixture_process import fixture_popen
 
 
 CPP_FIXTURE_SRC = """
@@ -97,7 +98,7 @@ class TestPhase22StlFixtures(unittest.TestCase):
         shutil.rmtree(cls.tmpdir, ignore_errors=True)
 
     def _run_with_binary(self, bin_path: str):
-        proc = subprocess.Popen([bin_path])
+        proc = fixture_popen([bin_path])
         time.sleep(0.15)
         try:
             adapter = LocalTargetAdapter()

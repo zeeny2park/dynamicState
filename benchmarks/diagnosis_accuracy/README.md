@@ -32,8 +32,21 @@ the runner crashes. Tests of the machinery (not of accuracy): `python3 -m unitte
   `repeat_agreement`: `mean_agreement_rate` (mean over scored targets), `pooled_agreement_rate` (modal runs / all runs),
   `fully_agreeing_targets`, and `per_target` (unscored targets listed but not in the overall figures). The results file name
   gets a `-repeatN` suffix. Agreement measures stability of the verdict only, not correctness. Repeated calls on one
-  process also exercise the engine against a process it has already been diagnosed on; a fresh process per run is not used.
+  process also exercise the engine against a process it has already been diagnosed on. Exception: targets whose kind is
+  `memory_leak`, `mapping_growth` or `thread_growth` get a fresh process for every repeat, so each repeat diagnoses the
+  target at the same age instead of at an ever larger state (one leak target would otherwise grow for minutes).
   Cost: roughly N x the per-target diagnose time (3-15 s each), so 20 repeats of all 21 targets is about 30-60 min.
+
+## Containment (targets cannot outlive the benchmark or eat the host)
+
+Every target is started through `tests/support/fixture_process.py` (`fixture_popen`): `PR_SET_PDEATHSIG(SIGKILL)` plus its
+own process group, an external watchdog that kills the target tree when the benchmark dies (also on `SIGKILL`), when a
+hard lifetime (`READY_TIMEOUT_S` + the diagnose budget + 60 s) expires, or when its resident memory exceeds 1.5 GiB, and an
+`atexit`/SIGTERM/SIGINT sweep. A target killed by the watchdog is an error row (`target setup failed: fixture exceeded
+memory ceiling ...`), never a scored diagnosis. The old `RLIMIT_AS` limit is gone (thread-heavy targets legitimately map
+several GB of stacks, so no safe value is useful). The growing targets also cap themselves in their source
+(`FIXTURE_CAP` comments, after the point where any diagnosis window ends), so even a hand-started target is bounded.
+Rule and details: `docs/TEST_BASELINE.md`, section "Fixture process containment".
 
 ## Targets
 

@@ -43,6 +43,7 @@ from extractor.leak_attribution import (
     judge,
     not_judged_explanation,
 )
+from tests.support.fixture_process import fixture_popen
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 FIXTURES = os.path.join(ROOT, "tests", "fixtures", "real_runtime")
@@ -194,7 +195,7 @@ class TestSawtoothRealProcesses(unittest.TestCase):
             subprocess.run(["gcc", "-g", "-O0", "-pthread", "-Wl,--build-id=sha1", src, "-o", out],
                            check=True, capture_output=True, timeout=120)
             self.bins[src] = out
-        proc = subprocess.Popen([self.bins[src]], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+        proc = fixture_popen([self.bins[src]], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                                 stdin=subprocess.DEVNULL)
         self.addCleanup(self._kill, proc)
         buf, deadline = b"", time.monotonic() + 60.0

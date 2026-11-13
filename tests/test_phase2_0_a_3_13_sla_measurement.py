@@ -16,6 +16,7 @@ import unittest
 
 from tests.fixture_builds import ensure_real_runtime_app_debug
 from extractor.target_adapter import LocalTargetAdapter
+from tests.support.fixture_process import fixture_popen
 
 
 class TestPhase20A313SlaMeasurement(unittest.TestCase):
@@ -26,7 +27,7 @@ class TestPhase20A313SlaMeasurement(unittest.TestCase):
         cls.bin_path = ensure_real_runtime_app_debug()
 
     def setUp(self):
-        self.proc = subprocess.Popen(
+        self.proc = fixture_popen(
             [self.bin_path],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,

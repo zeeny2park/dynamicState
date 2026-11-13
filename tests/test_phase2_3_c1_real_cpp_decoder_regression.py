@@ -23,6 +23,7 @@ from extractor.cpp_decoder import CppContainerDecoder
 from extractor.dwarf_indexer import DwarfIndexer
 from extractor.target_adapter import LocalTargetAdapter
 from extractor.watch_session import WatchSessionManager
+from tests.support.fixture_process import fixture_popen
 
 
 CPP_DECODER_TARGET_SRC = """
@@ -96,7 +97,7 @@ class TestPhase23C1RealCppDecoderRegression(unittest.TestCase):
         shutil.rmtree(cls.tmpdir, ignore_errors=True)
 
     def setUp(self):
-        self.proc = subprocess.Popen(
+        self.proc = fixture_popen(
             [self.bin_path],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,

@@ -28,6 +28,7 @@ import urllib.request
 from extractor.agent_runtime import AgentRuntime
 from extractor.web.server import run_server
 from extractor.web.workspace import build_workspace_arg_parser
+from tests.support.fixture_process import fixture_popen
 
 
 CPP_LIVE_SERVICE_TARGET = r"""
@@ -116,7 +117,7 @@ class TestPhase51RealWorkspaceWebService(unittest.TestCase):
             check=True,
         )
 
-        cls.proc = subprocess.Popen(
+        cls.proc = fixture_popen(
             [cls.bin_path],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,

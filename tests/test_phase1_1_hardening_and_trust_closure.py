@@ -58,6 +58,7 @@ from extractor.expert_diagnostic_engine import (
     TargetAssessor,
 )
 from extractor.target_adapter import LocalTargetAdapter, inspect_elf
+from tests.support.fixture_process import fixture_popen
 
 
 class TestPhase11HardeningAndTrustClosure(unittest.TestCase):
@@ -66,7 +67,7 @@ class TestPhase11HardeningAndTrustClosure(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.companion_elf, _ = ensure_expert_diagnostic_fixture(need_stripped=False)
-        cls.proc = subprocess.Popen([cls.companion_elf, "healthy"], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        cls.proc = fixture_popen([cls.companion_elf, "healthy"], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         time.sleep(0.15)
         cls.pid = cls.proc.pid
         cls.target_adapter = LocalTargetAdapter()

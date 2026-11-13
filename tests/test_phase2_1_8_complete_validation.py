@@ -111,6 +111,7 @@ from extractor.expert_diagnostic_engine import (
     TargetAssessor,
 )
 from extractor.watch_session import WatchSessionManager
+from tests.support.fixture_process import fixture_popen
 
 
 def make_authoritative_record(
@@ -208,7 +209,7 @@ class TestPhase218CompleteValidation(unittest.TestCase):
 
     def _spawn(self, mode: str, stripped: bool = False) -> subprocess.Popen:
         binary = self.stripped_bin if stripped else self.debug_bin
-        proc = subprocess.Popen([binary, mode], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        proc = fixture_popen([binary, mode], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         self._spawned_procs.append(proc)
         time.sleep(0.08)
         return proc
