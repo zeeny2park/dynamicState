@@ -460,7 +460,7 @@ details.dsv-ck > summary:hover { background: var(--accent); }
 }
 </style>
 <div class="dsv" lang="ko">
-<header class="card masthead" id="sec-masthead"><h1>dynamicState 무정지 런타임 인시던트 보고서</h1><div class="meta"><code>ok_idle_server</code><span>·</span><span>pid 3733586</span><span>·</span><span>aarch64</span><span>·</span><span>보고서 생성 시각: 2026-11-13 12:01:15 UTC</span></div><nav><a href="#sec-target">대상</a><a href="#dsv-checks">검사</a><a href="#sec-not-examined">확인하지 못한 것</a><a href="#sec-next">다음에 할 일</a><a href="#sec-method">진단 방법과 대상에 준 영향</a><a href="#reproducibility">재현 정보</a><a href="#sec-reference">참고 자료</a></nav></header>
+<header class="card masthead" id="sec-masthead"><h1>dynamicState 무정지 런타임 인시던트 보고서</h1><div class="meta"><code>ok_idle_server</code><span>·</span><span>pid 3733586</span><span>·</span><span>aarch64</span><span>·</span><span>보고서 생성 시각: 2026-11-13 12:03:26 UTC</span></div><nav><a href="#sec-target">대상</a><a href="#dsv-checks">검사</a><a href="#sec-not-examined">확인하지 못한 것</a><a href="#sec-next">다음에 할 일</a><a href="#sec-method">진단 방법과 대상에 준 영향</a><a href="#reproducibility">재현 정보</a><a href="#sec-reference">참고 자료</a></nav></header>
 <section class="card card-tone banner tone-pass" id="sec-conclusion"><div class="card-content"><h2 class="sr-only">결론</h2><div class="line1"><span class="badge badge-tone badge-lg">판정: 점검한 범위 안에서 정상</span><code>HEALTHY</code><span class="text-muted">점검한 범위 밖에 대해서는 판단하지 않습니다.</span></div><p class="sum"><code>ok_idle_server</code> (pid 3733586)은(는) 점검한 범위 안에서 정상입니다. 기본 검사 14개가 모두 끝까지 실행되었고 아무것도 발견하지 못했습니다. 점검하지 못한 것: ok_idle_server (tid 3733586), acceptor (tid 3733587)의 긴 대기가 정상인지 (밖에서는 유휴 대기와 멈춤이 같아 보임); 결론을 내지 못한 증상별 추가 검사 5개; 데이터 레이스, 프로그램 논리 오류처럼 기본 검사가 찾지 않는 결함.</p><details class="collapsible dsv-detail" id="verdict-detail"><summary>판정 근거 상세 (상세 기록, 영문)</summary><div class="dsv-detail-body in" lang="en"><h4>A. Executive Summary</h4>
 <p><strong>Overall Result:</strong> <span class="badge badge-tone tone-pass mono">HEALTHY</span> &nbsp;&nbsp; <strong>Target:</strong> PID 3733586 (/tmp/cap_kkqim69j/ok_idle_server)</p>
 <p><strong>Problem Statement:</strong> general health check</p>
@@ -580,7 +580,7 @@ collector_max_rss_kb: None
 impact_notes: [&quot;local target: attributable_cpu_ms is the diagnosing process&#x27;s CPU in the window (upper bound of the read cost, includes analysis)&quot;, &quot;target.* is the target&#x27;s own activity during the window (delta); it is not caused by the diagnosis, which never stops the target in zero-stop mode. Cost of the diagnosis is under diagnosis_attributable.&quot;]</pre></div><!--/dsv-detail-body--></details></div></section>
 <section class="card" id="reproducibility"><div class="card-header"><h2 class="card-title">재현 정보</h2></div><div class="card-content"><p>이 진단을 다시 설명하는 데 필요한 정보입니다. 엔진이 기록하지 못한 값은 알 수 없음으로 표시합니다.</p>
 <ul>
-<li>dynamicState 버전 / 커밋: <code>0.1.0 / a2ab80156f8e</code></li>
+<li>dynamicState 버전 / 커밋: <code>0.1.0 / fddf00bd914c</code></li>
 <li>관측 구간: 2026-11-13 06:59:15 UTC ~ 2026-11-13 06:59:21 UTC, 표본 간격 0.05초, 계획한 관측 시간 1.0초</li>
 <li>실행한 검사와 레시피 버전: 17개 (16개는 <code>1.0.0</code>; <code>2.0.0</code>: 이중 해제 (<code>RECIPE_DOUBLE_FREE</code>))</li>
 <li>검사별 실행 순서, 레시피 버전, 시작 시각, 걸린 시간은 HTML 보고서의 상세 블록과 JSON (<code>reproducibility.recipes</code>)에 있습니다.</li>
