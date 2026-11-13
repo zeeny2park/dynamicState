@@ -461,7 +461,6 @@ class DiagnoseJobManager:
         """"Add to report": the next report of this job carries the observation as its own section (or none)."""
         with job.report_lock:
             job.observation = observation
-            job.reports.clear()
 
     def get(self, job_id: str) -> Optional[DiagnoseJob]:
         if not is_valid_job_id(job_id):
@@ -492,7 +491,7 @@ class DiagnoseJobManager:
         lang = lang or job.language
         with job.report_lock:
             if lang in job.reports:
-                return job.reports[lang]
+                return self._with_observation(job, job.reports[lang], lang)
             engine = self._engine_getter()
             from extractor import incident_report
             if job.result is not None:      # the result the UI showed, so the report says exactly the same
@@ -509,4 +508,12 @@ class DiagnoseJobManager:
             out = {"success": True, "html": res.get("report_html") or "", "md": res.get("report_markdown") or "",
                    "json": res.get("report_json") or "{}"}
             job.reports[lang] = out
-            return out
+            return self._with_observation(job, out, lang)
+
+    @staticmethod
+    def _with_observation(job: DiagnoseJob, base: Dict[str, Any], lang: str) -> Dict[str, Any]:
+        """"Add to report": the same report (the cached one, byte for byte) plus the user's observation section."""
+        if not job.observation:
+            return base
+        from extractor.web.observation_report import add_to_report
+        return add_to_report(base, job.observation, lang)

@@ -562,5 +562,67 @@ class TestWatchSession(ExploreCase):
                 self.post(j, "watch/stop", {})
 
 
+# ---------------------------------------------------------------------------------------------- "Add to report"
+class TestObservationInReport(ExploreCase):
+    targets = (("slot_server", os.path.join(FIX, "slot_server.c"), ()),)
+
+    def test_add_to_report_adds_one_section_and_changes_nothing_else(self):
+        import gzip
+        from extractor.web.observation_report import strip_from_report
+        with gzip.open(os.path.join(ROOT, "tests", "fixtures", "ko_report", "deadlock_circular.json.gz"), "rt", encoding="utf-8") as fh:
+            result = json.load(fh)
+        j = self.job("slot_server", result=result)
+        before = {}
+        for lang in ("ko", "en"):
+            for fmt in ("html", "md", "json"):
+                st, b = self.request("GET", f"/api/diagnose/{j.job_id}/report?format={fmt}&lang={lang}")
+                self.assertEqual(st, 200)
+                before[(lang, fmt)] = b["raw"].decode() if "raw" in b else json.dumps(b)
+        st, b = self.post(j, "observation", {})
+        self.assertEqual(st, 404)                     # nothing observed yet: nothing is added
+        self.post(j, "watch", {"items": [{"expr": "g_slots_used"}, {"expr": "g_ticks"}], "pool": {"expr": "g_slots"}, "interval_s": 0.5})
+        try:
+            deadline = time.time() + 8
+            while time.time() < deadline:
+                w = self.get(j, "watch/status")[1]["watch"]
+                if w["samples"] >= 3:
+                    break
+                time.sleep(0.1)
+            self.post(j, "watch", {"items": [{"expr": "g_slots_used"}, {"expr": "g_ticks"}], "pool": {"expr": "g_slots"}, "interval_s": 0.5, "pin": "now"})
+            time.sleep(1.2)
+            st, b = self.post(j, "observation", {})
+            self.assertEqual(st, 200, b)
+            seq = b["observation"]["seq"]
+        finally:
+            self.post(j, "watch/stop", {})
+        snap = j.observation
+        self.assertEqual(snap["seq"], seq)
+        for lang, title in (("ko", "추가 관찰"), ("en", "Additional observation")):
+            got = {}
+            for fmt in ("html", "md", "json"):
+                st, b = self.request("GET", f"/api/diagnose/{j.job_id}/report?format={fmt}&lang={lang}")
+                self.assertEqual(st, 200)
+                got[fmt] = b["raw"].decode() if "raw" in b else json.dumps(b)
+            self.assertEqual(got["html"].count('id="obs-report"'), 1)
+            self.assertIn(title, got["html"])
+            self.assertIn('class="pool"', got["html"])
+            self.assertEqual(got["html"].count('<i class="pc s'), 4096 + len(snap["pool"]["legend"]))
+            self.assertIn("<svg class=\"spark", got["html"])
+            self.assertNotIn("<script", got["html"].split('id="obs-report"')[1].split("</section>")[0])
+            self.assertIn(f"## {title}", got["md"])
+            doc = json.loads(got["json"])
+            self.assertEqual(doc["additional_observation"]["seq"], seq)
+            # the section holds the values of that moment, and the rest of the report is unchanged
+            self.assertEqual(doc["additional_observation"]["items"][0]["value"], snap["items"][0]["value"])
+            stripped = strip_from_report({"html": got["html"], "md": got["md"], "json": got["json"]})
+            self.assertEqual(stripped["html"], before[(lang, "html")])
+            self.assertEqual(stripped["md"], before[(lang, "md")])
+            self.assertEqual(json.loads(stripped["json"]), json.loads(before[(lang, "json")]))
+            self.assertEqual(doc["verdict"], json.loads(before[(lang, "json")])["verdict"])
+        st, b = self.post(j, "observation", {"remove": True})
+        st, b = self.request("GET", f"/api/diagnose/{j.job_id}/report?format=md&lang=ko")
+        self.assertEqual(b["raw"].decode(), before[("ko", "md")])
+
+
 if __name__ == "__main__":
     unittest.main()

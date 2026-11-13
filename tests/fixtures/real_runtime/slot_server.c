@@ -48,12 +48,12 @@ static void *churn(void *arg)
     uint32_t x = 2463534242u;
     pthread_setname_np(pthread_self(), "slot_churn");
     for (;;) {
-        for (int k = 0; k < 40; k++) {
+        for (int k = 0; k < 120; k++) {
             x ^= x << 13; x ^= x >> 17; x ^= x << 5;
             struct slot *s = &g_slots[x % NSLOTS];
             switch (s->state) {
             case SLOT_FREE:
-                if ((x >> 12) % 3 == 0) {
+                if ((x >> 12) % 3 != 0) {
                     s->state = SLOT_ACCEPTING; s->fd = 5 + (int)(x % 1800);
                     s->peer_addr = 0x0a040000u | (x & 0xffffu); s->peer_port = (uint16_t)(40000 + x % 20000);
                     g_slots_used++;
@@ -61,7 +61,7 @@ static void *churn(void *arg)
                 break;
             case SLOT_ACCEPTING: s->state = SLOT_READING; break;
             case SLOT_READING: s->state = SLOT_WRITING; s->rx += 512 + (x % 97); break;
-            case SLOT_WRITING: s->state = (x >> 9) % 4 ? SLOT_READING : SLOT_CLOSING; s->tx += 256 + (x % 61); break;
+            case SLOT_WRITING: s->state = (x >> 9) % 8 ? SLOT_READING : SLOT_CLOSING; s->tx += 256 + (x % 61); break;
             case SLOT_CLOSING:
                 memset(s, 0, sizeof *s); s->fd = -1; g_slots_used--;
                 break;

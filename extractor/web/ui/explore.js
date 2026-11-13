@@ -214,7 +214,58 @@
       esc(xt(lang, "c_now")) + "</th><th>" + esc(xt(lang, "c_spark")) + '</th><th class="num">' + esc(xt(lang, "c_changes")) + '</th><th class="nw">' + esc(xt(lang, "c_last")) +
       "</th>" + (still ? "" : "<th></th>") + "</tr></thead><tbody>" + rows + "</tbody></table></div></div>";
   }
-  function poolSection(W, ui, still) { return root.DSX && root.DSX.poolSection ? root.DSX.poolSection(W, ui, still) : ""; }
+  /* the pool view: one cell per element (a bucket of elements past 4,096), coloured by the status field's value */
+  function poolForm(P, ui) {
+    var lang = ui.lang, c = (xs(ui).cfg && xs(ui).cfg.pool) || {};
+    var expr = P ? P.expr : c.expr || "", count = P ? P.count : c.count || "", field = P ? P.field : c.field || "";
+    return '<div class="obs-form"><label>' + esc(xt(lang, "expr")) + '<input class="input mono" id="pl-expr" value="' + esc(expr) + '" autocomplete="off" spellcheck="false"></label>' +
+      "<label>" + esc(xt(lang, "count")) + '<input class="input mono w-s" id="pl-count" value="' + esc(count) + '" autocomplete="off"></label>' +
+      "<label>" + esc(xt(lang, "field")) + '<input class="input mono w-s" id="pl-field" value="' + esc(field) + '" autocomplete="off" spellcheck="false"></label>' +
+      '<button type="button" class="btn btn-outline btn-sm" data-act="pool-apply">' + esc(xt(lang, P ? "apply" : "view")) + "</button>" +
+      (P ? '<button type="button" class="btn btn-ghost btn-sm" data-act="pool-close">' + esc(xt(lang, "pool_remove")) + "</button>" : "") +
+      (expr && field ? '<span class="dt-note">' + esc(xt(lang, "pool_prefill")) + "</span>" : "") + "</div>";
+  }
+  function poolSection(W, ui, still) {
+    var X = xs(ui), lang = ui.lang, P = W.pool;
+    if (!P) {
+      if (still) return "";
+      return '<div class="obs-sec" id="pool-sec"><h3>' + esc(xt(lang, "pool_h")) + ' <span class="text-muted">' + esc(xt(lang, "pool_sub")) + "</span></h3>" +
+        (X.poolForm ? poolForm(null, ui) : '<button type="button" class="btn btn-outline btn-sm" data-act="pool-form">' + esc(xt(lang, "pool_add")) + "</button>") + "</div>";
+    }
+    var cells = P.cells || "", n = cells.length, cols = 64, sel = X.pool.sel, cur = X.pool.cur, only = X.pool.only;
+    var size = n > 1024 ? "" : n > 256 ? " pool-md" : " pool-sm";
+    var selCell = sel == null ? null : Math.floor(sel / (P.per_cell || 1));
+    var h = [], labels = "", i;
+    for (i = 0; i < n; i++) h.push('<i class="pc s' + cells.charAt(i) + (i === selCell ? " sel" : "") + (i === cur && !still ? " cur" : "") + '" data-i="' + i + '"></i>');
+    for (i = 0; i < Math.ceil(n / cols); i++) labels += "<span>" + (i % 8 === 0 ? i * cols * (P.per_cell || 1) : "") + "</span>";
+    var legend = (P.legend || []).map(function (L) {
+      var name = L.name == null ? xt(lang, "other") : L.name;
+      var inner = '<i class="pc s' + L.cls + '"></i>' + esc(name) + " <b>" + esc(fmtN(L.count)) + "</b>" +
+        (W.seq > (P.start_seq || 0) ? '<span class="d">' + (L.delta > 0 ? "+" : "") + esc(fmtN(L.delta)) + "</span>" : "");
+      return still ? "<li>" + inner + "</li>" : '<button type="button" data-act="pool-only" data-cls="' + L.cls + '" aria-pressed="' + (only === L.cls) + '">' + inner + "</button>";
+    }).join("");
+    var side = "";
+    if (P.sel_view) {
+      var sv = P.sel_view, fields = sv.fields || {};
+      side = '<h4 style="margin-top:0">' + esc(xt(lang, "element")) + ' <span class="mono">' + esc(P.expr) + "[" + sv.index + "]</span> @ " + esc(sv.addr || "?") + "</h4>" +
+        '<div class="scroll-x"><table class="table compact"><tbody>' + Object.keys(fields).map(function (k) {
+          return '<tr><td class="mono">' + esc(k.replace(/^\./, "")) + '</td><td class="mono">' + esc(fmtN(fields[k])) + "</td></tr>";
+        }).join("") + "</tbody></table></div>" +
+        (still ? "" : '<div class="dt-actions">' + (sv.last_change ? '<span class="dt-note">' + esc(xt(lang, "sel_changed", { t: clock(sv.last_change) })) + "</span>" : "") +
+          '<button type="button" class="btn btn-outline btn-sm" data-act="track" data-expr="' + esc(P.expr + "[" + sv.index + "]") + '">' + esc(xt(lang, "watch_el")) + "</button></div>");
+    } else if (selCell != null && P.per_cell > 1 && !still) {
+      var a = selCell * P.per_cell, b = Math.min(P.count, a + P.per_cell) - 1, list = "";
+      for (i = a; i <= b; i++) list += '<button type="button" class="btn btn-ghost btn-sm" data-act="pool-el" data-i="' + i + '">[' + i + "]</button>";
+      side = '<p class="dt-note">' + esc(xt(lang, "bucket", { c: selCell, a: a, b: b })) + '</p><div class="dt-actions">' + list + "</div>";
+    } else if (!still) side = '<p class="dt-note">' + esc(xt(lang, "pool_cell")) + "</p>";
+    var grid = '<div class="pool' + size + '" role="grid" aria-label="' + esc(xt(lang, "pool_grid")) + '" tabindex="' + (still ? -1 : 0) + '" id="pool-grid"' +
+      (only != null && !still ? ' data-only="' + only + '"' : "") + ' style="--cols:' + cols + '"><div class="rl" aria-hidden="true">' + labels +
+      '</div><div class="cells"' + (still ? "" : ' data-act="pool-cell"') + ">" + h.join("") + "</div></div>";
+    return '<div class="obs-sec" id="pool-sec"><h3>' + esc(xt(lang, "pool_h")) + ' <span class="text-muted mono">' + esc(P.expr + " · " + fmtN(P.count) + " × " + P.elem_type +
+      " (" + P.elem_size + " B) · " + P.field + (P.field_type ? " (" + P.field_type + ")" : "")) + "</span></h3>" + (still ? "" : poolForm(P, ui)) +
+      '<div class="pool-wrap"><div>' + grid + (still ? '<ul class="pool-legend">' + legend + "</ul>" : '<div class="pool-legend">' + legend + "</div>") + "</div><div>" + side + "</div></div>" +
+      '<p class="dt-note" style="margin-top:6px">' + esc(xt(lang, "pool_note", { per: P.per_cell || 1, chg: fmtN(P.changed || 0), n: W.seq || 0, t: clock(W.last_t), b: fmtN(P.bytes) })) + "</p></div>";
+  }
   function compareSection(W, ui, still) {
     var X = xs(ui), lang = ui.lang, C = W.compare;
     var head = '<div class="obs-sec" id="cmp-sec"><h3>' + esc(xt(lang, "cmp_h")) + ' <span class="text-muted">' + esc(xt(lang, "cmp_sub")) + "</span></h3>";
@@ -233,7 +284,7 @@
         '</button><button type="button" class="btn btn-ghost btn-sm" data-act="unfreeze">' + esc(xt(lang, "unfreeze")) + "</button></div>") + "</div>";
   }
 
-  var api = { XSTR: XSTR, slot: slot, findingChips: findingChips, observe: observe, chipStatus: chipStatus, spark: spark, decorate: decorate,
+  var api = { XSTR: XSTR, slot: slot, findingChips: findingChips, observe: observe, chipStatus: chipStatus, spark: spark, poolSection: poolSection, decorate: decorate,
     trackSection: trackSection, compareSection: compareSection, xt: xt, clock: clock, fmtN: fmtN, xs: xs };
   if (typeof module !== "undefined" && module.exports) module.exports = api;
   root.DSX = api;
@@ -462,5 +513,62 @@
     if (root.DSX.poolKey) root.DSX.poolKey(ev, { ui: ui, X: xs(ui), S: S, sendCfg: sendCfg });
   });
   window.addEventListener("pagehide", closeWatch);
-  Object.assign(api, { opened: opened, click: click, onVerdict: onVerdict, reset: reset });
+
+  /* ---- pool view ---- */
+  function setPool(p) {
+    var X = xs(ui);
+    if (!X.cfg) X.cfg = { items: [], pool: null, interval_s: 1, running: true };
+    X.cfg.pool = p;
+    if (!(X.watch && X.watch.reason === "target_exited")) X.cfg.running = true;
+    return sendCfg();
+  }
+  function selectElement(i) {
+    var X = xs(ui);
+    X.pool.sel = i;
+    if (X.cfg && X.cfg.pool) { X.cfg.pool.sel = i; sendCfg(); }
+    S.drawNow();
+  }
+  function poolClick(act, el, ev) {
+    var X = xs(ui), W = X.watch || {}, P = W.pool;
+    switch (act) {
+      case "pool-go": {
+        X.pool = { sel: null, cur: 0, only: null };
+        setPool({ expr: el.getAttribute("data-expr"), count: +el.getAttribute("data-count"), field: el.getAttribute("data-field"), sel: null })
+          .then(function () { scrollToKey("pool-grid", true); });
+        break;
+      }
+      case "pool-form": X.poolForm = true; S.drawNow(); break;
+      case "pool-apply": {
+        var e = document.getElementById("pl-expr"), c = document.getElementById("pl-count"), f = document.getElementById("pl-field");
+        if (!e || !e.value.trim()) break;
+        X.pool = { sel: null, cur: 0, only: null };
+        setPool({ expr: e.value.trim(), count: c && c.value.trim() ? +c.value.trim() : undefined, field: f && f.value.trim() ? f.value.trim() : undefined, sel: null });
+        break;
+      }
+      case "pool-close": X.cfg.pool = null; X.pool = { sel: null, cur: 0, only: null }; sendCfg(); break;
+      case "pool-only": { var k = +el.getAttribute("data-cls"); X.pool.only = X.pool.only === k ? null : k; S.drawNow(); break; }
+      case "pool-cell": {
+        var i = ev.target.getAttribute && ev.target.getAttribute("data-i");
+        if (i == null || !P) break;
+        X.pool.cur = +i;
+        if ((P.per_cell || 1) === 1) selectElement(+i);
+        else { X.pool.sel = +i * P.per_cell; if (X.cfg.pool) { X.cfg.pool.sel = null; sendCfg(); } S.drawNow(); }
+        break;
+      }
+      case "pool-el": selectElement(+el.getAttribute("data-i")); break;
+      default: break;
+    }
+  }
+  function poolKey(ev) {
+    var g = ev.target && ev.target.closest && ev.target.closest(".pool");
+    var X = xs(ui), P = X.watch && X.watch.pool;
+    if (!g || !P || !P.cells) return;
+    var n = P.cells.length, d = { ArrowRight: 1, ArrowLeft: -1, ArrowDown: 64, ArrowUp: -64 }[ev.key];
+    if (d) { X.pool.cur = Math.max(0, Math.min(n - 1, (X.pool.cur || 0) + d)); ev.preventDefault(); S.drawNow(); }
+    else if (ev.key === "Enter" || ev.key === " ") {
+      ev.preventDefault();
+      if ((P.per_cell || 1) === 1) selectElement(X.pool.cur || 0); else { X.pool.sel = (X.pool.cur || 0) * P.per_cell; S.drawNow(); }
+    }
+  }
+  Object.assign(api, { opened: opened, click: click, onVerdict: onVerdict, reset: reset, poolClick: poolClick, poolKey: poolKey });
 })(typeof window !== "undefined" ? window : globalThis);
