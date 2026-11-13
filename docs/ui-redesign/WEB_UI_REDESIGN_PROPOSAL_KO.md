@@ -3,8 +3,11 @@
 - **작성일**: 2026-11-13
 - **브랜치 / worktree**: `feat/web-ui-redesign` · `/home/ubuntu/workspace/ut-webui` (기준 `feat/visual-incident-report` `bba6cf7`)
 - **상태**: 제안. 아래 6장의 결정이 나면 구현 단계로 간다.
-- **목업**: `docs/ui-redesign/mock/index.html` (의존성 없는 정적 파일 한 개). `?stage=0..6` 으로 단계를 고르고,
+- **목업**: `docs/ui-redesign/mock/index.html` + 공통 테마 `mock/theme.css` (의존성 없음). `?stage=0..6` 으로 단계를 고르고,
   오른쪽 아래 "목업 단계" 바의 **▶ 재생** 을 누르면 진단이 실제 속도의 약 0.9배로 흘러가며 화면이 쌓이는 모습을 볼 수 있다.
+  `?view=report` 는 같은 카드로 만든 정적 보고서 화면, `?theme=dark` 는 다크 모드, `mock/design-system.html` 은 토큰·컴포넌트 쇼케이스.
+- **디자인 시스템**: `docs/ui-redesign/DESIGN_SYSTEM_KO.md` (공통 화면 구성, 토큰, 상태 어휘, 컴포넌트, 일관성 체크리스트). 2026-11-13 09:26 요청으로
+  shadcn/ui 토큰 규약을 적용했다.
 
 ## 1. 현재 상태와 문제
 
@@ -26,7 +29,7 @@
 - 화면의 요소는 **추가만** 된다. 이미 보이는 것은 자리를 옮기지 않는다. 사용자는 아래로만 읽으면 된다.
 - 상세는 **관련 항목 안에서, 요청할 때만** 펼친다 (2026-11-13 08:43 요구). 검사 행을 누르면 그 검사의 결과만, 발견 카드의
   "근거"를 펼치면 그 발견의 근거만, 상세 보고서 링크는 해당 절(D/F/G)로 바로 간다.
-- 색·간격·배지는 보고서 HTML의 토큰(`--bad/--warn/--good/--unk`, 카드 반경 10~12px)을 그대로 쓴다. UI와 보고서가 한 시스템으로 보인다.
+- 색·간격·배지는 공통 `theme.css`(shadcn/ui 토큰 규약, 중립 OKLCH 팔레트, 상태색 4개)에서만 온다. 보고서 렌더러의 `.dsv-*` 변수는 브리지로 같은 토큰에 묶인다. UI와 보고서가 한 시스템으로 보인다.
 - 외부 의존 없음(CDN·웹폰트 없음). 임베디드 장비 옆 폐쇄망에서 열린다.
 
 ## 3. 참고한 화면과 가져온 패턴
@@ -50,6 +53,9 @@
 | 4 검증 | ANALYZING → VERIFYING → NARROWING | 발견 배지 "검증됨", 5번째 단계(재읽기 일치) 채워짐, 반박된 경쟁 가설 칩 | `screens/stage4.png` |
 | 5 판정 | 종료 | 배너가 판정색으로 바뀌고 결론 한 문장, 타일 완성(신뢰도·읽은 데이터·소요), "확인하지 못한 것", "다음에 할 일", "보고서"(HTML/MD/JSON·요약 복사·다시 진단) | `screens/stage5.png` |
 | 정상 사례 | 종료 (HEALTHY) | 같은 구조. 배너 초록, 발견 카드 없음, "확인하지 못한 것"이 범위 한계를 말함 | `screens/stage6.png` |
+| 보고서 보기 | 종료 | 같은 카드. 헤더 대신 마스트헤드(제목·메타·절 링크), 끝에 접힌 "쉬운 말 요약"과 "상세 A–I" | `screens/report.png` |
+| 다크 모드 | – | 같은 화면, `.dark` 토큰 | `screens/stage5-dark.png`, `screens/stage0-dark.png` |
+| 디자인 시스템 | – | 토큰 · 상태 어휘 · 컴포넌트 · 타이포 | `screens/design-system.png`, `screens/design-system-dark.png` |
 
 INCONCLUSIVE 는 회색 배너에 `not_covered` 의 첫 항목이 결론 문장이 된다(예: "디버그 이미지가 없어 판단하지 못했습니다"). 구조는 같다.
 
@@ -87,7 +93,7 @@ INCONCLUSIVE 는 회색 배너에 `not_covered` 의 첫 항목이 결론 문장�
 
 | 단계 | 내용 | 완료 조건 |
 |---|---|---|
-| A | 새 정적 UI + 기존 동기 `POST /api/diagnose` 로 **끝난 뒤 한 번에** 렌더 (5·6단계 화면) | 샘플 보고서 17종의 JSON 으로 화면이 깨지지 않음. 외부 의존 0 |
+| A | 새 정적 UI + 기존 동기 `POST /api/diagnose` 로 **끝난 뒤 한 번에** 렌더 (5·6단계 화면). `report_visuals._CSS` 를 `theme.css` 로 교체해 보고서가 같은 테마를 입음 | 샘플 보고서 17종의 JSON 으로 화면·보고서가 깨지지 않음. 외부 의존 0. DESIGN_SYSTEM_KO.md 5장 체크리스트 통과 |
 | B | `start` / `events` / `status` 엔드포인트와 타임라인 리스너, UI 의 점진 표시 (1~4단계) | 로컬 `deadlock_pipeline` 대상에서 첫 ✖ 가 1초 안에 화면에 뜸. 엔진 테스트 전부 통과, 판정 변화 없음 |
 | C | 라우팅 교체(`/` → 새 UI, 레거시 `/legacy/`), README · `bin/dynamic-state-ui` · nginx 데모 갱신 | 기존 서버 테스트 통과, 데모 주소에서 새 UI |
 
