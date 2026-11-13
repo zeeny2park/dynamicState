@@ -16,9 +16,15 @@ or a plain relative string such as `api/diagnose/jobs`). The public demo is serv
 - Errors are JSON `{"success": false, "error": {"code": "...", "message": "..."}}` with an HTTP status
   (400 bad request, 401 token, 403 host/origin, 404 unknown job, 409 not finished).
 - `job_id` is an unguessable URL-safe random token (22 chars of `[A-Za-z0-9_-]`). Anything else in that position is 404.
-- Wording is the UI's job. The server sends the engine's vocabulary (check status `PASS`, `FAIL`, `INCONCLUSIVE`,
-  `SKIPPED`, `NOT_EXECUTED`; engine state names; verdict names `HEALTHY`, `CONFIRMED_FAULT`, `DEGRADED`, `INCONCLUSIVE`
-  ... exactly as in `DiagnoseResult.verdict`).
+- Codes are the engine's vocabulary (check status `PASS`, `FAIL`, `INCONCLUSIVE`, `SKIPPED`, `NOT_EXECUTED`; engine
+  state names; verdict names exactly as in `DiagnoseResult.verdict`). **Words about the diagnosis** (check names,
+  domains, verdict words, one-line results, conclusion, pictures) come from the report code, in both languages, in the
+  fields marked *(UI)* below, built by `extractor/web/ui/view.py`; the UI keeps only its own interface words. A field
+  marked *(UI)* may be missing (an older server, or its builder failed): the UI then shows the codes and the engine's
+  English text, and no pictures.
+- HTML fragments (`view.*_html`, `view.findings[].body_html`, `view.checks[].detail_html`) are produced by the report
+  renderers: every value inside is escaped and they contain no `<script>`, no `on*=` attribute and no `javascript:` URL
+  (tested in `tests/test_web_ui.py` with hostile target strings). Every other string is plain text that the UI escapes.
 
 ## 1. `POST api/diagnose/start`
 
@@ -49,6 +55,12 @@ Response (HTTP 200):
   3 s for it). If it is not known yet it is `null`; it is also in `GET .../status` and in the `target` event later.
 - `state` is `running` | `done` | `error`.
 - At most 4 jobs run at the same time; beyond that: `{"success": false, "error": {"code": "TOO_MANY_JOBS", ...}}`.
+- A local target that the engine's own preflight (`expert_diagnostic_engine._preflight_target`) rejects is refused
+  before a job exists: `TARGET_NOT_FOUND` (no such process / it exited), `PERMISSION_DENIED` (its memory is not readable
+  by the server's user), `TARGET_UNREADABLE` (any other reason); `message` is the engine's reason. A remote target
+  is not pre-checked (its failure is an `INCONCLUSIVE` verdict, as before).
+- The UI resolves a process name to a pid with `GET api/target/processes?process_name=` (exact-name match, else the
+  single match; none → "not found", several → "give a PID").
 
 ## 2. `GET api/diagnose/jobs`
 
@@ -56,12 +68,14 @@ Response (HTTP 200):
 {"success": true, "jobs": [
   {"job_id": "Zk3v...", "investigation_id": "inv_3f9a1c20b7d4", "pid": 4242, "target_name": "deadlock_pipeline",
    "remote_host": null, "state": "done", "verdict": "CONFIRMED_FAULT",
+   "verdict_word": {"en": "confirmed fault", "ko": "확인된 결함"}, "headline": {"en": "deadlock", "ko": "교착 상태(deadlock)"},
    "started_at": "2026-11-13T05:01:02.123456+00:00", "finished_at": "2026-11-13T05:01:12.456789+00:00",
    "last_seq": 31}
 ]}
 ```
 
-Newest first. Bounded: the last 20 finished jobs plus the running ones, in memory only (lost on server restart).
+`verdict_word` *(UI)* is the report's word for the verdict, `headline` *(UI)* the first finding's category in words
+(empty when there is none); both `null` while running. Newest first. Bounded: the last 20 finished jobs plus the running ones, in memory only (lost on server restart).
 `verdict` and `finished_at` are `null` while running; for `state: "error"` the verdict is `null`.
 
 ## 3. `GET api/diagnose/{job_id}/events` (Server-Sent Events)
@@ -102,7 +116,10 @@ Default `format=html`, default `lang` = the language the job was started with. A
 Served by `incident_report.export_incident_report` (the one report renderer; no files are written by this endpoint):
 `text/html; charset=utf-8`, `text/markdown; charset=utf-8` or `application/json`, with `Content-Disposition: inline`.
 The body is the report itself, not wrapped in the `{"success": ...}` envelope. A report is built once per
-(job, language) and cached. There is no way to choose an output or input path.
+(job, language) and cached. There is no way to choose an output or input path. The report is rendered from the very
+result the `verdict` event carried (`export_incident_report(result=...)`, with the diagnosis's inline report), so the
+page and the report state the same verdict, findings and checks; per-part detail anchors: `#verdict-detail`,
+`#finding-<n>-detail`, `#check-<RECIPE_ID>-detail`, `#scope-detail`, `#method-detail`, `#reproducibility-detail`.
 
 ## 6. Events
 
@@ -130,6 +147,8 @@ Source: `TARGET_ASSESSED` and `session.target_assessment.to_dict()` (all its fie
  "allocator_type": "GLIBC_PTMALLOC", "capabilities": ["PROC_MEM"], "limitations": [],
  "investigation_id": "inv_3f9a1c20b7d4"}
 ```
+Also `architecture`, `libc`, `libc_version` *(UI)*, copied from `target_abi` when it was detected. The stop time is
+not known before the verdict, so it is not sent here.
 `process_name` is `null` for a remote target. "Build-ID matches" is not separately computed by the engine here:
 `build_id` is the target's build id and `companion_elf_valid` says whether the debug image was accepted.
 ### `plan`
@@ -137,10 +156,21 @@ Source: `PLAN_GENERATED` and `session.get_plan()`.
 ```json
 {"total_steps": 24, "rationale": "...", "estimated_overhead_ms": 120.0,
  "steps": [{"step_id": "step_1", "recipe_id": "RECIPE_MEMORY_GROWTH_RATE", "name": "Memory growth rate",
-            "category": "MEMORY_LEAK", "domain": "RESOURCE", "priority": 1, "status": "PENDING"}]}
+            "category": "MEMORY_LEAK", "domain": "RESOURCE", "priority": 1, "status": "PENDING",
+            "label": {"en": "Process memory growth", "ko": "프로세스 메모리 증가"},
+            "domain_label": {"en": "Memory growth", "ko": "메모리 증가"}}],
+ "not_planned": [{"recipe_id": "RECIPE_INVALID_FREE", "name": {"en": "...", "ko": "..."}, "domain": "MEMORY_INTEGRITY",
+                  "domain_label": {"en": "...", "ko": "..."}}],
+ "not_in_mode": [{"recipe_id": "RECIPE_USE_AFTER_FREE", "name": {...}, "domain": "...", "domain_label": {...},
+                  "capability": "allocation_tracing",
+                  "capability_label": {"en": "allocation tracing (a record of every allocation and free)",
+                                       "ko": "할당 추적 (모든 할당·해제 기록)"}}]}
 ```
-Excluded recipes ("not executed") are not part of the plan the engine exposes at this point; they appear in the
-`verdict` event inside `result.checks_run` with status `NOT_EXECUTED` / `SKIPPED`. A later replan (follow-up checks the
+`label` / `domain_label` *(UI)*: the check named in words (`view.plan_labels`). `not_planned` / `not_in_mode` *(UI)*:
+the recipes the plan leaves out, split as the report's `section_c.recipes_excluded` splits them — not selected for this
+symptom, and not examined in this mode because a zero-stop diagnosis lacks the capability (`view.plan_exclusions`;
+the `verdict`'s `not_covered` has the same as `recipes_not_planned` / `unsupported_in_mode`). Planned checks that are
+never reached appear in the `verdict` event inside `result.checks_run` with status `NOT_EXECUTED` / `SKIPPED`. A later replan (follow-up checks the
 engine adds when a check supports a hypothesis) is not re-sent: a `check_start`/`check_done` for a `recipe_id` that was
 not in `plan.steps` is a follow-up check and should be appended to the list.
 ### `check_start`
@@ -160,6 +190,9 @@ Source: `STEP_EXECUTED` and the last entry of `session.get_checks()`.
  "confidence": 0.9, "supporting_evidence_ids": ["ev_1"], "contradicting_evidence_ids": [],
  "limitations": [], "missing_evidence": [], "index": 2, "total": 24}
 ```
+Also `line` *(UI)* `{"en": ..., "ko": ...}`: the one-line result the report's check list shows for this check
+(`view.check_line`), and `bytes_read`: bytes read from the target so far in this diagnosis (cumulative), when the
+budget tracker has it.
 `status` is the engine check status (`PASS`, `FAIL`, `INCONCLUSIVE`, `SKIPPED`, `NOT_EXECUTED`, also possibly
 `NOT_APPLICABLE` / `ERROR` as in the engine). `duration_ms` may be `null`. `summary` is the engine's technical
 interpretation (English).
@@ -168,8 +201,10 @@ Derived from the first `FAIL` check of each (category, domain) pair, sent right 
 hypotheses only in its analyze step, so this is a suspicion, not a hypothesis object.
 ```json
 {"key": "MEMORY_LEAK/RESOURCE", "recipe_id": "RECIPE_MEMORY_GROWTH_RATE", "check_id": "chk_...", "name": "Memory growth rate",
- "category": "MEMORY_LEAK", "domain": "RESOURCE", "summary": "RSS grew 31% in 4 s", "status": "provisional"}
+ "category": "MEMORY_LEAK", "domain": "RESOURCE", "summary": "RSS grew 31% in 4 s", "status": "provisional",
+ "category_label": {"en": "memory leak", "ko": "메모리 누수"}}
 ```
+`category_label` *(UI)*: the category in words (`view.category_labels`).
 ### `verified`
 Source: `HYPOTHESES_VERIFIED` and `session.active_hypotheses` / `rejected_hypotheses`.
 ```json
@@ -191,8 +226,24 @@ Terminal. The same result as the synchronous endpoint plus pointers to the repor
  "report_path": "/corpus/reports/inv_3f9a1c20b7d4.report.json",
  "report_urls": {"html": "api/diagnose/Zk3v.../report?format=html", "md": "api/diagnose/Zk3v.../report?format=md",
                  "json": "api/diagnose/Zk3v.../report?format=json"},
- "language": "ko"}
+ "language": "ko",
+ "view": {"ko": {...}, "en": {...}},
+ "notice": {"code": "TARGET_EXITED", "message": "process 4242 exited during the diagnosis"}}
 ```
+`view` *(UI)* is `view.build_views(result, report)` — everything the final screen shows, in each language, made by the
+report code from the result with its inline report (the inline report itself is not sent):
+`verdict`, `tone` (`fail`/`warn`/`pass`/`skip`), `verdict_word`, `verdict_meaning`, `conclusion_html`,
+`symptom_html[]`, `scope_html`, `tiles` (`checks.value` + `counts{run,found,clean,undecided,not_run}`,
+`stop{value,note}`, `bytes{value,note}`, `duration{value}`), `checks[]` (`rid`, `status` in the four groups,
+`raw_status`, `kind` = `run`/`not_executed`/`not_planned`/`not_in_mode`, `name`, `domain`, `line`, `ms`,
+`capability`/`capability_label`, `findings[]`, `detail_html` = the report check list's `<dl>`, `anchor`),
+`findings[]` (`n`, `category`, `status`, `severity`, `severity_word`, `status_word`, `tone`, `heading_html`,
+`recipe_ids`, `body_html` = the report's finding block — key facts, picture, text, reasoning, evidence — without its
+heading, `anchor`), `not_examined_html`, `next_html`. The pictures need no extra stylesheet: their rules are part of
+the shared `extractor/web/ui/theme.css` (the "Finding pictures" section), which the UI loads and the report inlines.
+`notice` *(UI)*, optional: the target itself limited the diagnosis — `TARGET_EXITED` (a local process that was there at
+the start is gone at the end, or the engine found it gone), `PERMISSION_DENIED`, `TARGET_NOT_FOUND`,
+`TARGET_UNREADABLE` (from the result's `target_unreadable` entry). The verdict stands; the UI shows the notice under it.
 `result` is exactly `response.result` of `POST api/diagnose` for the same input (it includes `human_summary`).
 `report_path` is the engine's JSON report file on the server host (informational; it cannot be read through the API).
 `report_urls` are relative to the page like every other URL here.
@@ -202,7 +253,19 @@ Terminal. The diagnosis function raised (an unreadable target is NOT an error: i
 {"code": "DIAGNOSE_ERROR", "message": "RuntimeError: ...", "stage": "diagnose"}
 ```
 
-## 7. Routing (stage C)
+## 7. What the UI relies on (client side)
+
+- Events are sorted by `seq` and de-duplicated before they are reduced (`state = reduce(events)` in `ui.js`), so the
+  order of `classified` / `target`, duplicates after a reconnect and an overlap between the stream and `status` are
+  harmless.
+- Reconnect: up to 3 tries with `?after=<last seq>`, then `status?after=` polling; the stream is also abandoned for
+  polling when it delivers nothing for 4 s (a buffering proxy). A 404 from `status` is "this job is unknown here".
+- A `check_start` / `check_done` for a recipe not in `plan.steps` is appended as a row; a recipe in `not_planned` /
+  `not_in_mode` that the engine ran after all is shown as a row, not in the "not run" group.
+- Replays (`extractor/web/ui/replay/*.json`, `?replay=<name>`) are recorded event streams in exactly this wire shape,
+  made from saved results by `python3 -m extractor.web.ui.replay_gen` with the same builders.
+
+## 8. Routing (stage C)
 
 | URL | Content |
 |---|---|
