@@ -65,6 +65,30 @@ class TestDerivation(unittest.TestCase):
         rows = [(i * 0.25, _rec(0, run_ms=i * 0.1, wait_ms=i * 250)) for i in range(5)]
         self.assertEqual(judge(_series(rows))["runaway_threads"], [])
 
+    def test_yield_poller_on_saturated_machine_is_flagged(self):
+        # measured on spin_yield with 8 CPU burners on 4 cores: runnable 100%, 0.1% of a CPU, ~250 turns on a CPU per
+        # second, no voluntary switch. The 2% CPU floor alone cleared it (HEALTHY on a real busy wait).
+        def rec(i):
+            r = _rec(0, run_ms=i * 0.25, wait_ms=i * 249.75)
+            r["schedstat"]["timeslices"] = 1000 + i * 60
+            r["nonvoluntary_ctxt_switches"] = i * 60
+            return r
+        j = judge(_series([(i * 0.25, rec(i)) for i in range(5)]))
+        self.assertEqual(len(j["runaway_threads"]), 1, j["thread_findings"])
+        r = j["runaway_threads"][0]
+        self.assertEqual(r["judgement_basis"], "schedstat_runnable_fraction_dispatches")
+        self.assertEqual(r["cpu_dispatches"], 240)
+        self.assertTrue(r["contended_machine"])
+        self.assertIn("was put on a CPU 240 times", j["thread_findings"][0])
+
+    def test_few_turns_on_cpu_do_not_replace_the_cpu_floor(self):
+        # 3 turns in a 1 s window are not enough observation of the thread's own behaviour
+        def rec(i):
+            r = _rec(0, run_ms=i * 0.1, wait_ms=i * 249.9)
+            r["schedstat"]["timeslices"] = 1000 + (3 if i == 4 else i // 2)
+            return r
+        self.assertEqual(judge(_series([(i * 0.25, rec(i)) for i in range(5)]))["runaway_threads"], [])
+
     def test_missing_or_zero_schedstat_uses_fallback_and_says_so(self):
         for mk in (lambda i: _rec(i * 25),                          # key absent
                    lambda i: _rec(i * 25, run_ms=0, wait_ms=0)):    # CONFIG_SCHED_INFO off: all zero

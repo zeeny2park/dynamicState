@@ -61,6 +61,11 @@ class ThreadSamplingConfig:
     runaway_runnable_fraction: float = 0.90
     # A runnable thread that received (almost) no CPU is starved, not "monopolising": require a sliver of real CPU.
     runaway_min_cpu_share_when_runnable: float = 0.02
+    # ... unless the thread was demonstrably put on a CPU again and again (schedstat run count) and never blocked:
+    # a sched_yield() poller on a saturated machine runs for microseconds per turn and receives ~0.1% of a CPU, yet
+    # every turn it chose to stay runnable. That is direct evidence of a busy wait; the CPU-share floor would turn it
+    # into HEALTHY exactly when the machine is loaded. A thread starved on the run queue has no such turns.
+    runaway_min_dispatches_per_sec_when_starved: float = 10.0
     # Fallback only (schedstat absent or all zero): the old absolute rule, which a contended machine can defeat.
     runaway_cpu_share: float = 0.50
     # A spinner can still take a stray voluntary switch (page-fault lock, start-up tail). Requiring exactly zero
@@ -868,6 +873,7 @@ def derive(series: ThreadSeries) -> Dict[str, Any]:
         d["schedstat_available"] = bool(usable)
         d["runnable_fraction"] = None
         d["runnable_cpu_received"] = None
+        d["cpu_dispatches"] = None
         if usable:
             (ta, a), (tb, b) = ss_pts[0], ss_pts[-1]
             span_ns = max(1.0, (tb - ta) * 1e9)
@@ -875,6 +881,9 @@ def derive(series: ThreadSeries) -> Dict[str, Any]:
             if dr >= 0 and dw >= 0 and tb > ta:
                 d["runnable_fraction"] = round(min(1.0, (dr + dw) / span_ns), 3)
                 d["runnable_cpu_received"] = round(min(1.0, dr / span_ns), 3)
+                # times the thread was put on a CPU in the window (schedstat third field, pcount)
+                if isinstance(a.get("timeslices"), int) and isinstance(b.get("timeslices"), int):
+                    d["cpu_dispatches"] = max(0, b["timeslices"] - a["timeslices"])
             else:
                 d["schedstat_available"] = False
         vols = [r.get("voluntary_ctxt_switches") for r in recs]
@@ -1042,9 +1051,14 @@ def judge(series: ThreadSeries) -> Dict[str, Any]:
         # --- CPU monopoly without observable progress -----------------------------------
         share = d["cpu_share"] or 0.0
         rf = d["runnable_fraction"]
+        dispatched_often = False
         if rf is not None:
             got = d["runnable_cpu_received"]
-            wanted = rf >= cfg.runaway_runnable_fraction and got >= cfg.runaway_min_cpu_share_when_runnable
+            disp = d.get("cpu_dispatches")
+            dispatched_often = (isinstance(disp, int) and disp >= max(
+                cfg.min_samples_for_verdict, cfg.runaway_min_dispatches_per_sec_when_starved * window))
+            wanted = rf >= cfg.runaway_runnable_fraction and (
+                got >= cfg.runaway_min_cpu_share_when_runnable or dispatched_often)
             basis = "schedstat_runnable_fraction"
         else:
             got = share
@@ -1062,8 +1076,13 @@ def judge(series: ThreadSeries) -> Dict[str, Any]:
             if rf is not None:
                 contended = got < 0.8 * min(1.0, rf)
                 r["contended_machine"] = contended
+                turns = ""
+                if got < cfg.runaway_min_cpu_share_when_runnable and dispatched_often:
+                    r["judgement_basis"] = "schedstat_runnable_fraction_dispatches"
+                    turns = (f", was put on a CPU {d['cpu_dispatches']} times and stayed runnable after every "
+                             f"turn (it gives the CPU back without waiting for anything)")
                 msg = (f"Thread {label} was runnable {_fmt_pct(rf)} of the {window:.2f}s window and received "
-                       f"{_fmt_pct(got)} of a CPU{' (machine contended)' if contended else ''}, "
+                       f"{_fmt_pct(got)} of a CPU{' (machine contended)' if contended else ''}{turns}, "
                        f"with no voluntary context switch, no read/write syscall, and {tail}.")
             else:
                 r["limitation"] = SCHEDSTAT_FALLBACK_NOTE

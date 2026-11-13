@@ -1794,14 +1794,32 @@ class AdaptiveInvestigationSession:
         except Exception as le:
             return f"FAILED: {type(le).__name__}: {le}"
 
+    def _halt_on_budget(self) -> str:
+        """End the collection because the observation budget ran out.
+
+        What the checks that DID run found is kept: when one of them supported a problem, the hypotheses are formed
+        from the evidence already collected (``_step_analyze`` groups that evidence; it reads nothing from the
+        target) before the conclusion is sealed.  Otherwise a check that had already found the problem (e.g. lock
+        contention, a spinning thread) was dropped whenever a loaded host made the run slower than the budget, and
+        the verdict said "no problem finding was produced".  The findings stay probable (the verify / narrow steps
+        that could confirm them did not run) and the run is still never HEALTHY: budget_exhausted blocks it."""
+        self.state = STATE_BUDGET_EXHAUSTED
+        reason = self.budget_tracker.exhaustion_reason or "Observation resource budget exhausted."
+        if any(isinstance(e, dict) and e.get("status") == "SUPPORTED" for e in self.collected_evidence):
+            try:
+                self._step_analyze()
+            except Exception as exc:  # noqa: BLE001 - never let the synthesis hide the budget stop
+                self._record_timeline_event("ANALYZE_AFTER_BUDGET_FAILED", {"error": f"{type(exc).__name__}: {exc}"})
+            self.state = STATE_BUDGET_EXHAUSTED
+        self._finalize_conclusion(
+            stop_reason="BUDGET_EXHAUSTED",
+            summary=f"Investigation halted: {reason}",
+        )
+        return reason
+
     def _step_collect_next(self) -> Dict[str, Any]:
         if self.budget_tracker and not self.budget_tracker.can_continue():
-            self.state = STATE_BUDGET_EXHAUSTED
-            reason = self.budget_tracker.exhaustion_reason or "Observation resource budget exhausted."
-            self._finalize_conclusion(
-                stop_reason="BUDGET_EXHAUSTED",
-                summary=f"Investigation halted: {reason}",
-            )
+            reason = self._halt_on_budget()
             return {"action": "BUDGET_EXHAUSTED", "state": self.state, "reason": reason}
 
         if not self.plan:
@@ -1822,12 +1840,7 @@ class AdaptiveInvestigationSession:
             break
 
         if self.budget_tracker and not self.budget_tracker.can_continue():
-            self.state = STATE_BUDGET_EXHAUSTED
-            reason = self.budget_tracker.exhaustion_reason or "Observation resource budget exhausted."
-            self._finalize_conclusion(
-                stop_reason="BUDGET_EXHAUSTED",
-                summary=f"Investigation halted: {reason}",
-            )
+            self._halt_on_budget()
             return {"action": "BUDGET_EXHAUSTED", "state": self.state}
 
         if self.plan.current_step_index >= len(self.plan.steps):
@@ -2316,12 +2329,7 @@ class AdaptiveInvestigationSession:
         self.plan.current_step_index += 1
 
         if self.budget_tracker and not self.budget_tracker.can_continue():
-            self.state = STATE_BUDGET_EXHAUSTED
-            reason = self.budget_tracker.exhaustion_reason or "Observation resource budget exhausted."
-            self._finalize_conclusion(
-                stop_reason="BUDGET_EXHAUSTED",
-                summary=f"Investigation halted: {reason}",
-            )
+            reason = self._halt_on_budget()
             return {"action": "BUDGET_EXHAUSTED", "step_id": step.step_id, "state": self.state, "reason": reason}
 
         if self.plan.current_step_index >= len(self.plan.steps):
