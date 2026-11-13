@@ -60,7 +60,7 @@ untagged applies to both. (`dynamic-state skill install` installs this file as i
    running program on this machine. It is the host that analyses; nothing is stopped on the board. Key file path only,
    never a password or key contents. If the user agrees to copy the small collector to the board, also enable collector deployment.
 [mcp] Pass `remote_host`, `ssh_user`, `ssh_port`, `ssh_key`, optionally `ssh_proxy_jump` and `auto_deploy_collector=true` to the same `runtime_diagnose_process` call.
-[cli] Add `--host HOST --user USER --port PORT --identity KEYFILE [--ssh-proxy-jump JUMP] [--auto-deploy-collector]` to `dynamic-state diagnose` (also accepted by `find-process`, `callstacks`, `heap-owner`, `heap-leaks`, `export-report`; `--remote-host`, `--ssh-user`, `--ssh-port`, `--ssh-key` are the long names).
+[cli] Add `--host HOST --user USER --port PORT --identity KEYFILE [--ssh-proxy-jump JUMP] [--auto-deploy-collector]` to `dynamic-state diagnose` (`find-process`, `heap-owner`, `heap-leaks` and `export-report` take the same options; `callstacks` and `eval` take only the long names `--remote-host --ssh-user --ssh-port --ssh-key`).
 
 ## Workflow
 1. Run the diagnosis once; use language `ko` when the user writes Korean, otherwise `en`.

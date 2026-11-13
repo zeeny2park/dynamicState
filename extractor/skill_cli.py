@@ -6,7 +6,7 @@ Each command prints the same JSON object as the MCP tool of the same purpose:
 - `find-process`  -> candidates for a process name (the lookup behind `runtime_target_connect(process_name=...)`)
 - `heap-owner`    -> `runtime_heap_owner_lookup`
 - `heap-leaks`    -> `runtime_heap_leak_candidates`
-- `skill install` -> copies the skill directory to where an agent loads skills from
+- `skill install` -> copies the skill directory to where an agent loads skills from; `skill show` prints its text
 """
 
 import argparse
@@ -15,7 +15,7 @@ import os
 import sys
 from typing import Any, Dict, List, Optional
 
-from .agent_skill import SKILL_NAME, install_skill, skill_dir
+from .agent_skill import SKILL_NAME, install_skill, skill_body, skill_dir
 
 
 def _add_remote_arguments(p: argparse.ArgumentParser) -> None:
@@ -64,6 +64,8 @@ def add_parsers(subparsers) -> None:
     where.add_argument("--project", action="store_true", default=False, help="Install into ./.claude/skills of the current directory")
     si.add_argument("--force", action="store_true", default=False, help="Replace an existing installed copy")
     ss.add_parser("path", help="Print the directory of the skill shipped with this installation")
+    sh = ss.add_parser("show", help="Print the skill text without frontmatter, to paste into an agent's standing instructions (default: the command-line view)")
+    sh.add_argument("--transport", choices=("cli", "mcp"), default="cli", help="Which calling convention to print (default: cli)")
 
 
 def _fail(error: str, code: str) -> int:
@@ -151,6 +153,9 @@ def run_find_process(args) -> int:
 def run_skill(args) -> int:
     if args.skill_command == "path":
         print(skill_dir())
+        return 0
+    if args.skill_command == "show":
+        sys.stdout.write(skill_body(args.transport))
         return 0
     if args.dir:
         base = os.path.expanduser(args.dir)

@@ -28,7 +28,7 @@ dynamic-state diagnose -p $PID --json
 kill $PID
 ```
 
-From an AI agent, the same thing is one MCP call, `runtime_diagnose_process(pid, debug_image?, symptom?)`. The web UI/API has the same one-call entry: the diagnosis page at `/` (it starts `POST /api/diagnose/start` and shows each check as it finishes; events at `GET /api/diagnose/{job_id}/events`, same data as polling JSON at `.../status`, the report at `.../report?format=html|md|json&lang=ko|en`), or the synchronous `POST /api/diagnose` with `{"pid", "debug_image"?, "symptom"?, "time_limit_s"?}` (session token required; returns `{"success": true, "result": {...}}`).
+From an AI agent, the same thing is one MCP call, `runtime_diagnose_process(pid, debug_image?, symptom?)` (an agent without MCP uses the skill, see [Agents without MCP](#agents-without-mcp-the-skill)). The web UI/API has the same one-call entry: the diagnosis page at `/` (it starts `POST /api/diagnose/start` and shows each check as it finishes; events at `GET /api/diagnose/{job_id}/events`, same data as polling JSON at `.../status`, the report at `.../report?format=html|md|json&lang=ko|en`), or the synchronous `POST /api/diagnose` with `{"pid", "debug_image"?, "symptom"?, "time_limit_s"?}` (session token required; returns `{"success": true, "result": {...}}`).
 Configure your agent (Claude Desktop, Cursor, ...) with:
 
 ```json
@@ -67,6 +67,97 @@ Host tools used by the analysis (install the `binutils` package; `gcc`/`g++` onl
 Reading another process's memory needs the same user and `kernel.yama.ptrace_scope` permitting it (or `CAP_SYS_PTRACE`).
 Debug info: the target binary must be built with `-g`, or you must pass the unstripped build of the same program as
 `debug_image` (the GNU build-id must match).
+
+## Agents without MCP: the skill
+
+The `diagnose-process` skill ([skills/diagnose-process/SKILL.md](skills/diagnose-process/SKILL.md)) is the workflow an agent
+follows: when to diagnose, what to ask the user, how to read the verdict, what `INCONCLUSIVE` and `HEALTHY` mean, which
+narrower follow-up to run, and how to report honestly. It is one file for two ways of calling the tool. Every step has an
+`[mcp]` line (a tool call) and a `[cli]` line (a shell command); a test (`tests/test_skill_transports.py`) fails when the
+two diverge or when a named tool, command or option does not exist.
+
+**MCP or skill?** Use MCP when your agent can connect MCP servers: the server sends the skill's `[mcp]` view as its
+instructions, so nothing else is needed (configuration above). Use the skill when the agent cannot use MCP, or MCP
+cannot be configured where it runs, but the agent has a shell: it runs `dynamic-state` commands and reads their JSON.
+The skill also tells such an agent how to check that the tool is installed and what to do when it is not.
+
+**1. Install the tool** (on the machine where the target process runs, or where you analyse a remote target from):
+the commands in [Install](#install) (`python3 -m pip install .` from a checkout, in a venv if you like). The agent needs
+`dynamic-state` on its `PATH`; `readelf` (binutils) is needed for symbol-level diagnosis. The agent's user must be able
+to read the target (same user, or `CAP_SYS_PTRACE`, and `kernel.yama.ptrace_scope` permitting it); if not, the result is
+`INCONCLUSIVE` with `target_unreadable` in `not_covered`, never "healthy".
+
+**2. Install the skill.** The skill ships inside the installed package, so one command copies it:
+
+<!-- check: skip (writes to your home directory; the check script runs it with --dir and --project) -->
+```bash
+dynamic-state skill install            # ~/.claude/skills/diagnose-process/   (all your projects)
+dynamic-state skill install --project  # ./.claude/skills/diagnose-process/   (this project only)
+dynamic-state skill install --dir DIR  # DIR/diagnose-process/                (any skills directory)
+```
+
+It refuses to overwrite an existing copy unless you add `--force`. From a checkout without installing, `cp -r
+skills/diagnose-process ~/.claude/skills/` is the same thing. `dynamic-state skill path` prints where the shipped copy is.
+
+- **Claude Code** loads skills from `~/.claude/skills/<name>/SKILL.md` (personal) and `.claude/skills/<name>/SKILL.md`
+  (project), which is where the commands above write; restart or start a new session, then ask "diagnose PID 1234".
+- **Other agents** (Codex CLI, Gemini CLI, Cursor, Copilot, a chat model with a shell tool, ...) have no skill directory in
+  common. What works everywhere is to put the skill's text where the agent reads standing instructions, or paste it at the
+  start of the conversation. `dynamic-state skill show` prints the command-line view without the frontmatter, ready for that:
+
+<!-- check: skip (appends to a file of your choosing) -->
+```bash
+dynamic-state skill show >> AGENTS.md
+```
+
+`AGENTS.md` is read by Codex CLI and by other agents that follow that convention; Gemini CLI reads `GEMINI.md` and GitHub
+Copilot reads `.github/copilot-instructions.md`; for any other agent use its own rules or system-prompt file (check its
+documentation for the current name and location). The agent also needs permission to run shell commands.
+
+**3. What the agent runs.** A real session against the deadlock demo from the quick start, as an agent would run it
+(corpus and output files in a scratch directory):
+
+```bash
+mkdir -p /tmp/ds-example
+/tmp/deadlock_demo > /dev/null &
+PID=$!
+sleep 1
+dynamic-state find-process deadlock_demo
+dynamic-state diagnose -p $PID --corpus /tmp/ds-example/corpus --json > /tmp/ds-example/result.json
+python3 -c 'import json; d = json.load(open("/tmp/ds-example/result.json")); print(d["verdict"], d["confidence"]); print(d["findings"][0]["subjects"]); print(d["collection_impact"]["zero_stop"], d["collection_impact"]["measured_stop_ms"])'
+dynamic-state export-report -p $PID -d /proc/$PID/exe --corpus /tmp/ds-example/corpus -o /tmp/ds-example/report.md --report-html /tmp/ds-example/report.html --report-json /tmp/ds-example/report.json > /dev/null
+kill $PID
+```
+
+`find-process` prints (abridged) `{"success": true, "matches": [{"pid": 80135, "name": "deadlock_demo", "executable":
+"/tmp/deadlock_demo", ...}]}`. `diagnose --json` writes the full result object (about 20 keys: `verdict`, `confidence`,
+`summary`, `findings`, `checks_run`, `not_covered`, `collection_impact`, `healthy_scope`, `human_summary`, `report_path`, ...).
+The Python line prints:
+
+```text
+CONFIRMED_FAULT 0.92
+['80138', 'ingest', 'm_out', '80139', 'flush', 'm_in', '__GI___lll_lock_wait', 'pthread_mutex_lock', 'ingest', 'deadlock_pipeline.c:15', 'start_thread', 'thread_start', 'flush', 'deadlock_pipeline.c:27']
+True 0.0
+```
+
+The agent then relays `human_summary` (what is wrong, why, what was not examined, the measured impact) and, for narrower
+questions, runs the follow-ups in the skill. The commands and the MCP tool each one stands for:
+
+| Step | MCP tool | Command |
+| :--- | :--- | :--- |
+| find the PID by name | `runtime_target_connect(process_name=...)` | `dynamic-state find-process NAME` |
+| diagnose (symptom, structured symptom fields, remote, language) | `runtime_diagnose_process` | `dynamic-state diagnose -p PID [--symptom ...] [--symptom-kind ...] [--host ...] [--lang ko\|en] --json` |
+| export the report (Markdown, HTML, JSON) | `runtime_export_incident_report` | `dynamic-state export-report -p PID -d ELF -o r.md --report-html r.html --report-json r.json` |
+| thread call stacks, lock cycles | `runtime_inspect_thread_callstack_and_locks` | `dynamic-state callstacks -p PID -d ELF` |
+| heap leak candidates | `runtime_heap_leak_candidates` | `dynamic-state heap-leaks -p PID -d ELF` |
+| who owns this address | `runtime_heap_owner_lookup` | `dynamic-state heap-owner -p PID -d ELF -a 0xADDR,...` |
+| evaluate a variable | `runtime_eval_memory_path` | `dynamic-state eval --pid PID --debug-image ELF --expr NAME` |
+| find a symbol | `runtime_symbol_search` | no keyword search on the command line; `dynamic-state fuzzy-resolve -p PID -d ELF -q "words"` |
+
+Limits are the ones in [Supported targets and known limits](#supported-targets-and-known-limits): zero-stop by default,
+`HEALTHY` only within the stated scope, `INCONCLUSIVE` means "could not tell". Each command also takes the remote options:
+`--host --user --port --identity` on `diagnose`, `find-process`, `heap-leaks`, `heap-owner` and `export-report`;
+`--remote-host --ssh-user --ssh-port --ssh-key` on `callstacks` and `eval`.
 
 ## What the diagnosis returns
 
@@ -172,7 +263,7 @@ and installs the package into a fresh venv and runs the commands in this README 
 
 ## Documentation
 
-- [skills/diagnose-process/SKILL.md](skills/diagnose-process/SKILL.md): the agent workflow (single source for the MCP instructions and playbook)
+- [skills/diagnose-process/SKILL.md](skills/diagnose-process/SKILL.md): the agent workflow for MCP and for shell-only agents (single source for the MCP instructions and playbook; install: [Agents without MCP](#agents-without-mcp-the-skill))
 - [docs/PRACTICAL_PLAYBOOK_KO.md](docs/PRACTICAL_PLAYBOOK_KO.md): practical playbook (Korean)
 - [docs/PROCESS_HEALTH_INVESTIGATION_SKILL.md](docs/PROCESS_HEALTH_INVESTIGATION_SKILL.md), [docs/PROCESS_HEALTH_INVESTIGATION_KNOWLEDGE.md](docs/PROCESS_HEALTH_INVESTIGATION_KNOWLEDGE.md): investigation method and tool semantics
 - [target/collector/README.md](target/collector/README.md): the target-side collector

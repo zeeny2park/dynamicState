@@ -267,6 +267,8 @@ class TestSkillInstallCommand(unittest.TestCase):
             self.assertTrue(os.path.isfile(os.path.join(home, ".claude", "skills", "diagnose-process", "SKILL.md")))
             p = self._run("path")
             self.assertEqual(p.stdout.strip(), skill_dir())
+            self.assertEqual(self._run("show").stdout, skill_body("cli"))
+            self.assertEqual(self._run("show", "--transport", "mcp").stdout, skill_body("mcp"))
 
     def test_pyproject_ships_every_skill_file(self):
         with open(os.path.join(ROOT, "pyproject.toml")) as fh:
