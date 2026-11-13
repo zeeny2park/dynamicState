@@ -181,4 +181,10 @@ main > * { min-width: 0; }
   .phases { font-size: 10.5px; }
   .banner .sum { font-size: 15px; }
 }
+@media (max-width: 400px) {
+  .top { gap: 0; }
+  .top .btn-sm { padding: 0 7px; }
+  .brand { font-size: 13px; }
+}
+@media (max-width: 360px) { .brand { font-size: 0; gap: 0; } }   /* the dot stays; the header buttons fit */
 @media print { .top, .replaybar, .no-print { display: none !important; } }
