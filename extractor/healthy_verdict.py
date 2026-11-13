@@ -43,6 +43,8 @@ from .diagnostic_methodology import CheckStatus
 
 HEALTHY_RULE_ID = "RULE_5B_HEALTHY_WITHIN_BASELINE_SCOPE"
 
+OBS_FREED_MEMORY_USE = "freed_memory_use"   # observation key of RECIPE_FREED_MEMORY_USE (recipe_plugins.use_after_free)
+
 # not_covered kinds that mean the diagnosis could not look (never a scope limit)
 BLOCKING_KINDS = frozenset({
     "target_unreadable", "target_unreachable", "invalid_target", "missing_debug_image", "abi_detection_failed",
@@ -98,16 +100,13 @@ def _uaf_cap_scope_limit(c: Any) -> Optional[Dict[str, Any]]:
     limit (heap above the baseline cap) the UAF observation is NOT_CHECKED.  That is the same scope limit as the
     integrity check, not missing evidence, so it is reported in ``not_checked`` instead of blocking HEALTHY."""
     obs = _obs(c)
-    u = None
-    for k, v in obs.items():
-        if "freed_memory" in str(k) and isinstance(v, dict):
-            u = v
-            break
+    u = obs.get(OBS_FREED_MEMORY_USE)
     if not isinstance(u, dict) or u.get("status") != "NOT_CHECKED" or u.get("findings"):
         return None
     heap = ((obs.get("memory_integrity") or {}).get("heap") or {})
-    lims = " ".join(str(x) for x in (u.get("limitations") or []))
-    if heap.get("not_checked_reason") != "above_baseline_cap" and "above" not in lims and "cap" not in lims:
+    # structured reason only (stage 1): the check's own record carries the heap walk's not_checked_reason
+    if heap.get("not_checked_reason") != "above_baseline_cap" \
+            and u.get("heap_not_checked_reason") != "above_baseline_cap":
         return None
     return {"kind": "uaf_not_checked", "item": "use_after_free",
             "label": ("use-after-free (heap above the baseline walk cap; a memory-corruption symptom runs the full walk)",

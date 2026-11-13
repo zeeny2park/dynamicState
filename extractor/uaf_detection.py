@@ -701,8 +701,12 @@ def run_uaf(adapter: Any, pid: int, companion_elf: Optional[str], objs: Dict[str
         why = "; ".join(l for l in (integrity or {}).get("limitations") or [] if "heap" in l) or \
             "heap %s" % (heap.get("status") or "not walked")
         status = "UNSUPPORTED" if heap.get("status") == "UNSUPPORTED" else "NOT_CHECKED"
-        return {"status": status, "findings": [], "not_evidence": [],
-                "limitations": ["use-after-free not checked: no usable heap walk (%s)" % why], "cost": {"bytes_read": 0}}
+        out = {"status": status, "findings": [], "not_evidence": [],
+               "limitations": ["use-after-free not checked: no usable heap walk (%s)" % why], "cost": {"bytes_read": 0}}
+        if heap.get("not_checked_reason"):
+            # structured reason (the HEALTHY rule reads it, as for the double-free record)
+            out["heap_not_checked_reason"] = heap["not_checked_reason"]
+        return out
     if remaining_wall_s is not None and remaining_wall_s < cfg.window_s + 1.0:
         cfg = UafConfig(**dict(cfg.__dict__, window_s=max(0.1, remaining_wall_s / 4.0), observations=2,
                                reuse_probe_reads=2))
