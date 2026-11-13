@@ -64,6 +64,7 @@
    ```bash
    ./bin/dynamic-state-ui --host 0.0.0.0 --port 8080
    ```
+   - 접속 주소: `http://<호스트>:8080/` 가 새 진단 화면이고, 이전 8탭 화면은 `/legacy/`, 이전 채팅 워크스페이스는 `/legacy/workspace` 입니다 (아래 안내의 탭 이름은 `/legacy/` 기준).
 2. **Step 1 (Target 연결 및 레시피 실행)**:
    - `Matching Companion Nostrip / Debug ELF`에 호스트의 디버그 바이너리 경로를 입력합니다.
    - 원격 임베디드 장비라면 `🌐 Remote Embedded Target (SSH)` 드로어를 열어 장비 IP, 계정, `Process Name`을 입력하고 `Find` → `🔍 Validate Target`을 클릭합니다.

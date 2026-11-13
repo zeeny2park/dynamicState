@@ -386,7 +386,7 @@ class TestWebApi(unittest.TestCase):
 
     def test_11_static_file_serving_and_traversal_guard(self):
         # Root index.html
-        req = urllib.request.Request(self.base_url + "/")
+        req = urllib.request.Request(self.base_url + "/legacy/")
         with urllib.request.urlopen(req) as resp:
             self.assertEqual(resp.status, 200)
             self.assertIn("text/html", resp.headers.get("Content-Type", ""))
@@ -508,7 +508,7 @@ class TestWebApi(unittest.TestCase):
 
     def test_16_static_assets_and_html_elements(self):
         # 1. Root index.html
-        req_root = urllib.request.Request(self.base_url + "/")
+        req_root = urllib.request.Request(self.base_url + "/legacy/")
         with urllib.request.urlopen(req_root) as resp:
             self.assertEqual(resp.status, 200)
             html_str = resp.read().decode("utf-8")
@@ -614,7 +614,7 @@ class TestWebApi(unittest.TestCase):
     def test_21_object_explorer_html_workspace_and_components(self):
         """Verify 3-Pane Object Explorer workspace elements, summary bar, CSS and JS."""
         # 1. HTML elements
-        req_root = urllib.request.Request(self.base_url + "/")
+        req_root = urllib.request.Request(self.base_url + "/legacy/")
         with urllib.request.urlopen(req_root) as resp:
             html = resp.read().decode("utf-8")
             # Summary Bar

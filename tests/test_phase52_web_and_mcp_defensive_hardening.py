@@ -258,7 +258,7 @@ class TestPhase52WebAndMcpDefensiveHardening(unittest.TestCase):
 
         # Verify /workspace HTML includes AbortController and _refreshInFlight guards
         conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=10)
-        conn.request("GET", "/workspace")
+        conn.request("GET", "/legacy/workspace")
         resp = conn.getresponse()
         html_text = resp.read().decode("utf-8")
         conn.close()
@@ -361,7 +361,7 @@ class TestPhase52WebAndMcpDefensiveHardening(unittest.TestCase):
     def test_08_imp019_ui_receives_token_and_authorize_target_is_not_auto_enabled(self) -> None:
         """IMP-019: Existing UI receives session token via HTML/Cookie and works, and authorize_target is not auto-enabled by PID."""
         conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=10)
-        conn.request("GET", "/workspace")
+        conn.request("GET", "/legacy/workspace")
         resp = conn.getresponse()
         html_text = resp.read().decode("utf-8")
         set_cookie = resp.getheader("Set-Cookie") or ""

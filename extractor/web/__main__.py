@@ -49,7 +49,9 @@ def main():
     url = f"http://{args.host}:{args.port}"
     print("========================================")
     print(" dynamicState Web UI")
-    print(f" {url}")
+    print(f" {url}/            (diagnosis UI)")
+    print(f" {url}/legacy/      (previous 8-tab UI)")
+    print(f" {url}/legacy/workspace  (previous chat workspace)")
     print(" Mode: " + runtime.observation_mode + (" (mutation enabled)" if runtime.allow_mutation else " (read-only)"))
     print(" Corpus: " + corpus_dir)
     print(" Press Ctrl+C to terminate.")
