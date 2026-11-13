@@ -8,7 +8,8 @@ Defines the first-class diagnostic methodology model, separating:
 5. Evidence links (supporting and contradicting Evidence IDs).
 """
 
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass, field
+from .dataclass_dict import asdict
 from datetime import datetime, timezone
 import time
 from typing import Any, Dict, List, Optional, Set, Tuple, Union

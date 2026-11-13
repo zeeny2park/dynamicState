@@ -10,7 +10,8 @@ Guarantees:
 - Honest limitations: graceful degradation on missing DWARF, unreadable memory, or permission denial.
 """
 
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass, field
+from .dataclass_dict import asdict
 from datetime import datetime, timezone
 import hashlib
 import json
