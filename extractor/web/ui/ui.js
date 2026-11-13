@@ -580,7 +580,8 @@
     var lang = ui.lang, V = viewOf(s, lang), P = V && V.profile, body, desc = "";
     if (P && P.available) {
       body = '<div class="pbody dsv" lang="' + lang + '">' + P.html + "</div>";
-    } else if (P) {
+    } else if (P || s.verdict) {
+      /* the verdict is in but carries no profile (an older server, or nothing was observed): never keep saying "pending" */
       body = '<p class="empty">' + esc(tr(lang, "profile_none")) + "</p>";
     } else {
       var n = s.target && s.target.threads;
