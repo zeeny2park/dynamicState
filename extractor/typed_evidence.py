@@ -425,7 +425,13 @@ def derive_typed_evidence(ev: Dict[str, Any], domain: Optional[str] = None) -> T
         has_observation=ev.get("observed_value") is not None,
         subject=str(ev["symbol"]) if ev.get("symbol") else None,
         certainty_cap=str(cap) if isinstance(cap, str) else None,
-        fault_confirmed=bool(det.get("leak_confirmed") or det.get("corruption_confirmed")),
+        # A confirmed fault: an unreachable leak, confirmed corruption, or a confirmed allocation / free counter
+        # imbalance (the program's own counters show allocations not freed).  The imbalance is a fault observation
+        # independent of whether the growing blocks are still referenced, so a capped growth observation next to it
+        # does not lower the verdict (the verdict must not get stronger when the heap walks fail: before this, the
+        # same leak target was CONFIRMED when the walks ran out of budget and LIKELY when they completed).
+        fault_confirmed=bool(det.get("leak_confirmed") or det.get("corruption_confirmed")
+                             or (pol == POLARITY_SUPPORTS and det.get("imbalance_confirmed") is True)),
         corruption_confirmed=bool(det.get("corruption_confirmed")),
     )
 

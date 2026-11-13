@@ -361,6 +361,37 @@ class VerdictDefectRegressionTest(unittest.TestCase):
             shutil.rmtree(tmp, ignore_errors=True)
 
 
+class VerdictDoesNotDependOnWalkOutcomeTest(unittest.TestCase):
+    """A capped observation never lowers the verdict the other evidence supports.  Found as an order dependency of
+    tests/test_phase2_1_1_scenarios_a_to_j.py (scenario c): the leak fixture's heap is close to the per-walk read
+    budget, so whether the third heap walk fits depends on how long the diagnosis took to start (a first diagnosis
+    in a Python process is slower: cold imports and caches).  Walks failed -> only the allocation / free imbalance
+    supported the leak -> CONFIRMED; walks completed -> the same imbalance plus the walks' referenced-growth finding
+    (capped at PROBABLE, IMP-008) -> LIKELY.  More evidence must not give a weaker verdict."""
+
+    def test_capped_growth_next_to_confirmed_imbalance(self):
+        tmp = tempfile.mkdtemp(prefix="typed_ev_mono_")
+        try:
+            imbalance = _evidence_from_recipe("RECIPE_ALLOCATION_FREE_IMBALANCE",
+                                              {"alloc_delta": 400, "free_delta": 2}, 0)
+            self.assertTrue(any(typed_evidence_of(e).fault_confirmed for e in imbalance))
+            capped = attach_typed_evidence({
+                "evidence_id": "ev_cap", "status": "SUPPORTED", "recipe_id": "RECIPE_PROCESS_MEMORY_GROWTH",
+                "problem_category": "MEMORY_LEAK", "finding": "growth under a referenced container",
+                "details": {"growth_confirmed": True, "certainty_cap": "PROBABLE", "leak_verdict": "GROWTH_REFERENCED",
+                            "certainty_cap_reason": "still referenced"},
+                "raw_observation": {}, "step_id": "step_05"})
+            alone = _Session(tmp, copy.deepcopy(imbalance)).verify()
+            both = _Session(tmp, copy.deepcopy(imbalance) + [capped]).verify()
+            st = lambda rows: next(r[1] for r in rows if r[0] == "MEMORY_LEAK")
+            self.assertEqual(st(alone), "CONFIRMED")
+            self.assertEqual(st(both), st(alone))
+            # the capped observation alone stays capped
+            self.assertEqual(st(_Session(tmp, [copy.deepcopy(capped)]).verify()), "LIKELY")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+
 class VerificationScopeTest(unittest.TestCase):
     """Stage 1: a criterion PASSes only when a rule decided its invariant on an observation that covered it; an
     observed value alone, or a HOLDS claim from an observation cut for a reason that matters, is INCONCLUSIVE."""
