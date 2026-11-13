@@ -140,6 +140,28 @@ class TestMappingGrowthHelpers(unittest.TestCase):
         self.assertEqual(mg._malloc_chain(Rd({base: b"\x5a" * 16}), base, base + 0x40000), 0)   # application data
         self.assertEqual(mg._malloc_chain(Rd({}), base, base + 0x40000), 0)                     # unreadable
 
+    def test_growth_thread_only_when_exactly_one_thread_ran(self):
+        def rec(tid, name, slices):
+            return {"tid": tid, "name": name, "utime_ticks": 0, "stime_ticks": 0, "voluntary_ctxt_switches": 0,
+                    "nonvoluntary_ctxt_switches": 0, "schedstat": {"timeslices": slices}}
+        before = {1: rec(1, "main", 10), 2: rec(2, "loader", 50)}
+        g = mg.growth_thread(before, {1: rec(1, "main", 10), 2: rec(2, "loader", 57)})
+        self.assertEqual((g["status"], g["allocating_thread_name"], g["allocating_thread_tid"]), ("ATTRIBUTED", "loader", 2))
+        # two threads ran: nobody is named
+        g = mg.growth_thread(before, {1: rec(1, "main", 11), 2: rec(2, "loader", 57)})
+        self.assertEqual(g["status"], "AMBIGUOUS")
+        self.assertNotIn("allocating_thread_name", g)
+        # a thread appeared or ended in the window: nobody is named
+        self.assertEqual(mg.growth_thread(before, {2: rec(2, "loader", 57)})["status"], "AMBIGUOUS")
+        # no counters (adapter without thread samples) or a thread without counters: nobody is named
+        self.assertEqual(mg.growth_thread(None, before)["status"], "NOT_OBSERVED")
+        nos = {1: {"tid": 1, "name": "main"}, 2: rec(2, "loader", 57)}
+        self.assertEqual(mg.growth_thread(before, nos)["status"], "NOT_OBSERVED")
+        # without schedstat the CPU ticks and context switches decide
+        a = {1: dict(rec(1, "main", 0), schedstat=None), 2: dict(rec(2, "w", 0), schedstat=None)}
+        b = {1: dict(a[1]), 2: dict(a[2], voluntary_ctxt_switches=3)}
+        self.assertEqual(mg.growth_thread(a, b)["allocating_thread_name"], "w")
+
 
 class TestHeapRetentionRule(unittest.TestCase):
     def ev(self, obs):
