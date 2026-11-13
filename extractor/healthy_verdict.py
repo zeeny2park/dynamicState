@@ -4,7 +4,7 @@ HEALTHY means: every baseline check ran to completion with the evidence it needs
 stated scope.  It is a positive statement about what was checked, never "nothing was found because nothing could
 be looked at" (that stays INCONCLUSIVE, IMP-001).
 
-A diagnosis is HEALTHY only if ALL of the following hold:
+A diagnosis is HEALTHY only if ALL of the following hold (rule 5 is applied before rule 4 in the code):
 
 1. Collection succeeded: none of the blocking ``not_covered`` kinds (``BLOCKING_KINDS``: target unreadable /
    unreachable, missing debug image, ABI detection failed, a stage failed, nothing executed, a baseline check not
@@ -30,8 +30,14 @@ A diagnosis is HEALTHY only if ALL of the following hold:
    (non-baseline) checks that reached no result, recipes not planned for the symptom, and the questions of recipes
    this mode cannot execute (``unsupported_in_mode``: declared ``requires_capabilities``, left out of the plan).
 
-Symptom-specific checks never gate HEALTHY (a FAIL still does, through rule 2): their scope is the symptom, the
-HEALTHY scope is the baseline.  Defect classes no baseline check looks for (data races, logic errors) and the
+5. Verification scope (stage 1): every problem category a *specific* symptom asks about (the classifier's
+   candidate categories; none for a vague / general health check) is answered by a check that answers that category
+   and ran to completion with a clear result (PASS).  Otherwise the verdict is INCONCLUSIVE with the blocking reason
+   ``symptom_question_unanswered`` naming the category and what happened to its checks (no result, or not
+   supported in this mode).  "Evidence exists" is not enough: the question must have been checked.
+
+Beyond rule 5, a symptom-specific check that reached no result does not gate HEALTHY when another completed check
+answered the same question (a FAIL still blocks, through rule 2); it is listed as not checked.  Defect classes no baseline check looks for (data races, logic errors) and the
 forms of use-after-free / double free that leave no trace in a heap walk are always listed as not checked
 (``outside_baseline``).
 """
@@ -198,9 +204,57 @@ def long_wait_scope_items(checks: Iterable[Any]) -> List[Dict[str, Any]]:
     return out
 
 
+def _recipe_categories(recipe_id: str) -> List[str]:
+    """The problem categories a recipe answers (its own and the ones it is planned for)."""
+    from .diagnostic_recipes import DiagnosticRecipeRegistry
+    r = DiagnosticRecipeRegistry.get_recipe(str(recipe_id))
+    if r is None:
+        return []
+    return list(dict.fromkeys([r.problem_category] + list(r.applicable_problem_categories or [])))
+
+
+def symptom_question_gaps(symptom_categories: Iterable[str], checks: List[Any],
+                          not_covered: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Rule 5 (verification scope): every problem category the symptom asks about must be answered by a check of
+    that category that ran to completion and cleared (PASS).  One blocking row per unanswered category.
+
+    A category no registered recipe looks at is not a question this tool can be asked (skipped).  A category whose
+    checks all ended without a result, or could not run in this mode (``unsupported_in_mode``), is unanswered: the
+    diagnosis looked at the baseline but not at what the symptom asked, so it is INCONCLUSIVE with that reason."""
+    from .diagnostic_recipes import DiagnosticRecipeRegistry
+    by_cat: Dict[str, List[Any]] = {}
+    for c in checks:
+        for cat in _recipe_categories(str(getattr(c, "recipe_id", ""))):
+            by_cat.setdefault(cat, []).append(c)
+    not_in_mode: Dict[str, List[str]] = {}
+    for n in not_covered:
+        if n.get("kind") == "unsupported_in_mode":
+            for rid in [x for x in str(n.get("item") or "").split(",") if x]:
+                for cat in _recipe_categories(rid):
+                    not_in_mode.setdefault(cat, []).append(rid)
+    out: List[Dict[str, Any]] = []
+    for cat in dict.fromkeys(str(x) for x in symptom_categories or [] if x):
+        if not DiagnosticRecipeRegistry.get_recipes_for_category(cat):
+            continue
+        cs = by_cat.get(cat) or []
+        if any(_st(c) == CheckStatus.PASS for c in cs):
+            continue
+        if any(_st(c) == CheckStatus.FAIL for c in cs):
+            continue  # a FAIL blocks through rule 2
+        parts = [f"{getattr(c, 'recipe_id', '')} {_st(c)}" for c in cs]
+        parts += [f"{rid} not supported in this mode" for rid in not_in_mode.get(cat, [])]
+        out.append({"kind": "symptom_question_unanswered", "item": cat,
+                    "reason": (f"the symptom asks about {cat} and no check of it ran to completion"
+                               + (f" ({'; '.join(parts)})" if parts else " (none was executed)"))})
+    return out
+
+
 def evaluate(*, verdict: str, findings: List[Dict[str, Any]], checks: List[Any], not_covered: List[Dict[str, Any]],
-             baseline_ids: Iterable[str], recipe_names: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
+             baseline_ids: Iterable[str], recipe_names: Optional[Dict[str, str]] = None,
+             symptom_categories: Optional[Iterable[str]] = None) -> Dict[str, Any]:
     """Apply the HEALTHY rule.  ``checks`` are the session's executed DiagnosticCheck objects.
+    ``symptom_categories``: the problem categories a specific symptom asks about (rule 5; None or empty for a
+    general health check, whose scope is the baseline).
 
     Returns ``healthy_scope``: {rule, healthy (bool), checked [{recipe_id, what, what_ko, result}],
     not_checked [{kind, item, label, label_ko, reason}], blocking [{kind, item, reason}]}."""
@@ -260,6 +314,10 @@ def evaluate(*, verdict: str, findings: List[Dict[str, Any]], checks: List[Any],
             res = "; ".join([str(getattr(c, "technical_interpretation", "") or "") for c in cs
                              if _st(c) == CheckStatus.PASS] + partial)
             checked.append({"recipe_id": rid, "what": en, "what_ko": ko, "result": res})
+
+    # 5. the questions of a specific symptom were answered by a completed check (verification scope)
+    for gap in symptom_question_gaps(symptom_categories or [], checks, not_covered):
+        block(gap["kind"], gap["item"], gap["reason"])
 
     # 4. not_covered: blocking kinds vs scope limits
     sym_open: List[str] = []

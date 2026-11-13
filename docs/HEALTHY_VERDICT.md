@@ -24,6 +24,15 @@ HEALTHY only if all hold:
    non-PASS baseline status (INCONCLUSIVE, ERROR, NOT_APPLICABLE, UNSUPPORTED, NOT_EXECUTED) blocks.
 4. Scope limits do not block; they are listed in `healthy_scope.not_checked` and named in the first sentence of
    the summary ("healthy within the checked scope ... Not checked: ...").
+5. Verification scope (stage 1): every problem category a *specific* symptom asks about (the classifier's candidate
+   categories; none for a vague symptom or a general health check, whose scope is the baseline) is answered by a
+   check that answers that category and ran to completion with a clear result (PASS). Otherwise the result is
+   INCONCLUSIVE with the blocking row `symptom_question_unanswered` (item: the category; reason: the checks of it
+   and how they ended, or "not supported in this mode"). This is the only case where an `unsupported_in_mode`
+   question gates HEALTHY: the symptom asked exactly that question. Inside the engine the same principle applies to
+   the hypothesis criteria: a criterion PASSes only when a rule decided its invariant on an observation that covered
+   it (an observed value or a read variable is not a check; an observation cut for a reason that matters to the
+   invariant, `typed_evidence.INVARIANT_SCOPE_REASONS`, does not clear it).
 
 Not-healthy results carry the reasons in `healthy_scope.blocking`. A RULE_5 HEALTHY of the aggregator that fails
 this rule is reported INCONCLUSIVE.

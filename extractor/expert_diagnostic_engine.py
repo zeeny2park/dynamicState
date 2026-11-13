@@ -4494,10 +4494,16 @@ def _diagnose_run(
         # HEALTHY rule (extractor.healthy_verdict): every baseline check cleared, nothing blocking -> HEALTHY
         # within the stated scope; otherwise never HEALTHY (an aggregator HEALTHY is re-checked by the same rule).
         nc.extend(long_wait_scope_items(executed))
+        # Verification scope (stage 1): the categories a specific symptom asks about must each be answered by a
+        # completed check; a vague / general health check is scoped to the baseline.
+        _cls = session.classification_result
+        _sym_cats = ([str(c) for c, _w in (_cls.candidate_categories or [])]
+                     if _cls is not None and not _cls.is_vague and getattr(_cls, "understood", True) else [])
         res.healthy_scope = evaluate_healthy(
             verdict=res.verdict, findings=res.findings, checks=executed, not_covered=nc,
             baseline_ids=BASELINE_RECIPE_IDS,
-            recipe_names={r.recipe_id: r.name for r in DiagnosticRecipeRegistry.list_recipes()})
+            recipe_names={r.recipe_id: r.name for r in DiagnosticRecipeRegistry.list_recipes()},
+            symptom_categories=_sym_cats)
         if res.healthy_scope["healthy"]:
             res.verdict = VERDICT_HEALTHY
         elif res.verdict == VERDICT_HEALTHY:
