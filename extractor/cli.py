@@ -515,6 +515,12 @@ def main():
     er_p.add_argument("-a", "--assertions", type=str, default=None)
     er_p.add_argument("-o", "--output", dest="output_path", type=str, default=None)
     er_p.add_argument("--report-html", dest="report_html_path", type=str, default=None, help="Optional output path for standalone Zero-CDN HTML incident report")
+    er_p.add_argument("--report-json", dest="report_json_path", type=str, default=None, help="Optional output path for the JSON report")
+    er_p.add_argument("--remote-host", "--host", dest="remote_host", type=str, default=None, help="SSH host/IP of a REMOTE target")
+    er_p.add_argument("--ssh-user", "--user", dest="ssh_user", type=str, default=None, help="SSH username")
+    er_p.add_argument("--ssh-port", "--port", dest="ssh_port", type=int, default=22, help="SSH port (default: 22)")
+    er_p.add_argument("--ssh-key", "--identity", dest="ssh_key", type=str, default=None, help="SSH private key path")
+    er_p.add_argument("--ssh-proxy-jump", dest="ssh_proxy_jump", type=str, default=None, help="Optional SSH ProxyJump")
     er_p.add_argument("--template", dest="template_path", type=str, default=None, help="Optional custom HTML template path")
     er_p.add_argument("-p", "--pid", type=int, default=None)
     er_p.add_argument("-d", "--debug-image", "--companion-elf", dest="debug_image", type=str, default=None)
@@ -544,7 +550,14 @@ def main():
     dx_p.add_argument("--collector-path", dest="collector_path", type=str, default=None,
                       help="Path of an already installed collector on the remote target")
 
+    from .skill_cli import add_parsers as _add_skill_parsers, dispatch as _skill_dispatch
+    _add_skill_parsers(subparsers)
+
     args = parser.parse_args()
+
+    _rc = _skill_dispatch(args)
+    if _rc is not None:
+        sys.exit(_rc)
 
     if args.command == "capture-memory":
         capturer = MemoryCapture()
@@ -1782,9 +1795,12 @@ def main():
             assertions=a_list,
             output_path=args.output_path,
             report_html_path=getattr(args, "report_html_path", None),
+            report_json_path=args.report_json_path,
             template_path=getattr(args, "template_path", None),
             pid=args.pid,
             companion_elf_path=args.debug_image,
+            remote_host=args.remote_host, ssh_user=args.ssh_user, ssh_port=args.ssh_port,
+            ssh_key=args.ssh_key, ssh_proxy_jump=args.ssh_proxy_jump,
             language=getattr(args, "lang", "en") or "en",
         )
         if res.get("save_error"):
