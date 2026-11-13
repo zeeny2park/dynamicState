@@ -843,7 +843,13 @@ def inspect_thread_locals_and_frame_vars(
         target_adapter, pid, target_abi, map_data, endian
     )
     try:
-        main_exe_real = os.path.realpath(f"/proc/{pid}/exe")
+        if target_adapter.is_remote():
+            # a pid on the remote side must never be resolved in the local /proc: the main image is the one the
+            # unwinder's remote image provider names
+            _rp = getattr(getattr(unwinder, "remote_image_provider", None), "main_remote_path", None)
+            main_exe_real = os.path.realpath(_rp) if _rp else None
+        else:
+            main_exe_real = os.path.realpath(f"/proc/{pid}/exe")
     except Exception:
         main_exe_real = None
     sp_dw = {"x86_64": 7, "aarch64": 31}.get(target_abi.architecture or "")
