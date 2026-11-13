@@ -1126,9 +1126,16 @@ def _evaluate_leak_investigation(recipe: "DiagnosticRecipe", data: Dict[str, Any
                                            "retained_count": o.get("blocks_delta"), "is_unbounded": True}),
             )
         if rid == "RECIPE_HEAP_GROWTH":
-            fact = ("in-use heap grew +%d KB (+%d blocks) across %d heap walks over %.2f s, without a drop"
-                    % (int(li.get("in_use_growth_bytes") or 0) // 1024, int(li.get("in_use_growth_blocks") or 0),
-                       walks, float(li.get("window_s") or 0.0)))
+            if li.get("in_use_monotonic_growth") is False:
+                rows = list(li.get("unreachable_growth") or []) + list(li.get("growth_owners") or [])
+                fact = ("in-use heap rose and fell across %d heap walks over %.2f s, but +%d KB of blocks under it "
+                        "grew across every walk"
+                        % (walks, float(li.get("window_s") or 0.0),
+                           sum(int(r.get("bytes_delta") or 0) for r in rows) // 1024))
+            else:
+                fact = ("in-use heap grew +%d KB (+%d blocks) across %d heap walks over %.2f s, without a drop"
+                        % (int(li.get("in_use_growth_bytes") or 0) // 1024, int(li.get("in_use_growth_blocks") or 0),
+                           walks, float(li.get("window_s") or 0.0)))
             return RecipeEvaluationResult(
                 recipe_id=rid, status=RECIPE_STATUS_SUPPORTED, confidence=0.9, confidence_basis=fact,
                 supporting_facts=[fact],

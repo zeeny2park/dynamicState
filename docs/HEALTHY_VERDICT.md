@@ -36,7 +36,7 @@ this rule is reported INCONCLUSIVE.
 | LONG_RUNNING_BLOCKED_THREADS | **changed**: usable window, owners decodable, lock graph complete, no stalled lock wait, no cycle -> CONTRADICTED. Long waits in syscalls are kept as `long_wait_not_judged` (not checked: an idle wait and a stall look the same from outside) | lock-owner decoding unsupported, incomplete graph, unusable window -> INCONCLUSIVE (blocks) |
 | SUSPICIOUS_LOCK_OWNERSHIP | lock table read, no orphan/circular owner | unchanged |
 | POTENTIAL_DEADLOCK_PATTERNS | wait-for graph complete and acyclic | unchanged; owner decoding unsupported -> INCONCLUSIVE (blocks, DEF-ARM-1) |
-| PROCESS_MEMORY_GROWTH | no growth trend, or heap walks show no growth | heap walks not possible within the budget / too few walks -> INCONCLUSIVE (blocks) |
+| PROCESS_MEMORY_GROWTH | **changed**: the /proc samples stayed flat within the trend resolution (128 KB), or >= 3 heap walks show no growth: in-use flat, or the in-use total fell **and** no unreachable size class and no global/static owner grew across every walk | /proc samples that moved without a growth trend (rose and fell back, or only fell) are not cleared from /proc: the heap walks decide; walks not possible within the budget / too few walks -> INCONCLUSIVE (blocks), reason "memory growth not judged: ..." (see the scope limit below) |
 | HEAP_METADATA_CORRUPTION | heap walked, metadata intact | heap above cap -> scope limit (see 3); byte budget / unsupported allocator / incomplete walk -> blocks |
 | FD_LEAK | fd count trend flat | unchanged |
 | FREED_MEMORY_USE (plugin) | heap walked, no typed pointer into a free chunk, no write into one | heap above cap -> scope limit (`uaf_not_checked`); otherwise not walked -> blocks |
@@ -59,3 +59,46 @@ this rule is reported INCONCLUSIVE.
   with the long wait listed as not judged (the unscored `stall_*` benchmark targets).
 - A use-after-free whose damage the heap-metadata check does not see is HEALTHY within scope with use-after-free
   listed as not checked (the `uaf_*` benchmark targets, not detected before this rule either).
+- A process whose memory rises and falls (a batch / sawtooth working set) and whose heap is larger than the walk read
+  budget is INCONCLUSIVE, never HEALTHY: see the scope limit below (`ok_sawtooth` benchmark control).
+
+## Scope limit: memory that rises and falls
+
+What is observed. The cheap trend is 5-6 `/proc` samples (VmRSS, anonymous writable mappings) over the thread
+sampler's window, about 1 s. The heap walks (IMP-008) are >= 3 censuses of the in-use heap with per-owner and
+per-unreachable-size-class counts, spaced over the same window, each limited to 75 % of the session byte budget
+left (session budget 32 MiB, so about 24 MiB for the first walk).
+
+Why /proc is not enough. A periodic working set with a leak under it also rises and falls, and within one window
+of about one period its samples look like those of the healthy batch. RSS also does not move when a leak fills
+memory the allocator already holds (measured: `proc_leak_sawtooth_small`, an unreachable 2000-byte leak of
+~150 KB/s, kept RSS flat at 4.2 MiB). Comparing the low points of several periods would need >= 3 periods in the
+window and still misses that case. So a series that moved by the trend resolution without a growth trend is not
+cleared from `/proc`; the walks decide. Before this rule the cheap trend cleared any series with a fall in it,
+and `ok_sawtooth` (generic symptom) was HEALTHY or INCONCLUSIVE depending on whether the ~1 s window happened to
+contain the fall (3 of 6 runs HEALTHY).
+
+Why the walks are not enough for a large sawtooth. A fall of the in-use total is evidence of "released, not a
+leak" only when no unreachable size class and no global/static owner grew across every walk; before this rule
+any fall cleared, and `proc_leak_sawtooth_small` was HEALTHY in 4 of 4 runs (now a MEMORY_LEAK finding). That
+judgement needs the walks. On `ok_sawtooth` (50 x 2 MiB blocks per batch in a thread's arena, released after
+each batch) one walk needs about 62 MiB of reads (the arena heap), more than the 24 MiB a walk may use, so no
+walk completes and the check is INCONCLUSIVE with: "memory growth not judged: one heap walk of this process needs
+about 62.0 MiB of reads, more than the 24.0 MiB budget left for it ... The /proc samples rose by .. MiB and fell
+back ..: one window of memory that rises and falls cannot tell a periodic working set from one with a leak under
+it". The human report's conclusion quotes this sentence as the reason the result is not HEALTHY.
+
+What would be enough. >= 3 walks of the whole heap, i.e. a byte budget of about 3 x the heap (about 190 MiB here)
+and the wall time for them (about 6 s of walking on the 4-core AArch64 test host under load), plus the rest of
+the baseline within the session's wall-clock budget. Measured with the byte budget raised to 600 MiB (an
+experiment, not a setting `diagnose` offers): `ok_sawtooth` was HEALTHY (in-use 63488 / 22528 / 63488 / 63488 KB,
+no growing class) in about 21 s, and the same batch with an 8000-byte unreachable leak under it
+(`proc_leak_sawtooth_large`) was found (LEAK_UNREACHABLE, +365 blocks), but its walks pushed the session past
+the 20 s wall-clock budget. The default budget keeps the read volume on the live target bounded; raising it is
+a cost decision, not a rule change, and is not made here.
+
+Remaining exposure, unchanged by this rule: a window whose `/proc` samples are flat within the resolution (for
+example a window that falls entirely on a flat part of a cycle) clears memory growth within its scope, as for any
+process ("no growth in the observation window"). A memory symptom ("is it leaking?") always runs the walks.
+
+Pinned by `tests/test_memory_sawtooth.py`.
