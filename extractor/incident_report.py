@@ -23,6 +23,7 @@ from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional
 
 from .collection_impact import impact_summary_lines
+from .human_report import ko_text
 from .diagnostic_verdict_aggregator import (
     FAULT_VERDICTS,
     VERDICT_HEALTHY,
@@ -40,6 +41,52 @@ _LABELS = {
     "ko": {"summary": "쉬운 말 요약", "detail": "상세 보고서 (A-I 항목)",
            "verdict": "판정", "diag_summary": "진단 요약", "no_summary": "요약이 만들어지지 않았습니다."},
 }
+
+
+# Fixed wording of the Markdown incident report, (en, ko) per key like ``human_report.T``.  Engine-produced text that
+# is quoted in it (finding descriptions, limitations, remediation steps) goes through ``human_report.ko_text``.
+_MD: Dict[str, Any] = {
+    "h1": ("## 1. Target Identity & Zero-Stop Telemetry", "## 1. 대상 정보와 무중단 수집 측정"),
+    "pid": ("- **PID**: `{pid}` (`{name}`)", "- **PID**: `{pid}` (`{name}`)"),
+    "elf": ("- **Companion ELF**: `{x}`", "- **동반 ELF**: `{x}`"),
+    "build": ("- **Build ID**: `{x}`", "- **빌드 ID**: `{x}`"),
+    "inv": ("- **Investigation**: `{x}`", "- **조사 ID**: `{x}`"),
+    "mode": ("- **Collection Mode**: `{x}`", "- **수집 방식**: `{x}`"),
+    "stop": ("- **Process Stop Duration**: `{ms}ms` (Measured)", "- **프로세스 정지 시간**: `{ms}ms` (측정값)"),
+    "status": ("- **Overall Status**: `{v}` (Health Score: `{s}/100`)", "- **종합 상태**: `{v}` (건강 점수: `{s}/100`)"),
+    "status_na": ("- **Overall Status**: `{v}` (Health Score: `N/A — {why}`)", "- **종합 상태**: `{v}` (건강 점수: `해당 없음 — {why}`)"),
+    "why_incon": ("Inconclusive", "판단 불가"), "why_unscored": ("not scored", "점수 없음"),
+    "gen": ("- **Generated At**: `{x}`", "- **생성 시각**: `{x}`"),
+    "h2": ("## 2. Root-Cause Findings", "## 2. 근본 원인 발견"),
+    "th": ("| Severity | Category | Status | Subjects | Description |", "| 심각도 | 범주 | 상태 | 대상 | 설명 |"),
+    "incon": ("- Diagnostic inspection inconclusive: collection failed or target memory was unreadable.",
+              "- 진단 점검이 판단 불가로 끝났습니다: 수집에 실패했거나 대상 메모리를 읽을 수 없었습니다."),
+    "lim": ("  - Limitation: `{x}`", "  - 제한 사항: `{x}`"),
+    "healthy": ("- Healthy within the checked scope: every baseline check ran to completion and found nothing.",
+                "- 점검한 범위 안에서는 정상입니다: 기본 검사가 모두 끝까지 실행되었고 아무것도 발견하지 못했습니다."),
+    "checked": ("  - Checked: {what} (`{rid}`)", "  - 점검함: {what} (`{rid}`)"),
+    "notchecked": ("  - Not checked: {x}", "  - 점검하지 못함: {x}"),
+    "nofault": ("- No fault was found by the checks that ran.", "- 실행된 검사에서는 결함이 발견되지 않았습니다."),
+    "h3": ("## 3. Hypothesis Verification (`{v}` · Confidence `{c}%`)", "## 3. 가설 검증 (`{v}` · 신뢰도 `{c}%`)"),
+    "hyp": ("- **Hypothesis**: {x}", "- **가설**: {x}"),
+    "hyp_note": ("- This verifies the stated assertions only; it does not change the diagnosis verdict above.",
+                 "- 이 검증은 명시한 단언만 확인하며, 위의 진단 판정을 바꾸지 않습니다."),
+    "hyp_th": ("| Assertion | Resolved Expression | Observed Value | Expected | Passed |",
+               "| 단언 | 해석된 식 | 관측값 | 기대값 | 통과 |"),
+    "pass": ("PASS", "통과"), "fail": ("FAIL", "실패"),
+    "h4": ("## 4. Checks Run", "## 4. 실행한 검사"),
+    "h5": ("## 5. Remediation Checklist", "## 5. 조치 체크리스트"),
+    "rem_incon": ("Investigation inconclusive: the collection failed or parts of the target could not be examined "
+                  "({lims}). Verify target process accessibility and read permissions, then re-run.",
+                  "조사가 판단 불가로 끝났습니다: 수집에 실패했거나 대상의 일부를 확인하지 못했습니다 ({lims}). "
+                  "대상 프로세스에 접근할 수 있는지와 읽기 권한을 확인한 뒤 다시 실행하세요."),
+    "rem_healthy": ("No remediation needed within the checked scope: every baseline check ran to completion and found nothing.",
+                    "점검한 범위 안에서는 조치가 필요 없습니다: 기본 검사가 모두 끝까지 실행되었고 아무것도 발견하지 못했습니다."),
+    "rem_notchecked": ("Not checked (outside the healthy scope): {x}.", "점검하지 못함 (정상 판정 범위 밖): {x}."),
+    "rem_none": ("No fault was found by the checks that ran; see 'What could not be examined'.",
+                 "실행된 검사에서는 결함이 발견되지 않았습니다. '확인하지 못한 것'을 참고하세요."),
+}
+
 
 _HTML_CSS = """
 .ds-summary { max-width: 860px; margin: 24px auto; padding: 16px 24px; border: 1px solid #cbd5e1; border-radius: 8px;
@@ -70,6 +117,14 @@ def _summary_section(lang: str, verdict: str, summary_md: str) -> str:
 
 def _limitation_text(nc: Dict[str, Any]) -> str:
     return f"{nc.get('kind')}: {nc.get('item')}: {nc.get('reason')}"
+
+
+def _ko_limitation(text: str, li: int) -> str:
+    """A limitation line ``kind: item: reason`` for the Korean report: the engine's reason is translated, the rest kept."""
+    if not li:
+        return text
+    parts = str(text).split(": ", 2)
+    return ": ".join(parts[:2] + [ko_text(parts[2], li)]) if len(parts) == 3 else ko_text(text, li)
 
 
 def _inconclusive_result(pid: Any, debug_image: Optional[str], kind: str, item: str, reason: str) -> Dict[str, Any]:
@@ -172,6 +227,7 @@ def export_incident_report(
             "error": f"Target process PID {pid} is invalid.",
         }
     limitations: List[str] = list(pre_limitations or [])
+    li = 1 if language == "ko" else 0
 
     # 1. the diagnosis (the only verdict)
     if not pid:
@@ -214,17 +270,17 @@ def export_incident_report(
     findings = [_finding_row(f, remediation_checklist) for f in (res.get("findings") or []) if isinstance(f, dict)]
     if verdict == VERDICT_INCONCLUSIVE:
         remediation_checklist = [
-            "Investigation inconclusive: the collection failed or parts of the target could not be examined "
-            f"({'; '.join(limitations[:3])}). Verify target process accessibility and read permissions, then re-run."
+            _MD["rem_incon"][li].format(lims="; ".join(_ko_limitation(x, li) for x in limitations[:3]))
         ] + [x for x in remediation_checklist if "within expected parameters" not in x]
     elif verdict == VERDICT_HEALTHY:
         # HEALTHY rule (extractor.healthy_verdict): the claim is limited to the baseline scope; say what was not checked
-        not_checked = [str(x.get("label") or x.get("item")) for x in (res.get("healthy_scope") or {}).get("not_checked") or []]
+        from .healthy_verdict import display_label
+        not_checked = [display_label(x, bool(li)) for x in (res.get("healthy_scope") or {}).get("not_checked") or []]
         remediation_checklist = [
-            "No remediation needed within the checked scope: every baseline check ran to completion and found nothing."
-        ] + ([f"Not checked (outside the healthy scope): {'; '.join(not_checked)}."] if not_checked else [])
+            _MD["rem_healthy"][li]
+        ] + ([_MD["rem_notchecked"][li].format(x="; ".join(not_checked))] if not_checked else [])
     elif not remediation_checklist:
-        remediation_checklist.append("No fault was found by the checks that ran; see 'What could not be examined'.")
+        remediation_checklist.append(_MD["rem_none"][li])
     health_score = health_score_for(verdict, findings)
 
     # 2. optional hypothesis verification (its own section; never the verdict)
@@ -244,58 +300,61 @@ def export_incident_report(
     eff_pid = target.get("pid") or pid
     eff_elf = target.get("debug_image") or companion_elf_path
     now_iso = datetime.now(timezone.utc).isoformat()
-    status_line = (f"- **Overall Status**: `{verdict}` (Health Score: `{health_score}/100`)" if health_score is not None
-                   else f"- **Overall Status**: `{verdict}` (Health Score: `N/A — {'Inconclusive' if verdict == VERDICT_INCONCLUSIVE else 'not scored'}`)")
+    na = _MD["why_incon" if verdict == VERDICT_INCONCLUSIVE else "why_unscored"][li]
+    status_line = (_MD["status"][li].format(v=verdict, s=health_score) if health_score is not None
+                   else _MD["status_na"][li].format(v=verdict, why=na))
     md = [
         f"# {title}", "",
-        "## 1. Target Identity & Zero-Stop Telemetry",
-        f"- **PID**: `{eff_pid}` (`{target.get('process_name') or process_name or 'target'}`)",
-        f"- **Companion ELF**: `{eff_elf}`",
-        f"- **Build ID**: `{build_id or 'N/A'}`",
-        f"- **Investigation**: `{res.get('investigation_id') or 'N/A'}`",
-        f"- **Collection Mode**: `{collection_mode}`",
-        f"- **Process Stop Duration**: `{stop_ms:.2f}ms` (Measured)",
-        *impact_summary_lines(impact),
+        _MD["h1"][li],
+        _MD["pid"][li].format(pid=eff_pid, name=target.get('process_name') or process_name or 'target'),
+        _MD["elf"][li].format(x=eff_elf),
+        _MD["build"][li].format(x=build_id or 'N/A'),
+        _MD["inv"][li].format(x=res.get('investigation_id') or 'N/A'),
+        _MD["mode"][li].format(x=collection_mode),
+        _MD["stop"][li].format(ms=f"{stop_ms:.2f}"),
+        *impact_summary_lines(impact, language),
         status_line,
-        f"- **Generated At**: `{now_iso}`", "",
-        "## 2. Root-Cause Findings",
+        _MD["gen"][li].format(x=now_iso), "",
+        _MD["h2"][li],
     ]
     if findings:
-        md.append("| Severity | Category | Status | Subjects | Description |")
+        md.append(_MD["th"][li])
         md.append("| :--- | :--- | :--- | :--- | :--- |")
         for f in findings:
             md.append(f"| **{f.get('severity')}** | `{f.get('category')}` | {f.get('status')} | "
-                      f"{', '.join('`%s`' % s for s in (f.get('subjects') or [])[:6]) or '-'} | {f.get('description') or '-'} |")
+                      f"{', '.join('`%s`' % s for s in (f.get('subjects') or [])[:6]) or '-'} | "
+                      f"{ko_text(f.get('description') or '-', li)} |")
     elif verdict == VERDICT_INCONCLUSIVE:
-        md.append("- Diagnostic inspection inconclusive: collection failed or target memory was unreadable.")
+        md.append(_MD["incon"][li])
         for lim in limitations[:12]:
-            md.append(f"  - Limitation: `{lim}`")
+            md.append(_MD["lim"][li].format(x=_ko_limitation(lim, li)))
     elif verdict == VERDICT_HEALTHY:
+        from .healthy_verdict import display_label, display_what
         scope = res.get("healthy_scope") or {}
-        md.append("- Healthy within the checked scope: every baseline check ran to completion and found nothing.")
+        md.append(_MD["healthy"][li])
         for c in scope.get("checked") or []:
-            md.append(f"  - Checked: {c.get('what')} (`{c.get('recipe_id')}`)")
+            md.append(_MD["checked"][li].format(what=display_what(c, bool(li)), rid=c.get('recipe_id')))
         for x in scope.get("not_checked") or []:
-            md.append(f"  - Not checked: {x.get('label') or x.get('item')}")
+            md.append(_MD["notchecked"][li].format(x=display_label(x, bool(li))))
     else:
-        md.append("- No fault was found by the checks that ran.")
+        md.append(_MD["nofault"][li])
     if summary_md:
         md += ["", f"### {_LABELS[language]['diag_summary']}", ""] + _demote_headings(summary_md)
     if hyp_res is not None:
-        md += ["", f"## 3. Hypothesis Verification (`{hyp_res.get('verdict')}` · Confidence "
-                   f"`{round(float(hyp_res.get('confidence_score') or 0.0) * 100, 1)}%`)",
-               f"- **Hypothesis**: {hyp_res.get('hypothesis')}",
-               "- This verifies the stated assertions only; it does not change the diagnosis verdict above.", "",
-               "| Assertion | Resolved Expression | Observed Value | Expected | Passed |",
+        md += ["", _MD["h3"][li].format(v=hyp_res.get('verdict'),
+                                        c=round(float(hyp_res.get('confidence_score') or 0.0) * 100, 1)),
+               _MD["hyp"][li].format(x=hyp_res.get('hypothesis')),
+               _MD["hyp_note"][li], "",
+               _MD["hyp_th"][li],
                "| :--- | :--- | :--- | :--- | :--- |"]
         for ar in hyp_res.get("assertion_results", []):
             md.append(f"| `{ar.get('assertion')}` | `{ar.get('resolved_expression')}` | `{ar.get('observed_value')}` | "
-                      f"`{ar.get('expected')}` | **{'PASS' if ar.get('passed') else 'FAIL'}** |")
-    md += ["", "## 4. Checks Run"]
+                      f"`{ar.get('expected')}` | **{_MD['pass' if ar.get('passed') else 'fail'][li]}** |")
+    md += ["", _MD["h4"][li]]
     for c in (res.get("checks_run") or [])[:30]:
         md.append(f"- `{c.get('recipe_id')}`: {c.get('status')}")
-    md += ["", "## 5. Remediation Checklist"]
-    md += [f"{i}. [ ] {step}" for i, step in enumerate(remediation_checklist, start=1)]
+    md += ["", _MD["h5"][li]]
+    md += [f"{i}. [ ] {ko_text(step, li)}" for i, step in enumerate(remediation_checklist, start=1)]
     report_markdown = "\n".join(md) + "\n"
 
     report_html: Optional[str] = None
