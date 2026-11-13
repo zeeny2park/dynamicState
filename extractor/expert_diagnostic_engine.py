@@ -510,6 +510,7 @@ class TargetAssessmentResult:
     build_id: Optional[str] = None
     process_identity: Optional[str] = None
     executable_identity: Optional[str] = None
+    build_id_check: Optional[Dict[str, Any]] = None  # {status MATCHED|MISMATCHED|UNKNOWN, process_build_id, debug_build_id}
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -533,6 +534,7 @@ class TargetAssessmentResult:
             "build_id": self.build_id,
             "process_identity": self.process_identity,
             "executable_identity": self.executable_identity,
+            "build_id_check": self.build_id_check,
         }
 
 
@@ -692,10 +694,17 @@ class TargetAssessor:
             except Exception:
                 pass
 
+        process_build_id = build_id
+        build_id_check: Optional[Dict[str, Any]] = None
         if companion_elf and os.path.exists(companion_elf):
             try:
                 from .target_adapter import inspect_elf
                 companion_info = inspect_elf(companion_elf)
+                build_id_check = {"status": "UNKNOWN", "process_build_id": process_build_id,
+                                  "debug_build_id": companion_info.build_id or None}
+                if companion_info.build_id and process_build_id:
+                    same = str(process_build_id).strip().lower() == str(companion_info.build_id).strip().lower()
+                    build_id_check["status"] = "MATCHED" if same else "MISMATCHED"
                 if companion_info.build_id:
                     if build_id and str(build_id).strip().lower() != str(companion_info.build_id).strip().lower():
                         limitations.append(
@@ -733,6 +742,7 @@ class TargetAssessor:
             build_id=build_id,
             process_identity=proc_identity,
             executable_identity=executable_identity,
+            build_id_check=build_id_check,
         )
 
 
@@ -3179,6 +3189,7 @@ class AdaptiveInvestigationSession:
             binary_path=self.companion_elf,
             build_id=getattr(self.target_assessment, "build_id", None) if self.target_assessment else None,
             companion_elf=self.companion_elf,
+            build_id_check=getattr(self.target_assessment, "build_id_check", None) if self.target_assessment else None,
             target_capabilities=self.target_assessment.capabilities if self.target_assessment else [],
             collection_mode=actual_collection_mode,
             target_stop_duration_ms=round(measured_stop_ms, 3),

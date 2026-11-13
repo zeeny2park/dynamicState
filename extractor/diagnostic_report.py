@@ -22,6 +22,7 @@ import json
 from typing import Any, Dict, List, Optional, Set, Tuple, Union
 
 from .diagnostic_methodology import CheckStatus, DiagnosticCheck, DiagnosticMethodology
+from .reproducibility import ReproducibilitySection, render_html as _repro_html, render_markdown as _repro_md
 
 
 SCHEMA_VERSION = "2.1.5"
@@ -115,6 +116,7 @@ class TargetContextSection:
     observation_duration_sec: Optional[float] = None
     investigation_start_time: str = ""
     investigation_end_time: str = ""
+    build_id_check: Optional[Dict[str, Any]] = None  # {status, process_build_id, debug_build_id}; None = not recorded
     collection_failures: List[str] = field(default_factory=list)
     environmental_limitations: List[str] = field(default_factory=list)
 
@@ -336,6 +338,7 @@ class DiagnosticReport:
     section_g_evidence_and_provenance: Optional[EvidenceAndProvenanceSection] = None
     section_h_limitations_and_unverified: Optional[LimitationsSection] = None
     section_i_final_conclusions: Optional[FinalConclusionsSection] = None
+    section_j_reproducibility: Optional[ReproducibilitySection] = None
 
     def build_epistemic_hierarchy(self) -> Dict[str, List[Dict[str, Any]]]:
         """Explicitly separates the 5 epistemic classes required by Part E1:
@@ -504,6 +507,7 @@ class DiagnosticReport:
             "section_g_evidence_and_provenance": self.section_g_evidence_and_provenance.to_dict() if self.section_g_evidence_and_provenance else {},
             "section_h_limitations_and_unverified": self.section_h_limitations_and_unverified.to_dict() if self.section_h_limitations_and_unverified else {},
             "section_i_final_conclusions": self.section_i_final_conclusions.to_dict() if self.section_i_final_conclusions else {},
+            "section_j_reproducibility": self.section_j_reproducibility.to_dict() if self.section_j_reproducibility else {},
             "epistemic_hierarchy": self.build_epistemic_hierarchy(),
             "report_20_items": self.build_20_required_items(),
         }
@@ -525,6 +529,7 @@ class DiagnosticReport:
             section_g_evidence_and_provenance=EvidenceAndProvenanceSection.from_dict(data["section_g_evidence_and_provenance"]) if data.get("section_g_evidence_and_provenance") else None,
             section_h_limitations_and_unverified=LimitationsSection.from_dict(data["section_h_limitations_and_unverified"]) if data.get("section_h_limitations_and_unverified") else None,
             section_i_final_conclusions=FinalConclusionsSection.from_dict(data["section_i_final_conclusions"]) if data.get("section_i_final_conclusions") else None,
+            section_j_reproducibility=ReproducibilitySection.from_dict(data["section_j_reproducibility"]) if data.get("section_j_reproducibility") else None,
         )
 
     @classmethod
@@ -540,7 +545,7 @@ class DiagnosticReport:
             return str(o)
         return json.dumps(self.to_dict(), indent=indent, default=_fallback)
 
-    def to_markdown(self) -> str:
+    def to_markdown(self, language: str = "en") -> str:
         sec_a = self.section_a_executive_summary
         sec_b = self.section_b_target_context
         sec_c = self.section_c_diagnostic_strategy
@@ -883,9 +888,13 @@ class DiagnosticReport:
                 for rm in sec_i.safe_remediation_suggestions:
                     md.append(f"- 🔧 {rm}")
 
+        if self.section_j_reproducibility:
+            md.append("")
+            md.extend(_repro_md(self.section_j_reproducibility, language, heading="## J."))
+
         return "\n".join(md)
 
-    def to_html(self) -> str:
+    def to_html(self, language: str = "en") -> str:
         """Renders complete, standalone, HTML-escaped engineering diagnostic report without truncation."""
         sec_a = self.section_a_executive_summary
         sec_b = self.section_b_target_context
@@ -1182,6 +1191,9 @@ class DiagnosticReport:
                 for rem in sec_i.safe_remediation_suggestions:
                     html_out.append(f"<li>🔧 {html.escape(rem)}</li>")
                 html_out.append("</ul>")
+
+        if self.section_j_reproducibility:
+            html_out.append(_repro_html(self.section_j_reproducibility, language))
 
         html_out.extend([
             "</div>",
