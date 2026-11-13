@@ -182,3 +182,110 @@ register_recipe(DiagnosticRecipe(
     observations=(OBS_FD_USAGE,),
     rule=fd_leak_rule,
 ), baseline=True, category=CATEGORY_FD_LEAK)
+
+
+# ---------------------------------------------------------------------------------------------- presentation
+# How this diagnosis is shown to a person: registered from this file as well (extractor/report_registry.py).
+_TXT = {
+    "trend": ("Open file descriptors rose from {a} to {b} in {win} s ({rate}/s).",
+              "열린 파일 디스크립터가 {win}초 동안 {a}개에서 {b}개로 늘었습니다 (초당 {rate}개)."),
+    "limit": ("The limit is {limit}; at this rate it is reached in about {eta}.",
+              "한도는 {limit}개이며, 이 속도면 약 {eta} 뒤에 도달합니다."),
+    "near": ("{b} of {limit} descriptors are in use ({pct}% of the limit).",
+             "한도 {limit}개 중 {b}개를 쓰고 있습니다 (한도의 {pct}%)."),
+    "new": ("What appeared during the observation: {x}.", "관측하는 동안 새로 생긴 것: {x}."),
+    "open": ("Open now, by kind", "현재 열려 있는 것 (종류별)"),
+    "chart": ("Open file descriptors over the observation", "관측하는 동안 열린 파일 디스크립터 수"),
+    "x": ("seconds since first sample", "첫 샘플 이후 경과(초)"), "y": ("open descriptors", "열린 디스크립터 수"),
+    "tip": ("sample {i}: {n} open", "샘플 {i}: {n}개 열림"),
+    "closer": ("Which code opened them was not observed; look for the path that opens {x} without closing it.",
+               "어느 코드가 열었는지는 관측되지 않았습니다. {x}을(를) 열고 닫지 않는 경로를 찾으세요."),
+}
+
+
+def _eta(seconds: float, ko: bool) -> str:
+    for size, en, k in ((86400, "day(s)", "일"), (3600, "hour(s)", "시간"), (60, "minute(s)", "분")):
+        if seconds >= size:
+            return f"{seconds / size:.1f} {en}" if not ko else f"{seconds / size:.1f}{k}"
+    return f"{seconds:.0f} s" if not ko else f"{seconds:.0f}초"
+
+
+def _fd_obs(report: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    checks = ((report or {}).get("section_d_detailed_inspection_results") or {}).get("checks") or []
+    for c in checks:
+        if isinstance(c, dict) and c.get("recipe_id") == RECIPE_FD_LEAK:
+            fu = (c.get("actual_observations") or {}).get("fd_usage")
+            if isinstance(fu, dict):
+                return fu
+    return {}
+
+
+def _fd_facts(i: int, fu: Dict[str, Any], wrap: Any) -> List[str]:
+    """The sentences of the fd finding; ``wrap`` formats an identifier for the output medium."""
+    s = [x for x in fu.get("samples") or [] if isinstance(x, dict) and isinstance(x.get("open_fds"), int)]
+    out: List[str] = []
+    if len(s) < 2:
+        return out
+    a, b = s[0]["open_fds"], s[-1]["open_fds"]
+    win = (s[-1].get("t_s") or 0) - (s[0].get("t_s") or 0)
+    limit = fu.get("fd_limit")
+    if b > a and win > 0:
+        rate = (b - a) / win
+        out.append(_TXT["trend"][i].format(a=a, b=b, win=f"{win:.1f}", rate=f"{rate:.1f}"))
+        if limit and limit > b:
+            out.append(_TXT["limit"][i].format(limit=limit, eta=_eta((limit - b) / rate, bool(i))))
+    elif limit:
+        out.append(_TXT["near"][i].format(b=b, limit=limit, pct=round(b * 100 / limit)))
+    new = [t for t in fu.get("new_fd_targets") or [] if isinstance(t, dict) and t.get("fd_target")]
+    if new:
+        out.append(_TXT["new"][i].format(x=", ".join(f"{wrap(t['fd_target'])} × {t.get('count')}" for t in new)))
+        out.append(_TXT["closer"][i].format(x=wrap(new[0]["fd_target"])))
+    return out
+
+
+def fd_finding_text(ctx: Any, finding: Dict[str, Any], report: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    return {"lines": _fd_facts(ctx.i, _fd_obs(report), lambda x: "`" + str(x).replace("`", "'") + "`")}
+
+
+def fd_finding_viz(lx: Any, finding: Dict[str, Any], report: Optional[Dict[str, Any]], uid: str = "0") -> str:
+    from ..report_visuals import chip, code, esc, facts_list, series_chart, share_bars
+    fu = _fd_obs(report)
+    s = [x for x in fu.get("samples") or [] if isinstance(x, dict) and isinstance(x.get("open_fds"), int)]
+    if len(s) < 2:
+        return ""
+    i = lx.i
+    out = [f'<h4>{esc(_TXT["chart"][i])} {chip(lx, "obs")}</h4>',
+           series_chart([float(x.get("t_s") or 0) for x in s], [float(x["open_fds"]) for x in s], _TXT["chart"][i],
+                        _TXT["x"][i], _TXT["y"][i], [_TXT["tip"][i].format(i=k + 1, n=x["open_fds"]) for k, x in enumerate(s)])]
+    # the sentences carry target-controlled names: escape the sentence, then mark the names as code
+    marks: List[str] = []
+
+    def wrap(x: Any) -> str:
+        marks.append(str(x))
+        return f"\x00{len(marks) - 1}\x00"
+
+    facts = []
+    for line in _fd_facts(i, fu, wrap):
+        h = esc(line)
+        for k, m in enumerate(marks):
+            h = h.replace(f"\x00{k}\x00", code(m))
+        facts.append(h)
+    out.append(facts_list(facts))
+    kinds = fu.get("open_fds_by_kind")
+    if isinstance(kinds, dict) and kinds:
+        out.append(f'<h4>{esc(_TXT["open"][i])}</h4>'
+                   + share_bars([(str(k), float(v)) for k, v in kinds.items() if isinstance(v, (int, float))]))
+    return "".join(out)
+
+
+def _register_presentation() -> None:
+    from ..report_registry import register_category, register_finding_text, register_finding_viz, register_recipe_label
+    register_category(CATEGORY_FD_LEAK, "file descriptor leak", "파일 디스크립터 누수")
+    register_recipe_label(RECIPE_FD_LEAK, "ABNORMAL_STATE", "File descriptor leak", "파일 디스크립터 누수",
+                          "open file descriptors that keep increasing or approach the limit",
+                          "계속 늘어나거나 한도에 가까워지는 열린 파일 디스크립터")
+    register_finding_text(CATEGORY_FD_LEAK, fd_finding_text)
+    register_finding_viz(CATEGORY_FD_LEAK, fd_finding_viz)
+
+
+_register_presentation()

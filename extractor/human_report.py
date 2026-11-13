@@ -647,6 +647,10 @@ def _render_thread(ctx: _Ctx, f: Dict[str, Any], report: Optional[Dict[str, Any]
 
 
 def _cat_label(ctx: _Ctx, cat: str) -> str:
+    from .report_registry import category_label
+    reg = category_label(cat)
+    if reg:
+        return reg[ctx.i] + f" [{cat}]"
     if cat in CATEGORY_LABEL:
         return CATEGORY_LABEL[cat][ctx.i] + f" [{cat}]"
     return _c(cat)
@@ -1034,6 +1038,22 @@ def _glossary(ctx: _Ctx, res: Dict[str, Any]) -> List[str]:
     return out
 
 
+def _registered_text(ctx: _Ctx, f: Dict[str, Any], report: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """The summary lines a recipe definition file registered for this category (report_registry), if any."""
+    from .report_registry import finding_text
+    fn = finding_text(f.get("category"))
+    if fn is None:
+        return None
+    try:
+        r = fn(ctx, f, report)
+    except Exception:  # noqa: BLE001 - a registered renderer must not break the summary; fall back to the generic one
+        return None
+    if not isinstance(r, dict) or not isinstance(r.get("lines"), list) or not r["lines"]:
+        return None
+    r.setdefault("kinds", _by_kind(f))
+    return r
+
+
 def render_human_report(result: Dict[str, Any], report: Optional[Dict[str, Any]] = None, lang: str = "en") -> str:
     """Render the human summary (Markdown) of a ``DiagnoseResult`` dict.  ``lang`` is ``"en"`` or ``"ko"``."""
     if lang not in SUPPORTED_LANGS:
@@ -1046,7 +1066,10 @@ def render_human_report(result: Dict[str, Any], report: Optional[Dict[str, Any]]
     renders: List[Dict[str, Any]] = []
     for f in findings:
         cat = f.get("category")
-        if cat == "DEADLOCK_INDICATORS":
+        custom = _registered_text(ctx, f, report)
+        if custom is not None:
+            r = custom
+        elif cat == "DEADLOCK_INDICATORS":
             r = _render_deadlock(ctx, f, report)
             r["rows"] = _thread_rows(report, f.get("recipe_ids"))
         elif cat == "MEMORY_LEAK":

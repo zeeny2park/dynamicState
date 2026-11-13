@@ -109,6 +109,13 @@ def _uaf_cap_scope_limit(c: Any) -> Optional[Dict[str, Any]]:
             "reason": "use-after-free not checked: heap larger than the baseline cap"}
 
 
+def _registered_scope_label(recipe_id: str) -> Optional[Tuple[str, str]]:
+    """What a plugin baseline recipe clears, from its check-list label (report_registry)."""
+    from .report_registry import recipe_label
+    lab = recipe_label(recipe_id)
+    return (lab[3], lab[4]) if lab else None
+
+
 def _plain(recipe_id: str) -> str:
     return str(recipe_id).replace("RECIPE_", "").replace("_", " ").lower()
 
@@ -211,7 +218,7 @@ def evaluate(*, verdict: str, findings: List[Dict[str, Any]], checks: List[Any],
                 or str(getattr(c, "technical_interpretation", "") or "")
             block(f"baseline_check_{st.lower()}", rid, f"baseline check ended {st}" + (f": {why}" if why else ""))
         if ok:
-            en, ko = BASELINE_SCOPE_LABELS.get(rid, (names.get(rid) or _plain(rid),) * 2)
+            en, ko = BASELINE_SCOPE_LABELS.get(rid) or _registered_scope_label(rid) or ((names.get(rid) or _plain(rid),) * 2)
             res = "; ".join([str(getattr(c, "technical_interpretation", "") or "") for c in cs
                              if _st(c) == CheckStatus.PASS] + partial)
             checked.append({"recipe_id": rid, "what": en, "what_ko": ko, "result": res})

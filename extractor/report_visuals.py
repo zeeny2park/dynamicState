@@ -29,6 +29,7 @@ import math
 import re
 from typing import Any, Dict, List, Optional, Tuple
 
+from .report_registry import category_label, finding_viz, recipe_label
 from .human_report import (CATEGORY_LABEL, T, VERDICT_WORD, _by_kind, _checks, _cycle, _growth, _inline_html,
                            _observations, _thread_rows, _user_funcs, conclusion_sentence)
 
@@ -242,8 +243,6 @@ _RECIPES: Dict[str, Tuple[str, str, str, str, str]] = {
         "pointer variables holding null or an address outside any mapping", "널이거나 어떤 매핑에도 속하지 않는 주소를 담은 포인터 변수"),
     "RECIPE_SUSPICIOUS_BOUNDARY_VALUES": ("MEMORY_INTEGRITY", "Suspicious boundary values", "의심스러운 경계 값",
         "indexes and lengths at or beyond the limits of their buffers", "버퍼 한계에 닿았거나 넘어선 인덱스·길이"),
-    "RECIPE_FD_LEAK": ("ABNORMAL_STATE", "File descriptor leak", "파일 디스크립터 누수",
-        "open file descriptors that keep increasing or approach the limit", "계속 늘어나거나 한도에 가까워지는 열린 파일 디스크립터"),
     "RECIPE_UNEXPECTED_VARIABLE_CHANGES": ("ABNORMAL_STATE", "Unexpected variable changes", "예상 밖 변수 변화",
         "variables that leave their expected range", "예상 범위를 벗어나는 변수"),
     "RECIPE_STATE_TRANSITION_VIOLATIONS": ("ABNORMAL_STATE", "State transition violations", "상태 전이 위반",
@@ -513,6 +512,79 @@ def _legend(lx: _Lx, *kinds: str) -> str:
     if "rec" in kinds:
         parts.append(f"<span>{_chip(lx, 'rec')} {E(lx.t('legend_rec'))}</span>")
     return f'<div class="dsv-legend">{"".join(parts)}</div>' if parts else ""
+
+
+# ------------------------------------------------------------------------------------------------ drawing kit
+# Helpers a recipe definition file may use for its registered picture (report_registry.register_finding_viz).
+def esc(x: Any) -> str:
+    """HTML-escape a value from the target."""
+    return E(str(x))
+
+
+def code(x: Any) -> str:
+    """An identifier (variable, thread, lock, file:line) as escaped inline code."""
+    return _code(x)
+
+
+def chip(lx: "_Lx", kind: str) -> str:
+    """Epistemic tag: 'obs' (observed), 'rec' (reconstructed) or 'no' (not observed)."""
+    return _chip(lx, kind)
+
+
+def facts_list(items: List[str]) -> str:
+    """A bullet list; every item must already be safe HTML (build it with esc/code)."""
+    return f'<ul class="dsv-facts">{"".join(f"<li>{x}</li>" for x in items)}</ul>' if items else ""
+
+
+def series_chart(xs: List[float], ys: List[float], title: str, x_label: str, y_label: str,
+                 tips: Optional[List[str]] = None, unit: str = "") -> str:
+    """Zero-based area chart of an observed series (at least two points); labels are escaped here."""
+    if len(xs) < 2 or len(xs) != len(ys):
+        return ""
+    w, h, ml, mr, mt, mb = 640, 246, 62, 20, 34, 42
+    xmax = (max(xs) - min(xs)) or 1.0
+    x0 = min(xs)
+    ymax = (max(ys) * 1.1) or 1.0
+    px = lambda v: ml + (w - ml - mr) * (v - x0) / xmax  # noqa: E731
+    py = lambda v: mt + (h - mt - mb) * (1 - v / ymax)  # noqa: E731
+    s = [f'<svg viewBox="0 0 {w} {h}" width="{w}" role="img" aria-label="{E(title)}">']
+    for i in range(5):
+        v = ymax * i / 4
+        s.append(f'<line class="dsv-grid" x1="{ml}" y1="{py(v):.1f}" x2="{w - mr}" y2="{py(v):.1f}"/>'
+                 f'<text class="dsv-t-mute" x="{ml - 8}" y="{py(v) + 4:.1f}" text-anchor="end" font-size="11">{v:,.0f}</text>')
+    s.append(f'<line class="dsv-axis" x1="{ml}" y1="{py(0):.1f}" x2="{w - mr}" y2="{py(0):.1f}"/>')
+    pts = " ".join(f"{px(a):.1f},{py(b):.1f}" for a, b in zip(xs, ys))
+    s.append(f'<polygon class="dsv-area" points="{px(xs[0]):.1f},{py(0):.1f} {pts} {px(xs[-1]):.1f},{py(0):.1f}"/>'
+             f'<polyline class="dsv-linep" points="{pts}"/>')
+    for i, (a, b) in enumerate(zip(xs, ys)):
+        tip = f"<title>{E(tips[i])}</title>" if tips and i < len(tips) else ""
+        s.append(f'<circle class="dsv-pt" cx="{px(a):.1f}" cy="{py(b):.1f}" r="5">{tip}</circle>'
+                 f'<text class="dsv-t-mute" x="{px(a):.1f}" y="{h - mb + 16}" text-anchor="middle" font-size="11">+{a - x0:.2f}</text>')
+    for i, anchor in ((0, "start"), (len(ys) - 1, "end")):
+        s.append(f'<text x="{px(xs[i]) + (8 if i == 0 else -8):.1f}" y="{py(ys[i]) - 10:.1f}" text-anchor="{anchor}" '
+                 f'font-size="12" font-weight="700">{ys[i]:,.0f}{E(unit)}</text>')
+    s.append(f'<text class="dsv-t-mute" x="{(ml + w - mr) / 2}" y="{h - 6}" text-anchor="middle" font-size="11">{E(x_label)}</text>'
+             f'<text class="dsv-t-mute" x="12" y="14" font-size="11">{E(y_label)}</text></svg>')
+    return f'<div class="dsv-svgbox">{"".join(s)}</div>'
+
+
+def share_bars(items: List[Tuple[str, float]], unit: str = "") -> str:
+    """Horizontal bars for a few labelled quantities (label escaped here)."""
+    top = max((v for _, v in items), default=0) or 1.0
+    rows = "".join(f'<tr><td>{_code(k)}</td><td style="width:60%"><span class="dsv-meter" style="width:100%">'
+                   f'<i style="width:{max(0.0, min(100.0, v * 100 / top)):.0f}%"></i></span></td>'
+                   f'<td>{_fnum(v)}{E(unit)}</td></tr>' for k, v in items)
+    return f'<div class="dsv-scroll"><table class="dsv-tbl"><tbody>{rows}</tbody></table></div>' if rows else ""
+
+
+def thread_strip(lx: "_Lx", finding: Dict[str, Any], report: Optional[Dict[str, Any]], hot_tids: List[Any]) -> str:
+    """The per-sample thread state table, with ``hot_tids`` marked."""
+    return _thread_strip(lx, _thread_rows(report, finding.get("recipe_ids")), hot_tids, _sampling(report, finding))
+
+
+def observations(report: Optional[Dict[str, Any]], finding: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """The observation dicts of the checks behind a finding."""
+    return _observations(report, finding.get("recipe_ids"))
 
 
 # ------------------------------------------------------------------------------------------------ thread strip
@@ -838,33 +910,11 @@ def _viz_leak(lx: _Lx, f: Dict[str, Any], report: Optional[Dict[str, Any]], uid:
     out: List[str] = []
     walks = _heap_walks(report, f)
     if walks:
-        w, h, ml, mr, mt, mb = 640, 246, 62, 20, 34, 42
         t0 = walks[0]["t"]
-        xs = [float(x["t"] - t0) for x in walks]
         ys = [float(x["in_use_bytes"]) / 1024.0 for x in walks]
-        xmax = max(xs) or 1.0
-        ymax = max(ys) * 1.1 or 1.0
-        px = lambda v: ml + (w - ml - mr) * v / xmax  # noqa: E731
-        py = lambda v: mt + (h - mt - mb) * (1 - v / ymax)  # noqa: E731
-        s = [f'<svg viewBox="0 0 {w} {h}" width="{w}" role="img" aria-label="{E(lx.t("lk_title"))}">']
-        for i in range(5):
-            v = ymax * i / 4
-            s.append(f'<line class="dsv-grid" x1="{ml}" y1="{py(v):.1f}" x2="{w - mr}" y2="{py(v):.1f}"/>'
-                     f'<text class="dsv-t-mute" x="{ml - 8}" y="{py(v) + 4:.1f}" text-anchor="end" font-size="11">{v:,.0f}</text>')
-        s.append(f'<line class="dsv-axis" x1="{ml}" y1="{py(0):.1f}" x2="{w - mr}" y2="{py(0):.1f}"/>')
-        pts = " ".join(f"{px(a):.1f},{py(b):.1f}" for a, b in zip(xs, ys))
-        s.append(f'<polygon class="dsv-area" points="{px(xs[0]):.1f},{py(0):.1f} {pts} {px(xs[-1]):.1f},{py(0):.1f}"/>'
-                 f'<polyline class="dsv-linep" points="{pts}"/>')
-        for i, (a, b) in enumerate(zip(xs, ys)):
-            tip = lx.t("lk_point", i=i + 1, kb=f"{b:,.0f}", n=walks[i].get("in_use_count", "?"))
-            s.append(f'<circle class="dsv-pt" cx="{px(a):.1f}" cy="{py(b):.1f}" r="5"><title>{E(tip)}</title></circle>'
-                     f'<text class="dsv-t-mute" x="{px(a):.1f}" y="{h - mb + 16}" text-anchor="middle" font-size="11">+{a:.2f}</text>')
-        for i, anchor in ((0, "start"), (len(ys) - 1, "end")):
-            s.append(f'<text x="{px(xs[i]) + (8 if i == 0 else -8):.1f}" y="{py(ys[i]) - 10:.1f}" text-anchor="{anchor}" '
-                     f'font-size="12" font-weight="700">{ys[i]:,.0f} KB</text>')
-        s.append(f'<text class="dsv-t-mute" x="{(ml + w - mr) / 2}" y="{h - 6}" text-anchor="middle" font-size="11">{E(lx.t("lk_x"))}</text>'
-                 f'<text class="dsv-t-mute" x="12" y="14" font-size="11">{E(lx.t("lk_y"))}</text></svg>')
-        out.append(f'<h4>{E(lx.t("lk_title"))} {_chip(lx, "obs")}</h4><div class="dsv-svgbox">{"".join(s)}</div>')
+        tips = [lx.t("lk_point", i=i + 1, kb=f"{y:,.0f}", n=w.get("in_use_count", "?")) for i, (w, y) in enumerate(zip(walks, ys))]
+        out.append(f'<h4>{E(lx.t("lk_title"))} {_chip(lx, "obs")}</h4>'
+                   + series_chart([float(x["t"] - t0) for x in walks], ys, lx.t("lk_title"), lx.t("lk_x"), lx.t("lk_y"), tips, " KB"))
     g = _growth(f, report)
     if g and g.get("path"):
         root = g.get("var") or g["path"]
@@ -945,12 +995,14 @@ _VIZ = {"DEADLOCK_INDICATORS": _viz_deadlock, "MEMORY_CORRUPTION": _viz_overflow
 
 def _finding_card(lx: _Lx, i: int, f: Dict[str, Any], report: Optional[Dict[str, Any]]) -> str:
     cat = str(f.get("category"))
-    label = CATEGORY_LABEL[cat][lx.i] if cat in CATEGORY_LABEL else cat
+    reg = category_label(cat)
+    label = reg[lx.i] if reg else (CATEGORY_LABEL[cat][lx.i] if cat in CATEGORY_LABEL else cat)
     status = str(f.get("status") or "")
     st_word = {"CONFIRMED_ROOT_CAUSE": T["k_fstatus_c"][lx.i], "PROBABLE_CAUSE": T["k_fstatus_p"][lx.i]}.get(status, status)
     tone = "bad" if status == "CONFIRMED_ROOT_CAUSE" else "warn"
     try:
-        viz = _VIZ[cat](lx, f, report, f"f{i}") if cat in _VIZ else ""
+        fn = finding_viz(cat) or _VIZ.get(cat)
+        viz = (fn(lx, f, report, f"f{i}") or "") if fn else ""
     except Exception:  # noqa: BLE001 - a picture must never prevent the report from being written
         viz = ""
     kinds = _by_kind(f)
@@ -974,6 +1026,11 @@ def _finding_card(lx: _Lx, i: int, f: Dict[str, Any], report: Optional[Dict[str,
 
 
 # ------------------------------------------------------------------------------------------------ check list
+def _recipe_meta(rid: str) -> Optional[Tuple[str, str, str, str, str]]:
+    """Check-list label of a recipe: a registration from its definition file first, then the built-in table."""
+    return recipe_label(rid) or _RECIPES.get(rid)
+
+
 def _norm_status(s: Any) -> str:
     s = str(s or "").upper()
     if s in ("PASS", "FAIL", "INCONCLUSIVE", "ERROR"):
@@ -1044,11 +1101,10 @@ def _checklist(lx: _Lx, res: Dict[str, Any], report: Optional[Dict[str, Any]], f
         grp = [r for r in rows if r["status"] == s]
         if not grp:
             continue
-        grp.sort(key=lambda r: (_DOMAIN_ORDER.index(_RECIPES.get(r["rid"], ("OTHER",))[0])
-                                if _RECIPES.get(r["rid"], ("OTHER",))[0] in _DOMAIN_ORDER else 9, r["rid"]))
+        grp.sort(key=lambda r: (_DOMAIN_ORDER.index((_recipe_meta(r["rid"]) or ("OTHER",))[0]), r["rid"]))
         items = []
         for r in grp:
-            meta = _RECIPES.get(r["rid"])
+            meta = _recipe_meta(r["rid"])
             name = meta[1 + lx.i] if meta else str(r.get("name") or r["rid"])
             what = meta[3 + lx.i] if meta else ""
             dom = meta[0] if meta else (str(r.get("domain")) if ("dom_" + str(r.get("domain"))) in _L else "OTHER")
