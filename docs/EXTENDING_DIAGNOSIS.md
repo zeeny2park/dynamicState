@@ -15,6 +15,11 @@ Rules:
 - `baseline=True` runs the check in every diagnosis: it must be cheap, read-only and zero-stop, and it must be able
   to return CONTRADICTED on a healthy process, because a baseline check that cannot decide blocks a HEALTHY verdict.
 - A rule decides only from what was observed. Not enough evidence is INSUFFICIENT_EVIDENCE, never CONTRADICTED.
+- A SUPPORTED result is a fault finding unless its details say otherwise: `certainty_cap: "PROBABLE"` caps it at
+  probable, `finding_severity: "WARNING"` makes it a warning, and `finding_severity: "INFO"` marks a degradation that is
+  not a fault (e.g. `heap_retention.py`): when every finding of a diagnosis is INFO, the verdict is DEGRADED.
+- The first entry of `applicable_problem_categories` is the category of the check's evidence (also of its
+  CONTRADICTED facts); further entries only make the planner select the recipe for those symptom categories.
 - Text and pictures show only values present in the evidence. Mark what is reconstructed (`chip(lx, "rec")`) or was
   not observed (`chip(lx, "no")`). Escape every value from the target: use `esc()` / `code()` from
   `extractor.report_visuals`, which also offers `series_chart`, `share_bars`, `facts_list` and `thread_strip`.

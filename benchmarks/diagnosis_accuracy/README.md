@@ -21,20 +21,24 @@ the symptom text, `origin` (`project_fixture`, `external_style`, `new`) and `nam
 New programs print `READY` once in the faulty steady state and stay alive; reused fixtures use a fixed settle time.
 Heap-corruption targets do the bad write once, then idle without calling malloc/free again.
 
-11 scored defect targets (memory_leak 3, heap_overflow 2, use_after_free 2, deadlock 2, busy_wait 2), 2 unscored
-`long_stall` targets (`stall_pipe`, `stall_sleep`), 8 healthy controls, 3 `external_style` (small LRU cache, ring buffer, job queue written in a neutral style).
+13 scored defect targets (memory_leak 3, heap_overflow 2, use_after_free 2, deadlock 2, busy_wait 2, mapping_growth 2:
+`mapgrow_slabs` mmap()s without munmap, `mapgrow_pool` a custom region pool), 4 unscored targets (`long_stall`:
+`stall_pipe`, `stall_sleep`; `heap_retention`: `frag_sparse`, `frag_worker`), 8 healthy controls, 3 `external_style` (small LRU cache, ring buffer, job queue written in a neutral style).
 
 ## Scoring (per target, one `diagnose` call)
 
 - Unscored targets: a ground-truth record with `"scored": false` (and a mandatory `"scored_reason"`) is still built, run
   and printed, but under a separate "unscored (informational)" heading in the table and an `unscored` section in the
   results JSON (`totals.unscored`; rows carry `"scored": false`). It is excluded from every detection, cause-name,
-  location, per-kind/origin/naming, false-positive and error total and rate. Currently only the `long_stall` targets
-  (`stall_pipe`, `stall_sleep`) are unscored (owner decision): from outside, a thread blocked forever and an idle worker
+  location, per-kind/origin/naming, false-positive and error total and rate. The `heap_retention` targets
+  (`frag_sparse`, `frag_worker`) are unscored because fragmentation is a degradation, not a defect: the expected answer
+  is a `HEAP_RETENTION` finding with a DEGRADED (non-fault) verdict, a HEALTHY verdict on it is not a dangerous miss, and
+  neither the defect scoring (HEALTHY = false clear) nor the healthy-control scoring (any finding = false positive) can
+  express that. The `long_stall` targets (`stall_pipe`, `stall_sleep`) are unscored (owner decision): from outside, a thread blocked forever and an idle worker
   look identical, so the tool deliberately answers "long wait observed, cannot determine whether expected" rather than a
   fault, and counting that as a miss gave no actionable signal. A stall target is defective, so a fault-class verdict on it
   is not a false positive (false positives are defined for healthy controls only); the verdict is just reported.
-  `KIND_CATEGORIES` keeps `long_stall` only to label and describe those rows.
+  `KIND_CATEGORIES` keeps `long_stall` and `heap_retention` only to label and describe those rows.
 
 - False clear (defect): a scored defect target whose verdict is `HEALTHY` (the diagnoser told the user "nothing is
   wrong" about a real defect), the most dangerous miss. Counted as `false_clears` in the overall and per-kind totals,
