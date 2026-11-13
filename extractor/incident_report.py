@@ -208,7 +208,9 @@ def result_from_session(session: Any) -> Dict[str, Any]:
             "observed": [c.technical_interpretation for c in session.checks
                          if c.recipe_id in rules and c.status == CheckStatus.FAIL and c.technical_interpretation],
         })
-    executed = [c for c in session.checks if c.status not in (CheckStatus.NOT_EXECUTED, CheckStatus.SKIPPED)]
+    from .static_location_candidates import attach_location_candidates   # same as diagnose(): statically derived
+    attach_location_candidates(findings, session.companion_elf, report=report)
+    executed =[c for c in session.checks if c.status not in (CheckStatus.NOT_EXECUTED, CheckStatus.SKIPPED)]
     not_covered = []
     for c in session.checks:
         if c.status in (CheckStatus.PASS, CheckStatus.FAIL):

@@ -195,6 +195,59 @@ def _proc_sample(adapter: Any, pid: int) -> Optional[Dict[str, Any]]:
     return {"t": time.monotonic(), "rss_kb": rss, "threads": _kb(st.get("Threads")), "anon": _anon_rw(maps)}
 
 
+def _thread_counts(adapter: Any, pid: int) -> Optional[Dict[int, Dict[str, Any]]]:
+    """Per-thread run counters (one thread-sampler sample, through the adapter), or None."""
+    if not getattr(adapter, "thread_samples_supported", False):
+        return None
+    try:
+        recs = adapter.read_thread_samples(pid, {})
+    except Exception:  # noqa: BLE001 - attribution is optional; the growth measurement stands without it
+        return None
+    out = {int(r["tid"]): r for r in recs or [] if isinstance(r, dict) and isinstance(r.get("tid"), int)}
+    return out or None
+
+
+def _ran(a: Dict[str, Any], b: Dict[str, Any]) -> Optional[bool]:
+    """Whether a thread was put on a CPU between two of its samples (None: the counters do not say)."""
+    sa, sb = a.get("schedstat") or {}, b.get("schedstat") or {}
+    if isinstance(sa.get("timeslices"), int) and isinstance(sb.get("timeslices"), int):
+        return sb["timeslices"] > sa["timeslices"]
+    keys = ("utime_ticks", "stime_ticks", "voluntary_ctxt_switches", "nonvoluntary_ctxt_switches")
+    if any(not isinstance(a.get(k), int) or not isinstance(b.get(k), int) for k in keys):
+        return None
+    return any(b[k] > a[k] for k in keys)
+
+
+def growth_thread(before: Optional[Dict[int, Dict[str, Any]]],
+                  after: Optional[Dict[int, Dict[str, Any]]]) -> Dict[str, Any]:
+    """The thread that grew the mappings, when it is the ONLY thread of the process that ran during the window.
+
+    Only a running thread of the process can map memory into it (mmap / mremap / brk / stack growth are its own
+    system calls or faults).  If exactly one thread was put on a CPU between the first and the last sample, and no
+    thread appeared or ended in between, the growth was made by that thread.  Otherwise no thread is named."""
+    if not before or not after:
+        return {"status": "NOT_OBSERVED", "reason": "per-thread run counters not available"}
+    if set(before) != set(after):
+        return {"status": "AMBIGUOUS", "reason": "threads started or ended during the window"}
+    ran, unknown = [], []
+    for tid in sorted(before):
+        r = _ran(before[tid], after[tid])
+        if r is None:
+            unknown.append(tid)
+        elif r:
+            ran.append(tid)
+    if unknown:
+        return {"status": "NOT_OBSERVED", "reason": "run counters missing for %d thread(s)" % len(unknown)}
+    if len(ran) != 1:
+        return {"status": "AMBIGUOUS" if ran else "NOT_OBSERVED",
+                "reason": "%d threads ran during the window" % len(ran), "threads_ran": len(ran)}
+    tid = ran[0]
+    return {"status": "ATTRIBUTED", "allocating_thread_tid": tid,
+            "allocating_thread_name": str(after[tid].get("name") or ""),
+            "evidence": "the only one of %d threads that ran during the window (per-thread run counters before and "
+                        "after); only a running thread can map memory into the process" % len(before)}
+
+
 def _typed_owners(provider: Any, ctx: Dict[str, Any], rd: _Reader, ranges: List[Tuple[int, int]]) -> Dict[str, Any]:
     """Typed globals/statics of the executable whose pointer value lies in one of ``ranges`` (sorted)."""
     from ..reachability import _module_contexts
@@ -305,10 +358,15 @@ def collect_mapping_growth(provider: Any, ctx: Dict[str, Any]) -> None:
     steps: List[Dict[str, Any]] = []
     known_malloc: List[Tuple[int, int]] = []         # ranges classified as malloc in this window
     added_outside: List[Dict[str, Any]] = []
+    threads_before = threads_after = None
     for i in range(SAMPLES):
+        if i == 0:
+            threads_before = _thread_counts(adapter, pid)
         s = _proc_sample(adapter, pid)
         if s is None:
             break
+        if i + 1 == SAMPLES:
+            threads_after = _thread_counts(adapter, pid)
         if snaps:
             prev = snaps[-1]
             pr = [(m["start"], m["end"]) for m in prev["anon"]]
@@ -372,6 +430,7 @@ def collect_mapping_growth(provider: Any, ctx: Dict[str, Any]) -> None:
         if cum > 0 and live:
             rngs = sorted((r["start"], r["end"]) for r in live)
             obs["owner_search"] = _typed_owners(provider, ctx, rd, rngs)
+            obs["growth_thread"] = growth_thread(threads_before, threads_after if len(snaps) == SAMPLES else None)
         else:
             obs["owner_search"] = {"status": "NOT_RUN", "reason": "nothing grew outside malloc", "owners": []}
     obs["heap_walks"] = _leak_walks(provider, ctx)
@@ -432,6 +491,10 @@ def mapping_growth_rule(recipe: DiagnosticRecipe, data: Dict[str, Any]) -> Optio
         for o in owners[:3]:
             facts.append("%d pointer(s) in %s variable %s point into the new mappings"
                          % (o["pointers_into_new_ranges"], o["root_kind"], o["variable_path"]))
+        gt = mg.get("growth_thread") or {}
+        if gt.get("status") == "ATTRIBUTED":
+            facts.append("thread %s (tid %s) grew them: %s" % (gt.get("allocating_thread_name"),
+                                                               gt.get("allocating_thread_tid"), gt.get("evidence")))
         walks = mg.get("heap_walks") or []
         if len(walks) >= 2:
             facts.append("heap in-use %+d KB across %d heap walks"
@@ -487,6 +550,8 @@ register_recipe(DiagnosticRecipe(
                  % (MIN_GROWTH_KB, INTERVAL_S * (SAMPLES - 1)),
                  "which code maps the memory is not observed (no tracing); only typed global/static pointers are "
                  "searched for an owner, not pointers held in the heap, on stacks or in registers",
+                 "the mapping thread is named only when it was the only thread of the process that ran during the "
+                 "window; with several running threads none is named",
                  "an mmapped malloc block allocated with an alignment (memalign) is not recognised as malloc's"],
     output_structure={"samples": "list", "grown_mappings": "list", "owner_search": "dict"},
     observations=(OBS_MAPPING_GROWTH,),
@@ -513,6 +578,10 @@ _TXT = {
                  "stacks or in registers are not searched).",
                  "새 메모리를 가리키는 타입 있는 전역/정적 변수는 없습니다 (힙, 스택, 레지스터에 있는 포인터는 찾지 "
                  "않았습니다)."),
+    "thread": ("Thread {name} (tid {tid}) was the only thread of the process that ran during the observation, so "
+               "it made this growth (only a running thread can map memory).",
+               "관측하는 동안 실행된 스레드는 {name} (tid {tid}) 하나뿐이므로 이 스레드가 메모리를 늘렸습니다 (실행 "
+               "중인 스레드만 메모리를 매핑할 수 있음)."),
     "walks": ("The heap in use changed by {kb} KB across {n} heap walks.",
               "힙 조사 {n}회 동안 사용 중인 힙의 변화는 {kb} KB입니다."),
     "walk1": ("The heap in use was {kb} KB at the one heap walk; its trend was not observed.",
@@ -581,6 +650,10 @@ def _mg_facts(i: int, mg: Dict[str, Any], wrap: Any) -> List[str]:
                                             var=wrap(o["variable_path"])))
     if not owners and (mg.get("owner_search") or {}).get("status") == "COMPLETED":
         out.append(_TXT["no_owner"][i])
+    gt = mg.get("growth_thread") if isinstance(mg.get("growth_thread"), dict) else {}
+    if gt.get("status") == "ATTRIBUTED":
+        out.append(_TXT["thread"][i].format(name=wrap(gt.get("allocating_thread_name")),
+                                             tid=wrap(gt.get("allocating_thread_tid"))))
     walks = [w for w in mg.get("heap_walks") or [] if isinstance(w, dict) and _num(w.get("in_use_bytes")) is not None]
     if len(walks) >= 2:
         out.append(_TXT["walks"][i].format(kb="%+d" % ((walks[-1]["in_use_bytes"] - walks[0]["in_use_bytes"]) // 1024),

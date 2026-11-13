@@ -172,7 +172,8 @@ def score_result(gt: Dict[str, Any], result: Optional[Dict[str, Any]], error: Op
         if gt["kind"] == HEALTHY_KIND:
             row.update(false_positive=False, not_cleared=False, cleared=False)
         else:
-            row.update(detected=False, name_match="none", location_match=False, false_clear=False)
+            row.update(detected=False, name_match="none", location_match=False, false_clear=False,
+                       location_candidate_rank=None, location_candidate_hit=False)
         return row
 
     findings = list(result.get("findings") or [])
@@ -223,7 +224,29 @@ def score_result(gt: Dict[str, Any], result: Optional[Dict[str, Any]], error: Op
     row["location_match"] = bool(matching) and any(
         os.path.basename(loc["file"]) == f and abs(loc["line"] - ln) <= LINE_TOLERANCE
         for loc in gt["locations"] for f, ln in fl)
+    # Static location candidates (findings[].location_candidates): statically derived, never observed. Scored
+    # separately from `location_match` (which counts only subjects, i.e. what the diagnosis observed / named):
+    # the best (lowest) rank among the matching findings' candidates that lies within the same tolerance.
+    row["location_candidate_rank"] = candidate_rank(gt, matching)
+    row["location_candidate_hit"] = row["location_candidate_rank"] is not None
+    # time the engine spent deriving them (all findings; part of diagnose_s)
+    row["location_candidates_s"] = round(sum(float((f.get("location_candidates") or {}).get("elapsed_s") or 0.0)
+                                             for f in findings if isinstance(f.get("location_candidates"), dict)), 3)
     return row
+
+
+def candidate_rank(gt: Dict[str, Any], findings: List[Dict[str, Any]]) -> Optional[int]:
+    best: Optional[int] = None
+    for f in findings:
+        lc = f.get("location_candidates") if isinstance(f.get("location_candidates"), dict) else {}
+        for c in lc.get("candidates") or []:
+            if not isinstance(c, dict) or not isinstance(c.get("rank"), int):
+                continue
+            m = re.match(r"^(.*):(\d+)$", str(c.get("location") or ""))
+            if m and any(os.path.basename(loc["file"]) == os.path.basename(m.group(1))
+                         and abs(loc["line"] - int(m.group(2))) <= LINE_TOLERANCE for loc in gt["locations"]):
+                best = c["rank"] if best is None else min(best, c["rank"])
+    return best
 
 
 def _stats(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -235,6 +258,9 @@ def _stats(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
         "name_full": sum(1 for r in d if r.get("name_match") == "full"),
         "name_partial": sum(1 for r in d if r.get("name_match") == "partial"),
         "location_match": sum(1 for r in d if r.get("location_match")),
+        # static candidates (not observed): reported next to, never added to, location_match
+        "location_candidate_hit": sum(1 for r in d if r.get("location_candidate_hit")),
+        "location_candidate_rank1": sum(1 for r in d if r.get("location_candidate_rank") == 1),
         "false_clears": sum(1 for r in d if r.get("false_clear")),
         "healthy_targets": len(h),
         "cleared": sum(1 for r in h if r.get("cleared")),
@@ -258,7 +284,8 @@ def summarize(all_rows: List[Dict[str, Any]]) -> Dict[str, Any]:
         "unscored": {
             "note": "informational; excluded from every total and rate in this report",
             "targets": [{k: r.get(k) for k in ("id", "kind", "scored_reason", "verdict", "detected", "name_match",
-                                                "location_match", "false_clear", "finding_categories", "subjects",
+                                                "location_match", "location_candidate_rank", "false_clear",
+                                                "finding_categories", "subjects",
                                                 "error")}
                         for r in unscored],
         },
@@ -518,17 +545,20 @@ def run_all(targets: List[Dict[str, Any]], diagnose_fn: Callable = _default_diag
 
 
 def format_table(report: Dict[str, Any]) -> str:
-    lines = [f"{'target':20} {'kind':15} {'origin':15} {'verdict':16} {'det':>3} {'names':>7} {'loc':>3}  categories"]
+    lines = [f"{'target':20} {'kind':15} {'origin':15} {'verdict':16} {'det':>3} {'names':>7} {'loc':>3} {'cand':>4}"
+             f"  categories"]
     def row_line(r):
         if r["kind"] == HEALTHY_KIND:
             det = "FP" if r.get("false_positive") else ("ok" if r.get("cleared") else "nc")
-            names = loc = "-"
+            names = loc = cand = "-"
         else:
             det = "yes" if r.get("detected") else "no"
             names = r.get("name_match", "none")
             loc = "yes" if r.get("location_match") else "no"
+            cand = f"#{r['location_candidate_rank']}" if r.get("location_candidate_rank") else "-"
         extra = f"ERROR {r['error']}" if r.get("error") else ",".join(sorted(set(r["finding_categories"]))) or "-"
-        return f"{r['id']:20} {r['kind']:15} {r['origin']:15} {str(r['verdict']):16} {det:>3} {names:>7} {loc:>3}  {extra}"
+        return (f"{r['id']:20} {r['kind']:15} {r['origin']:15} {str(r['verdict']):16} {det:>3} {names:>7} {loc:>3}"
+                f" {cand:>4}  {extra}")
 
     lines.extend(row_line(r) for r in report["rows"] if r.get("scored", True))
     unscored_rows = [r for r in report["rows"] if not r.get("scored", True)]
@@ -537,6 +567,8 @@ def format_table(report: Dict[str, Any]) -> str:
     lines.append("")
     lines.append(f"scored defects: detected {o['detected']}/{o['defect_targets']}, cause names full {o['name_full']}"
                  f" partial {o['name_partial']}, location {o['location_match']}")
+    lines.append(f"static location candidates (not observed; not in 'location'): contain the true location "
+                 f"{o['location_candidate_hit']}/{o['defect_targets']}, at rank 1 {o['location_candidate_rank1']}")
     lines.append(f"healthy: cleared {o['cleared']}, not cleared {o['not_cleared']}, false positives "
                  f"{o['false_positives']} (of {o['healthy_targets']}), false clears {o['false_clears']} (of "
                  f"{o['defect_targets']} defects); errors {o['errors']}; "
