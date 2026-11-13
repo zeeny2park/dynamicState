@@ -386,6 +386,28 @@ def _wait_ready(proc: subprocess.Popen, gt: Dict[str, Any]) -> None:
     raise RuntimeError("timeout waiting for READY")
 
 
+TARGET_ADDRESS_SPACE_LIMIT = 8 << 30  # bytes; the leak targets grow without bound by design
+
+
+def _contain_target() -> None:
+    """Runs in the target between fork and exec: the target dies with the benchmark and cannot eat the host.
+
+    A benchmark killed from outside never reaches its ``finally``; a leak target left behind that way grew to 21 GB
+    and brought the host to the OOM killer. PR_SET_PDEATHSIG ends the target when the benchmark process dies for
+    any reason, and the address-space limit bounds what a leak target can take while it runs.
+    """
+    import ctypes
+    import resource
+    try:
+        ctypes.CDLL(None, use_errno=True).prctl(1, int(signal.SIGKILL), 0, 0, 0)  # 1 = PR_SET_PDEATHSIG
+    except Exception:  # noqa: BLE001 - containment is best effort; the run itself must not depend on it
+        pass
+    try:
+        resource.setrlimit(resource.RLIMIT_AS, (TARGET_ADDRESS_SPACE_LIMIT, TARGET_ADDRESS_SPACE_LIMIT))
+    except (ValueError, OSError):
+        pass
+
+
 def _kill(proc: subprocess.Popen) -> None:
     try:
         os.killpg(proc.pid, signal.SIGKILL)
@@ -424,7 +446,7 @@ def run_target(gt: Dict[str, Any], tmp: str, diagnose_fn: Callable, symptom_mode
         return row
     proc = subprocess.Popen([binary], stdin=subprocess.DEVNULL,
                             stdout=subprocess.PIPE if gt["ready"]["mode"] == "stdout_marker" else subprocess.DEVNULL,
-                            stderr=subprocess.DEVNULL, start_new_session=True)
+                            stderr=subprocess.DEVNULL, start_new_session=True, preexec_fn=_contain_target)
     result, error, diag_s = None, None, None
     runs: List[Dict[str, Any]] = []  # one entry per diagnose call: {"result", "error", "diagnose_s"}
     try:
