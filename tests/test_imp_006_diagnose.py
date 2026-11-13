@@ -25,7 +25,7 @@ SETTLE_S = 0.5
 RESULT_KEYS = {
     "schema_version", "verdict", "confidence", "confidence_basis", "summary", "findings", "checks_run",
     "not_covered", "collection_impact", "report_path", "report", "investigation_id", "target", "state",
-    "stop_reason", "duration_s", "healthy_scope",
+    "stop_reason", "duration_s", "healthy_scope", "symptom_interpretation",
 }
 
 
