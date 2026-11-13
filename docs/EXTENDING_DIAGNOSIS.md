@@ -26,6 +26,11 @@ Rules:
 - The HTML report contains no script. A picture may use the step classes of `report_visuals` but must not emit
   `<script>` or event-handler attributes.
 - Without step 3 and 4 the finding still appears, with the generic text and no picture.
+- The Korean report shows no English sentence of the engine. Sentences a rule writes into its evidence (`contradicting_facts`,
+  `supporting_facts`, `confidence_basis`, limitations) stay English where they are created, because verdict rules
+  read some of them; the Korean report translates them at render time with one full-match pattern per sentence shape
+  in `human_report._KO_ENGINE` (numbers and identifiers are captured and copied). A sentence without a pattern is shown
+  unchanged, and `tests/test_korean_report_language.py` fails for a representative report that still shows one.
 
 Tests: a unit test of the rule and the presentation on synthetic observations (see `tests/test_report_registry.py`),
 and, for a defect kind that should be scored, a target program and ground-truth record under

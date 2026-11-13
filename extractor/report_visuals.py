@@ -31,7 +31,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from .report_registry import category_label, finding_viz, recipe_label
 from .human_report import (CATEGORY_LABEL, T, VERDICT_WORD, _by_kind, _checks, _cycle, _growth, _inline_html,
-                           _observations, _thread_rows, _user_funcs, conclusion_sentence)
+                           _observations, _thread_rows, _user_funcs, conclusion_sentence, ko_text, _ko_free_list, _ko_write_basis)
 
 E = html.escape
 
@@ -877,6 +877,8 @@ def _viz_overflow(lx: _Lx, f: Dict[str, Any], report: Optional[Dict[str, Any]], 
              + (E(_L["ov_s2"][lx.i]).format(val=val_html) if val_html else E(lx.t("ov_s2_plain")))
              + f' {_chip(lx, "obs")}</li>']
     basis = str(dmg.get("extent_basis") or dmg.get("pattern") or "")
+    if lx.i == 1:
+        basis = _ko_write_basis(basis)
     basis_html = f'<span class="dsv-sub">{E(basis)}</span>' if basis else ""
     if n_over > 1:
         steps.append(f'<li{_sa(3)}>{lx.h("ov_s3", n=past)} {_chip(lx, "obs")}{basis_html}</li>')
@@ -962,7 +964,7 @@ def _viz_uaf(lx: _Lx, f: Dict[str, Any], report: Optional[Dict[str, Any]], uid: 
                    + (f' · {E(lx.t("ua_size", n=x["chunk_size"]))}' if x.get("chunk_size") else "")
                    + (f' <span class="dsv-chip">{E(lvl)}</span>' if lvl else "") + "</div>"
                    + (f'<div class="dsv-arrowtxt">{E(lx.t("ua_contains"))}<b>←</b></div>'
-                      f'<div class="dsv-box"><small>{E(lx.t("ua_list"))}</small>{E(str(x["free_list"]))}</div>' if x.get("free_list") else "")
+                      f'<div class="dsv-box"><small>{E(lx.t("ua_list"))}</small>{E(_ko_free_list(str(x["free_list"])) if lx.i == 1 else str(x["free_list"]))}</div>' if x.get("free_list") else "")
                    + "</div>")
         out.append('<div class="dsv-life">'
                    f'<div>{E(lx.t("ua_l1"))} {_chip(lx, "no")}</div><div>{E(lx.t("ua_l2"))} {_chip(lx, "obs")}</div>'
@@ -1012,10 +1014,10 @@ def _finding_card(lx: _Lx, i: int, f: Dict[str, Any], report: Optional[Dict[str,
     for key in ("variable", "lock", "thread_name", "function", "source_location", "resource"):
         vals = _user_funcs(kinds.get(key, [])) if key == "function" else kinds.get(key, [])
         chips += [_code(v) for v in vals[:6] if _code(v) not in chips]
-    facts = "".join(f"<li>{E(str(o))}</li>" for o in (f.get("observed") or [])[:4])
+    facts = "".join(f"<li>{E(ko_text(str(o), lx.i))}</li>" for o in (f.get("observed") or [])[:4])
     desc = str(f.get("description") or "")
     if not viz and desc:
-        facts = f"<li>{E(desc)}</li>" + facts
+        facts = f"<li>{E(ko_text(desc, lx.i))}</li>" + facts
     return (f'<section class="dsv-card dsv-tone-{tone}" id="dsv-finding-{i}"><div class="dsv-fhead">'
             f'<h3>{E(lx.t("finding", i=i))}: {E(label)}</h3><span class="dsv-badge">{E(st_word)}</span>'
             f'<span class="dsv-chip">{E(lx.t("severity"))} {E(str(f.get("severity") or "-"))}</span>'
@@ -1116,20 +1118,22 @@ def _checklist(lx: _Lx, res: Dict[str, Any], report: Optional[Dict[str, Any]], f
                     why.append(E(lx.t("ck_not_planned")))
                 if r.get("cap"):
                     why.append(lx.h("ck_need_cap", cap=r["cap"]))
-                why += [E(x) for x in reasons.get(r["rid"], [])] + [E(x) for x in r.get("limits", [])]
+                why += [E(ko_text(x, lx.i)) for x in reasons.get(r["rid"], [])] + [E(ko_text(x, lx.i)) for x in r.get("limits", [])]
                 if r.get("err"):
-                    why.append(E(str(r["err"])))
+                    why.append(E(ko_text(str(r["err"]), lx.i)))
                 if not why and s != "SKIPPED":
                     why.append(E(lx.t("ck_no_reason")))
             interp = str(r.get("interp") or "")
-            line = interp if (interp and interp != "Check executed" and s in ("FAIL", "PASS")) else ""
+            has_interp = bool(interp) and interp != "Check executed"
+            interp = ko_text(interp, lx.i)
+            line = interp if (has_interp and s in ("FAIL", "PASS")) else ""
             if not line and why:
                 line = re.sub(r"<[^>]+>", "", why[0])
                 line = html.unescape(line)
             dl = []
             if what:
                 dl.append((lx.t("ck_what"), E(what)))
-            if interp and interp != "Check executed":
+            if has_interp:
                 dl.append((lx.t("ck_result"), E(interp)))
             if why:
                 dl.append((lx.t("ck_why"), "<br>".join(dict.fromkeys(why))))
@@ -1149,7 +1153,7 @@ def _checklist(lx: _Lx, res: Dict[str, Any], report: Optional[Dict[str, Any]], f
                       f'{E(lx.t("ck_" + s))} ({len(grp)}) <small>{E(lx.t("ck_" + s + "_hint"))}</small></h4>{"".join(items)}</div>')
     nc_html = ""
     if other_nc:
-        lis = "".join(f"<li>{_code(n.get('item') or n.get('kind'))}: {E(str(n.get('reason') or ''))}</li>" for n in other_nc[:20])
+        lis = "".join(f"<li>{_code(n.get('item') or n.get('kind'))}: {E(ko_text(str(n.get('reason') or ''), lx.i))}</li>" for n in other_nc[:20])
         nc_html = f'<h4>{E(lx.t("nc_title"))}</h4><ul class="dsv-nc">{lis}</ul>'
     return (head + f'<div class="dsv-card dsv-checklist"><p class="dsv-note">{E(lx.t("ck_intro"))}</p>'
             f'<div class="dsv-bar">{bar}</div>{"".join(tools)}<div class="dsv-ckgroups">{"".join(groups)}</div>{nc_html}</div>')

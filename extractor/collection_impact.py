@@ -344,8 +344,11 @@ def impact_summary_for_report(
     return out
 
 
-def impact_summary_lines(summary: Dict[str, Any]) -> List[str]:
-    """Markdown bullet lines for the incident report's "collection impact" section."""
+def impact_summary_lines(summary: Dict[str, Any], lang: str = "en") -> List[str]:
+    """Markdown bullet lines for the incident report's "collection impact" section (``lang`` en or ko)."""
+    if lang == "ko":
+        return _impact_summary_lines_ko(summary)
+
     def f(v: Any, unit: str = "", nd: int = 2) -> str:
         if v is None:
             return "not measured"
@@ -366,4 +369,29 @@ def impact_summary_lines(summary: Dict[str, Any]) -> List[str]:
         lines.append(f"- **Bytes Read**: `{summary['bytes_read']}`")
     if summary.get("budget_exhausted"):
         lines.append(f"- **Budget exhausted**: `{summary.get('budget_exhaustion_reason') or 'yes'}` (result is partial)")
+    return lines
+
+
+def _impact_summary_lines_ko(summary: Dict[str, Any]) -> List[str]:
+    """Korean wording of :func:`impact_summary_lines` (same values, same order)."""
+    def f(v: Any, unit: str = "", nd: int = 2) -> str:
+        if v is None:
+            return "측정하지 못함"
+        return f"{v:.{nd}f}{unit}" if isinstance(v, float) else f"{v}{unit}"
+    if not summary.get("impact_measured"):
+        lines = ["- **수집이 준 영향**: 측정하지 못함"]
+    else:
+        lines = [
+            f"- **구간 동안 대상의 CPU 사용** (대상 자체의 활동이며 우리가 일으킨 것이 아님): `{f(summary.get('target_cpu_ms_during_window'), ' ms')}`"
+            f" · 문맥 전환 `{f(summary.get('target_ctx_switches_during_window'))}`"
+            f" · 실행 대기열 대기 `{f(summary.get('target_runqueue_wait_ms_during_window'), ' ms')}`",
+            f"- **구간 동안 시스템 CPU 사용률**: `{f(summary.get('system_cpu_busy_fraction'), '', 3)}`",
+            f"- **진단이 일으킨 CPU**: `{f(summary.get('attributable_cpu_ms'), ' ms')}` (산정 기준: `{summary.get('attributable_basis') or '해당 없음'}`)",
+        ]
+        if summary.get("collector_max_rss_kb") is not None or summary.get("collector_cpu_ms") is not None:
+            lines.append(f"- **수집 프로세스**: CPU `{f(summary.get('collector_cpu_ms'), ' ms')}` · 최대 RSS `{f(summary.get('collector_max_rss_kb'), ' KiB')}`")
+    if summary.get("bytes_read") is not None:
+        lines.append(f"- **읽은 바이트**: `{summary['bytes_read']}`")
+    if summary.get("budget_exhausted"):
+        lines.append(f"- **예산 소진**: `{summary.get('budget_exhaustion_reason') or '예'}` (결과가 부분적임)")
     return lines

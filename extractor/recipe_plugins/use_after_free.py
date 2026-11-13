@@ -21,7 +21,7 @@ it was: without an allocation tracer it is INSUFFICIENT_EVIDENCE on every live t
 from __future__ import annotations
 
 import uuid
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from ..diagnostic_recipes import (
     CATEGORY_USE_AFTER_FREE,
@@ -176,3 +176,132 @@ register_recipe(DiagnosticRecipe(
     observations=(OBS_FREED_MEMORY_USE,),
     rule=freed_memory_use_rule,
 ), baseline=True, category=CATEGORY_USE_AFTER_FREE)
+
+
+# ---------------------------------------------------------------------------------------------- presentation
+# Plain-language summary of a use-after-free finding (presentation only).  Every value comes from the finding's
+# ``freed_memory_use`` record; a value that is absent is left out of its sentence, and what was seen is kept apart
+# from what is inferred.  key -> (English, Korean)
+_UAF_TXT: Dict[str, Any] = {
+    "ptr": ("The pointer {v} still holds the address of a heap block{size} that has already been freed: "
+            "the allocator lists that block as free{lst}.",
+            "포인터 {v}이(가) 이미 해제된 힙 블록{size}의 주소를 아직 들고 있습니다. "
+            "할당자는 이 블록을 해제된 블록으로 기록하고 있습니다{lst}."),
+    "ptrs": ("The pointers {v} still hold the address of a heap block{size} that has already been freed: "
+             "the allocator lists that block as free{lst}.",
+             "포인터 {v}이(가) 이미 해제된 힙 블록{size}의 주소를 아직 들고 있습니다. "
+             "할당자는 이 블록을 해제된 블록으로 기록하고 있습니다{lst}."),
+    "noptr": ("The heap block{size} is on the allocator's free list, but its contents changed while it was "
+              "free{lst}. No variable the tool can identify still points to it, so the owner is unknown.",
+              "힙 블록{size}은 할당자의 해제 목록에 있는데, 해제된 상태에서 내용이 바뀌었습니다{lst}. "
+              "이 블록을 가리키는 변수는 확인되지 않아 소유자는 알 수 없습니다."),
+    "size": (" ({n} bytes, at {addr})", "(크기 {n}바이트, 주소 {addr})"),
+    "size_n": (" ({n} bytes)", "(크기 {n}바이트)"),
+    "size_a": (" (at {addr})", "(주소 {addr})"),
+    "lst": (" (on {name})", " ({name}에 있음)"),
+    "seen": ("It was seen free in {n} reads over {win} s, and the pointer kept its value.",
+             "{win}초 동안 {n}번 읽는 내내 이 블록은 해제된 상태였고 포인터 값도 그대로였습니다."),
+    "seen_noptr": ("It was seen free in {n} reads over {win} s.", "{win}초 동안 {n}번 읽는 내내 이 블록은 해제된 상태였습니다."),
+    "written_ptr": ("Seen: the block's contents changed while it was free, so something wrote into freed memory. "
+                    "Inferred: because {v} still points into the block, the write most likely went through that "
+                    "pointer.",
+                    "관측: 블록이 해제된 동안 내용이 바뀌었으므로, 누군가 해제된 메모리에 썼습니다. "
+                    "추정: {v}이(가) 아직 이 블록을 가리키고 있으므로 그 포인터를 통해 쓰였을 가능성이 높습니다."),
+    "written_meta": ("Seen: the allocator's own bookkeeping inside the freed block was overwritten, so something "
+                     "wrote into freed memory. Inferred: because {v} still points into the block, the write most "
+                     "likely went through that pointer.",
+                     "관측: 해제된 블록 안의 할당자 관리 정보가 덮어쓰였으므로, 누군가 해제된 메모리에 썼습니다. "
+                     "추정: {v}이(가) 아직 이 블록을 가리키고 있으므로 그 포인터를 통해 쓰였을 가능성이 높습니다."),
+    "written_noptr": ("Seen: the block's contents changed while it was free, so something wrote into freed memory.",
+                      "관측: 블록이 해제된 동안 내용이 바뀌었으므로, 누군가 해제된 메모리에 썼습니다."),
+    "not_written": ("No write into the freed block was observed, so an actual use of freed memory is not proven. "
+                    "The risk, inferred rather than seen, is the next read or write through the pointer, or the "
+                    "allocator handing the same block to a new owner.",
+                    "해제된 블록에 대한 쓰기는 관측되지 않아, 해제된 메모리를 실제로 사용했다는 것은 입증되지 않았습니다. "
+                    "위험은(관측이 아닌 추정) 이 포인터를 통한 다음 읽기·쓰기, 또는 할당자가 같은 블록을 새 소유자에게 "
+                    "다시 내주는 경우입니다."),
+    "who": ("Which code freed the block, and which code uses it afterwards, was not observed (allocator calls are "
+            "not traced). Look for the paths that free what {v} points to, and for later uses of {v}.",
+            "어느 코드가 블록을 해제했고 그 뒤 어느 코드가 사용하는지는 관측되지 않았습니다(할당자 호출은 추적하지 않음). "
+            "{v}이(가) 가리키는 대상을 해제하는 경로와, 그 뒤 {v}을(를) 사용하는 곳을 찾으세요."),
+    "who_noptr": ("Which code freed the block, and which code wrote into it, was not observed (allocator calls are "
+                  "not traced).",
+                  "어느 코드가 블록을 해제했고 어느 코드가 그 안에 썼는지는 관측되지 않았습니다(할당자 호출은 추적하지 않음)."),
+}
+
+
+def _uaf_list_name(name: Any, i: int) -> str:
+    """The free list as named by the heap walker, without the position suffix; Korean for the known shapes."""
+    import re
+    from .double_free import _list_name
+    base = re.sub(r", entry \d+ of \d+$", "", str(name or ""))
+    return _list_name(base, i) if base else ""
+
+
+def uaf_sentences(i: int, x: Dict[str, Any]) -> List[str]:
+    """The sentences for one ``freed_memory_use`` finding in language ``i`` (0 en, 1 ko)."""
+    code = lambda v: "`" + str(v).replace("`", "'") + "`"  # noqa: E731
+    ptrs: List[str] = []
+    for p in x.get("dangling_pointers") or []:
+        if isinstance(p, dict) and (p.get("variable_path") or p.get("variable")):
+            n = str(p.get("variable_path") or p.get("variable"))
+            if n not in ptrs:
+                ptrs.append(n)
+    if not ptrs and (x.get("variable_path") or x.get("variable")):
+        ptrs = [str(x.get("variable_path") or x.get("variable"))]
+    v = ", ".join(code(p) for p in ptrs[:3])
+    addr, n = x.get("user_address") or x.get("freed_chunk"), x.get("chunk_size")
+    has_n = isinstance(n, int) and not isinstance(n, bool)
+    if has_n and addr:
+        size = _UAF_TXT["size"][i].format(n=n, addr=code(addr))
+    elif has_n:
+        size = _UAF_TXT["size_n"][i].format(n=n)
+    elif addr:
+        size = _UAF_TXT["size_a"][i].format(addr=code(addr))
+    else:
+        size = ""
+    ln = _uaf_list_name(x.get("free_list"), i)
+    lst = _UAF_TXT["lst"][i].format(name=code(ln)) if ln else ""
+    written = bool(x.get("written_while_free"))
+    out: List[str] = []
+    if ptrs:
+        out.append(_UAF_TXT["ptr" if len(ptrs) == 1 else "ptrs"][i].format(v=v, size=size, lst=lst))
+    else:
+        out.append(_UAF_TXT["noptr"][i].format(size=size, lst=lst))
+    reads, win = x.get("observed_free_in_reads"), x.get("window_s")
+    if reads and isinstance(win, (int, float)) and not isinstance(win, bool):
+        out.append(_UAF_TXT["seen" if ptrs else "seen_noptr"][i].format(n=reads, win="%g" % round(float(win), 2)))
+    if written and ptrs:
+        meta = "allocator metadata" in str(x.get("write_evidence") or "")
+        out.append(_UAF_TXT["written_meta" if meta else "written_ptr"][i].format(v=v))
+    elif written:
+        out.append(_UAF_TXT["written_noptr"][i])
+    else:
+        out.append(_UAF_TXT["not_written"][i])
+    out.append(_UAF_TXT["who"][i].format(v=code(ptrs[0])) if ptrs else _UAF_TXT["who_noptr"][i])
+    return out
+
+
+def uaf_finding_text(ctx: Any, finding: Dict[str, Any], report: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    from ..report_visuals import _observations
+    items: List[Dict[str, Any]] = []
+    for o in _observations(report, finding.get("recipe_ids")):
+        fm = o.get("freed_memory_use")
+        for x in ((fm or {}).get("findings") or []) if isinstance(fm, dict) else []:
+            if isinstance(x, dict) and x.get("freed_chunk"):
+                items.append(x)
+    lines: List[str] = []
+    for x in items[:2]:
+        lines += uaf_sentences(ctx.i, x)
+    return {"lines": lines}
+
+
+def _register_presentation() -> None:
+    from ..report_registry import register_finding_text, register_recipe_label
+    register_recipe_label(RECIPE_FREED_MEMORY_USE, "MEMORY_INTEGRITY", "Use of freed memory", "해제된 메모리 사용",
+                          "pointers that still refer to freed blocks, and writes into freed blocks",
+                          "해제된 블록을 여전히 가리키는 포인터, 해제된 블록에 대한 쓰기")
+    register_finding_text(CATEGORY_USE_AFTER_FREE, uaf_finding_text)
+
+
+_register_presentation()
