@@ -1,7 +1,8 @@
-"""HTTP Web API server and static asset host for dynamicState Runtime State Explorer.
+"""HTTP server of the dynamicState web UI: the diagnosis page (extractor/web/ui/) and its read-only API.
 
-Strictly wraps AgentRuntime without duplicating semantics, executing arbitrary shell/GDB commands,
-or making silent target architecture assumptions.
+Every route is listed in API_ROUTES. No route writes target memory, stops the target, runs a shell/GDB command or
+changes state (tests/test_web_readonly_routes.py). WebApiAdapter wraps AgentRuntime for those routes; its other methods
+are the Python API that tests and in-process callers use (they have no HTTP route).
 """
 
 from collections import deque
@@ -190,7 +191,8 @@ def _build_semantic_paths(roots: List[Any], objects: List[Any]) -> Tuple[Dict[st
 
 
 class WebApiAdapter:
-    """Thin adapter mapping REST endpoints to AgentRuntime methods."""
+    """Thin adapter over AgentRuntime. Only get_health, find_target_processes, diagnose_api, diagnose_start_api and
+    diagnose_jobs back an HTTP route (API_ROUTES); the other methods are a Python API without a route."""
 
     def __init__(self, runtime: AgentRuntime):
         self.runtime = runtime
@@ -940,26 +942,6 @@ class WebApiAdapter:
 
         return {"success": True, "data": nav_result}
 
-    def list_transitions(self) -> Dict[str, Any]:
-        transitions = []
-        for tid in self.runtime.corpus.transitions:
-            t_data = self.runtime.corpus.get_transition(tid)
-            if t_data:
-                # Extract summary info
-                trans_inner = t_data.get("transition", t_data)
-                mut = trans_inner.get("mutation") or {}
-                exec_info = trans_inner.get("execution") or {}
-                transitions.append({
-                    "transition_id": tid,
-                    "parent_snapshot": trans_inner.get("parent_snapshot"),
-                    "child_snapshot": trans_inner.get("child_snapshot"),
-                    "mutation_field": mut.get("field") or mut.get("field_path"),
-                    "mutation_value": mut.get("after") if mut.get("after") is not None else mut.get("value"),
-                    "mutation_before": mut.get("before") if mut.get("before") is not None else mut.get("old_value"),
-                    "status": exec_info.get("status", "STOPPED"),
-                })
-        return {"success": True, "data": transitions}
-
     def inspect_transition(self, transition_id: str) -> Dict[str, Any]:
         res = self.runtime.inspect_transition(transition_id)
         if res.success:
@@ -1334,25 +1316,6 @@ class WebApiAdapter:
         return {"success": False, "error": {"code": res.error.code if res.error else "CAPTURE_FAILED",
                                             "message": res.error.message if res.error else "Fast capture failed"}}
 
-    def list_snapshots(self) -> Dict[str, Any]:
-        lab_snaps = self.runtime.state_lab.list_snapshots() if hasattr(self.runtime, "state_lab") else []
-        all_snaps = list(lab_snaps)
-        seen_ids = set(s["snapshot_id"] for s in lab_snaps)
-        for state_id, s_data in self.runtime.corpus.states.items():
-            if state_id not in seen_ids:
-                s_dict = s_data if isinstance(s_data, dict) else (s_data.to_dict() if hasattr(s_data, "to_dict") else {})
-                meta = self.runtime.corpus.get_metadata(state_id) or {}
-                all_snaps.append({
-                    "snapshot_id": state_id,
-                    "state_hash": meta.get("state_hash") or s_dict.get("metadata", {}).get("state_hash"),
-                    "parent_id": meta.get("parent_state"),
-                    "object_count": len(s_dict.get("persistent", {}).get("objects", [])),
-                    "thread_count": len(s_dict.get("execution", {}).get("threads", [])),
-                    "branch_name": "corpus_state",
-                    "created_at": s_dict.get("created_at"),
-                })
-        return {"success": True, "data": _to_json_serializable(all_snaps)}
-
     def get_snapshot(self, snapshot_id: str) -> Dict[str, Any]:
         state = self.runtime.state_lab.get_snapshot(snapshot_id) if hasattr(self.runtime, "state_lab") else None
         if state:
@@ -1363,27 +1326,6 @@ class WebApiAdapter:
             return {"success": True, "data": _to_json_serializable(s_dict)}
         return {"success": False, "error": {"code": "SNAPSHOT_NOT_FOUND", "message": f"Snapshot {snapshot_id} not found"}}
 
-    def get_semantic_state(self, state_id: str) -> Dict[str, Any]:
-        state = self.runtime.state_lab.get_snapshot(state_id) if hasattr(self.runtime, "state_lab") else None
-        if not state:
-            snap, _ = self.runtime._resolve_snapshot(state_id)
-            if snap:
-                from extractor.semantic_state import SemanticState
-                state = SemanticState.from_snapshot(snap)
-        if state:
-            return {"success": True, "data": _to_json_serializable(state.to_dict())}
-        return {"success": False, "error": {"code": "STATE_NOT_FOUND", "message": f"State {state_id} not found"}}
-
-    def mutate_snapshot(self, snapshot_id: str, params: Dict[str, Any]) -> Dict[str, Any]:
-        target = params.get("target") or (f"{params.get('object_id')}.{params.get('field')}" if params.get("field") else params.get("object_id"))
-        value = params.get("proposed_value") if "proposed_value" in params else params.get("value")
-        branch_name = params.get("branch_name")
-        res = self.runtime.mutate_snapshot(snapshot_id=snapshot_id, target=target, value=value, branch_name=branch_name)
-        if res.success:
-            return {"success": True, "data": _to_json_serializable(res.data)}
-        return {"success": False, "error": {"code": res.error.code if res.error else "MUTATION_FAILED",
-                                            "message": res.error.message if res.error else "Snapshot mutation failed"}}
-
     def branch_snapshot(self, snapshot_id: str, params: Dict[str, Any]) -> Dict[str, Any]:
         branch_name = params.get("branch_name")
         res = self.runtime.branch_snapshot(snapshot_id=snapshot_id, branch_name=branch_name)
@@ -1392,14 +1334,6 @@ class WebApiAdapter:
         return {"success": False, "error": {"code": res.error.code if res.error else "BRANCH_FAILED",
                                             "message": res.error.message if res.error else "Branch creation failed"}}
 
-
-
-    def get_impact_analysis(self, snapshot_id: str, target: Optional[str] = None, candidate_id: Optional[str] = None) -> Dict[str, Any]:
-        res = self.runtime.analyze_impact(snapshot_id=snapshot_id, target=target or "", candidate_id=candidate_id)
-        if res.success:
-            return {"success": True, "data": _to_json_serializable(res.data)}
-        return {"success": False, "error": {"code": res.error.code if res.error else "IMPACT_FAILED",
-                                            "message": res.error.message if res.error else "Impact analysis failed"}}
 
     def replay_mutation(self, snapshot_id: str, params: Dict[str, Any]) -> Dict[str, Any]:
         target_obj = params.get("object_id", "")
@@ -1410,11 +1344,6 @@ class WebApiAdapter:
             return {"success": True, "data": _to_json_serializable(res.data)}
         return {"success": False, "data": _to_json_serializable(res.data), "error": {"code": res.error.code if res.error else "REPLAY_FAILED",
                                             "message": res.error.message if res.error else "Replay failed"}}
-
-    def get_state_lab_tree(self) -> Dict[str, Any]:
-        if hasattr(self.runtime, "state_lab"):
-            return {"success": True, "data": _to_json_serializable(self.runtime.state_lab.get_tree())}
-        return {"success": True, "data": {"roots": [], "total_snapshots": 0, "total_branches": 0}}
 
     # -------------------------------------------------------------------------
     # Investigation Workflow API
@@ -1744,30 +1673,6 @@ class WebApiAdapter:
             }
         }
 
-    def deploy_remote_collector_api(self, params: Dict[str, Any]) -> Dict[str, Any]:
-        """Deploys or verifies the C99 dynamicstate-collector on a remote SSH target."""
-        try:
-            remote_host = (params.get("remote_host") or "").strip()
-            if not remote_host:
-                return {"success": False, "error": {"code": "INVALID_PARAM", "message": "remote_host is required"}}
-            adapter = self.watch_manager._resolve_adapter(
-                pid=1,
-                remote_host=remote_host,
-                ssh_user=(params.get("ssh_user") or "").strip() or None,
-                ssh_port=_safe_int(params.get("ssh_port"), 22, 1, 65535),
-                ssh_key=(params.get("ssh_key") or "").strip() or None,
-                ssh_proxy_jump=(params.get("ssh_proxy_jump") or "").strip() or None,
-            )
-            if not hasattr(adapter, "ensure_remote_collector"):
-                return {"success": False, "error": {"code": "UNSUPPORTED_ADAPTER", "message": "Target adapter is not remote SSH"}}
-            res = adapter.ensure_remote_collector(
-                local_collector_bin=(params.get("local_collector_bin") or "").strip() or None,
-                **({"remote_dest": str(params["remote_dest"])} if params.get("remote_dest") else {}),
-            )
-            return {"success": True, "data": res}
-        except Exception as e:
-            return {"success": False, "error": {"code": "DEPLOY_COLLECTOR_ERROR", "message": str(e)}}
-
     def find_target_processes(self, params: Dict[str, Any]) -> Dict[str, Any]:
         """Discovers running processes on local or remote target filtered by name or companion ELF Build ID."""
         try:
@@ -1968,31 +1873,6 @@ class WebApiAdapter:
             return {"success": True, "data": res}
         except Exception as e:
             return {"success": False, "error": {"code": "GOLDEN_BASELINE_COMPARE_ERROR", "message": str(e)}}
-
-    def run_diagnostic_recipe_api(self, params: Dict[str, Any]) -> Dict[str, Any]:
-        """Executes a guided diagnostic recipe (instant_xray, before_after_diff, timeseries_watch)."""
-        try:
-            pid, companion_elf, _rh, _su, _sp, _sk, _spj = self._resolve_watch_target(params)
-            recipe = str(params.get("recipe") or "instant_xray")
-            exprs = params.get("expressions")
-            if isinstance(exprs, str):
-                exprs = [e.strip() for e in exprs.split(",") if e.strip()]
-            res = self.watch_manager.run_diagnostic_recipe(
-                recipe=recipe,
-                pid=pid,
-                companion_elf_path=companion_elf,
-                expressions=exprs,
-                duration_ms=_safe_int(params.get("duration_ms"), 1000, 10, 15000),
-                interval_ms=_safe_int(params.get("interval_ms"), 200, 5, 10000),
-                remote_host=(params.get("remote_host") or "").strip() or None,
-                ssh_user=(params.get("ssh_user") or "").strip() or None,
-                ssh_port=_safe_int(params.get("ssh_port"), 22, 1, 65535),
-                ssh_key=(params.get("ssh_key") or "").strip() or None,
-                ssh_proxy_jump=(params.get("ssh_proxy_jump") or "").strip() or None,
-            )
-            return {"success": True, "data": res}
-        except Exception as e:
-            return {"success": False, "error": {"code": "DIAGNOSTIC_RECIPE_ERROR", "message": str(e)}}
 
     def scan_memory_pool_api(self, params: Dict[str, Any]) -> Dict[str, Any]:
         """Scans an entire memory pool or buffer array and returns slot allocation status and map chart."""
@@ -2896,30 +2776,6 @@ class WebApiAdapter:
         except Exception as e:
             return {"success": False, "error": {"code": "XRAY_BLUEPRINT_ERROR", "message": str(e)}}
 
-    def watch_until_condition_api(self, params: Dict[str, Any]) -> Dict[str, Any]:
-        """Polls target expressions until a condition triggers or times out (zero-stop)."""
-        try:
-            pid, companion_elf, _rh, _su, _sp, _sk, _spj = self._resolve_watch_target(params)
-            cond_expr = (params.get("condition_expression") or params.get("condition") or "ANY_CHANGE").strip()
-            res = self.watch_manager.watch_until_condition(
-                pid=pid,
-                companion_elf_path=companion_elf,
-                condition_expression=cond_expr,
-                watch_expressions=params.get("watch_expressions"),
-                poll_interval_ms=_safe_int(params.get("poll_interval_ms"), 40, 5, 5000),
-                timeout_ms=_safe_int(params.get("timeout_ms"), 2000, 10, 15000),
-                hold_duration_ms=_safe_int(params.get("hold_duration_ms"), 0, 0, 10000),
-                find_owner_on_hit=params.get("find_owner_on_hit"),
-                remote_host=(params.get("remote_host") or "").strip() or None,
-                ssh_user=(params.get("ssh_user") or "").strip() or None,
-                ssh_port=_safe_int(params.get("ssh_port"), 22, 1, 65535),
-                ssh_key=(params.get("ssh_key") or "").strip() or None,
-                ssh_proxy_jump=(params.get("ssh_proxy_jump") or "").strip() or None,
-            )
-            return {"success": True, "data": res}
-        except Exception as e:
-            return {"success": False, "error": {"code": "WATCH_CONDITION_ERROR", "message": str(e)}}
-
     def traverse_linked_structure_api(self, params: Dict[str, Any]) -> Dict[str, Any]:
         """Traverses a linked list or pointer chain in zero-stop mode."""
         try:
@@ -2962,67 +2818,6 @@ class WebApiAdapter:
         except Exception as e:
             return {"success": False, "error": {"code": "CALLSTACK_INSPECT_ERROR", "message": str(e)}}
 
-    def audit_memory_integrity_api(self, params: Dict[str, Any]) -> Dict[str, Any]:
-        """Audits DWARF symbols and memory pools for dangling pointers, corrupted bools/enums, and counter drift."""
-        try:
-            pid, companion_elf, _rh, _su, _sp, _sk, _spj = self._resolve_watch_target(params)
-            res = self.watch_manager.audit_memory_integrity(
-                pid=pid,
-                companion_elf_path=companion_elf,
-                target_expressions=params.get("target_expressions"),
-                remote_host=(params.get("remote_host") or "").strip() or None,
-                ssh_user=(params.get("ssh_user") or "").strip() or None,
-                ssh_port=_safe_int(params.get("ssh_port"), 22, 1, 65535),
-                ssh_key=(params.get("ssh_key") or "").strip() or None,
-                ssh_proxy_jump=(params.get("ssh_proxy_jump") or "").strip() or None,
-            )
-            return {"success": True, "data": res}
-        except Exception as e:
-            return {"success": False, "error": {"code": "MEMORY_AUDIT_ERROR", "message": str(e)}}
-
-    def resolve_code_pointers_api(self, params: Dict[str, Any]) -> Dict[str, Any]:
-        """Resolves function pointers and C++ vtable slots to function names and file:line."""
-        try:
-            pid, companion_elf, _rh, _su, _sp, _sk, _spj = self._resolve_watch_target(params)
-            exprs = params.get("expressions") or []
-            if isinstance(exprs, str):
-                exprs = [e.strip() for e in exprs.split(",") if e.strip()]
-            res = self.watch_manager.resolve_code_pointers(
-                pid=pid,
-                companion_elf_path=companion_elf,
-                expressions=exprs,
-                vtable_slots=_safe_int(params.get("vtable_slots"), 6, 1, 64),
-                remote_host=(params.get("remote_host") or "").strip() or None,
-                ssh_user=(params.get("ssh_user") or "").strip() or None,
-                ssh_port=_safe_int(params.get("ssh_port"), 22, 1, 65535),
-                ssh_key=(params.get("ssh_key") or "").strip() or None,
-                ssh_proxy_jump=(params.get("ssh_proxy_jump") or "").strip() or None,
-            )
-            return {"success": True, "data": res}
-        except Exception as e:
-            return {"success": False, "error": {"code": "RESOLVE_CODE_PTR_ERROR", "message": str(e)}}
-
-    def inspect_shared_memory_ipc_api(self, params: Dict[str, Any]) -> Dict[str, Any]:
-        """Inspects POSIX shm / shared mmap regions with DWARF type overlay casting and peer PID discovery."""
-        try:
-            pid, companion_elf, _rh, _su, _sp, _sk, _spj = self._resolve_watch_target(params)
-            res = self.watch_manager.inspect_shared_memory_ipc(
-                pid=pid,
-                companion_elf_path=companion_elf,
-                cast_type=params.get("cast_type"),
-                address=params.get("address"),
-                shm_name=params.get("shm_name"),
-                discover_peer_processes=bool(params.get("discover_peer_processes", True)),
-                remote_host=(params.get("remote_host") or "").strip() or None,
-                ssh_user=(params.get("ssh_user") or "").strip() or None,
-                ssh_port=_safe_int(params.get("ssh_port"), 22, 1, 65535),
-                ssh_key=(params.get("ssh_key") or "").strip() or None,
-                ssh_proxy_jump=(params.get("ssh_proxy_jump") or "").strip() or None,
-            )
-            return {"success": True, "data": res}
-        except Exception as e:
-            return {"success": False, "error": {"code": "INSPECT_SHM_ERROR", "message": str(e)}}
-
     def inspect_thread_locals_api(self, params: Dict[str, Any]) -> Dict[str, Any]:
         """Decodes function parameters and local variables across active thread stack frames (zero-stop)."""
         try:
@@ -3041,198 +2836,6 @@ class WebApiAdapter:
             return {"success": True, "data": res}
         except Exception as e:
             return {"success": False, "error": {"code": "FRAME_LOCALS_ERROR", "message": str(e)}}
-
-    def auto_triage_incident_api(self, params: Dict[str, Any]) -> Dict[str, Any]:
-        """Runs 1-call composite zero-stop incident auto-triage across memory, locks, pools, and lists."""
-        try:
-            pid, companion_elf, _rh, _su, _sp, _sk, _spj = self._resolve_watch_target(params)
-            res = self.watch_manager.auto_triage_incident(
-                pid=pid,
-                companion_elf_path=companion_elf,
-                remote_host=(params.get("remote_host") or "").strip() or None,
-                ssh_user=(params.get("ssh_user") or "").strip() or None,
-                ssh_port=_safe_int(params.get("ssh_port"), 22, 1, 65535),
-                ssh_key=(params.get("ssh_key") or "").strip() or None,
-                ssh_proxy_jump=(params.get("ssh_proxy_jump") or "").strip() or None,
-            )
-            return {"success": True, "data": res}
-        except Exception as e:
-            return {"success": False, "error": {"code": "AUTO_TRIAGE_ERROR", "message": str(e)}}
-
-    def trace_ipc_pipeline_api(self, params: Dict[str, Any]) -> Dict[str, Any]:
-        """Analyzes cross-process shared memory & IPC pipeline lag/bottlenecks (zero-stop)."""
-        try:
-            pid, companion_elf, _rh, _su, _sp, _sk, _spj = self._resolve_watch_target(params)
-            res = self.watch_manager.trace_ipc_pipeline(
-                pid=pid,
-                companion_elf_path=companion_elf,
-                cast_type=params.get("cast_type"),
-                address=params.get("address"),
-                shm_name=params.get("shm_name"),
-                remote_host=(params.get("remote_host") or "").strip() or None,
-                ssh_user=(params.get("ssh_user") or "").strip() or None,
-                ssh_port=_safe_int(params.get("ssh_port"), 22, 1, 65535),
-                ssh_key=(params.get("ssh_key") or "").strip() or None,
-                ssh_proxy_jump=(params.get("ssh_proxy_jump") or "").strip() or None,
-            )
-            return {"success": True, "data": res}
-        except Exception as e:
-            return {"success": False, "error": {"code": "IPC_PIPELINE_ERROR", "message": str(e)}}
-
-    def scan_heap_objects_api(self, params: Dict[str, Any]) -> Dict[str, Any]:
-        """Scans `[heap]` and `.data` for C++ polymorphic objects via `_vptr` and detects leaked instances."""
-        try:
-            pid, companion_elf, _rh, _su, _sp, _sk, _spj = self._resolve_watch_target(params)
-            res = self.watch_manager.scan_heap_objects(
-                pid=pid,
-                companion_elf_path=companion_elf,
-                class_filter=params.get("class_filter"),
-                max_scan_bytes=_safe_int(params.get("max_scan_bytes"), 524288, 4096, 4194304),
-                max_objects=_safe_int(params.get("max_objects"), 64, 1, 500),
-                remote_host=(params.get("remote_host") or "").strip() or None,
-                ssh_user=(params.get("ssh_user") or "").strip() or None,
-                ssh_port=_safe_int(params.get("ssh_port"), 22, 1, 65535),
-                ssh_key=(params.get("ssh_key") or "").strip() or None,
-                ssh_proxy_jump=(params.get("ssh_proxy_jump") or "").strip() or None,
-            )
-            return {"success": True, "data": res}
-        except Exception as e:
-            return {"success": False, "error": {"code": "SCAN_HEAP_ERROR", "message": str(e)}}
-
-    def build_dependency_graph_api(self, params: Dict[str, Any]) -> Dict[str, Any]:
-        """Synthesizes directed cross-entity dependency graph and causal chains (zero-stop)."""
-        try:
-            pid, companion_elf, _rh, _su, _sp, _sk, _spj = self._resolve_watch_target(params)
-            res = self.watch_manager.build_dependency_graph(
-                pid=pid,
-                companion_elf_path=companion_elf,
-                remote_host=(params.get("remote_host") or "").strip() or None,
-                ssh_user=(params.get("ssh_user") or "").strip() or None,
-                ssh_port=_safe_int(params.get("ssh_port"), 22, 1, 65535),
-                ssh_key=(params.get("ssh_key") or "").strip() or None,
-                ssh_proxy_jump=(params.get("ssh_proxy_jump") or "").strip() or None,
-            )
-            return {"success": True, "data": res}
-        except Exception as e:
-            return {"success": False, "error": {"code": "DEPENDENCY_GRAPH_ERROR", "message": str(e)}}
-
-    def correlate_source_and_state_api(self, params: Dict[str, Any]) -> Dict[str, Any]:
-        """Correlates DWARF source locations with C/C++ source code and inline live variables."""
-        try:
-            pid, companion_elf, _rh, _su, _sp, _sk, _spj = self._resolve_watch_target(params)
-            res = self.watch_manager.correlate_source_and_state(
-                pid=pid,
-                companion_elf_path=companion_elf,
-                source_location=params.get("source_location"),
-                tid=_safe_opt_int(params.get("tid"), 1),
-                context_lines=_safe_int(params.get("context_lines"), 8, 1, 50),
-                source_search_dirs=params.get("source_search_dirs"),
-                remote_host=(params.get("remote_host") or "").strip() or None,
-                ssh_user=(params.get("ssh_user") or "").strip() or None,
-                ssh_port=_safe_int(params.get("ssh_port"), 22, 1, 65535),
-                ssh_key=(params.get("ssh_key") or "").strip() or None,
-                ssh_proxy_jump=(params.get("ssh_proxy_jump") or "").strip() or None,
-            )
-            return {"success": True, "data": res}
-        except Exception as e:
-            return {"success": False, "error": {"code": "SOURCE_CORRELATE_ERROR", "message": str(e)}}
-
-    def investigate_symptom_api(self, params: Dict[str, Any]) -> Dict[str, Any]:
-        """Autonomous symptom-driven root-cause investigator (zero-stop)."""
-        try:
-            pid, companion_elf, _rh, _su, _sp, _sk, _spj = self._resolve_watch_target(params)
-            symptom_query = str(params.get("symptom_query") or params.get("query") or params.get("message") or "왜 멈췄지?").strip()
-            res = self.watch_manager.investigate_symptom(
-                pid=pid,
-                companion_elf_path=companion_elf,
-                symptom_query=symptom_query,
-                remote_host=(params.get("remote_host") or "").strip() or None,
-                ssh_user=(params.get("ssh_user") or "").strip() or None,
-                ssh_port=_safe_int(params.get("ssh_port"), 22, 1, 65535),
-                ssh_key=(params.get("ssh_key") or "").strip() or None,
-                ssh_proxy_jump=(params.get("ssh_proxy_jump") or "").strip() or None,
-            )
-            return {"success": True, "data": res}
-        except Exception as e:
-            return {"success": False, "error": {"code": "INVESTIGATE_SYMPTOM_ERROR", "message": str(e)}}
-
-    def sample_statistical_hotspots_api(self, params: Dict[str, Any]) -> Dict[str, Any]:
-        """Samples statistical CPU & callstack hotspots without stopping the target."""
-        try:
-            pid, companion_elf, _rh, _su, _sp, _sk, _spj = self._resolve_watch_target(params)
-            res = self.watch_manager.sample_statistical_hotspots(
-                pid=pid,
-                companion_elf_path=companion_elf,
-                samples_count=_safe_int(params.get("samples_count"), 6, 1, 64),
-                interval_ms=_safe_int(params.get("interval_ms"), 35, 5, 5000),
-                remote_host=(params.get("remote_host") or "").strip() or None,
-                ssh_user=(params.get("ssh_user") or "").strip() or None,
-                ssh_port=_safe_int(params.get("ssh_port"), 22, 1, 65535),
-                ssh_key=(params.get("ssh_key") or "").strip() or None,
-                ssh_proxy_jump=(params.get("ssh_proxy_jump") or "").strip() or None,
-            )
-            return {"success": True, "data": res}
-        except Exception as e:
-            return {"success": False, "error": {"code": "HOTSPOTS_ERROR", "message": str(e)}}
-
-    def resolve_fuzzy_intent_api(self, params: Dict[str, Any]) -> Dict[str, Any]:
-        """Resolves vague natural-language user intent to concrete DWARF symbols and live values."""
-        try:
-            pid, companion_elf, _rh, _su, _sp, _sk, _spj = self._resolve_watch_target(params)
-            natural_query = str(params.get("natural_query") or params.get("query") or params.get("message") or "").strip()
-            res = self.watch_manager.resolve_fuzzy_symbol_intent(
-                pid=pid,
-                companion_elf_path=companion_elf,
-                natural_query=natural_query,
-                limit=_safe_int(params.get("limit"), 5, 1, 100),
-                remote_host=(params.get("remote_host") or "").strip() or None,
-                ssh_user=(params.get("ssh_user") or "").strip() or None,
-                ssh_port=_safe_int(params.get("ssh_port"), 22, 1, 65535),
-                ssh_key=(params.get("ssh_key") or "").strip() or None,
-                ssh_proxy_jump=(params.get("ssh_proxy_jump") or "").strip() or None,
-            )
-            return {"success": True, "data": res}
-        except Exception as e:
-            return {"success": False, "error": {"code": "FUZZY_INTENT_ERROR", "message": str(e)}}
-
-    def flight_recorder_time_machine_api(self, params: Dict[str, Any]) -> Dict[str, Any]:
-        """Captures Flight Recorder Time-Machine micro-frames and detects transient glitches (zero-stop)."""
-        try:
-            pid, companion_elf, _rh, _su, _sp, _sk, _spj = self._resolve_watch_target(params)
-            res = self.watch_manager.flight_recorder_time_machine(
-                pid=pid,
-                companion_elf_path=companion_elf,
-                frames_count=_safe_int(params.get("frames_count"), 8, 1, 64),
-                interval_ms=_safe_int(params.get("interval_ms"), 25, 5, 5000),
-                watch_expressions=params.get("watch_expressions"),
-                remote_host=(params.get("remote_host") or "").strip() or None,
-                ssh_user=(params.get("ssh_user") or "").strip() or None,
-                ssh_port=_safe_int(params.get("ssh_port"), 22, 1, 65535),
-                ssh_key=(params.get("ssh_key") or "").strip() or None,
-                ssh_proxy_jump=(params.get("ssh_proxy_jump") or "").strip() or None,
-            )
-            return {"success": True, "data": res}
-        except Exception as e:
-            return {"success": False, "error": {"code": "FLIGHT_RECORDER_ERROR", "message": str(e)}}
-
-    def detect_behavioral_drift_api(self, params: Dict[str, Any]) -> Dict[str, Any]:
-        """Detects multi-dimensional behavioral drift against a baseline profile (zero-stop)."""
-        try:
-            pid, companion_elf, _rh, _su, _sp, _sk, _spj = self._resolve_watch_target(params)
-            res = self.watch_manager.detect_behavioral_drift(
-                pid=pid,
-                companion_elf_path=companion_elf,
-                baseline_id=params.get("baseline_id"),
-                save_as_new_baseline=bool(params.get("save_as_new_baseline", False)),
-                remote_host=(params.get("remote_host") or "").strip() or None,
-                ssh_user=(params.get("ssh_user") or "").strip() or None,
-                ssh_port=_safe_int(params.get("ssh_port"), 22, 1, 65535),
-                ssh_key=(params.get("ssh_key") or "").strip() or None,
-                ssh_proxy_jump=(params.get("ssh_proxy_jump") or "").strip() or None,
-            )
-            return {"success": True, "data": res}
-        except Exception as e:
-            return {"success": False, "error": {"code": "BEHAVIORAL_DRIFT_ERROR", "message": str(e)}}
 
     def inspect_thread_local_storage_api(self, params: Dict[str, Any]) -> Dict[str, Any]:
         """Decodes per-thread TLS (__thread / thread_local) variables across all active threads (zero-stop)."""
@@ -3345,7 +2948,7 @@ class WebApiAdapter:
             return {"success": False, "error": {"code": "COERCE_EXPRESSION_ERROR", "message": str(e)}}
 
     def ask_runtime_question_api(self, params: Dict[str, Any]) -> Dict[str, Any]:
-        """Universal 1-Call Zero-Stop Intent Gateway endpoint (`/api/watch/ask`)."""
+        """Universal 1-Call Zero-Stop Intent Gateway (Python API; no HTTP route)."""
         try:
             q = str(params.get("question") or params.get("message") or "").strip()
             res = self.watch_manager.ask_runtime_question(
@@ -3364,7 +2967,7 @@ class WebApiAdapter:
             return {"success": False, "error": {"code": "ASK_GATEWAY_ERROR", "message": str(e)}}
 
     def smart_compact_query_api(self, params: Dict[str, Any]) -> Dict[str, Any]:
-        """LLM Token-Budgeted Smart Compactor & Anomaly-First Pagination endpoint (`/api/watch/smart-compact`)."""
+        """LLM Token-Budgeted Smart Compactor & Anomaly-First Pagination (Python API; no HTTP route)."""
         try:
             res = self.watch_manager.smart_compact_query(
                 query_or_expression=str(params.get("query") or params.get("expression") or "*gpMem"),
@@ -3386,7 +2989,7 @@ class WebApiAdapter:
             return {"success": False, "error": {"code": "SMART_COMPACT_ERROR", "message": str(e)}}
 
     def batch_execute_api(self, params: Dict[str, Any]) -> Dict[str, Any]:
-        """1-Call Multi-Tool Composite Batch Macro Executor endpoint (`/api/watch/batch-execute`)."""
+        """1-Call Multi-Tool Composite Batch Macro Executor (Python API; no HTTP route)."""
         try:
             steps = params.get("steps") or []
             res = self.watch_manager.execute_batch_macro(
@@ -3407,7 +3010,7 @@ class WebApiAdapter:
             return {"success": False, "error": {"code": "BATCH_EXECUTE_ERROR", "message": str(e)}}
 
     def verify_hypothesis_api(self, params: Dict[str, Any]) -> Dict[str, Any]:
-        """Declarative Multi-Assertion Hypothesis Verifier endpoint (`/api/watch/verify-hypothesis`)."""
+        """Declarative Multi-Assertion Hypothesis Verifier (Python API; no HTTP route)."""
         try:
             assertions = params.get("assertions") or []
             if isinstance(assertions, str):
@@ -3430,7 +3033,7 @@ class WebApiAdapter:
             return {"success": False, "error": {"code": "VERIFY_HYPOTHESIS_ERROR", "message": str(e)}}
 
     def export_incident_report_api(self, params: Dict[str, Any]) -> Dict[str, Any]:
-        """1-Call Incident Report & Remediation Exporter endpoint (`/api/watch/export-report`)."""
+        """1-Call Incident Report & Remediation Exporter (Python API; no HTTP route)."""
         try:
             assertions = params.get("assertions")
             if isinstance(assertions, str):
@@ -4110,14 +3713,6 @@ class WebApiAdapter:
             "status": sess.get_status(),
         }
 
-    def verify_expert_hypothesis(self, investigation_id: str, hypothesis_id: Optional[str] = None) -> Dict[str, Any]:
-        sess = self.runtime.expert_diagnostic_engine.get_session(investigation_id)
-        if not sess:
-            return {"success": False, "error": {"code": "NOT_FOUND", "message": f"Investigation '{investigation_id}' not found"}}
-        target_hid = hypothesis_id or (sess.active_hypotheses[0].hypothesis_id if sess.active_hypotheses else "HYP_01")
-        res = sess.verify_hypothesis(target_hid)
-        return {"success": True, "investigation_id": investigation_id, **res}
-
     def get_expert_investigation_conclusion(self, investigation_id: str) -> Dict[str, Any]:
         sess = self.runtime.expert_diagnostic_engine.get_session(investigation_id)
         if not sess:
@@ -4242,14 +3837,6 @@ class WebApiAdapter:
         return {"success": False, "error": {"code": res.error.code if res.error else "SAVE_ERROR",
                                             "message": res.error.message if res.error else "Failed to save session"}}
 
-    def load_investigation(self, params: Dict[str, Any]) -> Dict[str, Any]:
-        data_or_path = params.get("file_path") or params.get("session_data") or params
-        res = self.runtime.load_investigation_session(data_or_path)
-        if res.success:
-            return {"success": True, "data": _to_json_serializable(res.data)}
-        return {"success": False, "error": {"code": res.error.code if res.error else "LOAD_ERROR",
-                                            "message": res.error.message if res.error else "Failed to load session"}}
-
     def analyze_investigation_chat(self, params: Dict[str, Any]) -> Dict[str, Any]:
         # Privileged configuration protection: reject any attempts to supply execution configuration from client
         privileged_keys = {
@@ -4319,6 +3906,55 @@ class WebApiAdapter:
 
 
 WebRuntimeAdapter = WebApiAdapter
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# Routes. The web server is read-only towards the target: no route writes target memory, stops or signals the target,
+# runs a command, or mutates / checkpoints / restores state. tests/test_web_readonly_routes.py enumerates these tables,
+# checks every route against that rule, and checks that every "/api/..." literal in extractor/web/ is one of them.
+# ---------------------------------------------------------------------------------------------------------------------
+
+#: Every API route the server answers: (method, path pattern); ``{name}`` stands for one path segment. HEAD is
+#: answered like GET. _handle_api_get / _handle_api_post answer 404 for anything not listed here, and
+#: _handle_diagnose_job_get answers only the job routes listed here.
+API_ROUTES: Tuple[Tuple[str, str], ...] = (
+    ("GET", "/api/health"),
+    ("GET", "/api/target/processes"),          # the UI resolves a process name to a pid
+    ("POST", "/api/diagnose"),                 # synchronous one-call diagnosis (IMP-006)
+    ("POST", "/api/diagnose/start"),           # the same diagnosis in a worker thread; returns a job id
+    ("GET", "/api/diagnose/jobs"),
+    ("GET", "/api/diagnose/{job_id}/events"),
+    ("GET", "/api/diagnose/{job_id}/status"),
+    ("GET", "/api/diagnose/{job_id}/report"),
+)
+
+
+def _route_regex(pattern: str) -> "re.Pattern[str]":
+    return re.compile("^" + re.sub(r"\\\{[A-Za-z_]+\\\}", "[^/]+", re.escape(pattern)) + "$")
+
+
+_API_ROUTE_RES = tuple((method, _route_regex(pattern)) for method, pattern in API_ROUTES)
+
+
+def is_api_route(method: str, path: str) -> bool:
+    """True when (method, path) is one of API_ROUTES (path without query string or trailing slash)."""
+    method = "GET" if method == "HEAD" else method
+    return any(m == method and rx.match(path) for m, rx in _API_ROUTE_RES)
+
+
+#: Page URLs of the removed UIs (the 8-tab UI at /legacy/, the chat workspace at /legacy/workspace and /workspace).
+#: A GET there answers 301 with a relative Location to the root UI, so it also works under a reverse-proxy prefix.
+REMOVED_UI_PATHS: Tuple[str, ...] = ("/legacy", "/workspace")
+
+
+def is_removed_ui_path(path: str) -> bool:
+    return any(path == p or path.startswith(p + "/") for p in REMOVED_UI_PATHS)
+
+
+def relative_root(raw_path: str) -> str:
+    """The relative URL of the root page as seen from ``raw_path`` ("/legacy" -> "./", "/legacy/workspace" -> "../")."""
+    depth = max(raw_path.count("/") - 1, 0)
+    return "../" * depth if depth else "./"
 
 
 class DynamicStateRequestHandler(http.server.BaseHTTPRequestHandler):
@@ -4453,15 +4089,11 @@ class DynamicStateRequestHandler(http.server.BaseHTTPRequestHandler):
         """Handle HEAD requests by processing GET headers without error."""
         self.do_GET()
 
-    _LEGACY_API_ALIAS = re.compile(r"^/legacy(?:/workspace)?(?=/api(?:/|$))")
-
     def _split_path(self) -> Tuple[str, str, Dict[str, List[str]]]:
-        """(path without trailing slash, raw path, query). ``/legacy/api`` and ``/legacy/workspace/api`` are aliases of
-        ``/api``: the legacy pages derive their API base from their own URL."""
+        """(path without trailing slash, raw path, query)."""
         parsed = urllib.parse.urlparse(self.path)
         raw = parsed.path
-        path = self._LEGACY_API_ALIAS.sub("", raw.rstrip("/"), count=1)
-        return path, raw, urllib.parse.parse_qs(parsed.query)
+        return raw.rstrip("/"), raw, urllib.parse.parse_qs(parsed.query)
 
     def do_GET(self) -> None:
         path, raw_path, query = self._split_path()
@@ -4524,11 +4156,18 @@ class DynamicStateRequestHandler(http.server.BaseHTTPRequestHandler):
         self._handle_api_post(path, body)
 
     # -------------------------------------------------------------------------
-    # REST API Handlers
+    # REST API Handlers. Every route is listed in API_ROUTES; anything else is 404.
     # -------------------------------------------------------------------------
+
+    def _not_found(self, path: str) -> None:
+        self._send_json({"success": False, "error": {"code": "NOT_FOUND", "message": f"Endpoint not found: {path}"}},
+                        status=404)
 
     def _handle_api_get(self, path: str, query: Dict[str, List[str]]) -> None:
         adapter = self.server.adapter
+        if not is_api_route("GET", path):
+            self._not_found(path)
+            return
 
         def q_param(name: str, default: Optional[str] = None) -> Optional[str]:
             vals = query.get(name)
@@ -4539,324 +4178,7 @@ class DynamicStateRequestHandler(http.server.BaseHTTPRequestHandler):
             if path == "/api/health":
                 self._send_json(adapter.get_health())
                 return
-
-            # GET /api/capabilities
-            if path == "/api/capabilities":
-                self._send_json(adapter.get_capabilities())
-                return
-
-            # GET /api/runtime
-            if path == "/api/runtime":
-                self._send_json(adapter.get_runtime_info())
-                return
-
-            # GET /api/memory-summary
-            if path == "/api/memory-summary":
-                self._send_json(adapter.get_memory_summary(snapshot_id=q_param("snapshot_id")))
-                return
-
-            # GET /api/modules
-            if path == "/api/modules":
-                self._send_json(adapter.get_modules(snapshot_id=q_param("snapshot_id")))
-                return
-
-            # GET /api/provenance
-            if path == "/api/provenance":
-                self._send_json(adapter.get_provenance(snapshot_id=q_param("snapshot_id")))
-                return
-
-            # GET /api/states
-            if path == "/api/states":
-                self._send_json(adapter.list_states())
-                return
-
-            # GET /api/states/{state_id}/memory-summary
-            m_state_mem = re.match(r"^/api/states/([^/]+)/memory-summary$", path)
-            if m_state_mem:
-                state_id = m_state_mem.group(1)
-                self._send_json(adapter.get_state_memory_summary(state_id))
-                return
-
-            # GET /api/states/{state_id}/objects/{object_id}
-            m_state_obj = re.match(r"^/api/states/([^/]+)/objects/([^/]+)$", path)
-            if m_state_obj:
-                state_id = m_state_obj.group(1)
-                object_id = m_state_obj.group(2)
-                self._send_json(adapter.inspect_object(object_id, snapshot_id=state_id))
-                return
-
-            # GET /api/states/{state_id}/objects
-            m_state_objs = re.match(r"^/api/states/([^/]+)/objects$", path)
-            if m_state_objs:
-                state_id = m_state_objs.group(1)
-                self._send_json(adapter.list_state_objects(state_id))
-                return
-
-            # GET /api/states/{state_id}
-            m_state = re.match(r"^/api/states/([^/]+)$", path)
-            if m_state:
-                state_id = m_state.group(1)
-                self._send_json(adapter.inspect_state(state_id))
-                return
-
-            # GET /api/states/{state_id}/objects/{object_id}/code-navigation
-            m_state_obj_nav = re.match(r"^/api/states/([^/]+)/objects/([^/]+)/code-navigation$", path)
-            if m_state_obj_nav:
-                state_id = m_state_obj_nav.group(1)
-                object_id = m_state_obj_nav.group(2)
-                self._send_json(adapter.get_code_navigation(
-                    object_id,
-                    field_name=q_param("field") or q_param("field_path"),
-                    snapshot_id=state_id
-                ))
-                return
-
-            # GET /api/objects/{object_id}/code-navigation
-            m_obj_nav = re.match(r"^/api/objects/([^/]+)/code-navigation$", path)
-            if m_obj_nav:
-                object_id = m_obj_nav.group(1)
-                self._send_json(adapter.get_code_navigation(
-                    object_id,
-                    field_name=q_param("field") or q_param("field_path"),
-                    snapshot_id=q_param("snapshot_id")
-                ))
-                return
-
-            # GET /api/objects/{object_id}/fields
-            m_obj_fields = re.match(r"^/api/objects/([^/]+)/fields$", path)
-            if m_obj_fields:
-                object_id = m_obj_fields.group(1)
-                self._send_json(adapter.inspect_fields(
-                    object_id,
-                    field_path=q_param("field_path") or q_param("field"),
-                    snapshot_id=q_param("snapshot_id")
-                ))
-                return
-
-            # GET /api/objects/{object_id}
-            m_obj = re.match(r"^/api/objects/([^/]+)$", path)
-            if m_obj:
-                object_id = m_obj.group(1)
-                self._send_json(adapter.inspect_object(object_id, snapshot_id=q_param("snapshot_id")))
-                return
-
-            # GET /api/transitions
-            if path == "/api/transitions":
-                self._send_json(adapter.list_transitions())
-                return
-
-            # GET /api/transitions/{transition_id}
-            m_trans = re.match(r"^/api/transitions/([^/]+)$", path)
-            if m_trans:
-                transition_id = m_trans.group(1)
-                self._send_json(adapter.inspect_transition(transition_id))
-                return
-
-            # GET /api/snapshots/{snapshot_id}/diff/{other_snapshot_id}
-            m_diff = re.match(r"^/api/snapshots/([^/]+)/diff/([^/]+)$", path)
-            if m_diff:
-                snap_a = m_diff.group(1)
-                snap_b = m_diff.group(2)
-                self._send_json(adapter.diff_snapshots(snap_a, snap_b))
-                return
-
-            # GET /api/snapshots
-            if path == "/api/snapshots":
-                self._send_json(adapter.list_snapshots())
-                return
-
-            # GET /api/state-lab/tree
-            if path == "/api/state-lab/tree":
-                self._send_json(adapter.get_state_lab_tree())
-                return
-
-            # GET /api/state/{state_id}
-            m_sem_state = re.match(r"^/api/state/([^/]+)$", path)
-            if m_sem_state:
-                state_id = m_sem_state.group(1)
-                self._send_json(adapter.get_semantic_state(state_id))
-                return
-
-            # GET /api/impact/{snapshot_id}
-            m_impact = re.match(r"^/api/impact/([^/]+)$", path)
-            if m_impact:
-                snapshot_id = m_impact.group(1)
-                self._send_json(adapter.get_impact_analysis(
-                    snapshot_id,
-                    target=q_param("target") or q_param("field"),
-                    candidate_id=q_param("candidate_id")
-                ))
-                return
-
-            # GET /api/snapshots/{snapshot_id}
-            m_snap = re.match(r"^/api/snapshots/([^/]+)$", path)
-            if m_snap:
-                snapshot_id = m_snap.group(1)
-                self._send_json(adapter.get_snapshot(snapshot_id))
-                return
-
-            # GET /api/mutation-candidates or /api/mutation/candidates
-            if path in ("/api/mutation-candidates", "/api/mutation/candidates"):
-                self._send_json(adapter.list_mutation_candidates(
-                    snapshot_id=q_param("snapshot_id"),
-                    object_id=q_param("object_id"),
-                    field_name=q_param("field_path") or q_param("field")
-                ))
-                return
-
-            # GET /api/state-graph
-            if path == "/api/state-graph":
-                self._send_json(adapter.get_state_graph())
-                return
-
-            # GET /api/verify-determinism
-            if path in ("/api/verify-determinism", "/api/runtime/verify_determinism"):
-                self._send_json(adapter.verify_restart_determinism({}))
-                return
-
-            # GET /api/investigation/status
-            if path == "/api/investigation/status":
-                self._send_json(adapter.get_investigation_status(q_param("investigation_id")))
-                return
-
-            # GET /api/investigation/evidence
-            if path == "/api/investigation/evidence":
-                self._send_json(adapter.get_evidence(
-                    q_param("investigation_id"),
-                    evidence_id=q_param("evidence_id"),
-                    finding_id=q_param("finding_id")
-                ))
-                return
-
-            # GET /api/investigation/follow
-            if path == "/api/investigation/follow":
-                self._send_json(adapter.follow_evidence(
-                    q_param("investigation_id"),
-                    q_param("evidence_id"),
-                    direction=q_param("direction", "related_objects")
-                ))
-                return
-
-            # GET /api/investigation/next-steps
-            if path == "/api/investigation/next-steps":
-                self._send_json(adapter.get_next_steps(q_param("investigation_id")))
-                return
-
-            # GET /api/investigation/report
-            if path == "/api/investigation/report":
-                self._send_json(adapter.get_investigation_report(q_param("investigation_id"), format_type=q_param("format")))
-                return
-
-            # GET /api/investigation/hypotheses
-            if path == "/api/investigation/hypotheses":
-                self._send_json(adapter.get_hypotheses(
-                    q_param("investigation_id"),
-                    status_filter=q_param("status_filter")
-                ))
-                return
-
-            # GET /api/investigation/timeline
-            if path == "/api/investigation/timeline":
-                self._send_json(adapter.get_investigation_timeline(q_param("investigation_id")))
-                return
-
-            # GET /api/investigation/drilldown
-            if path == "/api/investigation/drilldown":
-                self._send_json(adapter.get_finding_drilldown(
-                    q_param("investigation_id"),
-                    q_param("finding_id")
-                ))
-                return
-
-            # GET /api/investigations/{id}/plan
-            m_exp_plan = re.match(r"^/api/investigations/([^/]+)/plan$", path)
-            if m_exp_plan:
-                self._send_json(adapter.get_expert_investigation_plan(m_exp_plan.group(1)))
-                return
-
-            # GET /api/investigations/{id}/conclusion
-            m_exp_concl = re.match(r"^/api/investigations/([^/]+)/conclusion$", path)
-            if m_exp_concl:
-                self._send_json(adapter.get_expert_investigation_conclusion(m_exp_concl.group(1)))
-                return
-
-            # GET /api/investigations/{id}/export
-            m_exp_exp = re.match(r"^/api/investigations/([^/]+)/export$", path)
-            if m_exp_exp:
-                self._send_json(adapter.export_expert_investigation(m_exp_exp.group(1), format=q_param("format", "json") or "json"))
-                return
-
-            # GET /api/investigations/{id}
-            m_exp_get = re.match(r"^/api/investigations/([^/]+)$", path)
-            if m_exp_get:
-                self._send_json(adapter.get_expert_investigation(m_exp_get.group(1)))
-                return
-
-            # GET /api/investigations
-            if path == "/api/investigations":
-                self._send_json(adapter.list_investigations())
-                return
-
-            # GET /api/llm/status and /api/investigation/llm-status
-            if path in ("/api/llm/status", "/api/investigation/llm-status", "/api/investigation/chat/status"):
-                self._send_json(adapter.get_llm_status())
-                return
-
-            # GET /api/watch/sessions
-            if path == "/api/watch/sessions":
-                self._send_json(adapter.list_watch_sessions(query))
-                return
-
-            # GET /api/watch/memory-map
-            if path == "/api/watch/memory-map":
-                pid_str = q_param("pid")
-                if not pid_str:
-                    self._send_json({"success": False, "error": {"code": "INVALID_PARAM", "message": "Query parameter 'pid' is required"}}, status=400)
-                    return
-                try:
-                    pid = int(pid_str)
-                except ValueError:
-                    self._send_json({"success": False, "error": {"code": "INVALID_PARAM", "message": f"Invalid PID: {pid_str}"}}, status=400)
-                    return
-                companion_elf = q_param("companion_elf") or q_param("debug_image")
-                remote_host = q_param("remote_host")
-                ssh_user = q_param("ssh_user")
-                ssh_port = _safe_int(q_param("ssh_port"), 22, 1, 65535)
-                ssh_key = q_param("ssh_key")
-                ssh_proxy_jump = q_param("ssh_proxy_jump")
-                self._send_json(adapter.get_watch_memory_map(
-                    pid,
-                    companion_elf=companion_elf,
-                    remote_host=remote_host,
-                    ssh_user=ssh_user,
-                    ssh_port=ssh_port,
-                    ssh_key=ssh_key,
-                    ssh_proxy_jump=ssh_proxy_jump,
-                ))
-                return
-
-            # GET /api/watch/session/{session_id}/status
-            m_watch_status = re.match(r"^/api/watch/session/([^/]+)/status$", path)
-            if m_watch_status:
-                session_id = m_watch_status.group(1)
-                self._send_json(adapter.get_watch_session_status(session_id))
-                return
-
-            # GET /api/watch/session/{session_id}/observations
-            m_watch_obs = re.match(r"^/api/watch/session/([^/]+)/observations$", path)
-            if m_watch_obs:
-                session_id = m_watch_obs.group(1)
-                self._send_json(adapter.get_watch_observations(session_id, query))
-                return
-
-            # GET /api/watch/session/{session_id}
-            m_watch_sess = re.match(r"^/api/watch/session/([^/]+)$", path)
-            if m_watch_sess:
-                session_id = m_watch_sess.group(1)
-                self._send_json(adapter.get_watch_session(session_id))
-                return
-
-            # GET /api/target/processes
+            # GET /api/target/processes (the UI resolves a process name to a pid with it)
             if path == "/api/target/processes":
                 self._send_json(adapter.find_target_processes({
                     "process_name": q_param("process_name") or q_param("query"),
@@ -4868,406 +4190,26 @@ class DynamicStateRequestHandler(http.server.BaseHTTPRequestHandler):
                     "ssh_proxy_jump": q_param("ssh_proxy_jump"),
                 }))
                 return
-
-            # GET /api/watch/baselines
-            if path == "/api/watch/baselines":
-                self._send_json(adapter.list_golden_baselines_api({
-                    "binary_build_id": q_param("binary_build_id"),
-                }))
-                return
-
-            # GET /api/watch/search-symbols
-            if path == "/api/watch/search-symbols":
-                self._send_json(adapter.search_dwarf_symbols_api({
-                    "companion_elf": q_param("companion_elf") or q_param("debug_image"),
-                    "query": q_param("query", ""),
-                    "category": q_param("category", "all"),
-                    "limit": q_param("limit", "50"),
-                }))
-                return
-
-            # GET /api/target/inspect-range
-            if path == "/api/target/inspect-range":
-                pid_str = q_param("pid")
-                addr_str = q_param("address")
-                size_str = q_param("size", "64")
-                if not pid_str or not addr_str:
-                    self._send_json({"success": False, "error": {"code": "INVALID_PARAM", "message": "Query parameters 'pid' and 'address' are required"}}, status=400)
-                    return
-                self._send_json(adapter.inspect_memory_range({
-                    "pid": pid_str,
-                    "address": addr_str,
-                    "size": size_str,
-                }))
-                return
-
-            # GET /api/watch/session/{session_id}/compare
-            m_watch_cmp = re.match(r"^/api/watch/session/([^/]+)/compare$", path)
-            if m_watch_cmp:
-                session_id = m_watch_cmp.group(1)
-                self._send_json(adapter.compare_watch_observations(session_id, {
-                    "seq_a": q_param("seq_a", "1"),
-                    "seq_b": q_param("seq_b", "2"),
-                }))
-                return
-
-            # Unrecognized API endpoint
-            self._send_json({"success": False, "error": {"code": "NOT_FOUND", "message": f"Endpoint not found: {path}"}},
-                            status=404)
-
+            self._not_found(path)
         except Exception as exc:
             self._send_json({"success": False, "error": {"code": "RUNTIME_ERROR", "message": str(exc)}},
                             status=500)
 
     def _handle_api_post(self, path: str, body: Dict[str, Any]) -> None:
         adapter = self.server.adapter
-
-        # Security check: forbid any bypass endpoints
-        forbidden_endpoints = ("/api/gdb-command", "/api/write-memory", "/api/eval-expression", "/api/arbitrary-command")
-        if any(path.startswith(fb) for fb in forbidden_endpoints):
-            self._send_json({
-                "success": False,
-                "error": {"code": "CAPABILITY_UNSUPPORTED", "message": "Direct execution / memory write endpoints are strictly prohibited."}
-            }, status=403)
+        if not is_api_route("POST", path):
+            self._not_found(path)
             return
-
         try:
-            if path == "/api/observe":
-                self._send_json(adapter.observe(body))
-                return
-            if path == "/api/snapshot":
-                self._send_json(adapter.snapshot(body))
-                return
-            if path in ("/api/mutation", "/api/transition"):
-                self._send_json(adapter.execute_transition(body))
-                return
-            if path == "/api/checkpoint":
-                self._send_json(adapter.checkpoint(body))
-                return
-            if path == "/api/restore":
-                self._send_json(adapter.restore(body))
-                return
-            if path == "/api/explore":
-                self._send_json(adapter.explore(body))
-                return
-            if path in ("/api/verify-determinism", "/api/runtime/verify_determinism"):
-                self._send_json(adapter.verify_restart_determinism(body))
-                return
-
-            # State Laboratory POST routes
-            if path == "/api/capture":
-                self._send_json(adapter.fast_capture(body))
-                return
-
-            # POST /api/snapshots/{id}/mutate
-            m_mut_snap = re.match(r"^/api/snapshots/([^/]+)/mutate$", path)
-            if m_mut_snap:
-                sid = m_mut_snap.group(1)
-                self._send_json(adapter.mutate_snapshot(sid, body))
-                return
-
-            # POST /api/snapshots/{id}/branch
-            m_br_snap = re.match(r"^/api/snapshots/([^/]+)/branch$", path)
-            if m_br_snap:
-                sid = m_br_snap.group(1)
-                self._send_json(adapter.branch_snapshot(sid, body))
-                return
-
-            # POST /api/snapshots/{id}/diff/{other_id}
-            m_diff_post = re.match(r"^/api/snapshots/([^/]+)/diff/([^/]+)$", path)
-            if m_diff_post:
-                snap_a = m_diff_post.group(1)
-                snap_b = m_diff_post.group(2)
-                self._send_json(adapter.diff_snapshots(snap_a, snap_b))
-                return
-
-            # POST /api/snapshots/{id}/replay
-            m_rep_snap = re.match(r"^/api/snapshots/([^/]+)/replay$", path)
-            if m_rep_snap:
-                sid = m_rep_snap.group(1)
-                self._send_json(adapter.replay_mutation(sid, body))
-                return
-
-            # Investigation POST routes
-            if path in ("/api/investigation/validate-target", "/api/investigation/validate"):
-                self._send_json(adapter.validate_target(body))
-                return
-
-            if path == "/api/investigation/start":
-                self._send_json(adapter.start_investigation(body))
-                return
-
-            if path in ("/api/investigation/temporal-analyze", "/api/investigation/temporal-plan"):
-                self._send_json(adapter.analyze_temporal_investigation(body))
-                return
-
-            if path == "/api/investigation/compare":
-                self._send_json(adapter.compare_observations(body))
-                return
-
-            if path in ("/api/investigation/hypotheses/evaluate", "/api/investigation/evaluate"):
-                self._send_json(adapter.evaluate_hypothesis(body))
-                return
-
-            if path in ("/api/investigation/observe", "/api/investigation/observations/execute"):
-                self._send_json(adapter.execute_observation(body))
-                return
-
-            if path in ("/api/investigation/cancel-observation", "/api/investigation/observations/cancel"):
-                self._send_json(adapter.cancel_observation(body))
-                return
-
-            if path in ("/api/investigation/cycle", "/api/investigation/run-cycle"):
-                self._send_json(adapter.run_investigation_cycle(body))
-                return
-
-            if path in ("/api/investigation/step", "/api/investigation/step-cycle"):
-                self._send_json(adapter.step_investigation_cycle(body))
-                return
-
-            if path in ("/api/investigation/hypotheses/propose", "/api/investigation/propose-hypothesis", "/api/investigation/propose"):
-                self._send_json(adapter.propose_hypothesis(body))
-                return
-
-            if path == "/api/investigation/save":
-                self._send_json(adapter.save_investigation(body))
-                return
-
-            if path == "/api/investigation/load":
-                self._send_json(adapter.load_investigation(body))
-                return
-
-            if path in ("/api/investigation/chat", "/api/investigation/analyze-chat"):
-                self._send_json(adapter.analyze_investigation_chat(body))
-                return
-
-            if path in ("/api/investigation/chat/cancel", "/api/investigation/cancel-chat"):
-                self._send_json(adapter.cancel_investigation_chat(body))
-                return
-
-            # POST /api/investigations or /api/investigations/start
-            if path in ("/api/investigations", "/api/investigations/start"):
-                self._send_json(adapter.start_expert_investigation(body))
-                return
-
-            # POST /api/investigations/{id}/step
-            m_p_step = re.match(r"^/api/investigations/([^/]+)/step$", path)
-            if m_p_step:
-                self._send_json(adapter.execute_expert_investigation_step(m_p_step.group(1), step_id=body.get("step_id")))
-                return
-
-            # POST /api/investigations/{id}/verify
-            m_p_ver = re.match(r"^/api/investigations/([^/]+)/verify$", path)
-            if m_p_ver:
-                self._send_json(adapter.verify_expert_hypothesis(m_p_ver.group(1), hypothesis_id=body.get("hypothesis_id")))
-                return
-
-            # POST /api/investigations/{id}/pause
-            m_p_pause = re.match(r"^/api/investigations/([^/]+)/pause$", path)
-            if m_p_pause:
-                self._send_json(adapter.pause_expert_investigation(m_p_pause.group(1)))
-                return
-
-            # POST /api/investigations/{id}/resume
-            m_p_res = re.match(r"^/api/investigations/([^/]+)/resume$", path)
-            if m_p_res:
-                self._send_json(adapter.resume_expert_investigation(m_p_res.group(1)))
-                return
-
-            # POST /api/watch/session/create
-            if path == "/api/watch/session/create":
-                self._send_json(adapter.create_watch_session(body))
-                return
-
-            # POST /api/watch/session/{session_id}/stop
-            m_watch_stop = re.match(r"^/api/watch/session/([^/]+)/stop$", path)
-            if m_watch_stop:
-                session_id = m_watch_stop.group(1)
-                self._send_json(adapter.stop_watch_session(session_id))
-                return
-
-            # POST /api/watch/session/{session_id}/watch
-            m_watch_item = re.match(r"^/api/watch/session/([^/]+)/watch$", path)
-            if m_watch_item:
-                session_id = m_watch_item.group(1)
-                self._send_json(adapter.update_watch_items(session_id, body))
-                return
-
-            # POST /api/target/deploy-collector
-            if path == "/api/target/deploy-collector":
-                self._send_json(adapter.deploy_remote_collector_api(body))
-                return
-
-            # POST /api/target/find-processes
-            if path in ("/api/target/find-processes", "/api/target/processes"):
-                self._send_json(adapter.find_target_processes(body))
-                return
-
-            # POST /api/watch/search-symbols
-            if path == "/api/watch/search-symbols":
-                self._send_json(adapter.search_dwarf_symbols_api(body))
-                return
-
-            # POST /api/watch/eval-paths
-            if path == "/api/watch/eval-paths":
-                self._send_json(adapter.evaluate_symbol_paths_api(body))
-                return
-
-            # POST /api/watch/recipe
-            if path == "/api/watch/recipe":
-                self._send_json(adapter.run_diagnostic_recipe_api(body))
-                return
-
-            # POST /api/watch/baseline/save
-            if path == "/api/watch/baseline/save":
-                self._send_json(adapter.save_golden_baseline_api(body))
-                return
-
-            # POST /api/watch/baseline/compare
-            if path == "/api/watch/baseline/compare":
-                self._send_json(adapter.compare_golden_baseline_api(body))
-                return
-
-            # POST /api/watch/capture-diff
-            if path == "/api/watch/capture-diff":
-                self._send_json(adapter.capture_and_diff_paths_api(body))
-                return
-
-            # POST /api/watch/scan-pool
-            if path == "/api/watch/scan-pool":
-                self._send_json(adapter.scan_memory_pool_api(body))
-                return
-
-            # POST /api/watch/find-owners
-            if path == "/api/watch/find-owners":
-                self._send_json(adapter.find_symbol_owners_api(body))
-                return
-
-            # POST /api/watch/xray-blueprint
-            if path == "/api/watch/xray-blueprint":
-                self._send_json(adapter.get_xray_blueprint_api(body))
-                return
-
             # POST /api/diagnose/start (non-blocking diagnosis; events via GET /api/diagnose/{job_id}/events)
             if path == "/api/diagnose/start":
                 self._send_json(adapter.diagnose_start_api(body))
                 return
-
             # POST /api/diagnose (one-call diagnosis, IMP-006)
             if path == "/api/diagnose":
                 self._send_json(adapter.diagnose_api(body))
                 return
-
-            # POST /api/workspace/chat
-            if path == "/api/workspace/chat":
-                self._send_json(adapter.workspace_chat_api(body))
-                return
-
-            # Phase 40 (Phase 10) Advanced Diagnostic Routes
-            if path == "/api/watch/until-condition":
-                self._send_json(adapter.watch_until_condition_api(body))
-                return
-            if path == "/api/watch/traverse-list":
-                self._send_json(adapter.traverse_linked_structure_api(body))
-                return
-            if path in ("/api/watch/thread-callstacks", "/api/watch/callstack-locks"):
-                self._send_json(adapter.inspect_thread_callstacks_api(body))
-                return
-            if path == "/api/watch/audit-integrity":
-                self._send_json(adapter.audit_memory_integrity_api(body))
-                return
-            if path == "/api/watch/resolve-code-pointers":
-                self._send_json(adapter.resolve_code_pointers_api(body))
-                return
-            if path == "/api/watch/inspect-shm":
-                self._send_json(adapter.inspect_shared_memory_ipc_api(body))
-                return
-            if path == "/api/watch/frame-locals":
-                self._send_json(adapter.inspect_thread_locals_api(body))
-                return
-            if path == "/api/watch/auto-triage":
-                self._send_json(adapter.auto_triage_incident_api(body))
-                return
-            if path == "/api/watch/ipc-pipeline":
-                self._send_json(adapter.trace_ipc_pipeline_api(body))
-                return
-            if path == "/api/watch/scan-heap":
-                self._send_json(adapter.scan_heap_objects_api(body))
-                return
-            if path == "/api/watch/dependency-graph":
-                self._send_json(adapter.build_dependency_graph_api(body))
-                return
-            if path == "/api/watch/correlate-source":
-                self._send_json(adapter.correlate_source_and_state_api(body))
-                return
-            if path == "/api/watch/investigate-symptom":
-                self._send_json(adapter.investigate_symptom_api(body))
-                return
-            if path == "/api/watch/statistical-hotspots":
-                self._send_json(adapter.sample_statistical_hotspots_api(body))
-                return
-            if path == "/api/watch/resolve-fuzzy-intent":
-                self._send_json(adapter.resolve_fuzzy_intent_api(body))
-                return
-            if path == "/api/watch/flight-recorder":
-                self._send_json(adapter.flight_recorder_time_machine_api(body))
-                return
-            if path == "/api/watch/behavioral-drift":
-                self._send_json(adapter.detect_behavioral_drift_api(body))
-                return
-            if path == "/api/watch/tls-storage":
-                self._send_json(adapter.inspect_thread_local_storage_api(body))
-                return
-            if path == "/api/watch/verify-consistency":
-                self._send_json(adapter.verify_concurrent_read_consistency_api(body))
-                return
-            if path == "/api/watch/dpdk-lcores":
-                self._send_json(adapter.inspect_dpdk_lcores_and_rings_api(body))
-                return
-            if path == "/api/watch/active-context":
-                self._send_json(adapter.get_active_context_api(body))
-                return
-            if path == "/api/watch/coerce-expression":
-                self._send_json(adapter.coerce_expression_api(body))
-                return
-            if path == "/api/watch/ask":
-                self._send_json(adapter.ask_runtime_question_api(body))
-                return
-            if path == "/api/watch/smart-compact":
-                self._send_json(adapter.smart_compact_query_api(body))
-                return
-            if path == "/api/watch/batch-execute":
-                self._send_json(adapter.batch_execute_api(body))
-                return
-            if path == "/api/watch/verify-hypothesis":
-                self._send_json(adapter.verify_hypothesis_api(body))
-                return
-            if path == "/api/watch/export-report":
-                self._send_json(adapter.export_incident_report_api(body))
-                return
-
-            # POST /api/target/inspect-range
-            if path == "/api/target/inspect-range":
-                self._send_json(adapter.inspect_memory_range(body))
-                return
-
-            # POST /api/watch/session/{session_id}/capture
-            m_watch_cap = re.match(r"^/api/watch/session/([^/]+)/capture$", path)
-            if m_watch_cap:
-                session_id = m_watch_cap.group(1)
-                self._send_json(adapter.capture_watch_session(session_id))
-                return
-
-            # POST /api/watch/session/{session_id}/compare
-            m_watch_cmp_post = re.match(r"^/api/watch/session/([^/]+)/compare$", path)
-            if m_watch_cmp_post:
-                session_id = m_watch_cmp_post.group(1)
-                self._send_json(adapter.compare_watch_observations(session_id, body))
-                return
-
-            self._send_json({"success": False, "error": {"code": "NOT_FOUND", "message": f"Endpoint not found: {path}"}},
-                            status=404)
-
+            self._not_found(path)
         except Exception as exc:
             self._send_json({"success": False, "error": {"code": "RUNTIME_ERROR", "message": str(exc)}},
                             status=500)
@@ -5313,40 +4255,25 @@ class DynamicStateRequestHandler(http.server.BaseHTTPRequestHandler):
             self.send_error(403, "Forbidden Host")
             return
         raw_path = path if raw_path is None else raw_path
-        base = os.path.dirname(os.path.abspath(__file__))
-        # Old URLs: /workspace -> /legacy/workspace; /legacy -> /legacy/ (so its relative asset URLs resolve)
-        if path == "/workspace":
-            self._redirect("legacy/workspace" if raw_path == "/workspace" else "../legacy/workspace")
+        # The previous UIs (/legacy/, /legacy/workspace, /workspace) are gone: their page URLs lead to the root UI.
+        if is_removed_ui_path(path):
+            self._redirect(relative_root(raw_path))
             return
-        if path == "/legacy" and raw_path == "/legacy":
-            self._redirect("legacy/")
+        if path.startswith("/static/"):
+            # the previous UI's asset URLs: nothing is served there any more (and no page asset of the root UI moved there)
+            self.send_error(404, "File not found")
             return
-        if path == "/legacy/workspace":
-            self._send_static_file(os.path.join(base, "workspace_static"), "index.html")
-            return
-        legacy_dir = os.path.join(base, "static")
-        if path == "/legacy" or path.startswith("/legacy/"):
-            rel_path = path[len("/legacy"):].lstrip("/")
-            if rel_path.startswith("static/"):
-                rel_path = rel_path[len("static/"):]
-            self._send_static_file(legacy_dir, rel_path or "index.html", spa_fallback=True)
-            return
-        explicit = getattr(self.server, "static_dir_explicit", False)
-        if path.startswith("/static/") and not explicit:
-            self._send_static_file(legacy_dir, path[len("/static/"):])    # old asset URLs keep working
-            return
-        # The root UI: extractor/web/ui/ by default, or the directory the server was started with.
-        rel_path = "index.html" if not path or path == "/" else (
-            path[len("/static/"):] if path.startswith("/static/") else path.lstrip("/"))
-        if not explicit and os.path.splitext(rel_path)[1].lower() not in self._UI_STATIC_TYPES:
+        # The root UI: extractor/web/ui/.
+        rel_path = "index.html" if not path or path == "/" else path.lstrip("/")
+        if os.path.splitext(rel_path)[1].lower() not in self._UI_STATIC_TYPES:
             # extractor/web/ui/ also holds the server-side view builder (view.py) and its caches: only page assets
             self.send_error(404, "File not found")
             return
-        self._send_static_file(self.server.static_dir, rel_path, spa_fallback=explicit)
+        self._send_static_file(self.server.static_dir, rel_path)
 
     _UI_STATIC_TYPES = frozenset({".html", ".css", ".js", ".json", ".svg", ".png", ".ico"})
 
-    def _send_static_file(self, static_dir: str, rel_path: str, spa_fallback: bool = False) -> None:
+    def _send_static_file(self, static_dir: str, rel_path: str) -> None:
         tok = getattr(self.server, "session_token", "")
         static_dir = os.path.abspath(static_dir)
         if not os.path.isdir(static_dir):
@@ -5359,13 +4286,8 @@ class DynamicStateRequestHandler(http.server.BaseHTTPRequestHandler):
             return
 
         if not os.path.isfile(full_path):
-            # Fall back to index.html for client-side routing
-            index_path = os.path.join(static_dir, "index.html")
-            if spa_fallback and os.path.isfile(index_path):
-                full_path = index_path
-            else:
-                self.send_error(404, "File not found")
-                return
+            self.send_error(404, "File not found")
+            return
 
         mime_type, _ = mimetypes.guess_type(full_path)
         if not mime_type:
@@ -5530,18 +4452,13 @@ class DynamicStateWebServer(http.server.ThreadingHTTPServer):
         self,
         server_address: Tuple[str, int],
         runtime: AgentRuntime,
-        static_dir: Optional[str] = None,
         session_token: Optional[str] = None,
     ):
         super().__init__(server_address, DynamicStateRequestHandler)
-        # static_dir None: the new UI (extractor/web/ui/) is the root page and the old UIs live under /legacy/.
-        # An explicit static_dir is served as the root page instead (the dedicated workspace launcher does this).
-        self.static_dir_explicit = static_dir is not None
-        if static_dir is None:
-            static_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ui")
         self.runtime = runtime
         self.adapter = WebApiAdapter(runtime)
-        self.static_dir = os.path.abspath(static_dir)
+        # the page and its assets: extractor/web/ui/ (the only UI; the previous UIs were removed)
+        self.static_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ui")
         self.session_token: str = (
             session_token
             or os.environ.get("DYNAMICSTATE_SESSION_TOKEN")
@@ -5555,11 +4472,10 @@ def run_server(
     runtime: AgentRuntime,
     host: str = "127.0.0.1",
     port: int = 8000,
-    static_dir: Optional[str] = None,
     session_token: Optional[str] = None,
 ) -> DynamicStateWebServer:
     """Instantiate and configure the HTTP server."""
-    server = DynamicStateWebServer((host, port), runtime, static_dir, session_token=session_token)
+    server = DynamicStateWebServer((host, port), runtime, session_token=session_token)
     return server
 
 

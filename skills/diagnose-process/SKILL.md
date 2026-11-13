@@ -81,7 +81,7 @@ report the result honestly.
 ## Hard rules
 - Never say "no problem" / "healthy" when the verdict is INCONCLUSIVE or ABORTED. Say you could not tell, and why.
 - Never present a finding without a named subject as confirmed.
-- Zero-stop is the default and needs no approval. Anything that stops the process (stop-mode capture, `allow_stop`, CONSISTENT/GDB modes) and anything that changes the target (checkpoint, restore, transition, explore, replay, `--allow-mutation`, memory writes, signals) needs the user's explicit approval first. Ask, wait, then proceed.
+- Zero-stop is the default and needs no approval. Anything that stops the process (stop-mode capture, `allow_stop`, CONSISTENT/GDB modes) and anything that changes the target (checkpoint, restore, transition, explore, replay, `allow_mutation=True`, memory writes, signals) needs the user's explicit approval first. Ask, wait, then proceed.
 - Do not guess on unsupported targets (non-glibc allocator, unsupported architecture, no debug info). Report the refusal.
 - Do not invent symbols. Never assume a program has a particular global; take names from `subjects`, from the user, or from symbol search.
 - Do not claim more than the evidence: the benchmark shows today's one-call diagnosis reliably names lock and thread for deadlocks; leaks, heap corruption, busy-wait and long stalls are usually INCONCLUSIVE and need the narrower tools.

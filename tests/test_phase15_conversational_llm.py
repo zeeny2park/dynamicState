@@ -9,7 +9,8 @@ Covers:
    - Demotes claimed VALIDATED status to PROPOSED.
    - Caps candidate functions to STATIC_CANDIDATE (never VALIDATED_CAUSAL_FUNCTION).
 5. Audit timeline recording (CONVERSATIONAL_ANALYSIS_COMPLETED) and chat history persistence.
-6. REST API routes: GET /api/llm/status, GET /api/investigation/llm-status, POST /api/investigation/chat.
+6. WebApiAdapter.get_llm_status / analyze_investigation_chat (their HTTP routes were removed with the previous web UI:
+   checked to be 404).
 7. AgentRuntime protocol dispatch for ANALYZE_INVESTIGATION_CHAT and GET_LLM_STATUS.
 """
 
@@ -379,7 +380,7 @@ class TestConversationalAnalysisServiceEndToEnd(unittest.TestCase):
 
 
 class TestWebAPIAndRuntimeDispatch(unittest.TestCase):
-    """Test HTTP routes: GET /api/llm/status, POST /api/investigation/chat, and ARP action dispatch."""
+    """WebApiAdapter LLM status / investigation chat (routes removed: 404) and ARP action dispatch."""
 
     @classmethod
     def setUpClass(cls):
@@ -421,9 +422,8 @@ class TestWebAPIAndRuntimeDispatch(unittest.TestCase):
             return err.code, json.loads(err.read().decode("utf-8"))
 
     def test_get_llm_status_endpoint(self):
-        # 1. Primary route: /api/llm/status
-        status, data = self._get_json("/api/llm/status")
-        self.assertEqual(status, 200)
+        # 1. WebApiAdapter.get_llm_status (formerly GET /api/llm/status)
+        data = json.loads(json.dumps(self.server.adapter.get_llm_status(), default=str))
         self.assertTrue(data.get("success"))
         status_data = data.get("data", {})
         self.assertIn("provider_type", status_data)
@@ -433,17 +433,16 @@ class TestWebAPIAndRuntimeDispatch(unittest.TestCase):
         # Verify secret redaction: raw key must never be exposed
         self.assertNotIn("api_key", status_data["config"])
 
-        # 2. Alias route: /api/investigation/llm-status
-        status_alias, data_alias = self._get_json("/api/investigation/llm-status")
-        self.assertEqual(status_alias, 200)
-        self.assertTrue(data_alias.get("success"))
+        # 2. The old HTTP routes are gone
+        for path in ("/api/llm/status", "/api/investigation/llm-status", "/api/investigation/chat/status"):
+            self.assertEqual(self._get_json(path)[0], 404, path)
 
     def test_post_investigation_chat_workflow(self):
         # 1. Start an investigation session
-        status, start_resp = self._post_json("/api/investigation/start", {
+        adapter = self.server.adapter
+        start_resp = adapter.start_investigation({
             "goal": "Verify worker transition",
         })
-        self.assertEqual(status, 200)
         self.assertTrue(start_resp.get("success"))
         inv_id = start_resp["data"]["investigation_id"]
 
@@ -453,20 +452,19 @@ class TestWebAPIAndRuntimeDispatch(unittest.TestCase):
             "message": "Why is the worker in this state?",
             "provider_override": "none",  # Honest deterministic fallback test
         }
-        status, chat_resp = self._post_json("/api/investigation/chat", chat_payload)
-        self.assertEqual(status, 200)
+        chat_resp = json.loads(json.dumps(adapter.analyze_investigation_chat(chat_payload), default=str))
         self.assertTrue(chat_resp.get("success"))
         res_data = chat_resp.get("data", {})
         self.assertIn("summary", res_data)
         self.assertIn("hypotheses", res_data)
         self.assertIn("provider_metadata", res_data)
         self.assertEqual(res_data["provider_metadata"]["provider"], "deterministic_fallback")
+        self.assertEqual(self._post_json("/api/investigation/chat", chat_payload)[0], 404)   # route removed
 
     def test_post_investigation_chat_error_on_missing_id(self):
-        status, err_resp = self._post_json("/api/investigation/chat", {
+        err_resp = self.server.adapter.analyze_investigation_chat({
             "message": "Missing ID",
         })
-        self.assertEqual(status, 200)
         self.assertFalse(err_resp.get("success"))
         self.assertEqual(err_resp.get("error", {}).get("code"), "INVALID_PARAM")
 

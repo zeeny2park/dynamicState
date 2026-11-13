@@ -1528,7 +1528,7 @@ class AgentRuntime:
             return self._error(
                 "CAPABILITY_UNSUPPORTED",
                 f"{action} is not supported in LOW_IMPACT / read-only operation: it changes live target state and "
-                "the runtime was started without allow_mutation (restart with allow_mutation=True / --allow-mutation).",
+                "the runtime was started without allow_mutation (construct the runtime with allow_mutation=True; the web server never does).",
                 action,
                 t_start,
             )
