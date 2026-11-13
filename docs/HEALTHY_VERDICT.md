@@ -39,15 +39,19 @@ this rule is reported INCONCLUSIVE.
 | PROCESS_MEMORY_GROWTH | no growth trend, or heap walks show no growth | heap walks not possible within the budget / too few walks -> INCONCLUSIVE (blocks) |
 | HEAP_METADATA_CORRUPTION | heap walked, metadata intact | heap above cap -> scope limit (see 3); byte budget / unsupported allocator / incomplete walk -> blocks |
 | FD_LEAK | fd count trend flat | unchanged |
+| FREED_MEMORY_USE (plugin) | heap walked, no typed pointer into a free chunk, no write into one | heap above cap -> scope limit (`uaf_not_checked`); otherwise not walked -> blocks |
+| DOUBLE_FREE (plugin, `recipe_plugins/double_free.py`) | every tcache bin and fastbin of the integrity walk followed to its end, no block listed twice | heap above cap -> scope limit (`double_free_not_checked`); a list never read consistently, unsupported allocator, budget -> blocks |
 
 - **Target-support decision**: a feature unsupported on the target that no baseline check needs (e.g. `tcb_scan`)
   is a scope limit. A *baseline* check that could not answer its question for a target-support reason (mutex
   owners not decodable -> deadlock / lock checks INCONCLUSIVE) blocks HEALTHY: the question it owns was not answered.
 - **Symptom-specific (non-baseline) recipes** never gate HEALTHY: their FAIL still blocks (it is a finding), any
   other non-PASS result is listed as "symptom-specific checks that reached no result". Several of them cannot clear
-  anything on a live process (use-after-free / double free / object lifetime need allocation-lifecycle tracing,
+  anything on a live process (the traced use-after-free / object lifetime recipes need allocation-lifecycle tracing,
   `lifecycle_tracing_unavailable`); their negative is meaningless, so they are scope, not gate.
-- **Always not checked** (`outside_baseline`): use-after-free, double free, data races, program-logic errors.
+- **Always not checked** (`outside_baseline`): data races, program-logic errors, a use-after-free that leaves no
+  typed pointer to a freed block and no write into one, a double free of a block re-allocated in between (listed
+  once, like any free block).
 
 ## Known consequences
 

@@ -784,3 +784,273 @@ register_recipe(DiagnosticRecipe(
     observations=(OBS_FREE_LIST_REPEATS,),
     rule=double_free_rule,
 ), baseline=True, category=CATEGORY_INVALID_DOUBLE_FREE)
+
+
+# ---------------------------------------------------------------------------------------------- presentation
+# How this diagnosis is shown to a person: registered from this file as well (extractor/report_registry.py).
+_TXT = {
+    "repeat": ("Block {addr} (chunk size {size}) is listed twice as free on {list}: after {n} entries the list "
+               "returns to it.",
+               "블록 {addr}(청크 크기 {size})이 {list}에 해제된 블록으로 두 번 올라 있습니다: {n}개 항목 뒤에 목록이 "
+               "다시 이 블록으로 돌아옵니다."),
+    "two": ("Block {addr} (chunk size {size}) is listed as free on two lists at once: {lists}.",
+            "블록 {addr}(청크 크기 {size})이 두 해제 목록에 동시에 올라 있습니다: {lists}."),
+    "count": ("The tcache count of that bin says {c} entries, but the list holds only {d} different blocks: both "
+              "frees were counted.",
+              "그 tcache 칸의 개수는 {c}개인데 목록에는 서로 다른 블록이 {d}개뿐입니다: 두 번의 해제가 모두 세어졌습니다."),
+    "means": ("A block gets onto a free list only through free(): it was freed twice.",
+              "블록은 free()를 통해서만 해제 목록에 들어갑니다: 이 블록은 두 번 해제되었습니다."),
+    "conseq": ("Consequence: the next two allocations of {lo}-{hi} bytes can both return {addr}; two owners would "
+               "then share one block and overwrite each other's data.",
+               "결과: 다음 {lo}-{hi}바이트 할당 두 번이 모두 {addr}을(를) 돌려줄 수 있습니다. 그러면 두 소유자가 한 블록을 "
+               "나눠 쓰며 서로의 데이터를 덮어씁니다."),
+    "owner": ("Still pointing at it: {v} (the pointer that was freed twice, or a copy of it).",
+              "아직 이 블록을 가리키는 변수: {v} (두 번 해제된 포인터이거나 그 사본)."),
+    "no_owner": ("No typed variable still points at it ({why}).", "이 블록을 가리키는 타입 있는 변수는 없습니다 ({why})."),
+    "stable": ("The listing was the same in {n} live re-reads.", "실시간으로 {n}번 다시 읽어도 목록이 같았습니다."),
+    "who": ("Which code called free() the second time was not observed (free calls are not traced); look for the "
+            "paths that free {v}.",
+            "어느 코드가 두 번째로 free()를 불렀는지는 관측되지 않았습니다 (free 호출은 추적하지 않음). {v}을(를) "
+            "해제하는 경로를 찾으세요."),
+    "who_plain": ("Which code called free() the second time was not observed (free calls are not traced).",
+                  "어느 코드가 두 번째로 free()를 불렀는지는 관측되지 않았습니다 (free 호출은 추적하지 않음)."),
+    "title": ("The free list that holds the block twice", "블록이 두 번 들어 있는 해제 목록"),
+    "head": ("list head", "목록 시작"), "entry": ("entry {k}", "항목 {k}"),
+    "back": ("back to {addr}", "{addr}(으)로 되돌아감"),
+    "gap": ("{n} more", "{n}개 더"),
+    "s_head": ("The head of {list} points to {addr}.", "{list}의 시작이 {addr}을(를) 가리킵니다."),
+    "s_next": ("{a} links to {b}.", "{a}이(가) {b}(으)로 이어집니다."),
+    "s_gap": ("{n} more links.", "{n}개 연결이 더 있습니다."),
+    "s_back": ("{a} links back to {b}, which is already on the list: the same block twice.",
+               "{a}이(가) 이미 목록에 있는 {b}(으)로 다시 이어집니다: 같은 블록이 두 번 들어 있습니다."),
+    "s_on": ("{list} lists {addr} (entry {k}).", "{list}에 {addr}이(가) 있습니다 (항목 {k})."),
+    "s_bin": ("{list} also holds {addr}: {ev}.", "{list}에도 {addr}이(가) 있습니다: {ev}."),
+    "s_conseq": ("Two later allocations of {lo}-{hi} bytes can both receive {addr}.",
+                 "이후 {lo}-{hi}바이트 할당 두 번이 모두 {addr}을(를) 받을 수 있습니다."),
+    "who_viz": ("Which code freed it twice", "어느 코드가 두 번 해제했는지"),
+}
+_CODE_ARGS = ("addr", "a", "b", "list", "v")
+
+
+def _df_findings(report: Optional[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    checks = ((report or {}).get("section_d_detailed_inspection_results") or {}).get("checks") or []
+    for c in checks:
+        if isinstance(c, dict) and c.get("recipe_id") == RECIPE_DOUBLE_FREE:
+            rec = (c.get("actual_observations") or {}).get(OBS_FREE_LIST_REPEATS)
+            if isinstance(rec, dict):
+                return [f for f in rec.get("findings") or [] if isinstance(f, dict) and f.get("user_address")]
+    return []
+
+
+def _owners(f: Dict[str, Any]) -> List[str]:
+    out = [str(o.get("variable_path") or o.get("variable")) for o in f.get("owners") or []
+           if isinstance(o, dict) and (o.get("variable_path") or o.get("variable"))]
+    if not out and (f.get("variable_path") or f.get("variable")):
+        out = [str(f.get("variable_path") or f.get("variable"))]
+    return out
+
+
+def _df_facts(i: int, f: Dict[str, Any], wrap: Callable[[Any], str]) -> List[str]:
+    """The sentences of one double-free finding; ``wrap`` formats an identifier for the output medium."""
+    out: List[str] = []
+    lists = [x for x in f.get("lists") or [] if isinstance(x, dict)]
+    addr, size = wrap(f.get("user_address")), f.get("chunk_size")
+    rep = next((x for x in lists if x.get("returns_to") is not None), None)
+    if rep is not None:
+        out.append(_TXT["repeat"][i].format(addr=addr, size=size, list=wrap(rep.get("list")),
+                                            n=len(rep.get("chain") or [])))
+        if rep.get("tcache_count") is not None and rep.get("distinct_entries") is not None:
+            out.append(_TXT["count"][i].format(c=rep["tcache_count"], d=rep["distinct_entries"]))
+    if len(lists) > 1 or rep is None:
+        out.append(_TXT["two"][i].format(addr=addr, size=size, lists=", ".join(wrap(x.get("list")) for x in lists)))
+    out.append(_TXT["means"][i])
+    rq = f.get("request_sizes")
+    if isinstance(rq, list) and len(rq) == 2:
+        out.append(_TXT["conseq"][i].format(lo=rq[0], hi=rq[1], addr=addr))
+    own = _owners(f)
+    if own:
+        out.append(_TXT["owner"][i].format(v=", ".join(wrap(v) for v in own)))
+    elif f.get("owner_unknown"):
+        out.append(_TXT["no_owner"][i].format(why=f["owner_unknown"]))
+    if f.get("stable_rereads"):
+        out.append(_TXT["stable"][i].format(n=f["stable_rereads"]))
+    out.append(_TXT["who"][i].format(v=wrap(own[0])) if own else _TXT["who_plain"][i])
+    return out
+
+
+def double_free_finding_text(ctx: Any, finding: Dict[str, Any], report: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    lines: List[str] = []
+    for f in _df_findings(report)[:2]:
+        lines += _df_facts(ctx.i, f, lambda x: "`" + str(x).replace("`", "'") + "`")
+    return {"lines": lines}
+
+
+def _short(addr: Any) -> str:
+    s = str(addr)
+    return s if len(s) <= 15 else "…" + s[-12:]
+
+
+def _user(chunk: Any) -> str:
+    try:
+        return "0x%x" % (int(str(chunk), 16) + 16)
+    except (TypeError, ValueError):
+        return str(chunk)
+
+
+def _html_fmt(template: str, **kw: Any) -> str:
+    """Escape ``template`` and fill it with escaped values (addresses, list names and variables as inline code)."""
+    from ..report_visuals import code, esc
+    return esc(template).format(**{k: (code(v) if k in _CODE_ARGS else esc(v)) for k, v in kw.items()})
+
+
+def _row_boxes(x: Dict[str, Any], target: str, max_boxes: int = 6) -> List[Any]:
+    """(chain index, chunk address) of a list as drawn: a long list keeps both ends and the block, the rest
+    becomes ("gap", n) markers."""
+    chain = [str(c) for c in x.get("chain") or []]
+    if x.get("list_kind") == "bin" or not chain:
+        return [(None, target)]
+    if len(chain) <= max_boxes:
+        return list(enumerate(chain))
+    keep = {0, 1, len(chain) - 2, len(chain) - 1}
+    keep |= {k for k in (x.get("position"), x.get("returns_to")) if isinstance(k, int)}
+    out: List[Any] = []
+    for k, c in enumerate(chain):
+        if k in keep:
+            out.append((k, c))
+        elif out and out[-1][0] == "gap":
+            out[-1] = ("gap", out[-1][1] + 1)
+        else:
+            out.append(("gap", 1))
+    return out
+
+
+def _chain_picture(lx: Any, f: Dict[str, Any], uid: str) -> Tuple[str, List[str]]:
+    """SVG of the list(s) holding the block - the repeated block highlighted, the arrow that returns to it - and
+    the step items that go with it (one step per drawn link)."""
+    from ..report_visuals import _sa, chip, esc
+    i = lx.i
+    lists = [x for x in f.get("lists") or [] if isinstance(x, dict)][:3]
+    target = str(f.get("chunk_address"))
+    uaddr = str(f.get("user_address"))
+    bw, bh, gap, hw, left, row_h, top = 124, 46, 38, 104, 14, 124, 34
+    rows = [(x, _row_boxes(x, target)) for x in lists]
+    width = left + hw + max([len(b) for _, b in rows] + [1]) * (bw + gap) + 16
+    height = top + len(rows) * row_h
+    mk = "dsv-dfah-" + esc(uid)
+    s = [f'<svg viewBox="0 0 {width} {height}" width="{width}" role="img" aria-label="{esc(_TXT["title"][i])}">',
+         f'<defs><marker id="{mk}" markerWidth="9" markerHeight="8" refX="8" refY="4" orient="auto">'
+         '<path d="M0,0 L9,4 L0,8 z" fill="context-stroke"/></marker></defs>']
+    steps: List[str] = []
+    obs = chip(lx, "obs")
+    k = 0
+    for ri, (x, boxes) in enumerate(rows):
+        y = top + ri * row_h
+        name = str(x.get("list") or "")
+        chain = [str(c) for c in x.get("chain") or []]
+        repeat = isinstance(x.get("returns_to"), int) and bool(chain)
+        bin_row = x.get("list_kind") == "bin"
+        xs = [left + hw + bi * (bw + gap) for bi in range(len(boxes))]
+        s.append(f'<text class="dsv-t-mute" x="{left}" y="{y - 12}" font-size="12">{esc(name[:90])}</text>')
+        k += 1
+        row_step = k
+        group = [f'<rect class="dsv-lockbox" x="{left}" y="{y}" width="{hw - 24}" height="{bh}" rx="6"/>'
+                 f'<text x="{left + (hw - 24) / 2}" y="{y + 28}" text-anchor="middle" font-size="12">'
+                 f'{esc(_TXT["head"][i])}</text>']
+        row_steps: List[str] = []
+        for bi, (ci, b) in enumerate(boxes):
+            if repeat and bi > 0:
+                s.append(f'<g{_sa(k)}>{"".join(group)}</g>')     # close the previous step's group
+                group = []
+                k += 1
+            ax1 = (left + hw - 24) if bi == 0 else xs[bi - 1] + bw
+            group.append(f'<line class="dsv-arrow" x1="{ax1}" y1="{y + bh / 2}" x2="{xs[bi] - 4}" y2="{y + bh / 2}" '
+                         f'marker-end="url(#{mk})"/>')
+            if ci == "gap":
+                group.append(f'<rect x="{xs[bi]}" y="{y}" width="{bw}" height="{bh}" rx="6" '
+                             'style="fill:var(--bg);stroke:var(--line);stroke-dasharray:4 4"/>'
+                             f'<text class="dsv-t-mute" x="{xs[bi] + bw / 2}" y="{y + 28}" text-anchor="middle" '
+                             f'font-size="12">{esc(_TXT["gap"][i].format(n=b))}</text>')
+                row_steps.append(f'<li{_sa(k)}>{_html_fmt(_TXT["s_gap"][i], n=b)} {obs}</li>')
+                continue
+            hot = b == target
+            style = ("fill:var(--bad-bg);stroke:var(--bad);stroke-width:2.5" if hot
+                     else "fill:var(--panel);stroke:var(--line);stroke-width:1.5")
+            label = _user(b)
+            tcls = ' class="dsv-t-bad"' if hot else ""
+            group.append(f'<rect x="{xs[bi]}" y="{y}" width="{bw}" height="{bh}" rx="6" style="{style}"/>'
+                         f'<text{tcls} x="{xs[bi] + bw / 2}" y="{y + 20}" text-anchor="middle" font-size="12">'
+                         f'{esc(_short(label))}</text>'
+                         + ("" if ci is None else
+                            f'<text class="dsv-t-mute" x="{xs[bi] + bw / 2}" y="{y + 37}" text-anchor="middle" '
+                            f'font-size="10">{esc(_TXT["entry"][i].format(k=ci))}</text>'))
+            if repeat and bi > 0:
+                row_steps.append(f'<li{_sa(k)}>{_html_fmt(_TXT["s_next"][i], a=_user(chain[ci - 1]), b=label)} '
+                                 f'{obs}</li>')
+        s.append(f'<g{_sa(k)}>{"".join(group)}</g>')
+        if repeat:
+            steps.append(f'<li{_sa(row_step)}>{_html_fmt(_TXT["s_head"][i], list=name, addr=_user(chain[0]))} {obs}</li>')
+            steps += row_steps
+            back_i = next((bi for bi, (_, b) in enumerate(boxes) if b == target), 0)
+            k += 1
+            x1, x2, yb = xs[-1] + bw / 2, xs[back_i] + bw / 2, y + bh
+            s.append(f'<g{_sa(k)}><path class="dsv-arrow-bad" d="M{x1},{yb} C{x1},{yb + 50} {x2},{yb + 50} '
+                     f'{x2},{yb + 6}" marker-end="url(#{mk})"/>'
+                     f'<text class="dsv-t-bad" x="{(x1 + x2) / 2}" y="{yb + 48}" text-anchor="middle" font-size="11">'
+                     f'{esc(_TXT["back"][i].format(addr=_short(uaddr)))}</text></g>')
+            steps.append(f'<li{_sa(k)}>{_html_fmt(_TXT["s_back"][i], a=_user(chain[-1]), b=uaddr)} {obs}</li>')
+        elif bin_row:
+            steps.append(f'<li{_sa(row_step)}>{_html_fmt(_TXT["s_bin"][i], list=name, addr=uaddr, ev=x.get("evidence") or "")} '
+                         f'{obs}</li>')
+        else:
+            steps.append(f'<li{_sa(row_step)}>{_html_fmt(_TXT["s_on"][i], list=name, addr=uaddr, k=x.get("position"))} '
+                         f'{obs}</li>')
+    s.append("</svg>")
+    return "".join(s), steps
+
+
+def double_free_finding_viz(lx: Any, finding: Dict[str, Any], report: Optional[Dict[str, Any]], uid: str = "0") -> str:
+    from ..report_visuals import _sa, _stepper_controls, chip, code, esc, facts_list
+    i = lx.i
+    out: List[str] = []
+    for n, f in enumerate(_df_findings(report)[:2]):
+        u = "%s-%d" % (uid, n)
+        svg, steps = _chain_picture(lx, f, u)
+        rq = f.get("request_sizes")
+        if isinstance(rq, list) and len(rq) == 2:
+            steps.append(f'<li{_sa(len(steps) + 1)}>'
+                         f'{_html_fmt(_TXT["s_conseq"][i], lo=rq[0], hi=rq[1], addr=f.get("user_address"))} '
+                         f'{chip(lx, "rec")}</li>')
+        out.append(f'<h4>{esc(_TXT["title"][i])}</h4>'
+                   f'<div class="dsv-stepper" data-steps="{len(steps)}">{_stepper_controls(lx, u, len(steps))}'
+                   f'<div class="dsv-seq"><div class="dsv-svgbox">{svg}</div>'
+                   f'<ol class="dsv-steps">{"".join(steps)}</ol></div></div>')
+        marks: List[str] = []
+
+        def wrap(x: Any) -> str:
+            marks.append(str(x))
+            return f"\x00{len(marks) - 1}\x00"
+
+        facts = []
+        for line in _df_facts(i, f, wrap):
+            h = esc(line)
+            for m_i, m in enumerate(marks):
+                h = h.replace(f"\x00{m_i}\x00", code(m))
+            facts.append(h)
+        out.append(facts_list(facts))
+        own = _owners(f)
+        out.append(f'<p class="dsv-note">{chip(lx, "no")} {esc(_TXT["who_viz"][i])}: '
+                   + (_html_fmt(_TXT["who"][i], v=own[0]) if own else esc(_TXT["who_plain"][i])) + "</p>")
+    return "".join(out)
+
+
+def _register_presentation() -> None:
+    from ..report_registry import register_finding_text, register_finding_viz, register_recipe_label
+    register_recipe_label(RECIPE_DOUBLE_FREE, "MEMORY_INTEGRITY", "Double free", "이중 해제",
+                          "a block listed twice on the allocator's free lists (twice in one tcache bin or fastbin, "
+                          "or on two lists)",
+                          "할당자의 해제 목록에 두 번 올라 있는 블록 (한 tcache 칸·fastbin 안에 두 번, 또는 두 목록에)")
+    register_finding_text(CATEGORY_INVALID_DOUBLE_FREE, double_free_finding_text)
+    register_finding_viz(CATEGORY_INVALID_DOUBLE_FREE, double_free_finding_viz)
+
+
+_register_presentation()
