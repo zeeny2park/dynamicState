@@ -67,7 +67,7 @@ def spark_svg(series: List[Any], gone: bool = False) -> str:
         return (f'<svg class="{cls}" viewBox="0 0 {W_} {H}" aria-hidden="true"><polygon class="ar" points="{x0:.1f},{H} {" ".join(pts)} {W_},{H}"/>'
                 f'<polyline class="ln" points="{" ".join(pts)}"/><circle class="pt" r="2" cx="{lx}" cy="{ly}"/></svg>')
     tk = "".join(f'<line class="tk" x1="{x0 + i * step:.1f}" x2="{x0 + i * step:.1f}" y1="4" y2="{H - 4}"/>' for i in range(1, n) if a[i] != a[i - 1])
-    return (f'<svg class="{cls}" viewBox="0 0 {W_} {H}" aria-hidden="true"><line class="base" x1="{x0:.1f}" x2="{W_}" y1="{H / 2:g}" y2="{H / 2:g}"/>'
+    return (f'<svg class="{cls}" viewBox="0 0 {W_} {H}" aria-hidden="true"><line class="base" x1="0" x2="{W_}" y1="{H / 2:g}" y2="{H / 2:g}"/>'
             f'{tk}<circle class="pt" r="2" cx="{W_}" cy="{H / 2:g}"/></svg>')
 
 

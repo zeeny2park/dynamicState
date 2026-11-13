@@ -157,7 +157,7 @@
     }
     var tk = "";
     for (var i = 1; i < n; i++) if (a[i] !== a[i - 1]) tk += '<line class="tk" x1="' + (x0 + i * step).toFixed(1) + '" x2="' + (x0 + i * step).toFixed(1) + '" y1="4" y2="' + (H - 4) + '"/>';
-    return '<svg class="' + cls + '" viewBox="0 0 ' + W + " " + H + '" aria-hidden="true"><line class="base" x1="' + x0.toFixed(1) + '" x2="' + W + '" y1="' + H / 2 +
+    return '<svg class="' + cls + '" viewBox="0 0 ' + W + " " + H + '" aria-hidden="true"><line class="base" x1="0" x2="' + W + '" y1="' + H / 2 +
       '" y2="' + H / 2 + '"/>' + tk + '<circle class="pt" r="2" cx="' + W + '" cy="' + H / 2 + '"/></svg>';
   }
   function obsActive(ui) { var X = xs(ui); return !!(X.cfg && ((X.cfg.items || []).length || X.cfg.pool)); }

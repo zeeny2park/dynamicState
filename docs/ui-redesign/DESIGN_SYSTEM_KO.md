@@ -71,6 +71,13 @@ shadcn/ui의 `name` / `name-foreground` 규약, OKLCH, 중립 팔레트(크로�
 | Collapsible | `details.collapsible`, `-plain` (라벨 "펼치기/접기"·"Show/Hide" 는 `:lang()` 으로 테마 안에서 정해짐) | 근거, 실행 안 함, 부분별 상세 기록 |
 | 발견 그림 | `.dsv-*` (`theme.css` 의 "Finding pictures" 절: 시퀀스 그림, 메모리 칸, 스레드 표, 단계 넘기기) | 발견 카드 (화면과 보고서 공통) |
 | 상태 아이콘 | `.status-icon.{PASS,FAIL,INCONCLUSIVE,SKIPPED,RUNNING,PENDING}` | 검사 행 |
+| 스파크라인 (탐색) | `svg.spark` (`.ln` 선, `.ar` 면, `.pt` 마지막 점, `.tk` 비수치 값의 변화 눈금, `.base` 기준선; `.flat` 변화 없음, `.gone` 대상 종료). 색: `--chart-1`, 변화 없음 `--muted-foreground`, 종료 `--destructive`, 기준선 `--border` | 관찰 카드의 추적 표, 보고서의 "추가 관찰" |
+| 풀 격자 (탐색) | `.pool` (`.pool-md` 14 px, `.pool-sm` 22 px, 기본 8 px), `.rl` 행 번호, `.cells` + 칸 `.pc.s0..s5`, `.sel` 고른 칸, `.cur` 키보드 위치, `data-only` 거르기, 범례 `.pool-legend`. 색: 0값 `--muted`, 상태값 `--chart-1..5`, 선택 `--foreground`, 키보드 `--ring`. 격자는 Tab 한 번(화살표·Enter) | 관찰 카드의 풀 보기, 보고서의 "추가 관찰" |
+| 범위 보기 (탐색) | `.hex` (`.r` 줄, `.o` 주소, `.bs` 바이트, `.as` ASCII, `.tag` 표시) + 바이트 표시 `.b-hdr` `.b-buf` `.b-over`. 색: `--surface` `--muted` `--info-soft` `--destructive-soft` `--destructive` | 프로필 › 메모리 › 범위 읽기 |
+
+탐색의 세 컴포넌트는 `theme.css` 의 "Exploration components" 절에 있다 (보고서도 같은 파일을 인라인하므로 "추가 관찰" 절이 같은 모양이 된다).
+줄 버튼 `.row-btn`(검사 행과 같은 모양, 펼침 표시는 `aria-expanded` 로 CSS가 그림), 상세 들여쓰기 `.dt-in`(가는 세로선, 카드 안의 카드 아님),
+스택 `.stack`, 지역 변수 `.locals`, 값 상자 `.valbox`, 관련 정보 칩 `.related` 는 화면 배치라 `ui.css` 에 있다.
 
 React/Tailwind 컴포넌트 자체는 쓰지 않는다. 이 프로젝트는 Python 서버가 정적 파일 하나를 내보내고 폐쇄망에서 열려야 하므로 빌드 체인을 들이지 않는다. 가져온 것은 토큰 규약, 컴포넌트 어휘와 변형 체계, "레이아웃만 className, 색은 토큰" 규칙이다.
 

@@ -1,7 +1,7 @@
 # 프로세스 탐색 기능을 새 UI로 옮기는 제안 (목업)
 
 - **작성일**: 2026-11-13 · 기준 `stage1/integ` `5209d75`
-- **상태**: 목업만. 서버·엔진·실제 UI(`extractor/web/ui/`) 변경 없음
+- **상태**: 2026-11-13 구현됨 (E1–E5). 실제 화면: `docs/ui-redesign/screens/impl/explore-*.png`, 라우트: `API_CONTRACT.md` 10장. 아래 본문은 목업 당시의 제안 그대로
 - **목업**: `docs/ui-redesign/mock/explore.html` (+ `explore.css`, `explore.js`, `explore-data.js`). `theme.css` 와 실제 UI의 `ui.css` 를
   그대로 읽는다. 단일 파일판은 `python3 docs/ui-redesign/mock/build_standalone.py` → `mock/dist/explore.standalone.html`
   (출력은 커밋하지 않음. 원본에서 언제든 같은 바이트로 다시 만들어진다)
