@@ -225,3 +225,64 @@ test("the process profile card keeps its place: reserved from the plan, filled b
     }
   }
 });
+
+/* ------------------------------------------------------------------ exploration (explore.js) */
+global.DSUI = UI;
+const XP = require(path.join(__dirname, "..", "..", "extractor", "web", "ui", "explore.js"));
+const EVIL = '<script>alert(1)</script><img src=x onerror=alert(2)>"\'';
+function watchState(extra) {
+  return Object.assign({ seq: 5, samples: 5, state: "running", interval_s: 1, intervals: [0.5, 1, 2, 5], transport: "local",
+    last_t: "2026-11-13T05:02:10Z", plan: { reads_per_s: 2, bytes_per_s: 16 }, cost: {},
+    items: [{ id: "e:g_evil", label: EVIL, type: EVIL, value: EVIL, spark: [EVIL, "x"], changes: 1, last_change: "2026-11-13T05:02:09Z" },
+      { id: "e:handled", label: "handled", type: "uint64_t[2]", changes: 4, spark: ["a", "b"],
+        fields: [{ name: "[0]", value: 1, spark: [1, 2, 3], changes: 2 }, { name: EVIL, value: EVIL, spark: [EVIL], changes: 0 }] }],
+    pool: null, compare: { from_seq: 1, to_seq: 5, changed: [{ name: EVIL, before: EVIL, now: 1, diff: null }], same: 0 } }, extra || {});
+}
+
+test("the watch card escapes every value read from the target and has no card inside", () => {
+  const d = load(NAMES[0]);
+  const s = UI.reduce(d.events, d.request);
+  for (const lang of ["ko", "en"]) {
+    const ui = UIS(lang, { started: true, open: {}, x: Object.assign(XP.xs({}), { cfg: { items: [{ expr: "g_evil" }], interval_s: 1, running: true },
+      watch: watchState(), openTrack: { "e:handled": true } }) });
+    const html = UI.render(s, ui);
+    const card = html.slice(html.indexOf('id="observe"'), html.indexOf('id="report"'));
+    assert.ok(card.length > 100, "the watch card is there, between next steps and the report");
+    assert.ok(html.indexOf('id="next"') < html.indexOf('id="observe"'));
+    assert.doesNotMatch(card, /<script|<img|<[^>]*\son[a-z]+=/);
+    assert.match(card, /&lt;script&gt;/);
+    assert.strictEqual(nestedCards(html), 0);
+    assert.match(card, /<svg class="spark/);
+  }
+});
+
+test("the watch card says why it stopped and the header says the target is gone", () => {
+  const d = load(NAMES[0]);
+  const s = UI.reduce(d.events, d.request);
+  const ui = UIS("ko", { started: true, open: {}, x: Object.assign(XP.xs({}), { cfg: { items: [{ expr: "g" }], interval_s: 1, running: false },
+    watch: watchState({ state: "stopped", reason: "target_exited", reason_detail: "process 1 exited" }) }) });
+  const html = UI.render(s, ui);
+  assert.match(html, /대상이 종료되었습니다/);
+  assert.match(html, /data-act="obs-pause" disabled/);
+  assert.match(XP.chipStatus(s, ui), /대상 종료/);
+});
+
+test("server fragments are placed in their slot only when the row is open; the stack shows the chosen frame", () => {
+  const ui = UIS("ko", { open: { "th:7": true }, x: XP.xs({}) });
+  ui.x.frag["th:7"] = { st: "ok", data: { frames: [{ i: 0, fn: "a" }, { i: 1, fn: "b" }], default_frame: 1 },
+    html: { ko: '<button type="button" data-act="frame" data-k="th:7" data-i="0" data-fn="a" aria-current="false"></button>' +
+      '<button type="button" data-act="frame" data-k="th:7" data-i="1" data-fn="b" aria-current="false"></button>' +
+      '<div class="fr-loc" data-fr="0" hidden>A</div><div class="fr-loc" data-fr="1" hidden>B</div>' } };
+  const out = UI.fillSlots('<button class="row-btn" data-act="tog" data-key="th:7" aria-expanded="false"></button><!--slot:th:7--><!--slot:th:8-->', {}, ui, 0);
+  assert.match(out, /data-key="th:7" aria-expanded="true"/);
+  assert.match(out, /data-i="1" data-sel="1" data-fn="b" aria-current="true"/);
+  assert.match(out, /<div class="fr-loc" data-fr="1">B/);
+  assert.match(out, /<div class="fr-loc" data-fr="0" hidden>/);
+  assert.doesNotMatch(out, /slot:th:8/);
+  ui.x.frame["th:7"] = 0;
+  assert.match(UI.fillSlots("<!--slot:th:7-->", {}, ui, 0), /data-i="0" data-sel="1" data-fn="a" aria-current="true"/);
+});
+
+test("the exploration string table is complete in both languages", () => {
+  assert.deepStrictEqual(Object.keys(XP.XSTR.ko).sort(), Object.keys(XP.XSTR.en).sort());
+});

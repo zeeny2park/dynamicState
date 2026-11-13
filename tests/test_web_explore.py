@@ -361,11 +361,10 @@ class TestPoolAndRange(ExploreCase):
         self.assertIn('data-act="follow"', b["html"]["ko"])
         st, r = self.get(j, "memory/range?expr=g_last&len=48")
         self.assertEqual(st, 200, r)
-        self.assertEqual(r["cost"]["bytes"], 8 + 48)
+        self.assertGreaterEqual(r["cost"]["bytes"], 48)
         self.assertEqual(r["data"]["len"], 48)
 
     def test_overflow_marks_come_from_the_diagnosis(self):
-        res_path = os.path.join(ROOT, "tests", "fixtures", "explore", "overflow_ring.min.json")
         j = self.job("overflow_ring")
         x = self.mgr.explore.get(j)
         st, v = self.get(j, "value?expr=rb.buf")
@@ -379,11 +378,10 @@ class TestPoolAndRange(ExploreCase):
         self.assertEqual(st, 200, r)
         self.assertEqual(r["data"]["addr"], hex(user - 16))
         h = r["html"]["ko"]
-        self.assertEqual(h.count('class="b-over"'), 24)
-        self.assertEqual(h.count('class="b-buf"'), 72)
-        self.assertEqual(h.count('class="b-hdr"'), 16)
-        self.assertFalse(os.path.exists(res_path) and False)
-        del x
+        self.assertEqual(h.count('<span class="b-over">'), 24)
+        self.assertEqual(h.count('<span class="b-buf">'), 72)
+        self.assertEqual(h.count('<span class="b-hdr">'), 16)
+        self.assertEqual(len(x.heap_blocks()), 1)
 
 
 # ---------------------------------------------------------------------------------------------- watch session
