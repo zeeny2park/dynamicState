@@ -357,12 +357,23 @@ class FreeListRepeatDetector:
                     cd["lists"][k] = results[k]
                 cd["bin"] = claim
         findings: List[Dict[str, Any]] = []
-        for c in sorted(cands)[:self.cfg.max_reports * 4]:
+        order = sorted(cands)
+        for c in order[self.cfg.max_reports * 4:]:
+            for k in cands[c]["lists"]:            # not re-read: these lists cannot count as walked clean
+                results[k] = dict(results[k], outcome="incomplete", why="candidate repeat not re-read (limit %d)"
+                                  % (self.cfg.max_reports * 4))
+        for c in order[:self.cfg.max_reports * 4]:
             cd = cands[c]
             ok, n, why = self._confirm(cd)
             if not ok:
                 self.not_evidence.append({"chunk_address": _hx(c), "lists": [self.list_name(k) for k in cd["lists"]],
                                           "observed": self._what(cd), "why": why})
+                # the copy was not the state at rest: a list counts as walked only if a live walk ends cleanly
+                for k in cd["lists"]:
+                    r = self._settle(k, dict(results[k], outcome="incomplete"))
+                    results[k] = r if r["outcome"] == "complete" else dict(r, outcome="incomplete", why=(
+                        r.get("why") if r["outcome"] == "incomplete" else
+                        "a repeat that did not hold on re-read: %s" % why))
                 continue
             findings.append(self._finding(cd, n))
             if len(findings) >= self.cfg.max_reports:
@@ -371,6 +382,7 @@ class FreeListRepeatDetector:
             if r["outcome"] == "incomplete":
                 self.unresolved.append({"list": self.list_name(k), "why": r.get("why")})
         self.checked["wall_s"] = round(time.monotonic() - t0, 3)
+        self.checked["lists_rewalked_live"] = self._rewalked
         status = "COMPLETED" if not self.unresolved else "INCOMPLETE"
         return {"status": status, "findings": findings, "not_evidence": self.not_evidence[:16],
                 "lists_not_walked_completely": self.unresolved[:16], "limitations": list(self.limitations),
