@@ -3031,63 +3031,28 @@ def runtime_export_incident_report(
     ssh_proxy_jump: Optional[str] = None,
     language: str = "en",
 ) -> str:
-    """1-Call Comprehensive Incident Report & Remediation Exporter (zero-stop read; the target is not suspended).
-    Exports either an active expert investigation (`investigation_id`) as Markdown/JSON, or
-    combines Target Identity, Auto-Triage Scorecard, Thread Callstacks & Locks, and Hypothesis
-    Verification into a structured Markdown + JSON report (`report_markdown`, `remediation_checklist`).
+    """1-Call Incident Report & Remediation Exporter (zero-stop read; the target is not suspended).
+    One report path: the diagnosis is a stored investigation (`investigation_id`) or a fresh diagnosis of `pid`,
+    and either way the result is a DiagnosticReport rendered as the visual incident report (per-finding pictures,
+    check list, reproducibility section) in Markdown (`report_markdown`), HTML (`report_html`) and JSON.
+    `format` ("markdown", "html" or "json") picks what `report` and the file at `output_path` contain.
     `language` ("en" or "ko") sets the language of the plain-language summary and labels.
     """
     try:
-        if investigation_id:
-            sess = runtime.expert_diagnostic_engine.get_session(investigation_id)
-            if sess:
-                master_report_obj = sess.build_diagnostic_report()
-                master_dict = master_report_obj.to_dict()
-                report = sess.export_report(format=format)
-                safe_out_path = None
-                if output_path:
-                    from extractor.watch_session import sanitize_report_output_path
-                    safe_out_path, out_err = sanitize_report_output_path(output_path)
-                    if out_err or not safe_out_path:
-                        raise ValueError(out_err or f"Invalid report output_path: {output_path}")
-                    parent_dir = os.path.dirname(safe_out_path)
-                    if parent_dir:
-                        os.makedirs(parent_dir, mode=0o700, exist_ok=True)
-                    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
-                    if hasattr(os, "O_NOFOLLOW"):
-                        flags |= os.O_NOFOLLOW
-                    fd = os.open(safe_out_path, flags, 0o600)
-                    with os.fdopen(fd, "w", encoding="utf-8") as f:
-                        if isinstance(report, dict):
-                            json.dump(report, f, indent=2)
-                        else:
-                            f.write(str(report))
-                sec_a = master_dict.get("section_a_executive_summary", {})
-                sec_d = master_dict.get("section_d_detailed_inspection_results", {})
-                return _format_watch_result({
-                    "success": True,
-                    "investigation_id": investigation_id,
-                    "format": format,
-                    "output_path": safe_out_path or output_path,
-                    "overall_verdict": sec_a.get("overall_result", "INCONCLUSIVE"),
-                    "confirmed_problems": sec_a.get("confirmed_problems", []),
-                    "probable_problems": sec_a.get("probable_problems", []),
-                    "checks_summary": {
-                        "checks_total": sec_d.get("checks_total", 0),
-                        "checks_passed": sec_d.get("checks_passed", 0),
-                        "checks_failed": sec_d.get("checks_failed", 0),
-                        "checks_inconclusive": sec_d.get("checks_inconclusive", 0),
-                        "checks_not_executed": sec_d.get("checks_not_executed", 0),
-                        "checks_skipped": sec_d.get("checks_skipped", 0),
-                    },
-                    "report": report,
-                })
-
+        fmt = (format or "markdown").lower()
+        fmt = {"md": "markdown", "json_str": "json"}.get(fmt, fmt)
+        if fmt not in ("markdown", "html", "json"):
+            raise ValueError(f"format must be 'markdown', 'html' or 'json', got {format!r}")
+        # One generation path: an investigation_id only chooses where the diagnosis comes from (a stored session
+        # instead of a fresh diagnose of `pid`); both go through the same DiagnosticReport -> incident report code.
+        sess = runtime.expert_diagnostic_engine.get_session(investigation_id) if investigation_id else None
         res = runtime.watch_session_manager.export_incident_report(
             title=title,
             hypothesis=hypothesis,
             assertions=assertions,
-            output_path=output_path,
+            output_path=output_path if fmt == "markdown" else None,
+            report_html_path=output_path if fmt == "html" else None,
+            report_json_path=output_path if fmt == "json" else None,
             pid=pid,
             companion_elf_path=companion_elf,
             process_name=process_name,
@@ -3097,8 +3062,31 @@ def runtime_export_incident_report(
             ssh_key=ssh_key,
             ssh_proxy_jump=ssh_proxy_jump,
             language=language,
+            session=sess,
+            markdown_detail=True,
         )
-        return _format_watch_result({"success": True, **res})
+        saved = res.get("saved_path") or res.get("saved_html_path") or res.get("saved_json_path")
+        err = res.get("save_error") or res.get("save_html_error") or res.get("save_json_error")
+        if sess is not None and output_path and err:
+            raise ValueError(err)
+        report_dict = (json.loads(res["report_json"]).get("report") or {}) if res.get("report_json") else {}
+        sec_a = report_dict.get("section_a_executive_summary") or {}
+        sec_d = report_dict.get("section_d_detailed_inspection_results") or {}
+        extra = {
+            "format": fmt,
+            "output_path": saved or output_path,
+            "overall_verdict": res.get("verdict"),
+            "confirmed_problems": sec_a.get("confirmed_problems", []),
+            "probable_problems": sec_a.get("probable_problems", []),
+            "checks_summary": {k: sec_d.get(k, 0) for k in (
+                "checks_total", "checks_passed", "checks_failed", "checks_inconclusive", "checks_not_executed",
+                "checks_skipped")},
+            "report": {"markdown": res.get("report_markdown"), "html": res.get("report_html"),
+                       "json": report_dict}[fmt],
+        }
+        if investigation_id:
+            extra["investigation_found"] = sess is not None
+        return _format_watch_result({"success": True, **res, **extra})
     except Exception as e:
         return _format_watch_result({"success": False, "error": str(e), "error_code": type(e).__name__})
 

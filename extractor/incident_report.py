@@ -76,6 +76,7 @@ _MD: Dict[str, Any] = {
     "pass": ("PASS", "통과"), "fail": ("FAIL", "실패"),
     "h4": ("## 4. Checks Run", "## 4. 실행한 검사"),
     "h5": ("## 5. Remediation Checklist", "## 5. 조치 체크리스트"),
+    "h_detail": ("## Appendix: Detailed report (sections A-I)", "## 부록: 상세 보고서 (A-I 항목, 영문 원문)"),
     "rem_incon": ("Investigation inconclusive: the collection failed or parts of the target could not be examined "
                   "({lims}). Verify target process accessibility and read permissions, then re-run.",
                   "조사가 판단 불가로 끝났습니다: 수집에 실패했거나 대상의 일부를 확인하지 못했습니다 ({lims}). "
@@ -134,6 +135,72 @@ def _inconclusive_result(pid: Any, debug_image: Optional[str], kind: str, item: 
         "not_covered": [{"kind": kind, "item": item, "reason": reason}],
         "target": {"pid": pid, "debug_image": debug_image}, "report": None, "report_path": None,
         "investigation_id": None, "state": "NOT_RUN",
+    }
+
+
+def result_from_session(session: Any) -> Dict[str, Any]:
+    """A ``DiagnoseResult``-shaped dict (``res``) for an investigation that already ran (``investigation_id`` entry).
+
+    The adapter that lets a stored session go through the same report generator as a fresh ``diagnose()``: the
+    ``DiagnosticReport`` is the session's own, findings / checks / not-covered rows are derived from it the way
+    ``diagnose()`` derives them, and the verdict is the report's (no healthy-scope or INFO re-evaluation is applied,
+    exactly as the former session-export path did not apply one).
+    """
+    from .diagnostic_methodology import CheckStatus
+    from .expert_diagnostic_engine import _diagnose_check_row, _finding_subjects
+    report = session.build_diagnostic_report().to_dict()
+    sec_a, sec_b, sec_e = (report.get(k) or {} for k in (
+        "section_a_executive_summary", "section_b_target_context", "section_e_findings_and_root_cause"))
+    findings: List[Dict[str, Any]] = []
+    for rec in list(sec_e.get("confirmed_root_causes") or []) + list(sec_e.get("probable_causes") or []):
+        rules = list(rec.get("applicable_diagnostic_rules") or [])
+        details = _finding_subjects(session, rules)
+        findings.append({
+            "category": rec.get("affected_entity"), "severity": rec.get("severity"),
+            "status": rec.get("classification"), "description": rec.get("problem_description"),
+            "subjects": [d["name"] for d in details], "subject_details": details, "recipe_ids": rules,
+            "evidence_ids": list(rec.get("supporting_evidence_ids") or []),
+            "observed": [c.technical_interpretation for c in session.checks
+                         if c.recipe_id in rules and c.status == CheckStatus.FAIL and c.technical_interpretation],
+        })
+    executed = [c for c in session.checks if c.status not in (CheckStatus.NOT_EXECUTED, CheckStatus.SKIPPED)]
+    not_covered = []
+    for c in session.checks:
+        if c.status in (CheckStatus.PASS, CheckStatus.FAIL):
+            continue
+        why = "; ".join(list(c.limitations or []) + list(c.missing_evidence or [])) or (c.error_details or "") \
+            or (c.technical_interpretation or "")
+        not_covered.append({"kind": f"check_{str(c.status).lower()}", "item": c.recipe_id, "reason": why or str(c.status)})
+    concl = getattr(session, "conclusion", None)
+    for lim in (list(getattr(concl, "diagnostic_limitations", []) or [])
+                + list(getattr(concl, "missing_evidence_and_unknowns", []) or [])
+                + list(sec_b.get("environmental_limitations") or []) + list(sec_b.get("collection_failures") or [])):
+        not_covered.append({"kind": "limitation", "item": "engine", "reason": str(lim)})
+    metrics = getattr(getattr(session, "budget_tracker", None), "metrics", None)
+    stop_ms = float(sec_b.get("target_stop_duration_ms") or 0.0)
+    target: Dict[str, Any] = {"pid": session.pid, "process_name": sec_b.get("target_process_name"),
+                              "debug_image": session.companion_elf, "abi": None}
+    try:
+        from .target_abi import detect_target_abi
+        target["abi"] = detect_target_abi(session.adapter, session.pid, probe_version=False).to_dict()
+    except Exception:  # noqa: BLE001 - the process may be gone; the ABI is then recorded as unknown
+        pass
+    return {
+        "verdict": str(sec_a.get("overall_result") or VERDICT_INCONCLUSIVE),
+        "confidence": float(getattr(concl, "confidence", 0.0) or 0.0),
+        "confidence_basis": str(getattr(concl, "confidence_basis", "") or ""),
+        "summary": str(sec_a.get("verdict_rationale") or ""),
+        "findings": findings, "checks_run": [_diagnose_check_row(c) for c in executed], "not_covered": not_covered,
+        "collection_impact": {
+            "capture_mode": sec_b.get("collection_mode"), "measured_stop_ms": stop_ms, "zero_stop": stop_ms == 0.0,
+            "bytes_read": int(getattr(metrics, "bytes_read", 0) or 0),
+            "wall_clock_ms": float(getattr(metrics, "wall_clock_elapsed_ms", 0.0) or 0.0),
+            "samples_collected": int(getattr(metrics, "samples_collected", 0) or 0) if metrics is not None else None,
+            "budget_exhausted": bool(getattr(metrics, "is_budget_exhausted", False)),
+        },
+        "report": json.loads(json.dumps(report, default=str)), "report_path": None,
+        "investigation_id": session.investigation_id, "target": target, "state": session.state,
+        "stop_reason": getattr(concl, "stop_reason", None), "healthy_scope": {},
     }
 
 
@@ -213,13 +280,22 @@ def export_incident_report(
     hypothesis_verifier: Optional[Callable[..., Dict[str, Any]]] = None,
     pre_limitations: Optional[List[str]] = None,
     language: str = "en",
+    session: Any = None,
+    report_json_path: Optional[str] = None,
+    markdown_detail: bool = False,
 ) -> Dict[str, Any]:
-    """Diagnose ``pid`` once with ``diagnose()`` and render the incident report (Markdown, HTML, JSON)."""
+    """Render the incident report (Markdown, HTML, JSON) of one diagnosis.
+
+    The diagnosis is either a fresh ``diagnose()`` of ``pid`` or, with ``session`` (an investigation that already ran,
+    the ``investigation_id`` entry), that session adapted by :func:`result_from_session`.  Both end as a
+    ``DiagnosticReport`` and are rendered by the one code path below."""
     t0 = time.monotonic_ns()
     if language not in ("en", "ko"):
         raise ValueError(f"language must be 'en' or 'ko', got {language!r}")
     if title == DEFAULT_TITLE and language == "ko":
         title = DEFAULT_TITLE_KO
+    if session is not None and not pid:
+        pid = session.pid
     if pid is not None and (isinstance(pid, bool) or int(pid) <= 0):
         return {
             "success": False, "pid": pid, "overall_status": VERDICT_INCONCLUSIVE, "verdict": VERDICT_INCONCLUSIVE,
@@ -230,7 +306,17 @@ def export_incident_report(
     li = 1 if language == "ko" else 0
 
     # 1. the diagnosis (the only verdict)
-    if not pid:
+    if session is not None:
+        try:
+            from .human_report import render_human_report
+            res = result_from_session(session)
+            summary_md = render_human_report(res, res.get("report"), lang=language)
+        except Exception as exc:  # noqa: BLE001
+            res = _inconclusive_result(pid, companion_elf_path, "unexpected_error", "session report",
+                                       f"{type(exc).__name__}: {exc}")
+            summary_md = ""
+        companion_elf_path = companion_elf_path or session.companion_elf
+    elif not pid:
         res = _inconclusive_result(pid, companion_elf_path, "no_target", "pid",
                                    "no target process was given or bound, so nothing was examined")
         summary_md = ""
@@ -259,7 +345,22 @@ def export_incident_report(
 
     verdict = str(res.get("verdict") or VERDICT_INCONCLUSIVE)
     report = res.get("report") if isinstance(res.get("report"), dict) else None
+    from .diagnostic_report import DiagnosticReport
+    from .reproducibility import build_reproducibility, render_html as repro_html, render_markdown as repro_md
+    report_obj: Optional[DiagnosticReport] = None
+    if report is not None:
+        try:
+            report_obj = DiagnosticReport.from_dict(report)  # the standard model: every entry ends here
+        except Exception:  # noqa: BLE001 - rendered from the dicts by the fallback below
+            report_obj = None
+    repro = build_reproducibility(report or {}, res)
+    if report_obj is not None:
+        report_obj.section_j_reproducibility = repro
+    res["reproducibility"] = repro.to_dict()
+    if report is not None:
+        report["section_j_reproducibility"] = res["reproducibility"]
     sec_a = (report or {}).get("section_a_executive_summary") or {}
+    sec_b_build_id = ((report or {}).get("section_b_target_context") or {}).get("build_id")
     sec_i = (report or {}).get("section_i_final_conclusions") or {}
     remediation_checklist: List[str] = []
     for item in list(sec_i.get("safe_remediation_suggestions") or []) + list(sec_a.get("recommended_next_actions") or []):
@@ -308,7 +409,7 @@ def export_incident_report(
         _MD["h1"][li],
         _MD["pid"][li].format(pid=eff_pid, name=target.get('process_name') or process_name or 'target'),
         _MD["elf"][li].format(x=eff_elf),
-        _MD["build"][li].format(x=build_id or 'N/A'),
+        _MD["build"][li].format(x=build_id or sec_b_build_id or 'N/A'),
         _MD["inv"][li].format(x=res.get('investigation_id') or 'N/A'),
         _MD["mode"][li].format(x=collection_mode),
         _MD["stop"][li].format(ms=f"{stop_ms:.2f}"),
@@ -355,23 +456,29 @@ def export_incident_report(
         md.append(f"- `{c.get('recipe_id')}`: {c.get('status')}")
     md += ["", _MD["h5"][li]]
     md += [f"{i}. [ ] {ko_text(step, li)}" for i, step in enumerate(remediation_checklist, start=1)]
+    md += [""] + repro_md(repro, language, heading="## 6.")
+    if markdown_detail and report_obj is not None:
+        # the same A-I sections the HTML report carries in its collapsed block; the reproducibility section is above
+        from dataclasses import replace
+        md += ["", _MD["h_detail"][li], ""] + _demote_headings(
+            replace(report_obj, section_j_reproducibility=None).to_markdown(language))
     report_markdown = "\n".join(md) + "\n"
 
     report_html: Optional[str] = None
     if template_path and os.path.exists(template_path):
         with open(template_path, "r", encoding="utf-8") as tf:
             report_html = tf.read().replace("{{VERDICT}}", verdict)
-    elif report is not None:
+    elif report_obj is not None:
         try:
-            from .diagnostic_report import DiagnosticReport
             from .report_visuals import build_visual_summary, wrap_detail
-            base_html = wrap_detail(DiagnosticReport.from_dict(report).to_html(), _LABELS[language]["detail"])
+            from dataclasses import replace
+            base_html = wrap_detail(replace(report_obj, section_j_reproducibility=None).to_html(language), _LABELS[language]["detail"])
             try:
                 visual = build_visual_summary(res, report, language, title=title, summary_md=summary_md)
             except Exception:  # noqa: BLE001 - the pictures are an addition; the report must still be written
                 visual = f"<h1>{html.escape(title)}</h1>"
             report_html = base_html.replace(
-                "<body>", f"<body>\n{visual}\n{_summary_section(language, verdict, summary_md)}", 1)
+                "<body>", f"<body>\n{visual}\n{_summary_section(language, verdict, summary_md)}\n{repro_html(repro, language)}", 1)
             report_html = report_html.replace("<html>", f'<html lang="{language}">', 1)
             report_html = report_html.replace(
                 "<head>", '<head>\n<meta name="viewport" content="width=device-width, initial-scale=1">', 1)
@@ -383,6 +490,9 @@ def export_incident_report(
 
     saved_path, save_error = _write(output_path, report_markdown, "incident report")
     saved_html_path, save_html_error = _write(report_html_path, report_html, "HTML report", forbid_same_as=saved_path)
+    saved_json_path, save_json_error = _write(
+        report_json_path, json.dumps(report if report is not None else res, indent=2, default=str), "JSON report",
+        forbid_same_as=saved_path)
     latency_us = round((time.monotonic_ns() - t0) / 1000.0, 2)
     if verdict == VERDICT_INCONCLUSIVE:
         hint = (f"Incident report for PID {eff_pid} is INCONCLUSIVE ({len(limitations)} limitation(s): "
@@ -397,7 +507,7 @@ def export_incident_report(
         "success": True,
         "pid": eff_pid,
         "companion_elf": eff_elf,
-        "build_id": build_id,
+        "build_id": build_id or sec_b_build_id,
         "investigation_id": res.get("investigation_id"),
         "collection_mode": collection_mode,
         "stop_duration_ms": stop_ms,
@@ -422,11 +532,14 @@ def export_incident_report(
         "report_markdown": report_markdown,
         "report_html": report_html,
         "report_json": report_json,
+        "reproducibility": repro.to_dict(),
         "report_path": res.get("report_path"),
         "saved_path": saved_path,
         "save_error": save_error,
         "saved_html_path": saved_html_path,
         "save_html_error": save_html_error,
+        "saved_json_path": saved_json_path,
+        "save_json_error": save_json_error,
         "llm_next_step_hint": hint,
     }
 
