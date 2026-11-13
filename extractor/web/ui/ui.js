@@ -83,7 +83,8 @@
       ago_now: "방금", ago_min: "{n}분 전", ago_hour: "{n}시간 전", ago_day: "어제", ago_days: "{n}일 전",
       live_phase: "{phase} 단계", live_finding: "발견 {n}: {label} 의심", live_verdict: "판정: {word}",
       refuted: "반박된 경쟁 가설:", err_TOO_MANY_JOBS: "동시에 실행할 수 있는 진단 수(4)를 넘었습니다. 하나가 끝난 뒤 다시 시도하세요.",
-      err_TARGET_UNREADABLE: "대상 프로세스를 읽을 수 없습니다: {message}"
+      err_TARGET_UNREADABLE: "대상 프로세스를 읽을 수 없습니다: {message}",
+      back_finding: "← 발견 {n}로 돌아가기", back_checks: "← 검사로 돌아가기"
     },
     en: {
       title: "dynamicState · Diagnose", brand_sub: "diagnose", skip: "Skip to content",
@@ -158,7 +159,8 @@
       ago_now: "just now", ago_min: "{n} min ago", ago_hour: "{n} h ago", ago_day: "yesterday", ago_days: "{n} days ago",
       live_phase: "{phase}", live_finding: "Finding {n}: {label} suspected", live_verdict: "Verdict: {word}",
       refuted: "Competing hypotheses refuted:", err_TOO_MANY_JOBS: "Too many diagnoses at once (limit 4). Try again when one ends.",
-      err_TARGET_UNREADABLE: "Cannot read the target process: {message}"
+      err_TARGET_UNREADABLE: "Cannot read the target process: {message}",
+      back_finding: "← Back to finding {n}", back_checks: "← Back to the checks"
     }
   };
   var ICON = { FAIL: "✖", INCONCLUSIVE: "?", PASS: "✔", SKIPPED: "–", RUNNING: "", PENDING: "" };
@@ -574,11 +576,35 @@
       kv(tr(lang, "k_transport"), tp) + "</dl></div></section>";
   }
 
+  /* a detail the server drew (profile rows, read fragments): its sub-rows open in place where it marks <!--slot:KEY--> */
+  var SLOT_RE = /<!--slot:([A-Za-z0-9_.:\-]+)-->/g, EXP_RE = /data-key="([A-Za-z0-9_.:\-]+)" aria-expanded="false"/g;
+  function fillSlots(html, s, ui, depth) {
+    var open = ui.open || {};
+    return String(html || "").replace(EXP_RE, function (m, k) { return open[k] ? 'data-key="' + k + '" aria-expanded="true"' : m; })
+      .replace(SLOT_RE, function (m, k) {
+        return open[k] && (depth || 0) < 6 ? '<div class="dt-in" data-k="dt-' + k + '">' + slotBody(k, s, ui, (depth || 0) + 1) + "</div>" : "";
+      });
+  }
+  function slotBody(k, s, ui, depth) {
+    var x = (root.DSX && root.DSX.slot) ? root.DSX.slot(k, s, ui, depth) : "";
+    return x || "";
+  }
   /* the process profile: the place is reserved from the plan stage; the content is the server's (view.profile) */
   function renderProfile(s, ui) {
     if (!s.plan && !s.verdict) return "";
     var lang = ui.lang, V = viewOf(s, lang), P = V && V.profile, body, desc = "";
-    if (P && P.available) {
+    if (P && P.available && P.rows) {
+      desc = (P.window ? '<span class="card-description">' + esc(P.window) + "</span>" : "") +
+        (P.hint ? '<span class="right">' + esc(P.hint) + "</span>" : "");
+      body = ((P.figures || []).length ? '<div class="pf-sum">' + P.figures.map(function (f) { return "<div><b>" + esc(f.v) + "</b>" + esc(f.k) + "</div>"; }).join("") + "</div>" : "") +
+        '<ul class="rows">' + P.rows.map(function (r) {
+          var k = "pf:" + r.key, open = !!(ui.open && ui.open[k]);
+          return '<li><button type="button" class="row-btn" data-act="tog" data-key="' + esc(k) + '" aria-expanded="' + open + '"><span class="k">' +
+            esc(r.label) + '</span><span class="v">' + esc(r.line) + '</span><span class="src">' + esc(r.src) +
+            '</span><span class="chev" aria-hidden="true"></span></button>' +
+            (open ? '<div class="dt-in" id="dt-pf-' + esc(r.key) + '">' + fillSlots(r.detail_html, s, ui, 0) + backLink(k, ui) + "</div>" : "") + "</li>";
+        }).join("") + '</ul><p class="impact unseen">' + esc(P.unseen) + "</p>";
+    } else if (P && P.available) {
       body = '<div class="pbody dsv" lang="' + lang + '">' + P.html + "</div>";
     } else if (P || s.verdict) {
       /* the verdict is in but carries no profile (an older server, or nothing was observed): never keep saying "pending" */
@@ -589,6 +615,13 @@
     }
     return '<section class="card" id="profile" aria-labelledby="h-profile"><div class="card-header"><h2 class="card-title" id="h-profile">' +
       esc((P && P.title) || tr(lang, "profile_h")) + "</h2>" + desc + '</div><div class="card-content">' + body + "</div></section>";
+  }
+  /* "← back to finding 1" on the detail a chip opened */
+  function backLink(k, ui) {
+    if (!ui.from || ui.fromKey !== k) return "";
+    var m = /^finding-(\d+)$/.exec(ui.from);
+    return '<div class="dt-actions"><button type="button" class="btn btn-ghost btn-sm" data-act="back">' +
+      esc(m ? tr(ui.lang, "back_finding", { n: m[1] }) : tr(ui.lang, "back_checks")) + "</button></div>";
   }
 
   function checkName(s, rid, lang) {
@@ -862,7 +895,7 @@
     get: function (k) { try { return localStorage.getItem(k); } catch (e) { return null; } },
     set: function (k, v) { try { localStorage.setItem(k, v); } catch (e) { /* storage blocked */ } }
   };
-  var ui = { lang: (Q.get("lang") || LS.get("ds-lang") || "ko") === "en" ? "en" : "ko", expanded: {}, form: { mode: "local" },
+  var ui = { lang: (Q.get("lang") || LS.get("ds-lang") || "ko") === "en" ? "en" : "ko", expanded: {}, open: {}, form: { mode: "local" },
     elapsed: 0, conn: "ok", jobs: null, jobsState: "", examples: [], now: Date.now() };
   var events = [], request = null, job = null, replayTimers = [], es = null, pollTimer = null, watchdog = null,
     retries = 0, t0 = 0, tick = null, frozenElapsed = null, lastSpoken = "", gen = 0;
@@ -1038,8 +1071,10 @@
     closeStream();
     replayTimers.forEach(clearTimeout); replayTimers = [];
     events = []; request = null; job = null; t0 = 0; frozenElapsed = null; retries = 0;
-    ui.expanded = {}; ui.conn = "ok"; ui.started = false; ui.replay = null; ui.replayClock = null; ui.copied = false;
+    ui.expanded = {}; ui.open = {}; ui.from = null; ui.fromKey = null;
+    ui.conn = "ok"; ui.started = false; ui.replay = null; ui.replayClock = null; ui.copied = false;
     stopTick();
+    if (root.DSX && root.DSX.reset) root.DSX.reset();
   }
   function openJob(id, req) {
     reset();
@@ -1198,6 +1233,13 @@
         drawNow();
         break;
       }
+      case "tog": {
+        var key = el.getAttribute("data-key");
+        if (ui.open[key]) delete ui.open[key]; else ui.open[key] = true;
+        if (ui.open[key] && root.DSX && root.DSX.opened) root.DSX.opened(key, el);
+        drawNow();
+        break;
+      }
       case "mode": readForm(); ui.form.mode = el.getAttribute("data-mode"); ui.formError = ""; drawNow(); break;
       case "new": case "home":
         ev.preventDefault(); toggleMenu(false); history.pushState(null, "", location.pathname); reset(); loadIdle(); drawNow();
@@ -1226,7 +1268,9 @@
         copyText(V ? tr(ui.lang, "verdict_prefix") + ": " + V.verdict_word + "\n" + stripTags(V.conclusion_html) : (s.verdict.result || {}).summary || "");
         break;
       }
-      default: break;
+      default:
+        if (root.DSX && root.DSX.click) root.DSX.click(act, el, ev);
+        break;
     }
   });
   document.addEventListener("submit", function (ev) {

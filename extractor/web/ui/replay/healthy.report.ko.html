@@ -355,6 +355,56 @@ h1 { font-size: 22px; } h2 { font-size: 15px; } h3 { font-size: 14px; } h4 { fon
   .dsv [data-step], .dsv [data-step] > * { visibility: visible !important; opacity: 1 !important; animation: none !important; }
 }
 
+/* ---- Exploration components (docs/ui-redesign/EXPLORE_PROPOSAL_KO.md 7): used by the live UI and by the report's
+   "Additional observation" section, so they live here.  Tokens only. ---- */
+/* Sparkline: recent values of one tracked item (numeric: a line; non-numeric: a tick per change) */
+.spark { display: inline-block; vertical-align: middle; width: 110px; height: 22px; overflow: visible; color: var(--chart-1); }
+.spark .ln { fill: none; stroke: currentColor; stroke-width: 1.5; stroke-linejoin: round; stroke-linecap: round; }
+.spark .ar { fill: currentColor; fill-opacity: .14; stroke: none; }
+.spark .pt { fill: currentColor; }
+.spark .base { stroke: var(--border); stroke-width: 1; }
+.spark .tk { stroke: currentColor; stroke-width: 2; }
+.spark.flat { color: var(--muted-foreground); }
+.spark.gone { color: var(--destructive); }
+/* Pool grid: one cell per element (or per bucket of elements), coloured by the element's status value */
+.pool { --cell: 8px; display: grid; grid-template-columns: max-content max-content; gap: 0 8px; overflow: auto; max-height: 640px;
+  border: 1px solid var(--border); border-radius: calc(var(--radius) - 2px); background: var(--surface); padding: 8px; width: fit-content; max-width: 100%; }
+.pool:focus-visible { outline: 2px solid var(--ring); outline-offset: 2px; }
+.pool .rl { font-family: var(--font-mono); font-size: 10px; color: var(--muted-foreground); display: grid; grid-auto-rows: var(--cell); row-gap: 1px; text-align: right; }
+.pool .rl span { line-height: var(--cell); }
+.pool .cells { display: grid; grid-template-columns: repeat(var(--cols, 64), var(--cell)); grid-auto-rows: var(--cell); gap: 1px; }
+.pool-sm { --cell: 22px; } .pool-md { --cell: 14px; }
+.pc { display: block; border-radius: 1px; background: var(--muted); cursor: pointer; }
+.pool-sm .pc { border-radius: 3px; }
+.pc.s1 { background: var(--chart-1); } .pc.s2 { background: var(--chart-2); } .pc.s3 { background: var(--chart-3); }
+.pc.s4 { background: var(--chart-4); } .pc.s5 { background: var(--chart-5); } .pc.s0 { background: var(--muted); }
+.pc.cur { outline: 2px solid var(--ring); }
+.pc.sel { outline: 2px solid var(--foreground); outline-offset: 1px; position: relative; z-index: 1; }
+.pool[data-only] .pc { opacity: .15; }
+.pool[data-only="1"] .pc.s1, .pool[data-only="2"] .pc.s2, .pool[data-only="3"] .pc.s3, .pool[data-only="4"] .pc.s4,
+.pool[data-only="5"] .pc.s5, .pool[data-only="0"] .pc.s0 { opacity: 1; }
+.pool-legend { display: flex; flex-wrap: wrap; gap: 6px; margin: 8px 0 0; padding: 0; list-style: none; }
+.pool-legend button, .pool-legend li { all: unset; cursor: pointer; display: inline-flex; align-items: center; gap: 6px; font-size: 12px; padding: 2px 9px;
+  border: 1px solid var(--border); border-radius: 999px; color: var(--foreground); }
+.pool-legend li { cursor: default; }
+.pool-legend button:focus-visible { outline: 2px solid var(--ring); }
+.pool-legend button[aria-pressed="true"] { background: var(--accent); border-color: var(--ring); }
+.pool-legend i { width: 10px; height: 10px; border-radius: 2px; display: inline-block; }
+.pool-legend b { font-variant-numeric: tabular-nums; }
+.pool-legend .d { color: var(--muted-foreground); font-size: 11px; font-family: var(--font-mono); }
+/* Range view: a bounded memory range as hex + ASCII, from the table/code tokens */
+.hex { font-family: var(--font-mono); font-size: 12px; line-height: 1.75; overflow-x: auto; border: 1px solid var(--border);
+  border-radius: calc(var(--radius) - 2px); background: var(--surface); padding: 6px 10px; }
+.hex .r { display: flex; gap: 14px; white-space: nowrap; width: max-content; }
+.hex .o { color: var(--muted-foreground); }
+.hex .bs { display: flex; }
+.hex .bs span { padding: 0 3px; }
+.hex .bs span:nth-child(8) { margin-right: 8px; }
+.hex .as { color: var(--muted-foreground); letter-spacing: .5px; min-width: 16ch; }
+.hex .tag { color: var(--muted-foreground); font-family: var(--font-sans); font-size: 11.5px; }
+.b-hdr { background: var(--muted); } .b-buf { background: var(--info-soft); }
+.b-over { background: var(--destructive-soft); color: var(--destructive); font-weight: 600; }
+
 /* ---- Print (static report) ---- */
 @media print { body { background: var(--print-background); } .card { box-shadow: none; break-inside: avoid; } .no-print { display: none !important; } }
 
@@ -460,7 +510,7 @@ details.dsv-ck > summary:hover { background: var(--accent); }
 }
 </style>
 <div class="dsv" lang="ko">
-<header class="card masthead" id="sec-masthead"><h1>dynamicState 무정지 런타임 인시던트 보고서</h1><div class="meta"><code>ok_idle_server</code><span>·</span><span>pid 17424</span><span>·</span><span>aarch64</span><span>·</span><span>보고서 생성 시각: 2026-11-13 14:15:24 UTC</span></div><nav><a href="#sec-target">대상</a><a href="#sec-profile">프로세스 프로필</a><a href="#dsv-checks">검사</a><a href="#sec-not-examined">확인하지 못한 것</a><a href="#sec-next">다음에 할 일</a><a href="#sec-method">진단 방법과 대상에 준 영향</a><a href="#reproducibility">재현 정보</a><a href="#sec-reference">참고 자료</a></nav></header>
+<header class="card masthead" id="sec-masthead"><h1>dynamicState 무정지 런타임 인시던트 보고서</h1><div class="meta"><code>ok_idle_server</code><span>·</span><span>pid 17424</span><span>·</span><span>aarch64</span><span>·</span><span>보고서 생성 시각: 2026-11-13 15:01:36 UTC</span></div><nav><a href="#sec-target">대상</a><a href="#sec-profile">프로세스 프로필</a><a href="#dsv-checks">검사</a><a href="#sec-not-examined">확인하지 못한 것</a><a href="#sec-next">다음에 할 일</a><a href="#sec-method">진단 방법과 대상에 준 영향</a><a href="#reproducibility">재현 정보</a><a href="#sec-reference">참고 자료</a></nav></header>
 <section class="card card-tone banner tone-pass" id="sec-conclusion"><div class="card-content"><h2 class="sr-only">결론</h2><div class="line1"><span class="badge badge-tone badge-lg">판정: 점검한 범위 안에서 정상</span><code>HEALTHY</code><span class="text-muted">점검한 범위 밖에 대해서는 판단하지 않습니다.</span></div><p class="sum"><code>ok_idle_server</code> (pid 17424)은(는) 점검한 범위 안에서 정상입니다. 기본 검사 14개가 모두 끝까지 실행되었고 아무것도 발견하지 못했습니다. 점검하지 못한 것: ok_idle_server (tid 17424), acceptor (tid 17425)의 긴 대기가 정상인지 (밖에서는 유휴 대기와 멈춤이 같아 보임); 결론을 내지 못한 증상별 추가 검사 2개; 무정지 진단으로는 답할 수 없는 검사 3개; 무정지 진단으로는 답할 수 없는 검사 2개; 무정지 진단으로는 답할 수 없는 검사 1개; 데이터 레이스, 프로그램 논리 오류처럼 기본 검사가 찾지 않는 결함.</p></div></section>
 <div class="tiles" id="sec-tiles"><div class="card tile"><div class="k">검사</div><div class="v">17</div><div class="progress-stack"><i style="background:var(--warning);width:6.67%"></i><i style="background:var(--success);width:50.00%"></i><i style="background:var(--muted-foreground);width:43.33%"></i></div><div class="s">✖ 0 · ? 2 · ✔ 15 · – 13</div></div><div class="card tile"><div class="k">대상 정지 시간</div><div class="v">0 ms</div><div class="s">한 번도 멈추지 않음</div></div><div class="card tile"><div class="k">읽은 데이터</div><div class="v">55 KB</div></div><div class="card tile"><div class="k">소요 시간</div><div class="v">3.4초</div></div></div>
 <section class="card" id="sec-target"><div class="card-header"><h2 class="card-title">대상</h2></div><div class="card-content"><dl class="kv"><div><dt>프로세스</dt><dd><code>ok_idle_server</code> (pid 17424)</dd></div><div><dt>아키텍처</dt><dd><code>aarch64</code> · <code>glibc</code></dd></div><div><dt>대상 커널</dt><dd><code>7.0.0-1013-oracle</code></dd></div><div><dt>실행 파일</dt><dd><code>/tmp/cap_fotvaux9/ok_idle_server</code></dd></div><div><dt>빌드 ID</dt><dd><code>f3cf5acd7f8347908f394b55758fadc2a60e4db1</code> (디버그 정보와 일치)</dd></div><div><dt>디버그 정보</dt><dd><code>/tmp/cap_fotvaux9/ok_idle_server</code></dd></div><div><dt>전송</dt><dd>로컬 (이 호스트)</dd></div></dl></div></section>
@@ -510,7 +560,7 @@ collector_max_rss_kb: None
 impact_notes: [&quot;local target: attributable_cpu_ms is the diagnosing process&#x27;s CPU in the window (upper bound of the read cost, includes analysis)&quot;, &quot;target.* is the target&#x27;s own activity during the window (delta); it is not caused by the diagnosis, which never stops the target in zero-stop mode. Cost of the diagnosis is under diagnosis_attributable.&quot;]</pre></div><!--/dsv-detail-body--></details></div></section>
 <section class="card" id="reproducibility"><div class="card-header"><h2 class="card-title">재현 정보</h2></div><div class="card-content"><p>이 진단을 다시 설명하는 데 필요한 정보입니다. 엔진이 기록하지 못한 값은 알 수 없음으로 표시합니다.</p>
 <ul>
-<li>dynamicState 버전 / 커밋: <code>0.1.0 / 97e4a14ea0fa</code></li>
+<li>dynamicState 버전 / 커밋: <code>0.1.0 / 8937b2d5ebbe</code></li>
 <li>관측 구간: 2026-11-13 13:54:53 UTC ~ 2026-11-13 13:54:56 UTC, 표본 간격 0.05초, 계획한 관측 시간 1.0초</li>
 <li>실행한 검사와 레시피 버전: 실행된 레시피가 없습니다.</li>
 </ul><details class="collapsible dsv-detail" id="reproducibility-detail"><summary>검사별 정확한 시작·종료 시각 (상세 기록, 영문)</summary><div class="dsv-detail-body in" lang="en"><div class="dsd-scroll"><table class="table"><tr><th>바이너리</th><th>디버그 정보</th><th>프로세스 빌드 ID</th><th>디버그 정보 빌드 ID</th><th>일치 여부</th></tr><tr><td><code>/tmp/cap_fotvaux9/ok_idle_server</code></td><td><code>/tmp/cap_fotvaux9/ok_idle_server</code></td><td><code>f3cf5acd7f8347908f394b55758fadc2a60e4db1</code></td><td><code>f3cf5acd7f8347908f394b55758fadc2a60e4db1</code></td><td><code>일치</code></td></tr></table></div><p><strong>Observation window (as recorded)</strong></p><ul><li><strong>started_at</strong>: <code>2026-11-13T13:54:53.252529+00:00</code></li><li><strong>ended_at</strong>: <code>2026-11-13T13:54:56.352403+00:00</code></li><li><strong>interval_s</strong>: <code>0.05</code></li><li><strong>duration_s</strong>: <code>1.0</code></li><li><strong>samples_collected</strong>: <code>38</code></li><li><strong>wall_clock_ms</strong>: <code>3017.444</code></li></ul></div><!--/dsv-detail-body--></details></div></section>

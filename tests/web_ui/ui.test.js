@@ -202,9 +202,25 @@ test("the process profile card keeps its place: reserved from the plan, filled b
       const card = late.slice(late.indexOf('id="profile"'), late.indexOf('id="findings"'));
       assert.ok(card.includes(V.title), `${n} ${lang}: title from the view`);
       if (V.available) {
-        assert.ok(card.includes(V.html), `${n} ${lang}: the server's fragment, unchanged`);
-        assert.ok(card.includes("<details"), n);
+        const E = (s) => String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#39;");
+        assert.ok(V.figures.length <= 4, `${n} ${lang}: up to four summary figures (only observed ones)`);
+        assert.deepStrictEqual(V.rows.map((r) => r.key), ["threads", "memory", "locks", "files", "modules", "vars"], n);
+        for (const f of V.figures) assert.ok(card.includes(E(f.v)) && card.includes(E(f.k)), `${n} ${lang}: figure ${f.k}`);
+        for (const r of V.rows) {
+          assert.ok(card.includes(E(r.label)) && card.includes(E(r.line)) && card.includes(E(r.src)), `${n} ${lang}: row ${r.key}`);
+          assert.ok(card.includes(`data-key="pf:${r.key}" aria-expanded="false"`), `${n}: row ${r.key} is a closed button`);
+        }
+        assert.ok(card.includes(E(V.unseen)), `${n} ${lang}: the not-observed line`);
         assert.doesNotMatch(card, /판정이 나오면|Filled in when/);
+        assert.doesNotMatch(card, /<details/, "rows open in place, not in a collapsible");
+        // a row opens its own detail in place, right under it; nothing else opens
+        const opened = UI.render(UI.reduce(d.events, d.request), UIS(lang, { started: true, open: { "pf:threads": true } }));
+        const oc = opened.slice(opened.indexOf('id="profile"'), opened.indexOf('id="findings"'));
+        assert.ok(oc.includes('data-key="pf:threads" aria-expanded="true"'), n);
+        assert.ok(oc.includes('id="dt-pf-threads"'), n);
+        assert.ok(!oc.includes('id="dt-pf-memory"'), n);
+        assert.ok(!/<!--slot:/.test(oc), `${n}: closed sub-rows leave no slot marker`);
+        assert.strictEqual(nestedCards(opened), 0, n);
       }
     }
   }
