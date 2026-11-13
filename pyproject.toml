@@ -36,4 +36,4 @@ dynamicstate_skills = "skills"
 
 [tool.setuptools.package-data]
 "extractor.web" = ["ui/*"]
-dynamicstate_skills = ["*/SKILL.md"]
+dynamicstate_skills = ["*/SKILL.md", "*/*.md"]
