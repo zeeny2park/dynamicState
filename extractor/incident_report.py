@@ -65,7 +65,7 @@ def _summary_section(lang: str, verdict: str, summary_md: str) -> str:
     return (f'<style>{_HTML_CSS}</style>\n<section class="ds-summary" lang="{lang}" id="human-summary">\n'
             f'<h2>{html.escape(lb["summary"])}</h2>\n'
             f'<p class="ds-verdict">{html.escape(lb["verdict"])}: <code>{html.escape(verdict)}</code></p>\n'
-            f'{body}\n</section>\n<h2 class="ds-detail-title">{html.escape(lb["detail"])}</h2>\n')
+            f'{body}\n</section>\n')
 
 
 def _limitation_text(nc: Dict[str, Any]) -> str:
@@ -305,10 +305,17 @@ def export_incident_report(
     elif report is not None:
         try:
             from .diagnostic_report import DiagnosticReport
-            report_html = DiagnosticReport.from_dict(report).to_html().replace(
-                "<body>", f"<body>\n<h1>{html.escape(title)}</h1>\n"
-                          f"{_summary_section(language, verdict, summary_md)}", 1)
+            from .report_visuals import build_visual_summary, wrap_detail
+            base_html = wrap_detail(DiagnosticReport.from_dict(report).to_html(), _LABELS[language]["detail"])
+            try:
+                visual = build_visual_summary(res, report, language, title=title, summary_md=summary_md)
+            except Exception:  # noqa: BLE001 - the pictures are an addition; the report must still be written
+                visual = f"<h1>{html.escape(title)}</h1>"
+            report_html = base_html.replace(
+                "<body>", f"<body>\n{visual}\n{_summary_section(language, verdict, summary_md)}", 1)
             report_html = report_html.replace("<html>", f'<html lang="{language}">', 1)
+            report_html = report_html.replace(
+                "<head>", '<head>\n<meta name="viewport" content="width=device-width, initial-scale=1">', 1)
         except Exception:  # noqa: BLE001 - fall back to the plain rendering below
             report_html = None
     if report_html is None:
