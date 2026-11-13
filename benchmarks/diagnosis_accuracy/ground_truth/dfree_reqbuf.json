@@ -1,0 +1,36 @@
+{
+  "id": "dfree_reqbuf",
+  "origin": "new",
+  "naming": "neutral",
+  "kind": "double_free",
+  "source": "benchmarks/diagnosis_accuracy/targets/dfree_reqbuf.c",
+  "language": "c",
+  "symptom": "this program crashes sometimes and data looks wrong",
+  "ready": {
+    "mode": "stdout_marker"
+  },
+  "causes": {
+    "variables": [
+      "current"
+    ],
+    "locks": [],
+    "threads": [],
+    "functions": [
+      "request_finish",
+      "request_cleanup"
+    ]
+  },
+  "locations": [
+    {
+      "file": "benchmarks/diagnosis_accuracy/targets/dfree_reqbuf.c",
+      "line": 37,
+      "text": "free(r) (first free)"
+    },
+    {
+      "file": "benchmarks/diagnosis_accuracy/targets/dfree_reqbuf.c",
+      "line": 43,
+      "text": "free(current) (second free)"
+    }
+  ],
+  "notes": "freed into the unsorted bin while the tcache for its size was full, the tcache drained by allocations, then freed again into the tcache: the block is on two free lists; no malloc/free afterwards"
+}

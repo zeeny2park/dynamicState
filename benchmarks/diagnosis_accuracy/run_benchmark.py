@@ -44,6 +44,7 @@ KIND_CATEGORIES: Dict[str, frozenset] = {
     "memory_leak": frozenset({"MEMORY_LEAK"}),
     "heap_overflow": frozenset({"MEMORY_CORRUPTION"}),
     "use_after_free": frozenset({"USE_AFTER_FREE"}),
+    "double_free": frozenset({"INVALID_DOUBLE_FREE"}),
     "deadlock": frozenset({"DEADLOCK_INDICATORS"}),
     "busy_wait": frozenset({"PROCESS_INSTABILITY", "RESOURCE_EXHAUSTION"}),
     "long_stall": frozenset({"PROCESS_INSTABILITY"}),

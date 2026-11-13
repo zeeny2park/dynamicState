@@ -1,0 +1,36 @@
+{
+  "id": "dfree_outbox",
+  "origin": "external_style",
+  "naming": "neutral",
+  "kind": "double_free",
+  "source": "benchmarks/diagnosis_accuracy/targets/dfree_outbox.c",
+  "language": "c",
+  "symptom": "this program crashes sometimes and data looks wrong",
+  "ready": {
+    "mode": "stdout_marker"
+  },
+  "causes": {
+    "variables": [
+      "last_sent"
+    ],
+    "locks": [],
+    "threads": [],
+    "functions": [
+      "send_one",
+      "retire"
+    ]
+  },
+  "locations": [
+    {
+      "file": "benchmarks/diagnosis_accuracy/targets/dfree_outbox.c",
+      "line": 43,
+      "text": "free(m) (first free, send path)"
+    },
+    {
+      "file": "benchmarks/diagnosis_accuracy/targets/dfree_outbox.c",
+      "line": 48,
+      "text": "free(m) (second free, retire)"
+    }
+  ],
+  "notes": "fastbin double free with another free in between (tcache for the size full): free(a), free(b), free(a) leaves the fastbin a -> b -> a; no malloc/free afterwards"
+}
