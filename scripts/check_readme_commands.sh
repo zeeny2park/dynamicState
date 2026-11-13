@@ -63,7 +63,7 @@ assert "runtime_diagnose_process" in resp["result"]["instructions"], "instructio
 print("MCP server answers initialize with the skill as instructions")
 PY
 
-dynamic-state-workspace --host 127.0.0.1 --port 18765 --corpus "$WORK/corpus" > "$WORK/ws.log" 2>&1 &
+python3 -m tests.support.fixture_process -- dynamic-state-workspace --host 127.0.0.1 --port 18765 --corpus "$WORK/corpus" > "$WORK/ws.log" 2>&1 &
 WS=$!
 for _ in $(seq 1 20); do
     code=$(python3 - <<'PY'

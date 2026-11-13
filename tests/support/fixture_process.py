@@ -446,3 +446,38 @@ def _install_hooks() -> None:
             signal.signal(signum, handler)
         except (ValueError, OSError):
             pass
+
+
+# ------------------------------------------------------------------------------------------------- CLI
+def main(argv=None) -> int:
+    """``python3 -m tests.support.fixture_process [--pidfile F] [limits] -- CMD ARGS...``
+
+    For shell scripts: runs CMD contained (stdio inherited), writes the fixture's pid to ``--pidfile`` right
+    after the start, exits with the fixture's status (128+N for a signal) or 97 when a limit killed it.
+    """
+    import argparse
+    ap = argparse.ArgumentParser(prog="python3 -m tests.support.fixture_process")
+    ap.add_argument("--pidfile")
+    ap.add_argument("--max-rss-mib", type=float)
+    ap.add_argument("--max-lifetime-s", type=float)
+    ap.add_argument("cmd", nargs=argparse.REMAINDER)
+    a = ap.parse_args(argv)
+    cmd = a.cmd[1:] if a.cmd and a.cmd[0] == "--" else a.cmd
+    if not cmd:
+        ap.error("no command given")
+    proc = fixture_popen(cmd, max_rss_mib=a.max_rss_mib, max_lifetime_s=a.max_lifetime_s)
+    if a.pidfile:
+        tmp = a.pidfile + ".tmp"
+        with open(tmp, "w") as fh:
+            fh.write(str(proc.pid))
+        os.replace(tmp, a.pidfile)
+    try:
+        rc = proc.wait()
+    except FixtureLimitExceeded as exc:
+        print(f"fixture_process: {exc}", file=sys.stderr)
+        return 97
+    return rc if rc >= 0 else 128 - rc
+
+
+if __name__ == "__main__":
+    sys.exit(main())
