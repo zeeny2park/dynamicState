@@ -280,6 +280,8 @@ class TestPhase216DiagnosticVerdictIntegrity(unittest.TestCase):
         from extractor.evidence_ledger import PROVENANCE_CLASS_LIVE_RUNTIME_CAPTURE
         ledger = EvidenceLedger(session_id="INV_T6_G")
         token = get_trusted_capture_authority_token()
+        # stage 1: the static-segment precedence reads the record's structured segment, not its wording
+        static = {"EV_STATIC_OK": {"static_lifetime": True, "segment": ".data"}}
         for eid, obs_txt in [
             ("EV_UAF_1", "Wild access to 0x55550000"),
             ("EV_UAF_2", "Stack variable lifetime expired"),
@@ -300,7 +302,8 @@ class TestPhase216DiagnosticVerdictIntegrity(unittest.TestCase):
                 evidence_type="DIAGNOSTIC",
                 nature="observation",
                 provenance={"provenance_class": PROVENANCE_CLASS_LIVE_RUNTIME_CAPTURE, "live_capture_receipt": rcpt.to_dict()},
-                details={"provenance_class": PROVENANCE_CLASS_LIVE_RUNTIME_CAPTURE, "live_capture_receipt": rcpt.to_dict(), "target_pid": 1234},
+                details={"provenance_class": PROVENANCE_CLASS_LIVE_RUNTIME_CAPTURE, "live_capture_receipt": rcpt.to_dict(), "target_pid": 1234,
+                         **static.get(eid, {})},
                 target_identity={"pid": 1234, "process_identity": "proc_1234", "executable_identity": "/proc/1234/exe", "build_id": "sha1:testbuildid12345"},
                 observation=obs_txt,
             )

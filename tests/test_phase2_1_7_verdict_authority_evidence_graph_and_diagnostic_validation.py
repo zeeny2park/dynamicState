@@ -100,6 +100,7 @@ def make_trusted_record(
     target_pid: int = 0,
     evidence_type: str = "DIAGNOSTIC",
     nature: str = "observation",
+    extra_details: dict = None,
 ) -> EvidenceRecord:
     """Helper creating a valid trusted-provenance record without external I/O."""
     eff_pid = target_pid or 1234
@@ -125,7 +126,8 @@ def make_trusted_record(
         evidence_type=evidence_type,
         nature=nature,
         provenance={"provenance_class": PROVENANCE_CLASS_LIVE_RUNTIME_CAPTURE, "live_capture_receipt": rcpt.to_dict()},
-        details={"provenance_class": PROVENANCE_CLASS_LIVE_RUNTIME_CAPTURE, "live_capture_receipt": rcpt.to_dict(), "target_pid": eff_pid},
+        details={"provenance_class": PROVENANCE_CLASS_LIVE_RUNTIME_CAPTURE, "live_capture_receipt": rcpt.to_dict(), "target_pid": eff_pid,
+                 **(extra_details or {})},
         target_identity=dict(t_ident),
         observation=observation or f"Observation for {evidence_id}",
     )
@@ -491,7 +493,9 @@ class TestPhase217VerdictAuthorityAndEvidenceGraph(unittest.TestCase):
     def test_case_h_single_evidence_confirmation_rules(self):
         """Case H: Arbitrary strings or flags alone cannot confirm; requires valid registered rule with matching category."""
         ledger = EvidenceLedger(session_id="INV_H")
-        make_trusted_record(ledger, "EV_CANARY_01", observation="Canary overwrite detected: 0xDEADBEEF corrupted")
+        # stage 1: the rule reads the structured reading, not the words of the observation
+        make_trusted_record(ledger, "EV_CANARY_01", observation="Canary overwrite detected: 0xDEADBEEF corrupted",
+                            extra_details={"canary_corrupted": True})
 
         # H1. Non-empty arbitrary unregistered rule fails
         hyp1 = CompetingHypothesis(

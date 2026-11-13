@@ -51,6 +51,7 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Set
 
 from .diagnostic_methodology import CheckStatus, DiagnosticCheck
+from .typed_evidence import FAMILY_CORRUPTION, FAMILY_DEADLOCK, FAMILY_GROWTH, criteria_family
 
 try:
     from .evidence_ledger import TRUSTED_PROVENANCE_CLASSES
@@ -139,47 +140,37 @@ VERDICT_DECISION_TABLE: List[Dict[str, Any]] = [
     },
 ]
 
-_KNOWN_INVARIANT_KEYWORDS = (
-    "canary",
-    "heap chunk",
-    "chunk previnuse",
-    "previnuse",
-    "deadlock",
-    "circular wait",
-    "double free",
-    "double_free",
-    "use-after-free",
-    "use_after_free",
-    "dangling",
-    "overflow",
-    "corrupt",
-    "bounds",
-    "segv",
-    "oom",
-    "leak",
-    "imbalance",
-    "accumulation",
-    "invariant",
-)
+# Stage 1 (zero string search in the verdict path): no rule below reads the prose of a limitation, check name or
+# description.  Limitations are blocking as a whole (a limitation is something the investigation could not do;
+# ``diagnose`` blocks HEALTHY on every engine limitation the same way, RULE_5B kind "limitation"); a caller that
+# knows a limitation is only informational passes it as a structured item {"text": ..., "blocking": False}.
 
-_BLOCKING_LIMITATION_KEYWORDS = (
-    "failed",
-    "irregular",
-    "unresolved",
-    "clock regression",
-    "regression detected",
-    "eperm",
-    "permission",
-    "unreadable",
-    "inaccessible",
-    "incomplete",
-    "partial",
-    "untrusted",
-    "unverified",
-    "synthetic",
-    "timeout",
-    "missing authoritative",
-)
+
+def _check_category(c: Any) -> str:
+    """Problem category of a check: its own ``category`` attribute, else its recipe's registered category."""
+    cat = getattr(c, "category", None)
+    if cat:
+        return str(cat)
+    try:
+        from .diagnostic_recipes import DiagnosticRecipeRegistry
+        r = DiagnosticRecipeRegistry.get_recipe(str(getattr(c, "recipe_id", "") or ""))
+    except Exception:
+        r = None
+    return r.problem_category if r is not None else ""
+
+
+def limitation_text(lim: Any) -> str:
+    """Display text of a limitation item (a string, or a structured {"text", "blocking", "kind"} dict)."""
+    if isinstance(lim, dict):
+        return str(lim.get("text") or lim.get("kind") or "")
+    return str(lim)
+
+
+def limitation_is_blocking(lim: Any) -> bool:
+    """A limitation blocks HEALTHY unless it is a structured item that declares itself non-blocking."""
+    if isinstance(lim, dict):
+        return lim.get("blocking") is not False
+    return bool(str(lim))
 
 
 @dataclass
@@ -242,12 +233,11 @@ class DiagnosticVerdictAggregator:
         if not has_rule and not has_non_empty_crit:
             return False
 
-        # Validate against target_assessment if provided
+        # Validate against target_assessment if provided: a check declared not applicable because it needs symbols
+        # is unjustified on a target that has them (structured criterion, not the wording of the rule)
         if target_assessment is not None and isinstance(crit, dict):
             if crit.get("requires_symbols") is True and getattr(target_assessment, "symbols_available", None) is True:
-                # Target actually HAS symbols, so marking NOT_APPLICABLE due to missing symbols is invalid
-                if "missing symbols" in str(rule_str or "").lower():
-                    return False
+                return False
         return True
 
     @staticmethod
@@ -294,10 +284,9 @@ class DiagnosticVerdictAggregator:
                 return any(eid in trusted_ids for eid in chk_ev_ids)
             return len(trusted_ids) > 0
 
-        # 4. Standalone check evaluation (when active_hypotheses == [] and evidence_records is None):
-        combined_label = f"{getattr(c, 'check_id', '')} {getattr(c, 'name', '')} {getattr(c, 'description', '')} {getattr(c, 'technical_interpretation', '')}".lower()
-        if any(bad in combined_label for bad in ("manual", "arbitrary", "unverified", "unconfirmed")):
-            return False
+        # 4. Standalone check (no hypotheses, no evidence records): confirmed unless the check is flagged as manual /
+        # arbitrary / unverified (the structured flags of step 1).  Stage 1: the name, description or
+        # interpretation of a check is never read (they used to be searched for "manual", "arbitrary", ...).
         return True
 
     @staticmethod
@@ -313,7 +302,8 @@ class DiagnosticVerdictAggregator:
         required_scope: Optional[List[str]] = None,
     ) -> AggregatedVerdict:
         rej_hyps = rejected_hypotheses or []
-        lims = list(limitations or [])
+        lim_items = list(limitations or [])
+        lims = [limitation_text(x) for x in lim_items]
 
         # Categorize required vs optional checks
         required_checks: List[DiagnosticCheck] = []
@@ -368,7 +358,6 @@ class DiagnosticVerdictAggregator:
                         c.check_id == req_norm
                         or getattr(c, "recipe_id", None) == req_norm
                         or getattr(c, "category", None) == req_norm
-                        or req_norm.lower() in f"{c.name or ''} {c.description or ''}".lower()
                     )
                     for c in checks
                 )
@@ -401,6 +390,7 @@ class DiagnosticVerdictAggregator:
         limiting_factors: List[str] = list(lims)
         determining_checks: List[str] = []
         determining_hypotheses: List[str] = []
+        problem_categories: List[Any] = []   # (problem text, problem category) for the risk classification
 
         # 1. Inspect active hypotheses (re-validating CompetingHypothesis against bound ledger if present)
         for h in active_hypotheses:
@@ -424,6 +414,7 @@ class DiagnosticVerdictAggregator:
                         h_stat = h.status
                 if h_stat == "CONFIRMED":
                     confirmed_problems.append(h_stmt)
+                    problem_categories.append((h_stmt, h_cat))
                     determining_hypotheses.append(h_id)
                     contributing_factors.append(
                         f"Confirmed fault [{h_id}]: {h_stmt} ({h_basis or 'verified by deterministic criteria'})"
@@ -432,6 +423,7 @@ class DiagnosticVerdictAggregator:
 
             if h_stat in ("LIKELY", "PROPOSED", "SUPPORTED"):
                 probable_problems.append(h_stmt)
+                problem_categories.append((h_stmt, h_cat))
                 determining_hypotheses.append(h_id)
                 contributing_factors.append(
                     f"Probable cause [{h_id}]: {h_stmt} ({h_basis or 'supported by live observations'})"
@@ -443,6 +435,7 @@ class DiagnosticVerdictAggregator:
         for c in required_failed:
             determining_checks.append(c.check_id)
             f_msg = f"Check failed: {c.name or c.check_id} ({c.technical_interpretation or 'decision criteria violated'})"
+            problem_categories.append((f_msg, _check_category(c)))
             if DiagnosticVerdictAggregator._does_required_fail_satisfy_confirmation(c, active_hypotheses, evidence_records):
                 if f_msg not in confirmed_problems:
                     confirmed_problems.append(f_msg)
@@ -462,18 +455,21 @@ class DiagnosticVerdictAggregator:
             determining_checks.append(c.check_id)
             limiting_factors.append(f"Optional check failed [{c.check_id}]: {c.name or c.description}")
 
-        # Critical risks
+        # Critical risks: by the problem category of the hypothesis / failed check (criteria family), never by the
+        # words of the problem text
         critical_risks: List[str] = []
-        for p in confirmed_problems + probable_problems:
-            up = p.upper()
-            if any(k in up for k in ("CORRUPTION", "FREE", "DEADLOCK", "OVERFLOW", "WILD", "SEGV")):
+        for p, cat in problem_categories:
+            if p not in confirmed_problems and p not in probable_problems:
+                continue
+            fam = criteria_family(cat)
+            if fam in (FAMILY_CORRUPTION, FAMILY_DEADLOCK):
                 risk_msg = f"Critical memory safety or concurrency risk: {p}"
-                if risk_msg not in critical_risks:
-                    critical_risks.append(risk_msg)
-            elif any(k in up for k in ("LEAK", "EXHAUSTION", "IMBALANCE", "ACCUMULATION")):
+            elif fam == FAMILY_GROWTH or cat == "RESOURCE_EXHAUSTION":
                 risk_msg = f"Resource exhaustion risk: {p}"
-                if risk_msg not in critical_risks:
-                    critical_risks.append(risk_msg)
+            else:
+                continue
+            if risk_msg not in critical_risks:
+                critical_risks.append(risk_msg)
 
         # Coverage & environmental limitations
         if inconclusive_checks > 0:
@@ -657,10 +653,20 @@ class DiagnosticVerdictAggregator:
             and len(missing_required_scope) == 0
             and len(unresolved_questions) == 0
         )
-        has_no_blocking_limitations = not any(
-            any(kw in l.lower() for kw in _BLOCKING_LIMITATION_KEYWORDS)
-            for l in limiting_factors
-        )
+        # Structured blocking decision (stage 1): a caller limitation blocks unless declared non-blocking; the target
+        # assessment blocks when memory is unreadable or it recorded a limitation; a failed collection record
+        # blocks.  The factors this function added itself (inconclusive / unexecuted checks, ...) are already
+        # coverage conditions above.
+        blocking_limitations = [limitation_text(x) for x in lim_items if limitation_is_blocking(x)]
+        if target_assessment is not None:
+            if getattr(target_assessment, "memory_readable", True) is False:
+                blocking_limitations.append("target memory unreadable")
+            blocking_limitations += [limitation_text(x) for x in (getattr(target_assessment, "limitations", None) or [])
+                                     if limitation_is_blocking(x)]
+        for rec in evidence_records or []:
+            if str(getattr(rec, "collection_status", "") or "") == "FAILED":
+                blocking_limitations.append(f"collection failed: {getattr(rec, 'evidence_id', '')}")
+        has_no_blocking_limitations = not blocking_limitations
 
         if (
             lifecycle_state == "COMPLETED"

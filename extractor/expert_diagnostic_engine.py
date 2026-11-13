@@ -2817,24 +2817,26 @@ class AdaptiveInvestigationSession:
                 "Investigation inconclusive due to insufficient evidence or collection failures; "
                 "verify target permissions, debug symbols, and process accessibility before re-running."
             )
-        elif primary_finding:
-            pf_up = primary_finding.upper()
-            if "INCONCLUSIVE" in pf_up:
+        elif primary_finding and self.active_hypotheses:
+            # by the leading hypothesis's category (stage 1: never by the words of the finding text)
+            top = self.active_hypotheses[0]
+            fam = criteria_family(top.category)
+            if top.status == "INCONCLUSIVE" or top.category == "UNKNOWN":
                 remediations.append(
                     "Investigation inconclusive due to insufficient evidence or collection failures; "
                     "verify target permissions, debug symbols, and process accessibility before re-running."
                 )
-            elif "MEMORY" in pf_up or "CORRUPT" in pf_up or "POINTER" in pf_up:
+            elif top.category == "HEALTHY":
+                remediations.append("No active remediation required: runtime state verified clean within investigated scope.")
+            elif fam == FAMILY_CORRUPTION:
                 remediations.append("Audit pointer dereference bounds and verify memory mapping permissions before dereference.")
                 remediations.append("Enable AddressSanitizer (ASan) during build: `-fsanitize=address -g`.")
-            elif "LEAK" in pf_up or "GROWTH" in pf_up or "IMBALANCE" in pf_up:
+            elif fam == FAMILY_GROWTH or top.category in ("HEAP_RETENTION", "RESOURCE_EXHAUSTION"):
                 remediations.append("Profile heap allocations and verify balanced free/delete calls across container lifecycles.")
                 remediations.append("Inspect long-lived container capacities and unbounded cache queue limits.")
-            elif "DEADLOCK" in pf_up or "LOCK" in pf_up:
+            elif fam == FAMILY_DEADLOCK or top.category in ("LOCK_CONTENTION", "ORPHAN_LOCK"):
                 remediations.append("Enforce strict global lock acquisition ordering hierarchy across all threads.")
                 remediations.append("Consider replacing nested mutexes with lock-free structures or fine-grained atomics.")
-            elif "HEALTHY" in pf_up or "CLEAN" in pf_up or "NO ABNORMAL" in pf_up:
-                remediations.append("No active remediation required: runtime state verified clean within investigated scope.")
             else:
                 remediations.append("Review state transition logic and enforce assertions for valid enum state transitions.")
         elif agg.overall_result == VERDICT_HEALTHY:
