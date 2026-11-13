@@ -27,6 +27,7 @@ import uuid
 from .diagnostic_recipes import (
     recipe_requires_lock_owner,
     BASELINE_RECIPE_IDS,
+    CAPABILITY_DESCRIPTIONS,
     CATEGORY_ABNORMAL_VARIABLE_CHANGES,
     CATEGORY_DATA_RACE_INDICATORS,
     CATEGORY_DEADLOCK_INDICATORS,
@@ -857,23 +858,22 @@ class InvestigationPlanner:
                 "RECIPE_PROCESS_MEMORY_GROWTH",
                 "RECIPE_SUSPICIOUS_LOCK_OWNERSHIP",
                 "RECIPE_POTENTIAL_DEADLOCK_PATTERNS",
-                "RECIPE_UNEXPECTED_VARIABLE_CHANGES",
             ]
             for r_id in domain_reps:
-                r = self.recipe_registry.get_recipe(r_id)
+                r = self.recipe_registry.get_plannable_recipe(r_id)
                 if r:
                     candidate_recipes.append((r, 0.75))
         else:
             # Map candidate categories to matching recipes
             for cat, weight in classification.candidate_categories:
-                recs = self.recipe_registry.get_recipes_for_category(cat)
+                recs = self.recipe_registry.get_recipes_for_category(cat, plannable_only=True)
                 for r in recs:
                     if not any(cr[0].recipe_id == r.recipe_id for cr in candidate_recipes):
                         candidate_recipes.append((r, weight))
 
         # If no recipes found, fallback to generic screening
         if not candidate_recipes:
-            for r in self.recipe_registry.list_recipes()[:4]:
+            for r in self.recipe_registry.list_recipes(plannable_only=True)[:4]:
                 candidate_recipes.append((r, 0.5))
 
         # Baseline checks always run; the symptom only orders them (relevance) and adds recipes around them.
@@ -2267,7 +2267,7 @@ class AdaptiveInvestigationSession:
             # hypotheses; the comparison's own recommendation is the fallback.
             from .observation_selector import select_discriminating_recipe
             _cand_ids = sorted({r for ch in self.competing_hypotheses for r in (ch.applicable_diagnostic_rules or [])})
-            _cands = [rc for rc in (self.recipe_registry.get_recipe(r) for r in _cand_ids) if rc is not None]
+            _cands = [rc for rc in (self.recipe_registry.get_plannable_recipe(r) for r in _cand_ids) if rc is not None]
             _done = {s.recipe_id for s in self.plan.steps[:self.plan.current_step_index + 1]}
             sel_rid, sel_log, sel_why = select_discriminating_recipe(
                 self.competing_hypotheses, _cands, budget_tracker=self.budget_tracker, executed_recipe_ids=_done)
@@ -2282,7 +2282,7 @@ class AdaptiveInvestigationSession:
                 already_executed = any(s.recipe_id == next_rec_id for s in self.plan.steps[:self.plan.current_step_index + 1])
                 already_in = any(s.recipe_id == next_rec_id for s in remaining_steps)
                 if not already_executed and not already_in:
-                    f_rec = self.recipe_registry.get_recipe(next_rec_id)
+                    f_rec = self.recipe_registry.get_plannable_recipe(next_rec_id)
                     if f_rec:
                         discrim_step = self.planner.score_and_build_step(
                             recipe=f_rec,
@@ -3200,9 +3200,12 @@ class AdaptiveInvestigationSession:
                 r_obj = self.recipe_registry.get_recipe(rid)
                 r_dom = getattr(r_obj, "domain", "GENERAL") if r_obj else "GENERAL"
                 r_cats = getattr(r_obj, "applicable_problem_categories", []) if r_obj else []
+                _missing_caps = self.recipe_registry.missing_capabilities(rid)
                 excluded_recipes.append({
                     "recipe_id": rid,
+                    **({"unsupported_capability": _missing_caps[0]} if _missing_caps else {}),
                     "reason_excluded": (
+                        f"Not supported in this mode: needs {', '.join(_missing_caps)}" if _missing_caps else
                         f"Excluded by adaptive planner: recipe domain '{r_dom}' (categories {r_cats}) "
                         f"did not match primary symptom classification '{prim_cat}'"
                     ),
@@ -4417,7 +4420,13 @@ def _diagnose_run(
                     + list(sec_b.get("collection_failures") or [])
                     + list(report.get("section_h_limitations_and_unverified", {}).get("missing_symbols_or_dwarf") or [])):
             nc.append({"kind": "limitation", "item": "engine", "reason": str(lim)})
-        excluded = [e.get("recipe_id") for e in report.get("section_c_diagnostic_strategy", {}).get("recipes_excluded", [])]
+        _excl_rows = report.get("section_c_diagnostic_strategy", {}).get("recipes_excluded", [])
+        excluded = [e.get("recipe_id") for e in _excl_rows if not e.get("unsupported_capability")]
+        # Checks this mode cannot execute (declared capability requirement): "not examined", one row per capability.
+        for _cap in dict.fromkeys(e["unsupported_capability"] for e in _excl_rows if e.get("unsupported_capability")):
+            _ids = [e.get("recipe_id") for e in _excl_rows if e.get("unsupported_capability") == _cap]
+            nc.append({"kind": "unsupported_in_mode", "item": ",".join(map(str, _ids)), "capability": _cap,
+                       "reason": "not supported in this mode: needs " + CAPABILITY_DESCRIPTIONS.get(_cap, (_cap, _cap))[0]})
         if excluded:
             nc.append({"kind": "recipes_not_planned", "item": ",".join(map(str, excluded)),
                        "reason": "not selected by the planner for this symptom classification"})

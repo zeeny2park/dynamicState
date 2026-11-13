@@ -193,6 +193,8 @@ _L: Dict[str, Tuple[str, str]] = {
     "ck_not_planned": ("Not selected for this symptom.", "이 증상에 대해서는 선택되지 않았습니다."),
     "ck_need_cap": ("needs a capability that is not available here: {cap}", "여기서 사용할 수 없는 기능이 필요함: {cap}"),
     "ck_no_reason": ("The check recorded no reason.", "검사가 사유를 기록하지 않았습니다."),
+    "nc_unsupported_in_mode": ("not examined: a zero-stop diagnosis cannot answer this, it needs {cap}",
+                               "점검하지 않음: 무정지 진단으로는 답할 수 없음, {cap} 필요"),
     "ck_none": ("No check record is available for this diagnosis.", "이 진단에는 검사 기록이 없습니다."),
     "nc_title": ("Also not examined", "그 밖에 확인하지 못한 것"),
     "dom_CONCURRENCY": ("Threads and locks", "스레드와 락"), "dom_MEMORY_GROWTH": ("Memory growth", "메모리 증가"),
@@ -1153,7 +1155,13 @@ def _checklist(lx: _Lx, res: Dict[str, Any], report: Optional[Dict[str, Any]], f
                       f'{E(lx.t("ck_" + s))} ({len(grp)}) <small>{E(lx.t("ck_" + s + "_hint"))}</small></h4>{"".join(items)}</div>')
     nc_html = ""
     if other_nc:
-        lis = "".join(f"<li>{_code(n.get('item') or n.get('kind'))}: {E(ko_text(str(n.get('reason') or ''), lx.i))}</li>" for n in other_nc[:20])
+        def _nc_reason(n: Dict[str, Any]) -> str:
+            if n.get("kind") == "unsupported_in_mode":
+                from .diagnostic_recipes import CAPABILITY_DESCRIPTIONS
+                cap = CAPABILITY_DESCRIPTIONS.get(str(n.get("capability")), (str(n.get("capability")),) * 2)[lx.i]
+                return lx.t("nc_unsupported_in_mode", cap=cap)
+            return ko_text(str(n.get("reason") or ""), lx.i)
+        lis = "".join(f"<li>{_code(n.get('item') or n.get('kind'))}: {E(_nc_reason(n))}</li>" for n in other_nc[:20])
         nc_html = f'<h4>{E(lx.t("nc_title"))}</h4><ul class="dsv-nc">{lis}</ul>'
     return (head + f'<div class="dsv-card dsv-checklist"><p class="dsv-note">{E(lx.t("ck_intro"))}</p>'
             f'<div class="dsv-bar">{bar}</div>{"".join(tools)}<div class="dsv-ckgroups">{"".join(groups)}</div>{nc_html}</div>')

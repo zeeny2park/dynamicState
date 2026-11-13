@@ -106,6 +106,21 @@ OBS_RUNTIME_STATE = "runtime_state"           # DWARF globals: observed values a
 OBS_THREADS_AND_LOCKS = "threads_and_locks"   # thread states/samples, mutex owners, wait-for graph
 OBS_PROCESS_INFO = "process_info"             # /proc/<pid>/status (always collected last)
 
+# Capabilities a recipe may require beyond what a zero-stop, read-only diagnosis has.  ``AVAILABLE_CAPABILITIES`` is
+# what the current mode provides (none of these); an optional tracing mode would add its capabilities there.
+CAP_ALLOCATION_TRACING = "allocation_tracing"      # a record of every malloc/free (a tracer attached to the target)
+CAP_STOPPED_SNAPSHOT = "stopped_snapshot"          # a consistent snapshot of running threads (needs a stop)
+CAP_CALLER_SPECIFICATION = "caller_specification"  # a value domain / state machine the caller supplies
+CAPABILITY_DESCRIPTIONS: Dict[str, Tuple[str, str]] = {
+    CAP_ALLOCATION_TRACING: ("allocation tracing (a record of every allocation and free)",
+                             "할당 추적 (모든 할당·해제 기록)"),
+    CAP_STOPPED_SNAPSHOT: ("a stopped, consistent snapshot of the running threads",
+                           "실행 중인 스레드의 정지된 일관 스냅샷"),
+    CAP_CALLER_SPECIFICATION: ("a value range or state machine supplied by the caller",
+                               "호출자가 지정하는 값 범위 또는 상태 전이 명세"),
+}
+AVAILABLE_CAPABILITIES: frozenset = frozenset()
+
 # Baseline checks: planned and executed for EVERY investigation, whatever the symptom wording says.  They are the
 # cheap, read-only, zero-stop checks; the symptom text only orders them and adds more specific / costlier recipes.
 # Order = execution order when the symptom gives no preference (cheapest first).
@@ -171,6 +186,12 @@ class DiagnosticRecipe:
     requires_lock_owner: bool = False          # "nothing found" is only meaningful when mutex owners decode
     lock_owner_required_for_support: bool = False  # ... and so is "found" (a stall without owners is not attributable)
     risk_level: str = "READ_ONLY"
+    # Capabilities the recipe's verdict rule needs that a zero-stop diagnosis does not have (CAP_* above).  A recipe
+    # that declares one is not planned while the capability is absent (``DiagnosticRecipeRegistry.is_plannable``):
+    # it is neither executed nor counted as an open check, and the report lists its question as "not examined".
+    # ``unsupported_question`` is that question in plain words.  A baseline recipe must not declare any.
+    requires_capabilities: Tuple[str, ...] = ()
+    unsupported_question: str = ""
 
     @property
     def problem_category(self) -> str:
@@ -180,6 +201,7 @@ class DiagnosticRecipe:
         d = asdict(self)
         d.pop("rule", None)
         d["observations"] = list(self.observations)
+        d["requires_capabilities"] = list(self.requires_capabilities)
         return d
 
     @classmethod
@@ -188,6 +210,8 @@ class DiagnosticRecipe:
         filtered = {k: v for k, v in data.items() if k in valid_fields and k != "rule"}
         if "observations" in filtered:
             filtered["observations"] = tuple(filtered["observations"] or ())
+        if "requires_capabilities" in filtered:
+            filtered["requires_capabilities"] = tuple(filtered["requires_capabilities"] or ())
         return cls(**filtered)
 
 
@@ -246,6 +270,9 @@ def _register(recipe: DiagnosticRecipe) -> None:
 def register_recipe(recipe: DiagnosticRecipe, baseline: bool = False, category: Optional[str] = None) -> DiagnosticRecipe:
     """Register a recipe from its definition file (IMP-018).  ``baseline``: also plan and run it in every
     investigation (it must be cheap, read-only and zero-stop).  ``category``: a new problem category it reports."""
+    if baseline and recipe.requires_capabilities:
+        raise ValueError(f"{recipe.recipe_id}: a baseline check runs in every diagnosis and cannot require "
+                         f"{recipe.requires_capabilities}")
     if category:
         ALL_PROBLEM_CATEGORIES.add(category)
     _register(recipe)
@@ -335,6 +362,9 @@ _register(DiagnosticRecipe(
     version="1.0.0",
     name="Use-After-Free & Dangling Pointer Access Investigation",
     domain=DOMAIN_MEMORY_INTEGRITY,
+    requires_capabilities=(CAP_ALLOCATION_TRACING,),
+    unsupported_question=("Was a block used after it was freed, proven from the free() history? (a heap walk looks "
+                          "for typed pointers into free blocks instead: RECIPE_FREED_MEMORY_USE)"),
     observations=(OBS_MEMORY_INTEGRITY, OBS_PROCESS_INFO,),
     applicable_problem_categories=[CATEGORY_USE_AFTER_FREE, CATEGORY_MEMORY_CORRUPTION],
     required_prerequisites=["memory_read_available", "heap_inspection_available"],
@@ -405,6 +435,9 @@ _register(DiagnosticRecipe(
     version="1.0.0",
     name="Suspicious Allocation / Deallocation Pattern Detector",
     domain=DOMAIN_MEMORY_INTEGRITY,
+    requires_capabilities=(CAP_ALLOCATION_TRACING,),
+    unsupported_question=("Is an allocation unusually large or repeated? (needs the sizes of the allocation calls, "
+                          "which one point-in-time read does not give)"),
     observations=(OBS_MEMORY_INTEGRITY, OBS_PROCESS_INFO,),
     applicable_problem_categories=[CATEGORY_MEMORY_CORRUPTION, CATEGORY_MEMORY_LEAK],
     required_prerequisites=["memory_read_available"],
@@ -545,6 +578,9 @@ _register(DiagnosticRecipe(
     version="1.0.0",
     name="Object Lifetime & Premature / Prolonged Retention Anomaly Detector",
     domain=DOMAIN_MEMORY_GROWTH,
+    requires_capabilities=(CAP_ALLOCATION_TRACING,),
+    unsupported_question=("Does a live reference point to an object whose lifetime ended? (needs the allocation and "
+                          "free history, which one point-in-time read does not give)"),
     observations=(OBS_MEMORY_INTEGRITY, OBS_MEMORY_GROWTH, OBS_PROCESS_INFO,),
     applicable_problem_categories=[CATEGORY_MEMORY_LEAK, CATEGORY_FUNCTIONAL_STATE_INCONSISTENCY],
     required_prerequisites=["memory_read_available", "dwarf_symbols_available"],
@@ -647,6 +683,9 @@ _register(DiagnosticRecipe(
     version="1.0.0",
     name="Unexpected Variable Mutation & Range Violation Investigation",
     domain=DOMAIN_ABNORMAL_STATE,
+    requires_capabilities=(CAP_CALLER_SPECIFICATION,),
+    unsupported_question=("Did a variable leave its expected value range? (needs the range from the caller; the "
+                          "target does not contain it)"),
     observations=(OBS_RUNTIME_STATE, OBS_PROCESS_INFO,),
     applicable_problem_categories=[CATEGORY_ABNORMAL_VARIABLE_CHANGES, CATEGORY_FUNCTIONAL_STATE_INCONSISTENCY],
     required_prerequisites=["memory_read_available", "dwarf_symbols_available"],
@@ -681,6 +720,9 @@ _register(DiagnosticRecipe(
     version="1.0.0",
     name="State Machine Transition Invariant Violation Audit",
     domain=DOMAIN_ABNORMAL_STATE,
+    requires_capabilities=(CAP_CALLER_SPECIFICATION,),
+    unsupported_question=("Did a state variable make a transition its state machine forbids? (needs the allowed "
+                          "states from the caller; the target does not contain them)"),
     observations=(OBS_RUNTIME_STATE, OBS_PROCESS_INFO,),
     applicable_problem_categories=[CATEGORY_UNEXPECTED_STATE_TRANSITIONS, CATEGORY_FUNCTIONAL_STATE_INCONSISTENCY],
     required_prerequisites=["memory_read_available", "dwarf_symbols_available"],
@@ -957,6 +999,9 @@ _register(DiagnosticRecipe(
     version="1.0.0",
     name="Shared State Inconsistency & Data Race Indicator Audit",
     domain=DOMAIN_CONCURRENCY,
+    requires_capabilities=(CAP_STOPPED_SNAPSHOT,),
+    unsupported_question=("Is multi-field state shared by threads torn or inconsistent? (needs one consistent "
+                          "snapshot of running threads; reading them one at a time races with their updates)"),
     observations=(OBS_RUNTIME_STATE, OBS_THREADS_AND_LOCKS, OBS_PROCESS_INFO,),
     applicable_problem_categories=[CATEGORY_DATA_RACE_INDICATORS, CATEGORY_FUNCTIONAL_STATE_INCONSISTENCY],
     required_prerequisites=["memory_read_available", "dwarf_symbols_available"],
@@ -998,24 +1043,54 @@ class DiagnosticRecipeRegistry:
         return _RECIPES.get(recipe_id)
 
     @classmethod
-    def list_recipes(cls, domain: Optional[str] = None) -> List[DiagnosticRecipe]:
-        if domain:
-            return [r for r in _RECIPES.values() if r.domain == domain]
-        return list(_RECIPES.values())
+    def missing_capabilities(cls, recipe_or_id: Union[str, DiagnosticRecipe]) -> Tuple[str, ...]:
+        """Capabilities the recipe declares that the current mode does not provide (empty: it can be planned)."""
+        r = recipe_or_id if isinstance(recipe_or_id, DiagnosticRecipe) else _RECIPES.get(str(recipe_or_id))
+        if r is None:
+            return ()
+        return tuple(c for c in r.requires_capabilities if c not in AVAILABLE_CAPABILITIES)
+
+    @classmethod
+    def is_plannable(cls, recipe_or_id: Union[str, DiagnosticRecipe]) -> bool:
+        return not cls.missing_capabilities(recipe_or_id)
+
+    @classmethod
+    def get_plannable_recipe(cls, recipe_id: str) -> Optional[DiagnosticRecipe]:
+        """``get_recipe``, but None for a recipe the current mode cannot execute (plan construction uses this)."""
+        r = _RECIPES.get(recipe_id)
+        return r if r is not None and cls.is_plannable(r) else None
+
+    @classmethod
+    def unsupported_recipes(cls) -> Dict[str, List[DiagnosticRecipe]]:
+        """Recipes left out of every plan, grouped by the (first) missing capability."""
+        out: Dict[str, List[DiagnosticRecipe]] = {}
+        for r in _RECIPES.values():
+            miss = cls.missing_capabilities(r)
+            if miss:
+                out.setdefault(miss[0], []).append(r)
+        return out
+
+    @classmethod
+    def list_recipes(cls, domain: Optional[str] = None, plannable_only: bool = False) -> List[DiagnosticRecipe]:
+        rs = [r for r in _RECIPES.values() if (not domain or r.domain == domain)
+              and (not plannable_only or cls.is_plannable(r))]
+        return rs
 
     @classmethod
     def list_recipe_ids(cls, domain: Optional[str] = None) -> List[str]:
         return [r.recipe_id for r in cls.list_recipes(domain=domain)]
 
     @classmethod
-    def get_recipes_for_category(cls, category: str) -> List[DiagnosticRecipe]:
-        return cls.find_recipes_for_categories([category])
+    def get_recipes_for_category(cls, category: str, plannable_only: bool = False) -> List[DiagnosticRecipe]:
+        return cls.find_recipes_for_categories([category], plannable_only=plannable_only)
 
     @classmethod
-    def find_recipes_for_categories(cls, categories: List[str]) -> List[DiagnosticRecipe]:
+    def find_recipes_for_categories(cls, categories: List[str], plannable_only: bool = False) -> List[DiagnosticRecipe]:
         matched: List[DiagnosticRecipe] = []
         cat_set = set(categories)
         for r in _RECIPES.values():
+            if plannable_only and not cls.is_plannable(r):
+                continue
             if any(c in cat_set for c in r.applicable_problem_categories):
                 matched.append(r)
         return matched
