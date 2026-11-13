@@ -24,7 +24,6 @@ from ``incident_report.result_from_session``).
 
 from __future__ import annotations
 
-import bisect
 import os
 import re
 import subprocess
@@ -369,17 +368,30 @@ def _build_program(path: str, image_mtime: float, deadline: float) -> _Program:
         idx = DwarfIndexer.get_index(path)
     except Exception as exc:  # noqa: BLE001
         return _Program(path, STATUS_NO_DEBUG_INFO, detail=f"{type(exc).__name__}: {exc}")
-    subs = [s for s in (idx.subprograms or []) if s.low_pc and s.high_pc and s.high_pc > s.low_pc and s.decl_file
-            and not s.is_declaration]
+    # Every defined function with a source position, inlined-only ones (no code range of their own) included; a
+    # function's source extent runs from its declaration line to the line before the next function of its file,
+    # clipped to the last line with machine code (DWARF line table).  So a statement is attributed to the function
+    # it is written in, also when the compiler inlined that function elsewhere.
+    subs: Dict[str, Any] = {}
+    for sp in idx.subprograms or []:
+        if not sp.name or not sp.decl_file or not sp.decl_line or sp.is_declaration or _is_system(sp.decl_file):
+            continue
+        prev = subs.get(sp.name)
+        if prev is None or (not prev.low_pc and sp.low_pc) or (len(sp.variables or []) > len(prev.variables or [])
+                                                                and bool(prev.low_pc) == bool(sp.low_pc)):
+            subs[sp.name] = sp
     if not subs:
-        return _Program(path, STATUS_NO_DEBUG_INFO, idx=idx, detail="no DWARF subprograms with code ranges")
+        return _Program(path, STATUS_NO_DEBUG_INFO, idx=idx, detail="no DWARF subprograms with a source position")
     cus = _comp_dirs(path, deadline)
     rows = _line_rows(path, deadline)
     if time.monotonic() > deadline:
         return _Program(path, STATUS_TIME_LIMIT, idx=idx)
     if not rows:
         return _Program(path, STATUS_NO_DEBUG_INFO, idx=idx, detail="no DWARF line table")
-    addrs = [r[0] for r in rows]
+    code_lines: Dict[str, Set[int]] = {}
+    for _addr, base, ln in rows:
+        if ln > 0:
+            code_lines.setdefault(base, set()).add(ln)
     prog = _Program(path, STATUS_FOUND, idx=idx)
     resolved: Dict[str, Optional[str]] = {}
     newer: List[str] = []
@@ -418,33 +430,30 @@ def _build_program(path: str, image_mtime: float, deadline: float) -> _Program:
         resolved[decl_file] = found
         return found
 
-    for s in subs[:MAX_FUNCTIONS]:
+    by_file: Dict[str, List[Any]] = {}
+    for sp in list(subs.values())[:MAX_FUNCTIONS]:
         if time.monotonic() > deadline:
             prog.status = STATUS_TIME_LIMIT
             break
-        if _is_system(s.decl_file):
-            continue
-        src = _resolve(s.decl_file)
-        if not src:
-            continue
-        base = os.path.basename(s.decl_file)
-        i = bisect.bisect_left(addrs, s.low_pc)
-        lines: Set[int] = set()
-        while i < len(rows) and rows[i][0] < s.high_pc:
-            if rows[i][1] == base and rows[i][2] > 0:
-                lines.add(rows[i][2])
-            i += 1
-        if not lines:
-            continue
-        lo = min(min(lines), s.decl_line or min(lines))
-        hi = max(lines)
-        if s.name in prog.funcs:   # same static name in two units: keep the first (names are reported per file)
-            continue
-        f = _Func(name=s.name, path=src, file=os.path.basename(src), decl_line=s.decl_line or lo,
-                  lines=sorted(lines), first=lo, last=hi)
-        for v in s.variables or []:
-            f.locals[v.name] = _Var(v.name, v.type_offset, bool(v.is_parameter))
-        prog.funcs[s.name] = f
+        src = _resolve(sp.decl_file)
+        if src:
+            by_file.setdefault(src, []).append(sp)
+    for src, sps in by_file.items():
+        sps.sort(key=lambda x: int(x.decl_line))
+        code = code_lines.get(os.path.basename(src), set())
+        nlines = len(prog.source.get(src) or [])
+        for k, sp in enumerate(sps):
+            lo = int(sp.decl_line)
+            hi = (int(sps[k + 1].decl_line) - 1) if k + 1 < len(sps) else nlines
+            lines = sorted(ln for ln in code if lo <= ln <= hi)
+            if not lines:
+                continue
+            f = _Func(name=sp.name, path=src, file=os.path.basename(src), decl_line=lo, lines=lines, first=lo,
+                      last=lines[-1])
+            for v in sp.variables or []:
+                if v.name:
+                    f.locals[v.name] = _Var(v.name, v.type_offset, bool(v.is_parameter))
+            prog.funcs[sp.name] = f
     for v in list(idx.global_variables or []) + list(idx.static_variables or []):
         if v.name and v.name not in prog.globals and not v.is_declaration:
             prog.globals[v.name] = v

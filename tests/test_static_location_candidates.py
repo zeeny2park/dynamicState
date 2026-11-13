@@ -128,6 +128,12 @@ class StaticCandidateRules(unittest.TestCase):
             _finding("PROCESS_INSTABILITY", thread_name=["conn_worker"]), self._bin("accept_workers"),
             report=_runaway_report("idle_worker", "conn_worker"))["candidates"], [])
 
+    def test_optimised_build_keeps_the_function_a_statement_is_written_in(self):
+        """-O2 inlines job_finish into main: the candidate still names job_finish (source extent of the DIE)."""
+        lc = slc.location_candidates(_finding("USE_AFTER_FREE", variable=["cur"]),
+                                     self._bin("uaf_jobq", flags=("-g", "-O2")))
+        self.assertEqual([(c["location"], c["function"]) for c in lc["candidates"]][:1], [("uaf_jobq.c:37", "job_finish")])
+
     def test_nothing_defensible_gives_nothing(self):
         lc = slc.location_candidates(_finding("MEMORY_CORRUPTION", variable=["no_such_variable"]),
                                      self._bin("overflow_tbl"))
