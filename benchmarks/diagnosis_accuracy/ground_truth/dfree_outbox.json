@@ -24,12 +24,12 @@
     {
       "file": "benchmarks/diagnosis_accuracy/targets/dfree_outbox.c",
       "line": 43,
-      "text": "free(m) (first free, send path)"
+      "text": "free(m)"
     },
     {
       "file": "benchmarks/diagnosis_accuracy/targets/dfree_outbox.c",
       "line": 48,
-      "text": "free(m) (second free, retire)"
+      "text": "free(m)"
     }
   ],
   "notes": "fastbin double free with another free in between (tcache for the size full): free(a), free(b), free(a) leaves the fastbin a -> b -> a; no malloc/free afterwards"

@@ -24,12 +24,12 @@
     {
       "file": "benchmarks/diagnosis_accuracy/targets/dfree_reqbuf.c",
       "line": 37,
-      "text": "free(r) (first free)"
+      "text": "free(r)"
     },
     {
       "file": "benchmarks/diagnosis_accuracy/targets/dfree_reqbuf.c",
       "line": 43,
-      "text": "free(current) (second free)"
+      "text": "free(current)"
     }
   ],
   "notes": "freed into the unsorted bin while the tcache for its size was full, the tcache drained by allocations, then freed again into the tcache: the block is on two free lists; no malloc/free afterwards"
