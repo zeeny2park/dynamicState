@@ -253,7 +253,11 @@ class TestLiveTargets(unittest.TestCase):
 
     def test_ordinary_contention_stays_healthy(self):
         r, _ = self._run("ok_contention")
-        self.assertEqual(r["verdict"], "HEALTHY", r["summary"])
+        # the message carries what could not be decided: this live check has failed intermittently in long runs
+        why = [(x.get("kind"), x.get("item"), x.get("reason")) for x in r.get("not_covered") or []
+               if x.get("kind") != "recipes_not_planned"]
+        self.assertEqual(r["verdict"], "HEALTHY", f"{r['summary']} | not_covered={why} | "
+                                                  f"blocking={(r.get('healthy_scope') or {}).get('blocking')}")
 
 
 if __name__ == "__main__":

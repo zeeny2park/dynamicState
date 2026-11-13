@@ -1192,7 +1192,9 @@ class DiagnosticConclusion:
 _REPORTABLE_WITHOUT_CHECKS = {STATE_BLOCKED, STATE_FAILED, STATE_BUDGET_EXHAUSTED, STATE_INCONCLUSIVE}
 
 
-# Steps run_to_completion always allows beyond the plan's own steps (see its limit()).
+# run_to_completion without an explicit max_steps: at least DEFAULT_MIN_STEP_CAP steps, and never fewer than the
+# plan's own steps plus STEP_MARGIN_BEYOND_PLAN.
+DEFAULT_MIN_STEP_CAP = 30
 STEP_MARGIN_BEYOND_PLAN = 10
 
 
@@ -1476,16 +1478,23 @@ class AdaptiveInvestigationSession:
         self._save_to_disk()
         return res
 
-    def run_to_completion(self, max_steps: int = 30) -> DiagnosticConclusion:
-        """Runs the investigation state machine iteratively until a terminal state is reached."""
+    def run_to_completion(self, max_steps: Optional[int] = None) -> DiagnosticConclusion:
+        """Runs the investigation state machine iteratively until a terminal state is reached.
+
+        ``max_steps``: an explicit number is a hard cap (the run ends INCONCLUSIVE / STEP_BUDGET_REACHED when it is
+        hit).  None (the default) sizes the cap from the plan, so a plan is never cut short by a constant chosen
+        when there were fewer baseline recipes.
+        """
         steps_executed = 0
 
         def limit() -> int:
-            # max_steps guards against a state machine that never terminates; it must not cut a plan short.
-            # The plan grows with every registered baseline recipe (recipe_plugins), so the cap is never below
-            # what the current plan needs plus a margin for classify / assess / plan / replan / conclude steps.
+            if max_steps is not None:
+                return int(max_steps)
+            # Auto: the guard against a state machine that never terminates.  The plan grows with every registered
+            # baseline recipe (recipe_plugins); allow its steps plus a margin for classify / assess / plan /
+            # replan / conclude.
             planned = int(getattr(self.plan, "total_steps", 0) or 0) if self.plan is not None else 0
-            return max(max_steps, planned + STEP_MARGIN_BEYOND_PLAN)
+            return max(DEFAULT_MIN_STEP_CAP, planned + STEP_MARGIN_BEYOND_PLAN)
 
         while self.state not in TERMINAL_STATES and steps_executed < limit():
             if self.is_paused:
@@ -3713,7 +3722,7 @@ class ExpertDiagnosticEngine:
             budget_limits=budget_limits,
         )
 
-        conclusion = session.run_to_completion(max_steps=20)
+        conclusion = session.run_to_completion()
         check = next((c for c in session.checks if c.recipe_id == recipe.recipe_id), None)
         records = session.ledger.get_records()
 
@@ -4045,7 +4054,7 @@ def diagnose(
     target: Optional[Any] = None,
     corpus_dir: Optional[str] = None,
     time_limit_s: Optional[float] = None,
-    max_steps: int = 30,
+    max_steps: Optional[int] = None,
     include_report: bool = False,
     engine: Optional["ExpertDiagnosticEngine"] = None,
 ) -> DiagnoseResult:
@@ -4057,7 +4066,7 @@ def diagnose(
         normally stripped and is not fetched).  A path that does not exist yields an INCONCLUSIVE result.
     symptom: natural-language symptom; default "general health check" (the planner then runs its broad
         recipe set).  adapter: ready target adapter (default local).  time_limit_s: wall-clock observation
-        budget (default: 20 s local, 120 s for a remote target, where every read is an SSH round trip).  max_steps: state-machine step cap.
+        budget (default: 20 s local, 120 s for a remote target, where every read is an SSH round trip).  max_steps: explicit state-machine step cap (default: sized from the plan).
     target: remote target as a :class:`TargetSpec` or dict (``remote_host``, ``ssh_user``, ``ssh_port``,
         ``ssh_key``, ``ssh_proxy_jump``, ``auto_deploy_collector``, ``collector_path``); builds an SSH
         adapter that is closed again when the call ends.  An unreachable host or failed SSH is INCONCLUSIVE
@@ -4187,7 +4196,7 @@ def _diagnose_run(
     adapter: Optional[TargetExecutionAdapter],
     corpus_dir: Optional[str],
     time_limit_s: Optional[float],
-    max_steps: int,
+    max_steps: Optional[int],
     include_report: bool,
     engine: Optional["ExpertDiagnosticEngine"],
     extra_target: Dict[str, Any],

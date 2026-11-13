@@ -69,27 +69,36 @@ class TestPhase21AdaptiveInvestigationLifecycle(unittest.TestCase):
         self.assertGreater(session.plan.total_steps, 0)
 
         # Run remaining steps to completion
-        conclusion = session.run_to_completion(max_steps=20)
+        # no explicit cap: the plan length depends on how many baseline recipes are registered
+        conclusion = session.run_to_completion()
         self.assertEqual(session.state, STATE_COMPLETED)
         self.assertIsNotNone(conclusion)
         self.assertTrue(conclusion.confidence > 0.0)
         self.assertEqual(conclusion.investigation_id, session.investigation_id)
 
-    def test_step_cap_never_cuts_the_plan_short(self):
-        """A plan longer than max_steps (every registered baseline recipe adds a step) still runs to completion;
-        the cap only bounds what goes beyond the plan."""
-        from extractor.expert_diagnostic_engine import STEP_MARGIN_BEYOND_PLAN
-        session = self.engine.start_investigation(
-            problem_statement="0x7fff0038 주소에서 세그폴트 및 메모리 오염 의심", pid=self._spawn_healthy_target(),
-            companion_elf="/tmp/expert_diagnostic_debug.elf")
+    def test_default_step_cap_is_sized_from_the_plan(self):
+        """Without an explicit max_steps a plan of any length runs to completion (every registered baseline recipe
+        adds a step); an explicit max_steps stays a hard cap."""
+        from extractor.expert_diagnostic_engine import DEFAULT_MIN_STEP_CAP
+        statement = "0x7fff0038 주소에서 세그폴트 및 메모리 오염 의심"
+        session = self.engine.start_investigation(problem_statement=statement, pid=self._spawn_healthy_target(),
+                                                  companion_elf="/tmp/expert_diagnostic_debug.elf")
         for _ in range(3):
             session.step()
-        planned = session.plan.total_steps
-        self.assertGreater(planned, 3)
-        conclusion = session.run_to_completion(max_steps=3)
+        real_steps = session.plan.total_steps
+        session.plan.total_steps = DEFAULT_MIN_STEP_CAP * 4            # a plan far longer than any constant cap
+        try:
+            self.assertGreater(real_steps, 3)
+            conclusion = session.run_to_completion()
+        finally:
+            session.plan.total_steps = real_steps
         self.assertEqual(session.state, STATE_COMPLETED)
         self.assertNotEqual(conclusion.stop_reason, "STEP_BUDGET_REACHED")
-        self.assertGreaterEqual(STEP_MARGIN_BEYOND_PLAN, 4)
+
+        capped = self.engine.start_investigation(problem_statement=statement, pid=self._spawn_healthy_target(),
+                                                 companion_elf="/tmp/expert_diagnostic_debug.elf")
+        capped_conclusion = capped.run_to_completion(max_steps=5)
+        self.assertEqual(capped_conclusion.stop_reason, "STEP_BUDGET_REACHED")
 
     def test_pause_and_resume_control(self):
         """Verifies pause and resume semantics."""
