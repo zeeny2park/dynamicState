@@ -23,8 +23,8 @@ Heap-corruption targets do the bad write (or the second free) once, then idle wi
 
 21 scored defect targets (memory_leak 3, heap_overflow 2, use_after_free 2, double_free 2, deadlock 2, busy_wait 2,
 mapping_growth 2: `mapgrow_slabs` mmap()s without munmap, `mapgrow_pool` a custom region pool; orphan_lock 2,
-self_deadlock 2, thread_growth 2: `accept_workers`, `request_threads`), 4 unscored targets (`long_stall`: `stall_pipe`,
-`stall_sleep`; `heap_retention`: `frag_sparse`, `frag_worker`), 8 healthy controls, 4 `external_style` (small LRU cache,
+self_deadlock 2, thread_growth 2: `accept_workers`, `request_threads`), 6 unscored targets (`long_stall`: `stall_pipe`,
+`stall_sleep`; `heap_retention`: `frag_sparse`, `frag_worker`; `lock_contention`: `lock_convoy`, `lock_hotspot`), 8 healthy controls, 4 `external_style` (small LRU cache,
 ring buffer, job queue, message outbox written in a neutral style). The `double_free` targets leave states glibc's own
 checks let through: `dfree_outbox` a fastbin cycle (free a, free b, free a with the size's tcache full), `dfree_reqbuf`
 one block on the tcache and the unsorted bin (freed while the tcache was full, tcache drained, freed again). For
@@ -40,11 +40,14 @@ made the call is not observable from memory.
   (`frag_sparse`, `frag_worker`) are unscored because fragmentation is a degradation, not a defect: the expected answer
   is a `HEAP_RETENTION` finding with a DEGRADED (non-fault) verdict, a HEALTHY verdict on it is not a dangerous miss, and
   neither the defect scoring (HEALTHY = false clear) nor the healthy-control scoring (any finding = false positive) can
-  express that. The `long_stall` targets (`stall_pipe`, `stall_sleep`) are unscored (owner decision): from outside, a thread blocked forever and an idle worker
+  express that. The `lock_contention` targets (`lock_convoy`, `lock_hotspot`) are unscored for the same reason: threads queued
+  on a mutex whose owner keeps running are slow, not broken, and the expected answer is a `LOCK_CONTENTION` finding with a
+  DEGRADED verdict. The healthy control `ok_contention` (short critical sections, `usleep` between turns) must stay
+  HEALTHY: it is scored as any healthy control. The `long_stall` targets (`stall_pipe`, `stall_sleep`) are unscored (owner decision): from outside, a thread blocked forever and an idle worker
   look identical, so the tool deliberately answers "long wait observed, cannot determine whether expected" rather than a
   fault, and counting that as a miss gave no actionable signal. A stall target is defective, so a fault-class verdict on it
   is not a false positive (false positives are defined for healthy controls only); the verdict is just reported.
-  `KIND_CATEGORIES` keeps `long_stall` and `heap_retention` only to label and describe those rows.
+  `KIND_CATEGORIES` keeps `long_stall`, `heap_retention` and `lock_contention` only to label and describe those rows.
 
 - False clear (defect): a scored defect target whose verdict is `HEALTHY` (the diagnoser told the user "nothing is
   wrong" about a real defect), the most dangerous miss. Counted as `false_clears` in the overall and per-kind totals,

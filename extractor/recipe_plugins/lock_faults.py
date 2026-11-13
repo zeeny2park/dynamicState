@@ -21,10 +21,9 @@ Both recipes decide only from these observations: not enough samples, an undecod
 liveness could not be checked is INSUFFICIENT_EVIDENCE; a complete look that found nothing is CONTRADICTED.
 Mutexes the inspector cannot see (no debug info for the variable) are outside the check; this is a declared limit.
 
-Lock contention (waiters present in most samples while the owner keeps running) is NOT implemented here: a
-SUPPORTED recipe always becomes a FAIL of a required check and therefore a fault verdict; the engine has no
-non-fault severity for an executed recipe (DEGRADED only arises from an *optional* failed check and executed
-checks are always required).
+Lock contention (waiters present in most samples while the owner keeps running) is a degradation, not a fault: it
+is the separate check in ``lock_contention.py`` (severity INFO, verdict DEGRADED).  Both recipes here still
+report faults only; a mutex whose owner makes progress is never reported as orphaned or deadlocked.
 """
 
 from __future__ import annotations
@@ -73,7 +72,17 @@ def _user_frames(thread: Dict[str, Any], limit: int = 4) -> List[Dict[str, str]]
     return out
 
 
-def _digest(info: Dict[str, Any], t_s: float) -> Dict[str, Any]:
+def _switches(adapter: Any, pid: int) -> Dict[str, int]:
+    """Voluntary + involuntary context switches per thread (one /proc scan); {} when the adapter cannot provide them."""
+    try:
+        recs = adapter.read_thread_samples(pid, {}) if adapter is not None else None
+        return {str(r["tid"]): int(r.get("voluntary_ctxt_switches") or 0) + int(r.get("nonvoluntary_ctxt_switches") or 0)
+                for r in recs or [] if isinstance(r, dict) and r.get("tid") is not None}
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def _digest(info: Dict[str, Any], t_s: float, switches: Optional[Dict[str, int]] = None) -> Dict[str, Any]:
     """One inspection reduced to the fields the rules read.  Key names avoid the subject keys of the engine on
     purpose: the findings' subjects are taken from ``orphan_locks`` / ``self_waits`` only."""
     threads = [t for t in info.get("threads") or [] if isinstance(t, dict) and t.get("tid") is not None]
@@ -93,6 +102,8 @@ def _digest(info: Dict[str, Any], t_s: float) -> Dict[str, Any]:
             frames[t["tid"]] = _user_frames(t)
     return {"t_s": round(t_s, 3), "thread_ids": [t["tid"] for t in threads], "thread_labels": {str(t["tid"]): t.get("name") for t in threads},
             "locks": locks, "waits": waits, "wait_frames": {str(k): v for k, v in frames.items()},
+            "switches": {str(w["thread_id"]): (switches or {}).get(str(w["thread_id"])) for w in waits
+                         if (switches or {}).get(str(w["thread_id"])) is not None},
             "status": info.get("status"), "lock_owner_status": info.get("lock_owner_status"),
             "limitations": [str(x) for x in (info.get("limitations") or [])][:3]}
 
@@ -151,6 +162,12 @@ def analyse(samples: List[Dict[str, Any]], exists: Any) -> Dict[str, Any]:
         if not all(any(x["thread_id"] == tid and x.get("address") == w.get("address") and x.get("owner_id") == tid
                        for x in s["waits"]) for s in samples):
             continue
+        # A thread that is really stuck on its own lock never gets scheduled: no context switch between the samples.
+        # A thread that keeps being woken (a busy lock handed on between threads) shows up as its own owner in a
+        # sample only because the owner word was read a moment after its futex wait ended: it is not stuck.
+        sw = [(s.get("switches") or {}).get(str(tid)) for s in samples]
+        if all(v is not None for v in sw) and len(set(sw)) > 1:
+            continue
         frames = last["wait_frames"].get(str(tid)) or []
         item: Dict[str, Any] = {"lock_name": lock.get("lock_label"), "lock_address": lock.get("address"), "waiter_tid": tid,
                                 "waiter_name": w.get("thread_label"), "samples_seen": len(samples),
@@ -178,7 +195,7 @@ def collect_lock_wait_state(provider: Any, ctx: Dict[str, Any]) -> None:
             if not isinstance(info, dict) or info.get("error") or info.get("success") is False:
                 err = str((info or {}).get("error") if isinstance(info, dict) else "unexpected result")
                 break
-            samples.append(_digest(info, time.monotonic() - t0))
+            samples.append(_digest(info, time.monotonic() - t0, _switches(adapter, pid)))
         except Exception as exc:  # noqa: BLE001
             err = f"{type(exc).__name__}: {exc}"
             break

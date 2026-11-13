@@ -761,6 +761,7 @@ class ThreadSampler:
                 continue
             threads: Dict[int, Dict[str, Any]] = {int(r["tid"]): r for r in recs}
             info = None
+            lock_digest: Optional[List[Dict[str, Any]]] = None
             if inspect_fn is not None:
                 try:
                     info = inspect_fn()
@@ -778,6 +779,7 @@ class ThreadSampler:
                     if series.abi is None and info.get("target_abi"):
                         series.abi = TargetABI.from_dict(info["target_abi"])
                     series.lock_series.add_sample(i, info)
+                    lock_digest = _lock_digest(info)
                     by_tid = {int(t["tid"]): t for t in info.get("threads", []) if t.get("tid") is not None}
                     for tid, rec in threads.items():
                         tr = by_tid.get(tid)
@@ -793,7 +795,7 @@ class ThreadSampler:
                     self.budget_tracker.record_sample()
                 except Exception:  # noqa: BLE001
                     pass
-            series.samples.append({"index": i, "t": t_now, "threads": threads})
+            series.samples.append({"index": i, "t": t_now, "threads": threads, "locks": lock_digest})
         if series.abi is None:
             try:
                 series.abi = detect_target_abi(self.adapter, pid)
@@ -937,6 +939,49 @@ def derive(series: ThreadSeries) -> Dict[str, Any]:
     return out
 
 
+def _lock_digest(info: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Per mutex of one lock inspection: owner, state word and the threads blocked in a futex wait on it (the
+    per-sample evidence of the lock-contention check; ``judge`` adds the owner's progress counters)."""
+    waiters: Dict[str, List[int]] = {}
+    for t in info.get("threads") or []:
+        w = t.get("waiting_on_lock") if isinstance(t, dict) else None
+        if isinstance(w, dict) and t.get("tid") is not None:
+            waiters.setdefault(str(w.get("lock_address")), []).append(int(t["tid"]))
+    out = []
+    for l in info.get("locks") or []:
+        if not isinstance(l, dict):
+            continue
+        addr = str(l.get("runtime_address"))
+        out.append({"lock": l.get("name"), "address": addr, "type": l.get("type_name"),
+                    "state_word": l.get("lock_state_word"), "owner_tid": l.get("owner_tid"),
+                    "owner_name": l.get("owner_thread_name"), "waiter_tids": sorted(waiters.get(addr, []))})
+    return out
+
+
+def lock_wait_samples(series: "ThreadSeries") -> List[Dict[str, Any]]:
+    """One row per sample that has a lock inspection: ``t_s`` since the first sample, the mutexes with owner and
+    waiters, and ``owner_work`` = {owner tid: cpu ticks + context switches so far} (an owner whose counter rose
+    between two samples made progress; the owner's counters are read from the same sample's /proc reading)."""
+    out: List[Dict[str, Any]] = []
+    if not series.samples:
+        return out
+    t0 = series.samples[0]["t"]
+    for smp in series.samples:
+        digest = smp.get("locks")
+        if digest is None:
+            continue
+        work: Dict[str, int] = {}
+        for l in digest:
+            o = l.get("owner_tid")
+            r = smp["threads"].get(int(o)) if isinstance(o, int) else None
+            if r:
+                work[str(o)] = int(r["utime_ticks"] + r["stime_ticks"] + (r.get("voluntary_ctxt_switches") or 0)
+                                   + (r.get("nonvoluntary_ctxt_switches") or 0))
+        out.append({"index": smp["index"], "t_s": round(smp["t"] - t0, 3), "locks": digest, "owner_work": work,
+                    "thread_ids": sorted(int(k) for k in smp["threads"])})
+    return out
+
+
 def _fmt_pct(x: Optional[float]) -> str:
     return "n/a" if x is None else f"{x * 100:.0f}%"
 
@@ -1053,6 +1098,8 @@ def judge(series: ThreadSeries) -> Dict[str, Any]:
             )
     anomalous = bool(runaway or zombies or d_state)
     result["thread_summary"] = summary
+    result["lock_wait_samples"] = lock_wait_samples(series)
+    result["lock_cycle_seen"] = any(smp["cycles"] for smp in series.lock_series.samples)
     result["thread_findings"] = findings
     result["long_wait_findings"] = long_wait_findings
     result["long_wait_threads"] = long_waits

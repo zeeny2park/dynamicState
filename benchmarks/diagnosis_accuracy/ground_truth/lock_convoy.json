@@ -1,0 +1,35 @@
+{
+  "id": "lock_convoy",
+  "origin": "new",
+  "naming": "neutral",
+  "kind": "lock_contention",
+  "scored": false,
+  "scored_reason": "Not scored: lock contention is a degradation, not a defect. The expected answer is a LOCK_CONTENTION finding with a non-fault verdict (DEGRADED). A HEALTHY verdict is not a dangerous miss here (nothing is stuck or broken), so the defect scoring (HEALTHY = false clear) and the healthy-control scoring (any finding = false positive) both misdescribe it. The check is planned only for a concurrency/slowness symptom; any verdict is reported informationally.",
+  "source": "benchmarks/diagnosis_accuracy/targets/lock_convoy.c",
+  "language": "c",
+  "symptom": "the process feels slow, check for lock problems",
+  "ready": {
+    "mode": "stdout_marker"
+  },
+  "causes": {
+    "variables": [],
+    "locks": [
+      "table_mu"
+    ],
+    "threads": [
+      "tbl_worker"
+    ],
+    "functions": [
+      "worker",
+      "hold_for_ms"
+    ]
+  },
+  "locations": [
+    {
+      "file": "benchmarks/diagnosis_accuracy/targets/lock_convoy.c",
+      "line": 29,
+      "text": "pthread_mutex_lock(&table_mu)"
+    }
+  ],
+  "notes": "six workers loop lock(table_mu) / 2 ms of work / unlock: the lock is always held, about five threads wait, the holder changes every turn"
+}
