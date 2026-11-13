@@ -24,6 +24,7 @@ from extractor.expert_diagnostic_engine import (
     ExpertDiagnosticEngine,
 )
 from tests.support.fixture_process import fixture_popen
+from tests.support.tmpdirs import temp_dir
 
 
 class TestPhase211AdaptiveReplanning(unittest.TestCase):
@@ -36,7 +37,7 @@ class TestPhase211AdaptiveReplanning(unittest.TestCase):
         ensure_expert_diagnostic_fixture()
 
     def setUp(self):
-        self.corpus_dir = "/tmp/phase2_1_1_replan_corpus"
+        self.corpus_dir = temp_dir(self, "corpus_")
         self.engine = ExpertDiagnosticEngine(corpus_dir=self.corpus_dir)
         self.procs = []
 

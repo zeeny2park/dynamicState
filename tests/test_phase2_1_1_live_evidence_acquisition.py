@@ -31,6 +31,7 @@ from extractor.runtime_evidence_provider import (
 )
 from extractor.target_adapter import LocalTargetAdapter
 from tests.support.fixture_process import fixture_popen
+from tests.support.tmpdirs import temp_dir
 
 
 class TestPhase211LiveEvidenceAcquisition(unittest.TestCase):
@@ -46,7 +47,7 @@ class TestPhase211LiveEvidenceAcquisition(unittest.TestCase):
         self.procs = []
         self.provider = RuntimeEvidenceProvider(
             adapter=LocalTargetAdapter(),
-            corpus_dir="/tmp/phase2_1_1_ev_corpus",
+            corpus_dir=temp_dir(self, "corpus_"),
         )
         self.registry = DiagnosticRecipeRegistry()
 

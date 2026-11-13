@@ -26,6 +26,7 @@ from extractor.expert_diagnostic_engine import (
     ExpertHypothesis,
 )
 from tests.support.fixture_process import fixture_popen
+from tests.support.tmpdirs import temp_dir
 
 
 class TestPhase211EvidenceDrivenHypotheses(unittest.TestCase):
@@ -37,7 +38,7 @@ class TestPhase211EvidenceDrivenHypotheses(unittest.TestCase):
         ensure_expert_diagnostic_fixture(need_stripped=False)
 
     def setUp(self):
-        self.engine = ExpertDiagnosticEngine(corpus_dir="/tmp/phase2_1_1_hyp_corpus")
+        self.engine = ExpertDiagnosticEngine(corpus_dir=temp_dir(self, "corpus_"))
         self.procs = []
 
     def tearDown(self):

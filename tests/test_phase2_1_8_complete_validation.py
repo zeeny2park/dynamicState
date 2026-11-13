@@ -112,6 +112,7 @@ from extractor.expert_diagnostic_engine import (
 )
 from extractor.watch_session import WatchSessionManager
 from tests.support.fixture_process import fixture_popen
+from tests.support.tmpdirs import temp_dir
 
 
 def make_authoritative_record(
@@ -786,7 +787,7 @@ class TestPhase218CompleteValidation(unittest.TestCase):
 
     def test_matrix_U_real_cpp_memory_growth_scenarios_c1_01_to_c1_05(self):
         """Matrix U (Part C1.1–C1.5): Validates live C++ memory growth, transient warmup, container accumulation, fragmentation, and alloc/free imbalance."""
-        wsm = WatchSessionManager(corpus_dir="/tmp/dynamicstate_corpus")
+        wsm = WatchSessionManager(corpus_dir=temp_dir(self, "corpus_"))
 
         # C1-01: Continuous Heap Leak -> SUPPORTED
         p_leak = self._spawn("c1_01_heap_leak")
@@ -849,7 +850,7 @@ class TestPhase218CompleteValidation(unittest.TestCase):
 
     def test_matrix_V_real_cpp_memory_corruption_scenarios_c1_06_to_c1_12(self):
         """Matrix V (Part C1.6–C1.12): Validates live C++ UAF, double free, invalid free, heap overflow, adjacent corruption, stack corruption, and wild pointer."""
-        wsm = WatchSessionManager(corpus_dir="/tmp/dynamicstate_corpus")
+        wsm = WatchSessionManager(corpus_dir=temp_dir(self, "corpus_"))
 
         # C1-06: Use-After-Free
         p_uaf = self._spawn("c1_06_use_after_free")
@@ -931,7 +932,7 @@ class TestPhase218CompleteValidation(unittest.TestCase):
 
     def test_matrix_W_real_cpp_concurrency_scenarios_c2_01_to_c2_08(self):
         """Matrix W (Part C2.1–C2.8): Validates live C++ 2-thread deadlock, 3-thread deadlock, contention, slow progress, starvation, normal sync, lock-order risk, and transient wait."""
-        wsm = WatchSessionManager(corpus_dir="/tmp/dynamicstate_corpus")
+        wsm = WatchSessionManager(corpus_dir=temp_dir(self, "corpus_"))
 
         # C2-01: 2-Thread AB-BA Deadlock
         p_dl2 = self._spawn("c2_01_abba_deadlock")

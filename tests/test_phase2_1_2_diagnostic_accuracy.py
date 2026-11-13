@@ -55,6 +55,7 @@ from extractor.runtime_evidence_provider import (
 )
 from extractor.target_adapter import TargetExecutionAdapter
 from tests.support.fixture_process import fixture_popen
+from tests.support.tmpdirs import temp_dir
 
 
 class MockRemoteSshTargetAdapter(TargetExecutionAdapter):
@@ -158,7 +159,7 @@ class TestPhase212DiagnosticAccuracy(unittest.TestCase):
         )
 
     def setUp(self):
-        self.engine = ExpertDiagnosticEngine(corpus_dir="/tmp/phase2_1_2_corpus")
+        self.engine = ExpertDiagnosticEngine(corpus_dir=temp_dir(self, "corpus_"))
         self.procs = []
 
     def tearDown(self):

@@ -98,6 +98,7 @@ from scripts.mcp_server import (
     runtime_export_incident_report,
 )
 from tests.support.fixture_process import fixture_popen
+from tests.support.tmpdirs import temp_dir
 
 
 class TestDiagnosticMethodologyAndChecks(unittest.TestCase):
@@ -283,7 +284,7 @@ class TestPersistenceAndLedgerConsistency(unittest.TestCase):
     """Area 7, 8: Fail-closed persistence and full session recovery."""
 
     def test_persistence_fail_closed_raises_investigation_persistence_error(self):
-        engine = ExpertDiagnosticEngine(corpus_dir="/tmp/dynstate_test_persistence")
+        engine = ExpertDiagnosticEngine(corpus_dir=temp_dir(self, "corpus_"))
         session = engine.start_investigation("Memory leak in buffer", pid=999999)
 
         # Force a write error by patching os.replace to raise OSError
