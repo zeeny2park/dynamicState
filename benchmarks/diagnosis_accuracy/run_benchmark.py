@@ -264,6 +264,71 @@ def summarize(all_rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     }
 
 
+# ------------------------------------------------------------------------------------------------ timing / repeat
+def check_timings(result: Optional[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Per executed check wall time, from the engine's own ``checks_run[].duration_s``. Pure function."""
+    out = []
+    for c in (result or {}).get("checks_run") or []:
+        d = c.get("duration_s")
+        out.append({"check_id": c.get("check_id"), "recipe_id": c.get("recipe_id"), "name": c.get("name"),
+                    "status": c.get("status"), "duration_s": float(d) if isinstance(d, (int, float)) else None})
+    return out
+
+
+def verdict_agreement(verdicts: List[Optional[str]]) -> Dict[str, Any]:
+    """Distribution of verdicts over repeated runs and the share equal to the most common one. Pure function.
+    A run without a verdict (error) counts as the verdict "ERROR"; ties go to the verdict seen first."""
+    labels = [v if v else "ERROR" for v in verdicts]
+    dist: Dict[str, int] = {}
+    for v in labels:
+        dist[v] = dist.get(v, 0) + 1
+    if not labels:
+        return {"runs": 0, "distribution": {}, "modal_verdict": None, "agreement_rate": None}
+    modal = max(dist, key=lambda k: (dist[k], -labels.index(k)))
+    return {"runs": len(labels), "distribution": dist, "modal_verdict": modal,
+            "agreement_rate": round(dist[modal] / len(labels), 4)}
+
+
+def summarize_repeat(rows: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """Overall repeat-verdict agreement over rows that carry a ``repeat`` entry (None if no row does).
+    ``mean_agreement_rate`` = mean of per-target rates; ``pooled_agreement_rate`` = sum of modal counts / sum of runs.
+    Unscored targets are listed per target but kept out of the overall figures. Pure function."""
+    rep = [r for r in rows if isinstance(r.get("repeat"), dict) and r["repeat"].get("runs")]
+    if not rep:
+        return None
+    use = [r for r in rep if r.get("scored", True)]
+    rates = [r["repeat"]["agreement_rate"] for r in use]
+    modal = sum(r["repeat"]["distribution"][r["repeat"]["modal_verdict"]] for r in use)
+    runs = sum(r["repeat"]["runs"] for r in use)
+    return {
+        "targets": len(use),
+        "runs_per_target": sorted({r["repeat"]["runs"] for r in use}),
+        "mean_agreement_rate": round(sum(rates) / len(rates), 4) if rates else None,
+        "pooled_agreement_rate": round(modal / runs, 4) if runs else None,
+        "fully_agreeing_targets": sum(1 for x in rates if x == 1.0),
+        "per_target": {r["id"]: {**r["repeat"], "scored": r.get("scored", True)} for r in rep},
+    }
+
+
+def summarize_timing(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Diagnosis wall time over rows (all targets, scored or not) and per-check mean/max/count keyed by check_id.
+    Uses every run of a row when ``check_runs`` is present, else its single ``checks``. Pure function."""
+    diag = [r["diagnose_s"] for r in rows if isinstance(r.get("diagnose_s"), (int, float))]
+    per: Dict[str, List[float]] = {}
+    names: Dict[str, str] = {}
+    for r in rows:
+        for run in (r.get("check_runs") or [r.get("checks") or []]):
+            for c in run:
+                if isinstance(c.get("duration_s"), (int, float)):
+                    per.setdefault(str(c["check_id"]), []).append(float(c["duration_s"]))
+                    names[str(c["check_id"])] = c.get("name") or ""
+    return {
+        "diagnose_s": {"mean": round(sum(diag) / len(diag), 3), "max": max(diag), "n": len(diag)} if diag else None,
+        "per_check": {k: {"name": names[k], "mean_s": round(sum(v) / len(v), 4), "max_s": round(max(v), 4),
+                          "n": len(v)} for k, v in sorted(per.items(), key=lambda kv: -max(kv[1]))},
+    }
+
+
 # ------------------------------------------------------------------------------------------------ running
 def environment() -> Dict[str, Any]:
     def sh(*cmd):
@@ -346,8 +411,9 @@ def _default_diagnose(pid, debug_image, symptom, corpus_dir):
 GENERIC_SYMPTOM = "general health check"
 
 
-def run_target(gt: Dict[str, Any], tmp: str, diagnose_fn: Callable, symptom_mode: str = "ground_truth") -> Dict[str, Any]:
-    """Build, launch, diagnose once, kill, score. ``diagnose_fn(pid, debug_image, symptom, corpus_dir)`` -> dict."""
+def run_target(gt: Dict[str, Any], tmp: str, diagnose_fn: Callable, symptom_mode: str = "ground_truth",
+               repeat: int = 1) -> Dict[str, Any]:
+    """Build, launch, diagnose once (``repeat`` times if > 1, same process; scoring uses the first run), kill, score. ``diagnose_fn(pid, debug_image, symptom, corpus_dir)`` -> dict."""
     t_start = time.monotonic()
     symptom = gt["symptom"] if symptom_mode == "ground_truth" else GENERIC_SYMPTOM
     try:
@@ -360,45 +426,55 @@ def run_target(gt: Dict[str, Any], tmp: str, diagnose_fn: Callable, symptom_mode
                             stdout=subprocess.PIPE if gt["ready"]["mode"] == "stdout_marker" else subprocess.DEVNULL,
                             stderr=subprocess.DEVNULL, start_new_session=True)
     result, error, diag_s = None, None, None
+    runs: List[Dict[str, Any]] = []  # one entry per diagnose call: {"result", "error", "diagnose_s"}
     try:
         _wait_ready(proc, gt)
-        box: Dict[str, Any] = {}
+        for _i in range(max(1, repeat)):
+            box: Dict[str, Any] = {}
 
-        def _call():
-            try:
-                box["result"] = diagnose_fn(proc.pid, binary, symptom, os.path.join(tmp, "corpus"))
-            except BaseException as exc:  # noqa: BLE001 - a crash in the system under test is a result row
-                box["error"] = f"{type(exc).__name__}: {exc}"
+            def _call():
+                try:
+                    box["result"] = diagnose_fn(proc.pid, binary, symptom, os.path.join(tmp, "corpus"))
+                except BaseException as exc:  # noqa: BLE001 - a crash in the system under test is a result row
+                    box["error"] = f"{type(exc).__name__}: {exc}"
 
-        t0 = time.monotonic()
-        th = threading.Thread(target=_call, daemon=True)
-        th.start()
-        th.join(DIAGNOSE_TIMEOUT_S)
-        diag_s = round(time.monotonic() - t0, 2)
-        if th.is_alive():
-            error = f"diagnose did not return within {DIAGNOSE_TIMEOUT_S:.0f}s (hang)"
-        else:
-            result, error = box.get("result"), box.get("error")
+            t0 = time.monotonic()
+            th = threading.Thread(target=_call, daemon=True)
+            th.start()
+            th.join(DIAGNOSE_TIMEOUT_S)
+            run_s = round(time.monotonic() - t0, 2)
+            if th.is_alive():
+                runs.append({"result": None, "diagnose_s": run_s,
+                             "error": f"diagnose did not return within {DIAGNOSE_TIMEOUT_S:.0f}s (hang)"})
+                break  # the hung thread still uses the target; do not call again
+            runs.append({"result": box.get("result"), "error": box.get("error"), "diagnose_s": run_s})
+        result, error, diag_s = runs[0]["result"], runs[0]["error"], runs[0]["diagnose_s"]
     except (RuntimeError, OSError) as exc:
         error = f"target setup failed: {exc}"
     finally:
         _kill(proc)
     row = score_result(gt, result, error)
     row["diagnose_s"] = diag_s
+    row["checks"] = check_timings(result)
+    if repeat > 1 and runs:
+        row["repeat"] = verdict_agreement([(r["result"] or {}).get("verdict") for r in runs])
+        row["repeat"]["requested"] = repeat
+        row["repeat"]["diagnose_s"] = [r["diagnose_s"] for r in runs]
+        row["check_runs"] = [check_timings(r["result"]) for r in runs]
     row["wall_s"] = round(time.monotonic() - t_start, 2)
     row["symptom"] = symptom
     return row
 
 
 def run_all(targets: List[Dict[str, Any]], diagnose_fn: Callable = _default_diagnose,
-            symptom_mode: str = "ground_truth") -> Dict[str, Any]:
+            symptom_mode: str = "ground_truth", repeat: int = 1) -> Dict[str, Any]:
     t0 = time.monotonic()
     tmp = tempfile.mkdtemp(prefix="diagacc_")
     try:
-        rows = [run_target(gt, tmp, diagnose_fn, symptom_mode) for gt in targets]
+        rows = [run_target(gt, tmp, diagnose_fn, symptom_mode, repeat) for gt in targets]
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
-    return {
+    report = {
         "schema_version": SCHEMA_VERSION,
         "environment": environment(),
         "symptom_mode": symptom_mode,
@@ -406,8 +482,17 @@ def run_all(targets: List[Dict[str, Any]], diagnose_fn: Callable = _default_diag
         "line_tolerance": LINE_TOLERANCE,
         "totals": summarize(rows),
         "total_wall_s": round(time.monotonic() - t0, 1),
+        "timing": summarize_timing(rows),
         "rows": rows,
     }
+    if repeat > 1:
+        report["repeat_requested"] = repeat
+        report["repeat_agreement"] = summarize_repeat(rows)
+    try:
+        report["host_loadavg"] = list(os.getloadavg())  # at the end of the run; other jobs may share the host
+    except OSError:
+        pass
+    return report
 
 
 def format_table(report: Dict[str, Any]) -> str:
@@ -449,6 +534,23 @@ def format_table(report: Dict[str, Any]) -> str:
         lines.extend(row_line(r) for r in unscored_rows)
         for r in unscored_rows:
             lines.append(f"  {r['id']}: {r.get('scored_reason', '')}")
+    tm = report.get("timing") or {}
+    if tm.get("diagnose_s"):
+        lines.append("")
+        lines.append(f"diagnose time per target (first run): mean {tm['diagnose_s']['mean']}s max {tm['diagnose_s']['max']}s; "
+                     f"slowest checks (mean/max s over {'all runs' if report.get('repeat_requested') else 'targets'}):")
+        for cid, c in list(tm["per_check"].items())[:5]:
+            lines.append(f"  {cid:28} {c['mean_s']:7.3f} {c['max_s']:7.3f}  n={c['n']}  {c['name']}")
+    ra = report.get("repeat_agreement")
+    if ra:
+        lines.append("")
+        lines.append(f"repeat-verdict agreement ({ra['runs_per_target']} runs/target): mean {ra['mean_agreement_rate']}, "
+                     f"pooled {ra['pooled_agreement_rate']}, fully agreeing {ra['fully_agreeing_targets']}/{ra['targets']} scored targets")
+        for tid, v in ra["per_target"].items():
+            dist = ", ".join(f"{k} {n}" for k, n in sorted(v["distribution"].items(), key=lambda kv: -kv[1]))
+            lines.append(f"  {tid:20} {v['agreement_rate']:5}  {dist}{'' if v['scored'] else '  (unscored)'}")
+    if report.get("host_loadavg"):
+        lines.append("host loadavg at end of run: " + " ".join(f"{x:.2f}" for x in report["host_loadavg"]))
     lines.append(f"total wall time {report['total_wall_s']}s")
     return "\n".join(lines)
 
@@ -459,6 +561,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     ap.add_argument("--output", help="results JSON path (default results/<date>-<arch>-<commit>.json)")
     ap.add_argument("--symptom", choices=("ground_truth", "generic"), default="ground_truth",
                     help="symptom text: the ground-truth file's (default) or 'general health check' for every target")
+    ap.add_argument("--repeat", type=int, default=1, metavar="N",
+                    help="diagnose each target N times (default 1 = off) and report verdict agreement")
     ap.add_argument("--list", action="store_true", help="list targets and exit")
     args = ap.parse_args(argv)
     targets = load_ground_truth()
@@ -473,11 +577,12 @@ def main(argv: Optional[List[str]] = None) -> int:
             print(f"unknown target(s): {bad}", file=sys.stderr)
             return 2
         targets = [g for g in targets if g["id"] in args.only]
-    report = run_all(targets, symptom_mode=args.symptom)
+    report = run_all(targets, symptom_mode=args.symptom, repeat=max(1, args.repeat))
     env = report["environment"]
     out = args.output or os.path.join(
         RESULTS_DIR, f"{datetime.date.today().isoformat()}-{env['arch']}-{env['commit'][:7]}"
-        f"{'' if args.symptom == 'ground_truth' else '-generic-symptom'}.json")
+        f"{'' if args.symptom == 'ground_truth' else '-generic-symptom'}"
+        f"{'' if args.repeat <= 1 else '-repeat%d' % args.repeat}.json")
     os.makedirs(os.path.dirname(os.path.abspath(out)), exist_ok=True)
     with open(out, "w", encoding="utf-8") as fh:
         json.dump(report, fh, indent=2)

@@ -276,5 +276,87 @@ class TestRunnerWithFakeDiagnosers(unittest.TestCase):
         self.assertEqual(seen["s"], self.targets[0]["symptom"])
 
 
+class TestTimingAndRepeat(unittest.TestCase):
+    """Pure aggregation of per-check timing and repeat-verdict agreement."""
+
+    def test_check_timings_reads_checks_run(self):
+        res = {"checks_run": [{"check_id": "c1", "recipe_id": "r1", "name": "n", "status": "OK", "duration_s": 0.9},
+                              {"check_id": "c2", "duration_s": None}]}
+        t = rb.check_timings(res)
+        self.assertEqual([c["check_id"] for c in t], ["c1", "c2"])
+        self.assertEqual(t[0]["duration_s"], 0.9)
+        self.assertIsNone(t[1]["duration_s"])
+        self.assertEqual(rb.check_timings(None), [])
+
+    def test_verdict_agreement(self):
+        a = rb.verdict_agreement(["HEALTHY"] * 15 + ["INCONCLUSIVE"] * 5)
+        self.assertEqual(a["modal_verdict"], "HEALTHY")
+        self.assertEqual(a["agreement_rate"], 0.75)
+        self.assertEqual(a["distribution"], {"HEALTHY": 15, "INCONCLUSIVE": 5})
+        self.assertEqual(rb.verdict_agreement(["A", "A"])["agreement_rate"], 1.0)
+        self.assertEqual(rb.verdict_agreement(["B", "A"])["modal_verdict"], "B")  # tie: first seen
+        e = rb.verdict_agreement(["A", None, None])
+        self.assertEqual(e["distribution"], {"A": 1, "ERROR": 2})
+        self.assertIsNone(rb.verdict_agreement([])["agreement_rate"])
+
+    def test_summarize_repeat(self):
+        rows = [{"id": "a", "scored": True, "repeat": rb.verdict_agreement(["X"] * 4)},
+                {"id": "b", "repeat": rb.verdict_agreement(["X", "X", "Y", "Y"][:3])},
+                {"id": "u", "scored": False, "repeat": rb.verdict_agreement(["X", "Y"])},
+                {"id": "norepeat"}]
+        s = rb.summarize_repeat(rows)
+        self.assertEqual(s["targets"], 2)
+        self.assertEqual(s["mean_agreement_rate"], 0.8334)  # (1.0 + round(2/3, 4)) / 2
+        self.assertEqual(s["pooled_agreement_rate"], round(6 / 7, 4))
+        self.assertEqual(s["fully_agreeing_targets"], 1)
+        self.assertIn("u", s["per_target"])
+        self.assertFalse(s["per_target"]["u"]["scored"])
+        self.assertIsNone(rb.summarize_repeat([{"id": "a"}]))
+
+    def test_summarize_timing(self):
+        rows = [{"diagnose_s": 2.0, "checks": [{"check_id": "c1", "name": "one", "duration_s": 0.1},
+                                                {"check_id": "c2", "name": "two", "duration_s": 0.9}]},
+                {"diagnose_s": 4.0, "checks": [{"check_id": "c1", "name": "one", "duration_s": 0.3}]},
+                {"diagnose_s": None, "checks": []}]
+        t = rb.summarize_timing(rows)
+        self.assertEqual(t["diagnose_s"], {"mean": 3.0, "max": 4.0, "n": 2})
+        self.assertEqual(list(t["per_check"]), ["c2", "c1"])  # slowest first
+        self.assertEqual(t["per_check"]["c1"]["mean_s"], 0.2)
+        self.assertEqual(t["per_check"]["c1"]["max_s"], 0.3)
+        # with check_runs every run counts, `checks` is not double counted
+        rows = [{"checks": [{"check_id": "c", "duration_s": 9.0}],
+                 "check_runs": [[{"check_id": "c", "duration_s": 1.0}], [{"check_id": "c", "duration_s": 3.0}]]}]
+        self.assertEqual(rb.summarize_timing(rows)["per_check"]["c"], {"name": "", "mean_s": 2.0, "max_s": 3.0, "n": 2})
+
+    def test_run_target_repeat_with_fake_diagnoser(self):
+        gt = next(g for g in GT if g["kind"] == rb.HEALTHY_KIND)
+        calls = []
+
+        def fake(pid, img, sym, corpus):
+            calls.append(1)
+            r = _clean_result(None)
+            r["verdict"] = "HEALTHY" if len(calls) % 4 else "INCONCLUSIVE"
+            r["checks_run"] = [{"check_id": "c", "duration_s": 0.5}]
+            return r
+
+        tmp = rb.tempfile.mkdtemp(prefix="diagacc_test_")
+        try:
+            row = rb.run_target(gt, tmp, fake, repeat=8)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+        self.assertEqual(len(calls), 8)
+        self.assertEqual(row["repeat"]["runs"], 8)
+        self.assertEqual(row["repeat"]["agreement_rate"], 0.75)
+        self.assertEqual(len(row["check_runs"]), 8)
+        self.assertEqual(row["checks"][0]["duration_s"], 0.5)
+
+    def test_default_run_has_no_repeat_fields(self):
+        gt = next(g for g in GT if g["kind"] == rb.HEALTHY_KIND)
+        rep = rb.run_all([gt], lambda *a: _clean_result(None))
+        self.assertNotIn("repeat", rep["rows"][0])
+        self.assertNotIn("repeat_agreement", rep)
+        self.assertIn("timing", rep)
+
+
 if __name__ == "__main__":
     unittest.main()
