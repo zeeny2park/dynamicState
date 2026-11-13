@@ -76,6 +76,7 @@ from .temporal_observation_window import (
     MemoryAnalysisResult,
 )
 from .competing_hypotheses import (
+    candidate_verdict_source,
     CompetingHypothesis,
     CompetingHypothesisManager,
     HypothesisComparisonResult,
@@ -720,6 +721,11 @@ class TargetAssessor:
 # 5. Stage C: Investigation Planner & Step Representation
 # -----------------------------------------------------------------------------
 
+# Recipes whose confirmed growth schedules the heap follow-ups (the recipe ids containing "GROWTH" when the former
+# substring test was written; explicit so a new recipe is added deliberately)
+_GROWTH_FOLLOWUP_TRIGGERS = frozenset({"RECIPE_PROCESS_MEMORY_GROWTH", "RECIPE_HEAP_GROWTH", "RECIPE_MAPPING_GROWTH"})
+
+
 @dataclass
 class InvestigationStep:
     """An executable step in an investigation plan."""
@@ -737,6 +743,7 @@ class InvestigationStep:
     status: str = "PENDING"  # PENDING, RUNNING, COMPLETED, SKIPPED, FAILED
     result: Optional[Dict[str, Any]] = None
     executed_at: Optional[str] = None
+    dynamic_followup: bool = False  # scheduled by a confirmed growth step (IMP-004); structured, not the rationale
 
 
 @dataclass
@@ -2207,7 +2214,7 @@ class AdaptiveInvestigationSession:
         if eval_result.status == RECIPE_STATUS_SUPPORTED:
             # If RSS growth was observed, dynamically schedule heap growth and object accumulation
             dynamic_followups: List[InvestigationStep] = []
-            if "MEMORY_GROWTH" in recipe.recipe_id or "GROWTH" in recipe.recipe_id:
+            if recipe.recipe_id in _GROWTH_FOLLOWUP_TRIGGERS:
                 followup_ids = ["RECIPE_HEAP_GROWTH", "RECIPE_LONG_LIVED_OBJECT_ACCUMULATION"]
                 for fid in reversed(followup_ids):
                     if (
@@ -2225,6 +2232,7 @@ class AdaptiveInvestigationSession:
                                 target_assessment=self.target_assessment,
                                 rationale_override=f"Dynamic follow-up: isolated from confirmed {recipe.recipe_id}",
                             )
+                            new_step.dynamic_followup = True
                             remaining_steps.insert(0, new_step)
                             dynamic_followups.append(new_step)
 
@@ -2246,7 +2254,7 @@ class AdaptiveInvestigationSession:
                 # (IMP-008: also the follow-ups scheduled by an EARLIER growth step - a supported first follow-up
                 # must not cut off the second one.)
                 if (not any(s.status == "PENDING" for s in dynamic_followups)
-                        and not any(s.status == "PENDING" and str(s.rationale or "").startswith("Dynamic follow-up")
+                        and not any(s.status == "PENDING" and s.dynamic_followup
                                     for s in remaining_steps)
                         and not any(s.status == "PENDING" and s.recipe_id in BASELINE_RECIPE_IDS
                                     for s in remaining_steps)):
@@ -2482,12 +2490,23 @@ class AdaptiveInvestigationSession:
 
         # Filter out refuted hypotheses
         self.active_hypotheses = [h for h in self.active_hypotheses if h.status != "REFUTED"]
+        self._bind_competing_candidates()
         self._record_timeline_event("HYPOTHESES_VERIFIED", {
             "active_count": len(self.active_hypotheses),
             "rejected_count": len(self.rejected_hypotheses),
         })
         self.state = STATE_NARROWING
         return {"action": "VERIFY", "state": self.state}
+
+    def _bind_competing_candidates(self) -> None:
+        """Stage 1, one hypothesis model: the verified hypotheses are the source of truth for the final verdict and
+        for the report's competing candidates; each candidate becomes a view of the verified hypothesis that
+        consumed its rules' evidence (competing_hypotheses.candidate_verdict_source)."""
+        verified = list(self.active_hypotheses) + list(self.rejected_hypotheses)
+        if not verified:
+            return
+        for ch in self.competing_hypotheses:
+            ch.bind_verdict(candidate_verdict_source(ch, verified), ledger=self.ledger)
 
     def _execute_verification_for_hypothesis(self, hyp: ExpertHypothesis) -> Dict[str, Any]:
         """Executes explicit verification criteria for a single hypothesis.
@@ -3668,6 +3687,9 @@ class AdaptiveInvestigationSession:
                 for h in data["competing_hypotheses"]
                 if isinstance(h, dict)
             ]
+        # one hypothesis model: candidates are re-bound to the verified hypotheses (never trusted from disk)
+        if any(h.verification_execution_results for h in sess.active_hypotheses + sess.rejected_hypotheses):
+            sess._bind_competing_candidates()
         return sess
 
 
@@ -4481,7 +4503,8 @@ def _diagnose_run(
         # Checks this mode cannot execute (declared capability requirement): "not examined", one row per capability.
         for _cap in dict.fromkeys(e["unsupported_capability"] for e in _excl_rows if e.get("unsupported_capability")):
             _ids = [e.get("recipe_id") for e in _excl_rows if e.get("unsupported_capability") == _cap]
-            nc.append({"kind": "unsupported_in_mode", "item": ",".join(map(str, _ids)), "capability": _cap,
+            nc.append({"kind": "unsupported_in_mode", "item": ",".join(map(str, _ids)), "recipe_ids": list(_ids),
+                       "capability": _cap,
                        "reason": "not supported in this mode: needs " + CAPABILITY_DESCRIPTIONS.get(_cap, (_cap, _cap))[0]})
         if excluded:
             nc.append({"kind": "recipes_not_planned", "item": ",".join(map(str, excluded)),

@@ -363,6 +363,7 @@ class TestHealthyRule(unittest.TestCase):
         # ... or that could not run in this mode
         s = ev(["UNEXPECTED_STATE_TRANSITIONS"],
                nc=[{"kind": "unsupported_in_mode", "item": "RECIPE_STATE_TRANSITION_VIOLATIONS",
+                    "recipe_ids": ["RECIPE_STATE_TRANSITION_VIOLATIONS"],
                     "capability": "caller_specification", "reason": "x"}])
         self.assertFalse(s["healthy"])
         self.assertIn("not supported in this mode", s["blocking"][0]["reason"])

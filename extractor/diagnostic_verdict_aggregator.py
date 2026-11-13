@@ -664,7 +664,7 @@ class DiagnosticVerdictAggregator:
             blocking_limitations += [limitation_text(x) for x in (getattr(target_assessment, "limitations", None) or [])
                                      if limitation_is_blocking(x)]
         for rec in evidence_records or []:
-            if str(getattr(rec, "collection_status", "") or "") == "FAILED":
+            if getattr(rec, "collection_status", None) == "FAILED":
                 blocking_limitations.append(f"collection failed: {getattr(rec, 'evidence_id', '')}")
         has_no_blocking_limitations = not blocking_limitations
 

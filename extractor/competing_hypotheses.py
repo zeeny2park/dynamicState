@@ -173,6 +173,58 @@ def _validate_rule_clean_refutation(rec: Any) -> Tuple[bool, str]:
     return False, "Evidence record does not contain positive clean-state invariant verification indicators"
 
 
+# Verified-hypothesis status -> candidate status vocabulary
+_BOUND_STATUS = {"CONFIRMED": VERDICT_CONFIRMED, "LIKELY": VERDICT_LIKELY, "SUPPORTED": VERDICT_SUPPORTED,
+                 "PROPOSED": VERDICT_SUPPORTED, "INCONCLUSIVE": VERDICT_INCONCLUSIVE, "REFUTED": VERDICT_REFUTED,
+                 "CONTRADICTED": VERDICT_REFUTED}
+_BOUND_RANK = {VERDICT_CONFIRMED: 5, VERDICT_LIKELY: 4, VERDICT_SUPPORTED: 3, VERDICT_INCONCLUSIVE: 2,
+               VERDICT_REFUTED: 1}
+
+
+def candidate_verdict_source(candidate: Any, verified: List[Any]) -> Dict[str, Any]:
+    """The verdict a competing candidate takes from the verified hypotheses (stage 1: one hypothesis model).
+
+    ``verified``: the investigation's verified hypotheses (active + rejected ExpertHypothesis).  The candidate's
+    evidence is the evidence its discriminating rules (``applicable_diagnostic_rules``) produced:
+    * some of it supports a verified hypothesis -> that hypothesis's status and confidence (the strongest one);
+    * it only contradicts -> REFUTED (its own checks found their invariant holding);
+    * none of its rules produced evidence -> INCONCLUSIVE (not checked)."""
+    rules = set(getattr(candidate, "applicable_diagnostic_rules", None) or [])
+    best: Optional[Tuple[int, float, Any, List[str]]] = None
+    contra_ids: List[str] = []
+    contra_by: List[str] = []
+    for h in verified:
+        supp = [e.get("evidence_id") for e in (getattr(h, "supporting_evidence", None) or [])
+                if isinstance(e, dict) and e.get("recipe_id") in rules]
+        con = [e.get("evidence_id") for e in (getattr(h, "contradicting_evidence", None) or [])
+               if isinstance(e, dict) and e.get("recipe_id") in rules]
+        contra_ids += [x for x in con if x]
+        if con:
+            contra_by.append(str(getattr(h, "hypothesis_id", "")))
+        if supp:
+            st = _BOUND_STATUS.get(str(getattr(h, "status", "")), VERDICT_INCONCLUSIVE)
+            key = (_BOUND_RANK.get(st, 0), float(getattr(h, "confidence", 0.0) or 0.0))
+            if best is None or key > best[:2]:
+                best = (key[0], key[1], h, [x for x in supp if x])
+    if best is not None:
+        h = best[2]
+        st = _BOUND_STATUS.get(str(getattr(h, "status", "")), VERDICT_INCONCLUSIVE)
+        return {"hypothesis_id": getattr(h, "hypothesis_id", None), "category": getattr(h, "category", None),
+                "rules": sorted(rules), "status": st, "confidence": round(float(getattr(h, "confidence", 0.0)), 4),
+                "supporting_evidence_ids": best[3], "contradicting_evidence_ids": contra_ids,
+                "basis": f"Verified hypothesis {getattr(h, 'hypothesis_id', '')} ({getattr(h, 'category', '')}): "
+                         + str(getattr(h, "confidence_basis", "") or "")}
+    if contra_ids:
+        return {"hypothesis_id": contra_by[0] if contra_by else None, "category": None, "rules": sorted(rules),
+                "status": VERDICT_REFUTED, "confidence": 0.10, "supporting_evidence_ids": [],
+                "contradicting_evidence_ids": contra_ids,
+                "basis": "Its discriminating checks ran and found their invariant holding (evidence "
+                         + ", ".join(contra_ids[:6]) + ")."}
+    return {"hypothesis_id": None, "category": None, "rules": sorted(rules), "status": VERDICT_INCONCLUSIVE,
+            "confidence": 0.20, "supporting_evidence_ids": [], "contradicting_evidence_ids": [],
+            "basis": "None of its discriminating checks produced evidence in this investigation."}
+
+
 # Dependency-graph defects that make the graph itself invalid (not merely unverified): get_independent_root_sources
 _INVALID_GRAPH_KINDS = frozenset({"GRAPH_CYCLE", "GRAPH_SELF_DEPENDENCY", "GRAPH_MISSING_PARENT", "GRAPH_MALFORMED"})
 
@@ -479,6 +531,11 @@ class CompetingHypothesis:
     ledger: Optional[Any] = None
     strict_ledger: bool = True
     details: Dict[str, Any] = field(default_factory=dict)
+    # Stage 1 (one hypothesis model): when an investigation has verified its hypotheses, a candidate is a view of
+    # the verified hypothesis (extractor.expert_diagnostic_engine.ExpertHypothesis) that consumed the evidence of
+    # its discriminating rules: status / confidence / basis come from there (bind_verdict).  Empty for a
+    # stand-alone candidate, which keeps its own ledger-authority evaluation.  Never restored from disk.
+    verdict_source: Dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         self._base_confidence: float = float(self.confidence)
@@ -1269,7 +1326,8 @@ class CompetingHypothesis:
                             continue
                     for p in unique_parents:
                         if p in path:
-                            cycle_str = " -> ".join(path[path.index(p):] + [p])
+                            first_at = next(k for k, node in enumerate(path) if node == p)
+                            cycle_str = " -> ".join(path[first_at:] + [p])
                             branch_error_reason = f"Dependency cycle detected: {cycle_str}"
                             invalid_kinds.add("GRAPH_CYCLE")
                             self._add_limitation_unique(branch_error_reason)
@@ -1716,9 +1774,11 @@ class CompetingHypothesis:
 
         # 5. Compute deterministic base + delta confidence (insertion-order independent!)
         support_delta = sum(w for _, w in sorted(self._support_weights.items()))
+        # weight keys of irrelevant contradictions (an evidence id, or "contra:" + the observation for one without)
+        irrelevant_keys = {ic.evidence_id for ic in irrelevant_contradictions if ic.evidence_id} | {
+            "contra:" + str(ic.contradiction) for ic in irrelevant_contradictions}
         contra_delta = sum(
-            w for k, w in sorted(self._contradiction_weights.items())
-            if not any(ic.evidence_id == k or f"contra:{ic.contradiction}" == k for ic in irrelevant_contradictions)
+            w for k, w in sorted(self._contradiction_weights.items()) if k not in irrelevant_keys
         )
         computed_conf = max(0.05, min(0.99, round(self._base_confidence + support_delta - contra_delta, 6)))
 
@@ -1854,6 +1914,16 @@ class CompetingHypothesis:
                     decision_rule_applied = "RULE_INCONCLUSIVE_FALLBACK"
                     decision_explanation = "Insufficient authoritative evidence for confirmation or refutation."
 
+        if self.verdict_source:
+            # One source of truth: the verified hypothesis decides; the ledger audit above stays as provenance data
+            decision_rule_applied = "RULE_BOUND_TO_VERIFIED_HYPOTHESIS"
+            decision_explanation = (f"Verdict of verified hypothesis {self.verdict_source.get('hypothesis_id')} "
+                                    f"({self.verdict_source.get('category')}) for the evidence of rules "
+                                    f"{self.verdict_source.get('rules')}; ledger audit: {self.status}.")
+            self.status = str(self.verdict_source.get("status") or VERDICT_INCONCLUSIVE)
+            self.confidence = float(self.verdict_source.get("confidence") or 0.0)
+            self.confidence_basis = str(self.verdict_source.get("basis") or "")
+
         self._computed_confidence = self.confidence
         self.decision_trace = {
             "hypothesis_id": self.hypothesis_id,
@@ -1882,8 +1952,14 @@ class CompetingHypothesis:
             "integrity_limitations": list(self.integrity_limitations),
             "decision_rule_applied": decision_rule_applied,
             "decision_explanation": decision_explanation,
+            "verdict_source": dict(self.verdict_source) if self.verdict_source else None,
         }
         return self.status
+
+    def bind_verdict(self, source: Optional[Dict[str, Any]], ledger: Optional[Any] = None) -> str:
+        """Make this candidate a view of a verified hypothesis (see ``verdict_source``); None unbinds."""
+        self.verdict_source = dict(source) if source else {}
+        return self.evaluate_verdict(ledger=ledger)
 
     def to_dict(self) -> Dict[str, Any]:
         saved_ledger = self.ledger
@@ -1904,6 +1980,7 @@ class CompetingHypothesis:
     def from_dict(cls, data: Dict[str, Any], ledger: Optional[Any] = None) -> "CompetingHypothesis":
         data_copy = dict(data)
         bound_ledger = ledger or data_copy.pop("ledger", None)
+        data_copy.pop("verdict_source", None)   # re-derived by the session from its verified hypotheses
         base_conf = data_copy.pop("_base_confidence", None)
         sup_weights = data_copy.pop("_support_weights", None)
         con_weights = data_copy.pop("_contradiction_weights", None)

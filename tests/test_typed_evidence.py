@@ -20,7 +20,7 @@ import unittest
 from types import SimpleNamespace
 from typing import Any, Dict, List, Tuple
 
-from extractor import healthy_verdict, typed_evidence
+from extractor import competing_hypotheses, diagnostic_verdict_aggregator, healthy_verdict, typed_evidence
 from extractor.diagnostic_recipes import ALL_PROBLEM_CATEGORIES, DiagnosticRecipeRegistry
 from extractor.expert_diagnostic_engine import AdaptiveInvestigationSession
 from extractor.typed_evidence import (
@@ -511,12 +511,78 @@ class NoStringSearchInVerificationPathTest(unittest.TestCase):
         healthy_verdict._uaf_cap_scope_limit,
         healthy_verdict._double_free_cap_scope_limit,
         healthy_verdict._heap_cap_scope_limit,
+        healthy_verdict.symptom_question_gaps,
+        # stage 1, rest of the verdict path: the aggregator, the null-hypothesis / remediation choice, the hypothesis
+        # model binding and the competing-hypothesis model's rules
+        AdaptiveInvestigationSession._step_analyze,
+        AdaptiveInvestigationSession._finalize_conclusion,
+        AdaptiveInvestigationSession._bind_competing_candidates,
+        diagnostic_verdict_aggregator.DiagnosticVerdictAggregator.aggregate,
+        diagnostic_verdict_aggregator.DiagnosticVerdictAggregator._is_not_applicable_justified,
+        diagnostic_verdict_aggregator.DiagnosticVerdictAggregator._does_required_fail_satisfy_confirmation,
+        diagnostic_verdict_aggregator.limitation_is_blocking,
+        competing_hypotheses.CompetingHypothesis.evaluate_verdict,
+        competing_hypotheses.CompetingHypothesis._evaluate_decisive_contradiction_rule,
+        competing_hypotheses.CompetingHypothesis.get_independent_root_sources,
+        competing_hypotheses.CompetingHypothesis.validate_primary_evidence_rule,
+        competing_hypotheses.CompetingHypothesisManager.generate_competing_hypotheses_for_symptom,
+        competing_hypotheses.candidate_verdict_source,
+        competing_hypotheses._record_is_static_storage,
+        competing_hypotheses._validate_rule_canary,
+        competing_hypotheses._validate_rule_double_free,
+        competing_hypotheses._validate_rule_segv_crash,
+        competing_hypotheses._validate_rule_deadlock_cycle,
+        competing_hypotheses._validate_rule_oom_kill,
+        competing_hypotheses._validate_rule_clean_refutation,
     )
 
     def test_guarded_functions(self):
         for fn in self.GUARDED:
             with self.subTest(fn=fn.__qualname__):
                 self.assertEqual(_violations(_func_tree(fn)), [])
+
+    def test_primary_rules_are_guarded(self):
+        # every built-in primary evidence rule's criteria function is in the guarded set
+        guarded = set(self.GUARDED)
+        for rid in competing_hypotheses.PrimaryEvidenceRuleRegistry._builtin_ids:
+            fn = competing_hypotheses.PrimaryEvidenceRuleRegistry.get(rid).validator_fn
+            self.assertIn(fn, guarded, rid)
+
+    def test_candidate_set_table_matches_registered_categories(self):
+        # explicit table replacing the substring tests on the category name; the one intended difference is
+        # ABNORMAL_VARIABLE_CHANGES ("CHANGES" contains "HANG")
+        def legacy(c):
+            if "GROWTH" in c or "LEAK" in c or "ACCUMULATION" in c or "IMBALANCE" in c:
+                return "LEAK"
+            if "CORRUPT" in c or "USE_AFTER_FREE" in c or "DOUBLE_FREE" in c or "INVALID_MEMORY" in c or "OVERFLOW" in c:
+                return "CORRUPTION"
+            if any(w in c for w in ("DEADLOCK", "CONCURRENCY", "CONTENTION", "FREEZE", "HANG", "THREAD")):
+                return "CONCURRENCY"
+            if "INSTABILITY" in c or "CRASH" in c or "EXHAUSTION" in c:
+                return "INSTABILITY"
+            return "GENERAL"
+        cats = set(ALL_PROBLEM_CATEGORIES) | {r.problem_category for r in DiagnosticRecipeRegistry.list_recipes()}
+        for cat in sorted(cats):
+            got = competing_hypotheses.SYMPTOM_CANDIDATE_SET.get(cat, competing_hypotheses.CANDIDATES_GENERAL)
+            want = "GENERAL" if cat == "ABNORMAL_VARIABLE_CHANGES" else legacy(cat)
+            self.assertEqual(got, want, cat)
+
+    def test_rule_criteria_ignore_observation_wording(self):
+        # the observation text of a ledger record neither satisfies nor fails a primary evidence rule
+        rec = SimpleNamespace(observation="Canary overwritten 0xdeadbeef corrupt overflow deadlock cycle oom clean",
+                              details={})
+        for rid in competing_hypotheses.PrimaryEvidenceRuleRegistry._builtin_ids:
+            ok, _ = competing_hypotheses.PrimaryEvidenceRuleRegistry.get(rid).evaluate_criteria(rec)
+            self.assertFalse(ok, rid)
+        rec = SimpleNamespace(observation="lorem ipsum", details={"canary_corrupted": True})
+        self.assertTrue(competing_hypotheses._validate_rule_canary(rec)[0])
+
+    def test_blocking_limitation_ignores_wording(self):
+        agg = diagnostic_verdict_aggregator
+        for text in ("timeout", "permission denied", "lorem ipsum"):
+            self.assertTrue(agg.limitation_is_blocking(text))
+            self.assertTrue(agg.limitation_is_blocking({"text": text}))
+            self.assertFalse(agg.limitation_is_blocking({"text": text, "blocking": False}))
 
     def test_typed_evidence_module(self):
         with open(typed_evidence.__file__, encoding="utf-8") as fh:

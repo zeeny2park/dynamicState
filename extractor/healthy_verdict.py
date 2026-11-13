@@ -229,7 +229,7 @@ def symptom_question_gaps(symptom_categories: Iterable[str], checks: List[Any],
     not_in_mode: Dict[str, List[str]] = {}
     for n in not_covered:
         if n.get("kind") == "unsupported_in_mode":
-            for rid in [x for x in str(n.get("item") or "").split(",") if x]:
+            for rid in n.get("recipe_ids") or []:
                 for cat in _recipe_categories(rid):
                     not_in_mode.setdefault(cat, []).append(rid)
     out: List[Dict[str, Any]] = []
