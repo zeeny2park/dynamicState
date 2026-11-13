@@ -1,0 +1,34 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>dynamicState · 프로세스 탐색 (목업)</title>
+<!-- the one token/component file and the live UI's own layout file, unchanged; explore.css holds only what this proposal adds -->
+<link rel="stylesheet" href="../../../extractor/web/ui/theme.css">
+<link rel="stylesheet" href="../../../extractor/web/ui/ui.css">
+<link rel="stylesheet" href="explore.css">
+<script>
+/* theme before first paint: ?theme=dark|light, else the OS preference (no class) */
+(function () {
+  var q = new URLSearchParams(location.search).get("theme");
+  if (q === "dark" || q === "light") document.documentElement.classList.add(q);
+})();
+</script>
+</head>
+<body>
+<a class="skip" href="#main">본문으로 건너뛰기</a>
+<header class="top" role="banner">
+  <a class="brand" href="#main"><span class="dot" aria-hidden="true"></span>dynamicState <small>진단</small></a>
+  <div id="tchip" class="tchip" hidden></div>
+  <div class="grow"></div>
+  <button type="button" class="btn btn-ghost btn-sm">새 진단</button>
+  <button type="button" class="btn btn-ghost btn-sm" id="btn-theme" aria-label="테마 전환"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M12 3a6 6 0 0 0 9 9 9 9 0 1 1-9-9Z"/></svg></button>
+  <button type="button" class="btn btn-ghost btn-sm" id="btn-lang">KO</button>
+</header>
+<main id="main" tabindex="-1"></main>
+<div class="mock no-print" id="mock" role="region" aria-label="목업 단계"></div>
+<script src="explore-data.js"></script>
+<script src="explore.js"></script>
+</body>
+</html>
