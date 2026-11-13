@@ -219,10 +219,6 @@ T: Dict[str, Tuple[str, str]] = {
                  "실행했지만 '{st}'로 끝나 결론을 내지 못한 검사: {items}."),
     "nc_recipes_not_planned": ("{n} other check(s) were not selected for this symptom: {items}.",
                                "이 증상에는 선택되지 않아 실행하지 않은 다른 검사 {n}개: {items}."),
-    "nc_unsupported_in_mode": ("Not examined, because a zero-stop diagnosis cannot answer them (they need allocation tracing, "
-                               "a stopped snapshot or a specification from the caller): {items}.",
-                               "무정지 진단으로는 답할 수 없어 점검하지 않은 항목 (할당 추적, 정지된 스냅샷 또는 호출자의 명세가 "
-                               "필요함): {items}."),
     "nc_baseline_check_not_run": ("Planned checks that never ran because the investigation ended early: {items}.",
                                   "조사가 일찍 끝나 실행되지 못한 계획된 검사: {items}."),
     "nc_budget_exhausted": ("The observation budget ran out, so the observation was cut short.",
@@ -381,6 +377,7 @@ T: Dict[str, Tuple[str, str]] = {
                         "발견하지 못했습니다. 점검하지 못한 것: {nc}."),
     "nc_short_long_wait": ("whether the long wait of {n} thread(s) is expected", "스레드 {n}개의 긴 대기가 정상인지"),
     "nc_short_symptom": ("{n} symptom-specific check(s) that reached no result", "결론을 내지 못한 증상별 추가 검사 {n}개"),
+    "nc_short_in_mode": ("{n} check(s) a zero-stop diagnosis cannot answer", "무정지 진단으로는 답할 수 없는 검사 {n}개"),
     "nc_short_outside": ("data races, program-logic errors and other defects no baseline check looks for",
                          "데이터 레이스, 프로그램 논리 오류처럼 기본 검사가 찾지 않는 결함"),
     "c_healthy_noscope2": ("The checks that ran found no problem in {who}; this does not prove the process is fine "
@@ -434,6 +431,8 @@ T: Dict[str, Tuple[str, str]] = {
     "g_why_none": ("the check recorded no reason", "검사가 이유를 기록하지 않음"),
     "g_why_status": ("{st}", "{st}"),
     "g_not_planned": ("not selected for this symptom", "이번 증상에 선택되지 않음"),
+    "g_not_in_mode": ("not examined in this mode: a zero-stop diagnosis cannot answer these (they need {cap})",
+                      "무정지 진단으로는 답할 수 없어 점검하지 않은 검사 (필요한 것: {cap})"),
     "g_not_executed": ("planned but not executed before the investigation ended", "계획했지만 조사가 끝날 때까지 실행되지 않음"),
     "st_NOT_APPLICABLE": ("the check does not apply to this target", "이 대상에는 적용되지 않는 검사"),
     "st_ERROR": ("the check itself ended with an error", "검사 자체가 오류로 끝남"),
@@ -478,6 +477,7 @@ T: Dict[str, Tuple[str, str]] = {
     "p_checks": ("Each check's result", "검사별 결과"),
     "p_scope": ("Check totals and limitations", "검사 집계와 제한 사항"),
     "p_method": ("Target, collection and plan", "대상, 수집, 계획"),
+    "p_repro": ("Exact time of every check", "검사별 정확한 시각"),
     "p_line": ("{what}: HTML {anchor}; JSON {keys}.", "{what}: HTML {anchor}, JSON {keys}."),
     "seconds": ("{x} s", "{x}초"),
 }
@@ -976,6 +976,8 @@ def _healthy_sentence(ctx: _Ctx, who: str, res: Dict[str, Any]) -> str:
             shown.append(ctx.t("nc_short_symptom", n=len(items) or 1))
         elif kind == "outside_baseline":
             shown.append(ctx.t("nc_short_outside"))
+        elif kind == "unsupported_in_mode":
+            shown.append(ctx.t("nc_short_in_mode", n=len(items) or 1))
         else:
             shown.append(display_label(x, bool(ctx.i)))
     return ctx.t("c_healthy_short", who=who, n=len(scope.get("checked") or []), nc="; ".join(shown) or "-")
@@ -1099,6 +1101,14 @@ def check_rows(res: Dict[str, Any], report: Optional[Dict[str, Any]]) -> List[Di
             raw = kind[6:].upper()
             rows.append({"rid": rid, "status": check_group(raw), "raw_status": raw, "planned": True, "limits": []})
     for n in res.get("not_covered") or []:
+        if isinstance(n, dict) and n.get("kind") == "unsupported_in_mode":
+            for rid in str(n.get("item") or "").split(","):
+                rid = rid.strip()
+                if rid and rid not in seen:
+                    seen.add(rid)
+                    rows.append({"rid": rid, "status": "SKIPPED", "raw_status": "NOT_IN_MODE", "planned": False,
+                                 "mode_cap": str(n.get("capability") or ""), "limits": []})
+    for n in res.get("not_covered") or []:
         if isinstance(n, dict) and n.get("kind") == "recipes_not_planned":
             for rid in str(n.get("item") or "").split(","):
                 rid = rid.strip()
@@ -1136,6 +1146,10 @@ def check_label(rid: str, i: int, fallback: Any = None) -> str:
 
 
 def _undecided_reason(ctx: _Ctx, r: Dict[str, Any], reasons: Dict[str, List[str]]) -> str:
+    if r.get("raw_status") == "NOT_IN_MODE":
+        from .diagnostic_recipes import CAPABILITY_DESCRIPTIONS
+        cap = CAPABILITY_DESCRIPTIONS.get(r.get("mode_cap") or "", (r.get("mode_cap") or "?",) * 2)[ctx.i]
+        return ctx.t("g_not_in_mode", cap=cap)
     if not r.get("planned", True):
         return ctx.t("g_not_planned")
     if r["status"] == "SKIPPED":
@@ -1242,7 +1256,7 @@ def _pointer(ctx: _Ctx, what: str, anchor: str, keys: List[str]) -> str:
     return "- " + ctx.t("p_line", what=what, anchor=_c(anchor), keys=", ".join(_c(k) for k in keys))
 
 
-def _where_lines(ctx: _Ctx, blocks: List[Dict[str, Any]]) -> List[str]:
+def _where_lines(ctx: _Ctx, blocks: List[Dict[str, Any]], repro: bool = False) -> List[str]:
     """Per part of the report, where its detailed records are: the anchor of the collapsed block in the HTML report
     and the keys of the JSON result (the Markdown report carries no detail by default)."""
     out = [ctx.t("r_where_intro"), "",
@@ -1257,13 +1271,17 @@ def _where_lines(ctx: _Ctx, blocks: List[Dict[str, Any]]) -> List[str]:
             _pointer(ctx, ctx.t("p_method"), "#method-detail",
                      ["target", "collection_impact", "report.section_b_target_context",
                       "report.section_c_diagnostic_strategy", "report.section_g_evidence_and_provenance"])]
+    if repro:
+        out.append(_pointer(ctx, ctx.t("p_repro"), "#reproducibility-detail",
+                            ["reproducibility", "report.section_j_reproducibility"]))
     return out
 
 
 def _not_examined_lines(ctx: _Ctx, res: Dict[str, Any]) -> List[str]:
     """not_covered items that are not about one check (those are in the check groups), in plain words."""
     nc = [n for n in (res.get("not_covered") or []) if isinstance(n, dict)
-          and not str(n.get("kind")).startswith("check_") and n.get("kind") != "recipes_not_planned"]
+          and not str(n.get("kind")).startswith("check_")
+          and n.get("kind") not in ("recipes_not_planned", "unsupported_in_mode")]
     out: List[str] = []
     groups: Dict[str, List[Dict[str, Any]]] = {}
     for n in nc:
@@ -1291,8 +1309,7 @@ def _not_examined_lines(ctx: _Ctx, res: Dict[str, Any]) -> List[str]:
         elif kind in ("unattributed_finding", "stage_failed", "unexpected_error"):
             line = ctx.t(f"nc_{kind}", items=_join(names))
         elif kind == "unsupported_in_mode":
-            ids = [x for n in items for x in str(n.get("item")).split(",") if x]
-            line = ctx.t("nc_unsupported_in_mode", items=_join([check_label(x, ctx.i) for x in ids]))
+            continue        # listed with its checks under "Not run", with the capability they need
         elif kind == "limitation":
             line = ctx.t("nc_limitation") + " " + "; ".join(_c(ko_text(r, ctx.i)) for r in raws)
         elif f"nc_{kind}" in T:
@@ -1308,7 +1325,7 @@ def _not_examined_lines(ctx: _Ctx, res: Dict[str, Any]) -> List[str]:
         # what the HEALTHY verdict does not cover and is not listed elsewhere (docs/HEALTHY_VERDICT.md)
         from .healthy_verdict import display_label
         for x in scope.get("not_checked") or []:
-            if x.get("kind") not in ("long_wait_not_judged", "symptom_checks_without_result") \
+            if x.get("kind") not in ("long_wait_not_judged", "symptom_checks_without_result", "unsupported_in_mode") \
                     and x.get("kind") not in groups:
                 out.append(f"- {display_label(x, bool(ctx.i))}")
     return out
@@ -1363,10 +1380,13 @@ def _section4(ctx: _Ctx, res: Dict[str, Any], rows: List[Dict[str, Any]]) -> Lis
             by_reason: Dict[str, List[str]] = {}
             for r in grp:
                 by_reason.setdefault(_undecided_reason(ctx, r, reasons), []).append(check_label(r["rid"], ctx.i, r.get("name")))
-            if g == "SKIPPED" and len(by_reason) == 1:
-                why = next(iter(by_reason))
-                out.append(f"{why[:1].upper()}{why[1:]}:" if ctx.i == 0 else f"{why}:")
-                out += _by_domain(ctx, grp)
+            if g == "SKIPPED":
+                first = True
+                for why in by_reason:
+                    sub = [r for r in grp if _undecided_reason(ctx, r, reasons) == why]
+                    out += ([] if first else [""]) + [f"{why[:1].upper()}{why[1:]}:" if ctx.i == 0 else f"{why}:"]
+                    out += _by_domain(ctx, sub)
+                    first = False
             else:
                 for why, names in by_reason.items():
                     out.append(f"- {_join(names)}: {why}")
@@ -1471,7 +1491,7 @@ def _section6(ctx: _Ctx, res: Dict[str, Any], extra: Optional[Dict[str, Any]] = 
     else:
         ctx.term("zerostop")
         ms = fmt_ms(ci.get("measured_stop_ms") or 0.0, ctx.i)
-        out.append(ctx.t("m_zero" if ci.get("zero_stop") else "m_stop", ms=ms, mode=_c(ci.get("capture_mode"))))
+        out.append(ctx.t("m_zero" if ci.get("zero_stop") else "m_stop", ms=ms, mode=_c(ci.get("capture_mode") or "-")))
         if ci.get("wall_clock_ms") is not None:
             line = ctx.t("m_time", obs=fmt_ms(ci.get("wall_clock_ms"), ctx.i), s=_num(ci.get("samples_collected")))
             if isinstance(res.get("duration_s"), (int, float)):
@@ -1618,7 +1638,8 @@ def compose(result: Dict[str, Any], report: Optional[Dict[str, Any]] = None, lan
     if g:
         ref += [f"### {ctx.t('hg')}", ""] + g
     if pointers:
-        ref += ([""] if ref else []) + [f"### {ctx.t('r_where')}", ""] + _where_lines(ctx, blocks)
+        ref += ([""] if ref else []) + [f"### {ctx.t('r_where')}", ""] + _where_lines(
+            ctx, blocks, bool(extra_sections.get("reproducibility")))
     body["reference"] = ref
     sections = [{"key": k, "title": ctx.t(_SECTION_TITLE[k]), "lines": body[k]} for k in SECTION_ORDER if body.get(k)]
     for n, s in enumerate(sections, 1):
@@ -1697,12 +1718,26 @@ def _inline_html(text: str) -> str:
 
 def markdown_to_html(md: str, heading_offset: int = 0) -> str:
     """Dependency-free converter for the subset the human summary uses: ``#`` headings, paragraphs, ``-`` bullet
-    lists, ``1.`` numbered lists, inline code, bold and fenced code blocks.  Everything is HTML-escaped."""
+    lists, ``1.`` numbered lists, ``| a | b |`` tables (first row is the header, the ``:---`` row is skipped), inline
+    code, bold and fenced code blocks.  Everything is HTML-escaped."""
     import html as _h
     out: List[str] = []
     para: List[str] = []
     lst: Optional[str] = None
     fence: Optional[List[str]] = None
+    table: List[List[str]] = []
+
+    def cells(row: str) -> List[str]:
+        return [c.strip() for c in row.strip().strip("|").split(" | ")]
+
+    def flush_table():
+        if table:
+            head, body = table[0], [r for r in table[1:] if not all(re.fullmatch(r":?-{3,}:?", c) for c in r)]
+            out.append('<div class="dsv-scroll"><table class="dsv-tbl"><thead><tr>'
+                       + "".join(f"<th>{_inline_html(c)}</th>" for c in head) + "</tr></thead><tbody>"
+                       + "".join("<tr>" + "".join(f"<td>{_inline_html(c)}</td>" for c in r) + "</tr>" for r in body)
+                       + "</tbody></table></div>")
+            table.clear()
 
     def flush_para():
         if para:
@@ -1717,6 +1752,12 @@ def markdown_to_html(md: str, heading_offset: int = 0) -> str:
 
     for raw in (md or "").splitlines():
         line = raw.rstrip()
+        if fence is None and line.strip().startswith("|") and line.strip().endswith("|"):
+            flush_para()
+            close_list()
+            table.append(cells(line))
+            continue
+        flush_table()
         if fence is not None:
             if line.strip().startswith("```"):
                 out.append("<pre><code>" + _h.escape("\n".join(fence)) + "</code></pre>")
@@ -1755,6 +1796,7 @@ def markdown_to_html(md: str, heading_offset: int = 0) -> str:
         para.append(line.strip())
     if fence is not None:
         out.append("<pre><code>" + _h.escape("\n".join(fence)) + "</code></pre>")
+    flush_table()
     flush_para()
     close_list()
     return "\n".join(out)

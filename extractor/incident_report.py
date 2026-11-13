@@ -15,6 +15,7 @@ fault needs a finding, and an unattributed finding is not confirmed.
 from __future__ import annotations
 
 import html
+from dataclasses import asdict
 import json
 import os
 import sys
@@ -22,7 +23,6 @@ import time
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional
 
-from .collection_impact import impact_summary_lines
 from .human_report import ko_text
 from .diagnostic_verdict_aggregator import (
     FAULT_VERDICTS,
@@ -59,6 +59,7 @@ _MD: Dict[str, Any] = {
     "ap_check": ("Check {x}", "검사 {x}"),
     "ap_scope": ("Scope: check totals and limitations", "검사 범위: 검사 집계와 제한 사항"),
     "ap_method": ("Method: target, collection and plan", "진단 방법: 대상, 수집, 계획"),
+    "ap_repro": ("Reproducibility", "재현 정보"),
     "ap_other": ("Other detailed records", "그 밖의 상세 기록"),
 }
 
@@ -101,37 +102,52 @@ def _hypothesis_lines(hyp_res: Optional[Dict[str, Any]], li: int) -> List[str]:
     return out
 
 
-def _reproducibility_section(res: Dict[str, Any], report: Optional[Dict[str, Any]], language: str) -> List[str]:
-    """RESERVED SLOT for the reproducibility section (``extractor/reproducibility.py``, added separately).
+def _reproducibility_section(repro: Any, language: str) -> List[str]:
+    """The reproducibility section (``extractor.reproducibility``) as Markdown lines without its heading;
+    ``human_report.compose`` places it as "Reproducibility / 재현 정보" after "How the diagnosis was done" and before
+    "Reference", in the Markdown and the HTML report alike.  Empty: the section is left out."""
+    if repro is None:
+        return []
+    from .reproducibility import outline_markdown
+    return outline_markdown(repro, language)
 
-    Return its Markdown lines here; ``human_report.compose`` places them as the "Reproducibility / 재현 정보"
-    section after "How the diagnosis was done" and before "Reference", in the Markdown and the HTML report alike.
-    Empty: the section is left out."""
-    return []
+
+_SECTION_NAMES = {
+    "A": "A. Executive Summary", "B": "B. Target and Investigation Context", "C": "C. Diagnostic Strategy",
+    "C_excluded": "C. Diagnostic Strategy (excluded recipes)", "D": "D. Detailed Inspection Results",
+    "D_totals": "D. Detailed Inspection Results (totals)", "D_links": "D. Checks behind this finding",
+    "E": "E. Findings and Root Cause Analysis", "F": "F. Competing Hypotheses", "F_head": "F. Competing Hypotheses (ranking)",
+    "G": "G. Evidence & Provenance Index", "G_head": "G. Evidence & Provenance Index (totals)",
+    "H": "H. Limitations and Unverified Areas", "I": "I. Final Conclusions and Recommendations",
+    "meta": "Report identity", "collection_impact": "Collection impact (measured)", "J": "J. Reproducibility",
+}
 
 
-def _detail_appendix_markdown(parts: Dict[str, Any], comp: Dict[str, Any], li: int) -> List[str]:
-    """Opt-in Markdown appendix of the detailed records, organised by report part (not as one A-I sequence)."""
+def _detail_appendix_markdown(parts: Dict[str, Any], comp: Dict[str, Any], li: int, repro: Any = None) -> List[str]:
+    """Opt-in Markdown appendix of the detailed records, organised by report part (not as one A-I sequence); each
+    record is titled with the name of the A-I section it comes from."""
     from .diagnostic_report import detail_record_markdown
     from .human_report import check_label
     rec = parts.get("records") or {}
     out = [f"## {_MD['appendix'][li]}", ""]
 
-    def block(title: str, records: Any) -> None:
-        items = [r for r in (records or []) if r]
+    def block(title: str, groups: Any) -> None:
+        items = [(k, v) for g in (groups or []) if isinstance(g, dict) for k, v in g.items() if v]
         if not items:
             return
         out.extend([f"### {title}", ""])
-        for r in items:
-            out.extend(detail_record_markdown(", ".join(sorted(r.keys())) if isinstance(r, dict) else "-", r))
+        for k, v in items:
+            out.extend(detail_record_markdown(_SECTION_NAMES.get(k, k), v))
     block(_MD["ap_verdict"][li], rec.get("verdict"))
     for i, r in sorted((rec.get("findings") or {}).items()):
-        block(_MD["ap_finding"][li].format(i=i), [{k: v} for k, v in r.items() if v])
+        block(_MD["ap_finding"][li].format(i=i), [r])
     for rid, r in (rec.get("checks") or {}).items():
-        block(_MD["ap_check"][li].format(x=check_label(rid, li)), [{k: v} for k, v in r.items() if v])
+        block(_MD["ap_check"][li].format(x=check_label(rid, li)), [r])
     block(_MD["ap_scope"][li], rec.get("scope"))
     block(_MD["ap_method"][li], rec.get("method"))
-    block(_MD["ap_other"][li], [x for x in (rec.get("other") or []) if any(v for v in x.values())])
+    if repro is not None:
+        block(_MD["ap_repro"][li], [{"J": repro.to_dict()}])
+    block(_MD["ap_other"][li], rec.get("other"))
     return out
 
 
@@ -168,6 +184,124 @@ def _inconclusive_result(pid: Any, debug_image: Optional[str], kind: str, item: 
         "target": {"pid": pid, "debug_image": debug_image}, "report": None, "report_path": None,
         "investigation_id": None, "state": "NOT_RUN",
     }
+
+
+def result_from_session(session: Any) -> Dict[str, Any]:
+    """A ``DiagnoseResult``-shaped dict (``res``) for an investigation that already ran (``investigation_id`` entry).
+
+    The adapter that lets a stored session go through the same report generator as a fresh ``diagnose()``: the
+    ``DiagnosticReport`` is the session's own, findings / checks / not-covered rows are derived from it the way
+    ``diagnose()`` derives them, and the verdict is the report's (no healthy-scope or INFO re-evaluation is applied,
+    exactly as the former session-export path did not apply one).
+    """
+    from .diagnostic_methodology import CheckStatus
+    from .expert_diagnostic_engine import _diagnose_check_row, _finding_subjects
+    report = session.build_diagnostic_report().to_dict()
+    sec_a, sec_b, sec_e = (report.get(k) or {} for k in (
+        "section_a_executive_summary", "section_b_target_context", "section_e_findings_and_root_cause"))
+    findings: List[Dict[str, Any]] = []
+    for rec in list(sec_e.get("confirmed_root_causes") or []) + list(sec_e.get("probable_causes") or []):
+        rules = list(rec.get("applicable_diagnostic_rules") or [])
+        details = _finding_subjects(session, rules)
+        findings.append({
+            "category": rec.get("affected_entity"), "severity": rec.get("severity"),
+            "status": rec.get("classification"), "description": rec.get("problem_description"),
+            "subjects": [d["name"] for d in details], "subject_details": details, "recipe_ids": rules,
+            "evidence_ids": list(rec.get("supporting_evidence_ids") or []),
+            "observed": [c.technical_interpretation for c in session.checks
+                         if c.recipe_id in rules and c.status == CheckStatus.FAIL and c.technical_interpretation],
+        })
+    executed = [c for c in session.checks if c.status not in (CheckStatus.NOT_EXECUTED, CheckStatus.SKIPPED)]
+    not_covered = []
+    for c in session.checks:
+        if c.status in (CheckStatus.PASS, CheckStatus.FAIL):
+            continue
+        why = "; ".join(list(c.limitations or []) + list(c.missing_evidence or [])) or (c.error_details or "") \
+            or (c.technical_interpretation or "")
+        not_covered.append({"kind": f"check_{str(c.status).lower()}", "item": c.recipe_id, "reason": why or str(c.status)})
+    concl = getattr(session, "conclusion", None)
+    for lim in (list(getattr(concl, "diagnostic_limitations", []) or [])
+                + list(getattr(concl, "missing_evidence_and_unknowns", []) or [])
+                + list(sec_b.get("environmental_limitations") or []) + list(sec_b.get("collection_failures") or [])):
+        not_covered.append({"kind": "limitation", "item": "engine", "reason": str(lim)})
+    metrics = getattr(getattr(session, "budget_tracker", None), "metrics", None)
+    stop_ms = float(sec_b.get("target_stop_duration_ms") or 0.0)
+    target: Dict[str, Any] = {"pid": session.pid, "process_name": sec_b.get("target_process_name"),
+                              "debug_image": session.companion_elf, "abi": None}
+    if not sec_b.get("target_abi"):
+        # Nothing was recorded at diagnosis time (older session): re-read now, labelled as such in the report; if the
+        # process is gone the ABI stays unknown.
+        try:
+            from .target_abi import detect_target_abi
+            redetected = detect_target_abi(session.adapter, session.pid, probe_version=False)
+            if redetected.status == "DETECTED":   # target process gone / unreadable: everything stays unknown
+                target["abi"] = redetected.to_dict()
+                target["abi_source"] = "export_time_detection"
+        except Exception:  # noqa: BLE001
+            pass
+    return {
+        "verdict": str(sec_a.get("overall_result") or VERDICT_INCONCLUSIVE),
+        "confidence": float(getattr(concl, "confidence", 0.0) or 0.0),
+        "confidence_basis": str(getattr(concl, "confidence_basis", "") or ""),
+        "summary": str(sec_a.get("verdict_rationale") or ""),
+        "findings": findings, "checks_run": [_diagnose_check_row(c) for c in executed], "not_covered": not_covered,
+        "collection_impact": {
+            "capture_mode": sec_b.get("collection_mode"), "measured_stop_ms": stop_ms, "zero_stop": stop_ms == 0.0,
+            "bytes_read": int(getattr(metrics, "bytes_read", 0) or 0),
+            "wall_clock_ms": float(getattr(metrics, "wall_clock_elapsed_ms", 0.0) or 0.0),
+            "samples_collected": int(getattr(metrics, "samples_collected", 0) or 0) if metrics is not None else None,
+            "budget_exhausted": bool(getattr(metrics, "is_budget_exhausted", False)),
+        },
+        "report": json.loads(json.dumps(report, default=str)), "report_path": None,
+        "investigation_id": session.investigation_id, "target": target, "state": session.state,
+        "stop_reason": getattr(concl, "stop_reason", None), "healthy_scope": {},
+    }
+
+
+def session_report_extras(session: Any, report: Dict[str, Any]) -> Dict[str, Any]:
+    """Session-only keys that ``AdaptiveInvestigationSession.export_report("json")`` adds next to the DiagnosticReport
+    dict; kept in the JSON of an ``investigation_id`` export (no second report generation: ``report`` is the one built)."""
+    sec_d = report.get("section_d_detailed_inspection_results") or {}
+    concl = getattr(session, "conclusion", None)
+    ta = getattr(session, "target_assessment", None)
+    return {
+        "report_13_points": {
+            "1_problem_description": session.raw_problem_statement,
+            "2_target_information": report.get("section_b_target_context", {}),
+            "3_initial_classification": report.get("section_c_diagnostic_strategy", {}),
+            "4_investigation_scope": {"targeted_recipes": [st.recipe_id for st in session.plan.steps] if session.plan else []},
+            "5_executed_diagnostic_procedures": [c for c in sec_d.get("checks", [])
+                                                 if c.get("status") not in ("NOT_EXECUTED", "SKIPPED")],
+            "6_actual_observations": [r.to_dict() for r in session.collected_evidence_records],
+            "7_confirmed_findings": [h.to_dict() for h in session.active_hypotheses if h.status == "CONFIRMED"],
+            "7_findings_detail": report.get("section_e_findings_and_root_cause", {}),
+            "8_probable_causes": [h.problem_statement for h in session.active_hypotheses
+                                  if h.status in ("CONFIRMED", "LIKELY")],
+            "9_rejected_hypotheses": [h.to_dict() for h in session.rejected_hypotheses],
+            "10_unresolved_hypotheses": [h.to_dict() for h in session.active_hypotheses
+                                         if h.status in ("PROPOSED", "LIKELY", "INCONCLUSIVE")],
+            "11_evidence_to_source_mapping": [c for c in [ev.get("correlation") for ev in session.collected_evidence] if c],
+            "12_missing_evidence": ta.limitations if ta else [],
+            "13_recommended_next_actions": concl.recommended_remediations if concl else [],
+        },
+        "investigation_id": session.investigation_id,
+        "target_pid": session.pid,
+        "problem_statement": session.raw_problem_statement,
+        "status": session.state,
+        "conclusion": asdict(concl) if concl else None,
+        "plan": session.plan.to_dict() if session.plan else None,
+        "active_hypotheses": [h.to_dict() for h in session.active_hypotheses],
+        "rejected_hypotheses": [h.to_dict() for h in session.rejected_hypotheses],
+        "timeline": session.timeline,
+        "diagnostic_limitations": ta.limitations if ta else [],
+    }
+
+
+def _safe_extras(session: Any, report: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    try:
+        return json.loads(json.dumps(session_report_extras(session, report), default=str))
+    except Exception:  # noqa: BLE001 - an addition to the JSON; the report itself is already built
+        return None
 
 
 def _finding_row(f: Dict[str, Any], remediation: List[str]) -> Dict[str, Any]:
@@ -230,8 +364,14 @@ def _write(path_in: Optional[str], content: str, file_type: str, forbid_same_as:
         print(f"WARNING: {err}", file=sys.stderr)
         return None, err
     try:
-        os.makedirs(os.path.dirname(san), exist_ok=True)
-        with open(san, "w", encoding="utf-8") as fh:
+        parent = os.path.dirname(san)
+        if parent:
+            os.makedirs(parent, mode=0o700, exist_ok=True)
+        flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW          # a symlink at the output path is refused, never followed
+        fd = os.open(san, flags, 0o600)      # a newly created report file is owner-only
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
             fh.write(content)
         return san, None
     except OSError as exc:
@@ -262,18 +402,27 @@ def export_incident_report(
     hypothesis_verifier: Optional[Callable[..., Dict[str, Any]]] = None,
     pre_limitations: Optional[List[str]] = None,
     language: str = "en",
+    session: Any = None,
+    report_json_path: Optional[str] = None,
     markdown_detail: bool = False,
 ) -> Dict[str, Any]:
-    """Diagnose ``pid`` once with ``diagnose()`` and render the incident report (Markdown, HTML, JSON).
+    """Render the incident report (Markdown, HTML, JSON) of one diagnosis.
 
-    The Markdown and the HTML follow the same outline (``human_report.compose``).  The detailed (A-I) records are
-    attached to the part of the HTML report they explain (``report_detail.partition``); the Markdown points to them,
-    and ``markdown_detail=True`` appends them to the Markdown as well, organised by report part."""
+    The diagnosis is either a fresh ``diagnose()`` of ``pid`` or, with ``session`` (an investigation that already ran,
+    the ``investigation_id`` entry), that session adapted by :func:`result_from_session`.  Both end as a
+    ``DiagnosticReport`` and are rendered by the one code path below.
+
+    The Markdown and the HTML follow the same outline (``human_report.compose``), with the reproducibility section
+    (``extractor.reproducibility``) in its place.  The detailed (A-I) records are attached to the part of the HTML
+    report they explain (``report_detail.partition``); the Markdown points to them, and ``markdown_detail=True``
+    appends them to the Markdown as well, organised by report part."""
     t0 = time.monotonic_ns()
     if language not in ("en", "ko"):
         raise ValueError(f"language must be 'en' or 'ko', got {language!r}")
     if title == DEFAULT_TITLE and language == "ko":
         title = DEFAULT_TITLE_KO
+    if session is not None and not pid:
+        pid = session.pid
     if pid is not None and (isinstance(pid, bool) or int(pid) <= 0):
         return {
             "success": False, "pid": pid, "overall_status": VERDICT_INCONCLUSIVE, "verdict": VERDICT_INCONCLUSIVE,
@@ -284,7 +433,17 @@ def export_incident_report(
     li = 1 if language == "ko" else 0
 
     # 1. the diagnosis (the only verdict)
-    if not pid:
+    if session is not None:
+        try:
+            from .human_report import render_human_report
+            res = result_from_session(session)
+            summary_md = render_human_report(res, res.get("report"), lang=language)
+        except Exception as exc:  # noqa: BLE001
+            res = _inconclusive_result(pid, companion_elf_path, "unexpected_error", "session report",
+                                       f"{type(exc).__name__}: {exc}")
+            summary_md = ""
+        companion_elf_path = companion_elf_path or session.companion_elf
+    elif not pid:
         res = _inconclusive_result(pid, companion_elf_path, "no_target", "pid",
                                    "no target process was given or bound, so nothing was examined")
         summary_md = ""
@@ -313,7 +472,22 @@ def export_incident_report(
 
     verdict = str(res.get("verdict") or VERDICT_INCONCLUSIVE)
     report = res.get("report") if isinstance(res.get("report"), dict) else None
+    from .diagnostic_report import DiagnosticReport
+    from .reproducibility import build_reproducibility, detail_html as repro_detail_html
+    report_obj: Optional[DiagnosticReport] = None
+    if report is not None:
+        try:
+            report_obj = DiagnosticReport.from_dict(report)  # the standard model: every entry ends here
+        except Exception:  # noqa: BLE001 - rendered from the dicts by the fallback below
+            report_obj = None
+    repro = build_reproducibility(report or {}, res)
+    if report_obj is not None:
+        report_obj.section_j_reproducibility = repro
+    res["reproducibility"] = repro.to_dict()
+    if report is not None:
+        report["section_j_reproducibility"] = res["reproducibility"]
     sec_a = (report or {}).get("section_a_executive_summary") or {}
+    sec_b_build_id = ((report or {}).get("section_b_target_context") or {}).get("build_id")
     sec_i = (report or {}).get("section_i_final_conclusions") or {}
     remediation_checklist: List[str] = []
     for item in list(sec_i.get("safe_remediation_suggestions") or []) + list(sec_a.get("recommended_next_actions") or []):
@@ -362,12 +536,13 @@ def export_incident_report(
     elif process_name and not target.get("process_name"):
         view["target"] = dict(target, process_name=process_name)
     comp = compose(view, report, language, pointers=True,
-                   method_extra={"build_id": build_id, "generated": _generated_at()},
+                   method_extra={"build_id": build_id or sec_b_build_id, "generated": _generated_at()},
                    extra_sections={"hypothesis": _hypothesis_lines(hyp_res, li),
-                                   "reproducibility": _reproducibility_section(view, report, language)})
+                                   "reproducibility": _reproducibility_section(repro, language)})
     from .report_detail import partition
     parts = partition(view, report, comp["rows"])
-    appendix = _detail_appendix_markdown(parts, comp, li) if markdown_detail else []
+    parts["reproducibility"] = repro_detail_html(repro, language)
+    appendix = _detail_appendix_markdown(parts, comp, li, repro) if markdown_detail else []
     report_markdown = _compose_markdown(title, comp, appendix)
 
     report_html: Optional[str] = None
@@ -385,6 +560,11 @@ def export_incident_report(
 
     saved_path, save_error = _write(output_path, report_markdown, "incident report")
     saved_html_path, save_html_error = _write(report_html_path, report_html, "HTML report", forbid_same_as=saved_path)
+    extras = _safe_extras(session, report) if session is not None and report is not None else None
+    json_doc = {**report, **{k: v for k, v in extras.items() if k not in report}} if (report is not None and extras) \
+        else (report if report is not None else res)
+    saved_json_path, save_json_error = _write(
+        report_json_path, json.dumps(json_doc, indent=2, default=str), "JSON report", forbid_same_as=saved_path)
     latency_us = round((time.monotonic_ns() - t0) / 1000.0, 2)
     if verdict == VERDICT_INCONCLUSIVE:
         hint = (f"Incident report for PID {eff_pid} is INCONCLUSIVE ({len(limitations)} limitation(s): "
@@ -399,7 +579,7 @@ def export_incident_report(
         "success": True,
         "pid": eff_pid,
         "companion_elf": eff_elf,
-        "build_id": build_id,
+        "build_id": build_id or sec_b_build_id,
         "investigation_id": res.get("investigation_id"),
         "collection_mode": collection_mode,
         "stop_duration_ms": stop_ms,
@@ -424,11 +604,15 @@ def export_incident_report(
         "report_markdown": report_markdown,
         "report_html": report_html,
         "report_json": report_json,
+        "reproducibility": repro.to_dict(),
+        "session_report_extras": extras,
         "report_path": res.get("report_path"),
         "saved_path": saved_path,
         "save_error": save_error,
         "saved_html_path": saved_html_path,
         "save_html_error": save_html_error,
+        "saved_json_path": saved_json_path,
+        "save_json_error": save_json_error,
         "llm_next_step_hint": hint,
     }
 

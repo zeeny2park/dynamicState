@@ -104,6 +104,7 @@ _L: Dict[str, Tuple[str, str]] = {
     "ts_R": ("running", "실행"), "ts_S": ("sleeping / waiting", "대기(sleep)"), "ts_D": ("uninterruptible wait", "중단 불가 대기"),
     "ts_Z": ("zombie", "좀비"), "ts_T": ("stopped", "정지"), "ts_other": ("other", "기타"),
     "ts_runnable": ("ready to run in {p}% of samples", "샘플의 {p}%에서 실행 가능 상태"),
+    "ts_dispatches": ("put on a CPU {n} times, never blocked", "CPU에 {n}번 올려졌고 한 번도 대기하지 않음"),
     # overflow
     "ov_title": ("How the write ran past the buffer", "쓰기가 버퍼를 넘어간 모습"),
     "ov_hdr": ("block header", "블록 헤더"),
@@ -195,8 +196,6 @@ _L: Dict[str, Tuple[str, str]] = {
     "ck_not_planned": ("Not selected for this symptom.", "이 증상에 대해서는 선택되지 않았습니다."),
     "ck_need_cap": ("needs a capability that is not available here: {cap}", "여기서 사용할 수 없는 기능이 필요함: {cap}"),
     "ck_no_reason": ("The check recorded no reason.", "검사가 사유를 기록하지 않았습니다."),
-    "nc_unsupported_in_mode": ("not examined: a zero-stop diagnosis cannot answer this, it needs {cap}",
-                               "점검하지 않음: 무정지 진단으로는 답할 수 없음, {cap} 필요"),
     "ck_none": ("No check record is available for this diagnosis.", "이 진단에는 검사 기록이 없습니다."),
     "nc_title": ("Also not examined", "그 밖에 확인하지 못한 것"),
     "dom_CONCURRENCY": ("Threads and locks", "스레드와 락"), "dom_MEMORY_GROWTH": ("Memory growth", "메모리 증가"),
@@ -209,6 +208,8 @@ _L: Dict[str, Tuple[str, str]] = {
     "d_scope": ("Check totals and limitations (detailed records, English)", "검사 집계와 제한 사항 (상세 기록, 영문)"),
     "d_method": ("Target, collection and plan (detailed records, English)", "대상·수집·계획 상세 (상세 기록, 영문)"),
     "d_other": ("Other detailed records (English)", "그 밖의 상세 기록 (영문)"),
+    "d_repro": ("Exact start and end time of every check (detailed records, English)",
+                "검사별 정확한 시작·종료 시각 (상세 기록, 영문)"),
 }
 
 # recipe id -> (domain, name en, name ko, looks-for en, looks-for ko)
@@ -653,7 +654,16 @@ def _thread_strip(lx: _Lx, rows: Dict[int, Dict[str, Any]], hot: List[Any], samp
         except (TypeError, ValueError):
             pct = None
         cpu = (f'<span class="dsv-meter"><i style="width:{pct:.0f}%"></i></span> {pct:.0f}%' if pct is not None else "")
-        if r.get("runnable_fraction") is not None and pct is not None and pct >= 1:
+        if r.get("judgement_basis") == "schedstat_runnable_fraction_dispatches" and isinstance(r.get("cpu_dispatches"), int):
+            # a yield-polling busy wait: its CPU share depends on the host load, so show what was judged instead
+            try:
+                run = max(0.0, min(100.0, float(r.get("runnable_fraction") or 0.0) * 100.0))
+            except (TypeError, ValueError):
+                run = 0.0
+            cpu = (f'<span class="dsv-meter"><i style="width:{run:.0f}%"></i></span> '
+                   f'{E(lx.t("ts_runnable", p=round(run)))}<br><span class="dsv-note">'
+                   f'{E(lx.t("ts_dispatches", n=r["cpu_dispatches"]))}</span>')
+        elif r.get("runnable_fraction") is not None and pct is not None and pct >= 1:
             try:
                 cpu += f'<br><span class="dsv-note">{E(lx.t("ts_runnable", p=round(float(r["runnable_fraction"]) * 100)))}</span>'
             except (TypeError, ValueError):
@@ -1232,7 +1242,7 @@ def _hero(lx: _Lx, title: str, res: Dict[str, Any], rows: List[Dict[str, Any]], 
 
 
 _SEC_ID = {"conclusion": "sec-conclusion", "findings": "dsv-findings", "hypothesis": "sec-hypothesis",
-           "next": "sec-next", "scope": "dsv-checks", "method": "sec-method", "reproducibility": "sec-reproducibility",
+           "next": "sec-next", "scope": "dsv-checks", "method": "sec-method", "reproducibility": "reproducibility",
            "reference": "sec-reference"}
 
 
@@ -1270,7 +1280,8 @@ def build_visual_summary(result: Dict[str, Any], report: Optional[Dict[str, Any]
             parts.append(f'<div class="dsv-card">{_md_html([x for x in s["lines"] if not x.startswith("_")])}'
                          + _detail(lx, "d_method", details.get("method", ""), "method-detail") + "</div>")
         elif key == "reproducibility":
-            parts.append(f'<div class="dsv-card">{_md_html(s["lines"])}</div>')
+            parts.append(f'<div class="dsv-card dsv-repro">{_md_html(s["lines"])}'
+                         + _detail(lx, "d_repro", details.get("reproducibility", ""), "reproducibility-detail") + "</div>")
         elif key == "reference":
             # the "where is the detail" list is for the Markdown reader; here each part carries its own detail
             where = f"### {T['r_where'][lx.i]}"

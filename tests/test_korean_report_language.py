@@ -134,7 +134,8 @@ class TestKoreanReportHasNoEnglishSentences(unittest.TestCase):
         self.assertIn("is a heap buffer with 72 usable bytes", out["human_summary"])
         md = out["report_markdown"]
         for h in ("## 1. Conclusion", "## 2. What was found", "## 3. What to do next", "## 4. What was checked",
-                  "## 5. How the diagnosis was done and what it cost the target", "## 6. Reference"):
+                  "## 5. How the diagnosis was done and what it cost the target", "## 6. Reproducibility",
+                  "## 7. Reference"):
             self.assertIn(h, md)
 
     def test_verdicts_are_the_saved_ones(self):

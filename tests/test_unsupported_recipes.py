@@ -325,7 +325,7 @@ class TestReportRendering(unittest.TestCase):
     def test_human_report_lists_them_in_the_not_examined_section(self):
         from extractor import human_report
         res = self._result()
-        for lang, needle in (("en", "Not examined"), ("ko", "점검하지 않은 항목")):
+        for lang, needle in (("en", "Not examined in this mode"), ("ko", "점검하지 않은 검사")):
             text = human_report.render_human_report(res, res["report"], lang)
             self.assertIn("RECIPE_USE_AFTER_FREE", text, lang)
             self.assertIn(needle, text, lang)

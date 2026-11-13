@@ -51,5 +51,28 @@ class YieldBusyWaitSentence(unittest.TestCase):
         self.assertIn("used 97.0% of a CPU", text)
 
 
+
+class TestThreadStripMeter(unittest.TestCase):
+    """The HTML thread strip shows the same basis as the sentence: runnable share and dispatch count, not 0 % CPU."""
+
+    def _cell(self, lang, **kw):
+        import re as _re
+        from extractor.report_visuals import _Lx, _thread_strip
+        row = {"name": "poll", "states": ["R"] * 5, "cpu_share": 0.0, "runnable_fraction": 1.0, "top_function": "f"}
+        row.update(kw)
+        h = _thread_strip(_Lx(lang), {5: row}, [5], (5, 1.0))
+        return _re.findall(r"<td>(<span class=\"dsv-meter.*?)</td>", h)[0]
+
+    def test_dispatch_basis_shows_runnable_share_and_dispatches(self):
+        en = self._cell("en", **DISP)
+        self.assertIn("ready to run in 100% of samples", en)
+        self.assertIn("put on a CPU 1432 times", en)
+        self.assertNotIn(" 0%", en)
+        self.assertIn("CPU에 1432번", self._cell("ko", **DISP))
+
+    def test_other_bases_keep_the_cpu_meter(self):
+        self.assertIn(" 0%", self._cell("en", judgement_basis="schedstat_runnable_fraction"))
+
+
 if __name__ == "__main__":
     unittest.main()

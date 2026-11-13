@@ -83,7 +83,11 @@ class TestOutline(unittest.TestCase):
                 out = _render_dict(_load(name), lang)
                 md, html = _md_h2(out["report_markdown"]), _html_h2(out["report_html"])
                 self.assertEqual(md, html, (name, lang))
-                self.assertEqual(_md_h2(out["human_summary"]), md[:len(_md_h2(out["human_summary"]))], (name, lang))
+                # the summary is the same outline without the incident-only parts (hypothesis, reproducibility)
+                titles = lambda hs: [h.split(". ", 1)[1] for h in hs]  # noqa: E731
+                incident_only = ("Reproducibility", "재현 정보", "The hypothesis you asked to check", "요청한 가설 검증")
+                self.assertEqual(titles(_md_h2(out["human_summary"])),
+                                 [t for t in titles(md) if t not in incident_only], (name, lang))
                 comp = compose(_load(name), _load(name)["report"], lang)
                 keys[lang] = [s["key"] for s in comp["sections"]]
             self.assertEqual(keys["en"], keys["ko"], name)
@@ -170,9 +174,15 @@ class TestOutline(unittest.TestCase):
         # each thing is said once; what remains is the conclusion, one advice line, the 30 checks named once in
         # grouped lines, what the verdict does not cover, the method block and the glossary: <= 80 lines and
         # <= 700 words in either language (Korean words are longer units, English runs about 20 % more words).
+        # The reproducibility section is reference material for re-explaining the run (one table row per executed
+        # check, about 25 lines) and is not counted; it is bounded on its own: one line per executed check + 30.
         for name in ("ok_idle_server", "ok_scenario_a"):
             for lang, words in (("ko", 700), ("en", 850)):
-                md = _render_dict(_load(name), lang)["report_markdown"]
+                full = _render_dict(_load(name), lang)["report_markdown"]
+                title = "재현 정보" if lang == "ko" else "Reproducibility"
+                md, repro = re.split(r"(?m)^## \d+\. " + title + "$", full)
+                repro = repro.split("\n## ")[0]
+                self.assertLessEqual(len(repro.splitlines()), len(_load(name)["checks_run"]) + 30, (name, lang))
                 self.assertLessEqual(len(md.splitlines()), 80, (name, lang))
                 self.assertLessEqual(len(md.split()), words, (name, lang))
 
