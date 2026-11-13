@@ -27,7 +27,8 @@ A diagnosis is HEALTHY only if ALL of the following hold:
    features unsupported on the target ABI that no baseline check needed (``unsupported_on_target``), the heap cap
    above, long waits in syscalls whose expectedness cannot be judged from outside (``long_wait_not_judged``),
    leak-owner attribution limits when the leak check itself cleared, remote-target limits, symptom-specific
-   (non-baseline) checks that reached no result, and recipes not planned for the symptom.
+   (non-baseline) checks that reached no result, recipes not planned for the symptom, and the questions of recipes
+   this mode cannot execute (``unsupported_in_mode``: declared ``requires_capabilities``, left out of the plan).
 
 Symptom-specific checks never gate HEALTHY (a FAIL still does, through rule 2): their scope is the symptom, the
 HEALTHY scope is the baseline.  Defect classes no baseline check looks for (data races, logic errors) and the
@@ -53,6 +54,7 @@ BLOCKING_KINDS = frozenset({
 SCOPE_KINDS = frozenset({
     "unsupported_on_target", "recipes_not_planned", "remote_limitation", "collector_not_deployed",
     "integrity_not_checked", "integrity_limited", "leak_owner_limited", "report_not_saved", "long_wait_not_judged",
+    "unsupported_in_mode",
 })
 
 # What each built-in baseline check clears, in plain words (en, ko).  A plugin baseline recipe uses its name.
@@ -79,7 +81,8 @@ OUTSIDE_BASELINE = ("data races and program-logic errors (no baseline check look
 
 _NOT_CHECKED_ORDER = {k: i for i, k in enumerate((
     "integrity_not_checked", "long_wait_not_judged", "leak_owner_limited", "integrity_limited",
-    "unsupported_on_target", "remote_limitation", "symptom_checks_without_result", "outside_baseline"))}
+    "unsupported_on_target", "remote_limitation", "symptom_checks_without_result", "unsupported_in_mode",
+    "outside_baseline"))}
 
 
 def _st(c: Any) -> str:
@@ -283,6 +286,20 @@ def evaluate(*, verdict: str, findings: List[Dict[str, Any]], checks: List[Any],
         if kind == "long_wait_not_judged":
             long_waits.append(n)
             continue  # one item for all long waits, below
+        if kind == "unsupported_in_mode":
+            # Questions whose checks this mode cannot execute (declared capability requirement).  Never a gate:
+            # no baseline check owns them; they are listed so a HEALTHY verdict does not read as "examined".
+            from .diagnostic_recipes import CAPABILITY_DESCRIPTIONS
+            cap_en, cap_ko = CAPABILITY_DESCRIPTIONS.get(str(n.get("capability")), (str(n.get("capability")),) * 2)
+            ids = [x for x in item.split(",") if x]
+            en_names = ", ".join(_plain(x) for x in ids)
+            ko_names = ", ".join(_plain_ko(x) for x in ids)
+            not_checked.append({
+                "kind": kind, "item": item, "capability": n.get("capability"),
+                "label": f"not examined: {en_names} (a zero-stop diagnosis cannot answer these: they need {cap_en})",
+                "label_ko": f"점검하지 않음: {ko_names} (무정지 진단으로는 답할 수 없음: {cap_ko} 필요)",
+                "reason": str(n.get("reason") or "")})
+            continue
         label = {
             "unsupported_on_target": (f"{item} (not supported on this target)", f"{item} (이 대상에서 지원되지 않음)"),
             "leak_owner_limited": ("which variable owns heap memory (leak-owner attribution was limited)",

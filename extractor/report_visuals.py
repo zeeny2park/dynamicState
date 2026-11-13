@@ -195,6 +195,8 @@ _L: Dict[str, Tuple[str, str]] = {
     "ck_not_planned": ("Not selected for this symptom.", "이 증상에 대해서는 선택되지 않았습니다."),
     "ck_need_cap": ("needs a capability that is not available here: {cap}", "여기서 사용할 수 없는 기능이 필요함: {cap}"),
     "ck_no_reason": ("The check recorded no reason.", "검사가 사유를 기록하지 않았습니다."),
+    "nc_unsupported_in_mode": ("not examined: a zero-stop diagnosis cannot answer this, it needs {cap}",
+                               "점검하지 않음: 무정지 진단으로는 답할 수 없음, {cap} 필요"),
     "ck_none": ("No check record is available for this diagnosis.", "이 진단에는 검사 기록이 없습니다."),
     "nc_title": ("Also not examined", "그 밖에 확인하지 못한 것"),
     "dom_CONCURRENCY": ("Threads and locks", "스레드와 락"), "dom_MEMORY_GROWTH": ("Memory growth", "메모리 증가"),

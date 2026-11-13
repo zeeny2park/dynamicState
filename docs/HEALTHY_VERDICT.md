@@ -46,9 +46,16 @@ this rule is reported INCONCLUSIVE.
   is a scope limit. A *baseline* check that could not answer its question for a target-support reason (mutex
   owners not decodable -> deadlock / lock checks INCONCLUSIVE) blocks HEALTHY: the question it owns was not answered.
 - **Symptom-specific (non-baseline) recipes** never gate HEALTHY: their FAIL still blocks (it is a finding), any
-  other non-PASS result is listed as "symptom-specific checks that reached no result". Several of them cannot clear
-  anything on a live process (the traced use-after-free / object lifetime recipes need allocation-lifecycle tracing,
-  `lifecycle_tracing_unavailable`); their negative is meaningless, so they are scope, not gate.
+  other non-PASS result is listed as "symptom-specific checks that reached no result".
+- **Checks this mode cannot execute** (`unsupported_in_mode`): a recipe whose rule reads values no zero-stop collector
+  fills in declares `requires_capabilities` (`allocation_tracing`: traced use-after-free, suspicious allocation
+  patterns, object lifetime anomalies; `caller_specification`: unexpected variable changes, state transition
+  violations; `stopped_snapshot`: shared-state inconsistencies). Plan construction leaves it out, so it is neither
+  executed nor an open check, and its question is listed in `healthy_scope.not_checked` ("not examined: ... they
+  need ...") and in `not_covered`. It never gates HEALTHY (no baseline check owns the question) and never clears
+  anything; a baseline recipe cannot declare a capability (registration refuses it). The recipes stay registered
+  (explicit `run_recipe` still runs them, e.g. with a caller-supplied specification); an optional tracing mode would
+  provide the capability and put them back in the plan.
 - **Always not checked** (`outside_baseline`): data races, program-logic errors, a use-after-free that leaves no
   typed pointer to a freed block and no write into one, a double free of a block re-allocated in between (listed
   once, like any free block).

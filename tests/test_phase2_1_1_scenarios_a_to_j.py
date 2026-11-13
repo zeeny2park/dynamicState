@@ -153,10 +153,12 @@ class TestPhase211ScenariosAToJ(unittest.TestCase):
 
         self.assertEqual(session.state, STATE_COMPLETED)
         self.assertIsNotNone(conclusion)
-        trans = [c for c in session.checks if c.recipe_id == "RECIPE_STATE_TRANSITION_VIOLATIONS"]
-        self.assertTrue(trans)
-        self.assertNotEqual(trans[0].status, "FAIL")  # no confirmed transition violation from a value alone
-        self.assertTrue(any("g_worker_state" in str(c.actual_observations.get("variable_name") or "") for c in trans))
+        # The transition check needs a state machine from the caller (declared capability), so zero-stop plans
+        # leave it out instead of running a check that can only end INCONCLUSIVE; a value alone confirms nothing.
+        self.assertFalse([c for c in session.checks if c.recipe_id == "RECIPE_STATE_TRANSITION_VIOLATIONS"])
+        self.assertNotIn("RECIPE_STATE_TRANSITION_VIOLATIONS", [s.recipe_id for s in session.plan.steps])
+        self.assertFalse([c for c in session.checks if c.status == "FAIL"
+                          and c.recipe_id in ("RECIPE_STATE_TRANSITION_VIOLATIONS", "RECIPE_UNEXPECTED_VARIABLE_CHANGES")])
 
     def test_scenario_f_related_field_inconsistency(self):
         """Scenario F: Buffer length > capacity invariant violation confirmed."""

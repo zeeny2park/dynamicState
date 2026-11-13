@@ -219,6 +219,10 @@ T: Dict[str, Tuple[str, str]] = {
                  "실행했지만 '{st}'로 끝나 결론을 내지 못한 검사: {items}."),
     "nc_recipes_not_planned": ("{n} other check(s) were not selected for this symptom: {items}.",
                                "이 증상에는 선택되지 않아 실행하지 않은 다른 검사 {n}개: {items}."),
+    "nc_unsupported_in_mode": ("Not examined, because a zero-stop diagnosis cannot answer them (they need allocation tracing, "
+                               "a stopped snapshot or a specification from the caller): {items}.",
+                               "무정지 진단으로는 답할 수 없어 점검하지 않은 항목 (할당 추적, 정지된 스냅샷 또는 호출자의 명세가 "
+                               "필요함): {items}."),
     "nc_baseline_check_not_run": ("Planned checks that never ran because the investigation ended early: {items}.",
                                   "조사가 일찍 끝나 실행되지 못한 계획된 검사: {items}."),
     "nc_budget_exhausted": ("The observation budget ran out, so the observation was cut short.",
@@ -1286,6 +1290,9 @@ def _not_examined_lines(ctx: _Ctx, res: Dict[str, Any]) -> List[str]:
             line = ctx.t("nc_baseline_check_not_run", items=_join(names))
         elif kind in ("unattributed_finding", "stage_failed", "unexpected_error"):
             line = ctx.t(f"nc_{kind}", items=_join(names))
+        elif kind == "unsupported_in_mode":
+            ids = [x for n in items for x in str(n.get("item")).split(",") if x]
+            line = ctx.t("nc_unsupported_in_mode", items=_join([check_label(x, ctx.i) for x in ids]))
         elif kind == "limitation":
             line = ctx.t("nc_limitation") + " " + "; ".join(_c(ko_text(r, ctx.i)) for r in raws)
         elif f"nc_{kind}" in T:
