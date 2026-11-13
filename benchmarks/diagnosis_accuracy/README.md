@@ -21,7 +21,7 @@ the symptom text, `origin` (`project_fixture`, `external_style`, `new`) and `nam
 New programs print `READY` once in the faulty steady state and stay alive; reused fixtures use a fixed settle time.
 Heap-corruption targets do the bad write once, then idle without calling malloc/free again.
 
-11 scored defect targets (memory_leak 3, heap_overflow 2, use_after_free 2, deadlock 2, busy_wait 2), 2 unscored
+13 scored defect targets (memory_leak 3, heap_overflow 2, use_after_free 2, deadlock 2, busy_wait 2, thread_growth 2: `accept_workers` (a never-joined thread per 100 ms, capped at 400) and `request_threads` (detached threads that never exit, capped at 300); the location is the `pthread_create` line, which the diagnosis cannot observe: it names the new threads and their start function, not their creator), 2 unscored
 `long_stall` targets (`stall_pipe`, `stall_sleep`), 8 healthy controls, 3 `external_style` (small LRU cache, ring buffer, job queue written in a neutral style).
 
 ## Scoring (per target, one `diagnose` call)

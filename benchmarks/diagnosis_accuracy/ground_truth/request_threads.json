@@ -1,0 +1,30 @@
+{
+  "id": "request_threads",
+  "origin": "new",
+  "naming": "neutral",
+  "kind": "thread_growth",
+  "source": "benchmarks/diagnosis_accuracy/targets/request_threads.c",
+  "language": "c",
+  "symptom": "the thread count of this process is going up all the time",
+  "ready": {
+    "mode": "stdout_marker"
+  },
+  "causes": {
+    "variables": [],
+    "locks": [],
+    "threads": [
+      "req_handler"
+    ],
+    "functions": [
+      "handle_request"
+    ]
+  },
+  "locations": [
+    {
+      "file": "benchmarks/diagnosis_accuracy/targets/request_threads.c",
+      "line": 24,
+      "text": "pthread_create(&t, &at, handle_request, NULL)"
+    }
+  ],
+  "notes": "one detached thread per 100 ms in the main loop; each sleeps forever instead of ending; capped at 300 threads so the host is not exhausted"
+}
