@@ -314,7 +314,6 @@ _CSS = """
 .dsv .finding + .finding { border-top: 1px solid var(--border); margin-top: 18px; padding-top: 18px; }
 .dsv .fhead { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-bottom: 6px; }
 .dsv .fhead h3 { margin: 0; }
-.dsv-keyfacts { list-style: none; padding-left: 0 !important; font-size: 13px; }
 /* checks: rows as in the live UI (status icon · name · domain · one-line result), each row opens in place */
 .dsv .ckhead { display: flex; align-items: center; gap: 8px; margin: 16px 0 4px; font-size: 13px; font-weight: 600; }
 .dsv .ckhead small { font-weight: 400; color: var(--muted-foreground); font-size: 12px; }
@@ -340,127 +339,22 @@ details.dsv-ck > summary:hover { background: var(--accent); }
 .dsv-detail-body td code { white-space: pre-wrap; word-break: break-all; }
 .dsv-detail-body .dsd-pre { white-space: pre-wrap; word-break: break-all; }
 .dsv-detail-body .meta-bar { color: var(--muted-foreground); }
-/* pictures of the findings (report-specific; colours through the bridge variables) */
-.dsv-chip { display: inline-block; padding: 1px 8px; border-radius: 999px; font-size: 12px; border: 1px solid var(--line);
-  color: var(--mute); background: var(--panel); white-space: nowrap; }
-.dsv-chip-obs { color: var(--good); border-color: var(--good); } .dsv-chip-rec { color: var(--warn); border-color: var(--warn); }
-.dsv-chip-no { color: var(--unk); border-style: dashed; }
-.dsv-bar { display: flex; height: 6px; border-radius: 3px; overflow: hidden; background: var(--soft); margin: 8px 0 4px; }
-.dsv-bar i { display: block; height: 100%; background: var(--sc); }
-.dsv-s-FAIL { --sc: var(--bad); --sb: var(--bad-bg); } .dsv-s-PASS { --sc: var(--good); --sb: var(--good-bg); }
-.dsv-s-INCONCLUSIVE { --sc: var(--warn); --sb: var(--warn-bg); } .dsv-s-SKIPPED { --sc: var(--unk); --sb: var(--unk-bg); }
-.dsv-note { font-size: 13px; color: var(--mute); }
-.dsv-legend { display: flex; flex-wrap: wrap; gap: 4px 14px; font-size: 12px; color: var(--mute); margin: 8px 0 0; }
-.dsv-facts { margin: 8px 0 0; padding-left: 20px; font-size: 13px; } .dsv-facts li { margin: 3px 0; }
-.dsv-r { position: absolute; opacity: 0; width: 1px; height: 1px; margin: 0; pointer-events: none; }
-.dsv-r + label { display: inline-block; font-size: 12.5px; padding: 2px 10px; margin: 0 4px 8px 0; border-radius: calc(var(--radius) - 2px);
-  cursor: pointer; border: 1px solid var(--line); background: var(--bg); color: var(--ink); user-select: none; }
-.dsv-r + label:hover { background: var(--panel); }
-.dsv-r:checked + label { background: var(--primary); color: var(--primary-foreground); border-color: var(--primary); }
-.dsv-r:focus-visible + label { outline: 2px solid var(--ring); outline-offset: 2px; }
-.dsv-r + label .dsv-n { font-weight: 700; margin-left: 5px; }
-.dsv-steplbl { font-size: 12.5px; color: var(--mute); margin-right: 6px; }
-@keyframes dsv-appear { from { opacity: 0; } to { opacity: 1; } }
-@media (prefers-reduced-motion: no-preference) {
-  .dsv-rplay:checked ~ [data-step], .dsv-rplay:checked ~ * [data-step] { animation: dsv-appear .45s both; animation-delay: calc(var(--d) * 1.1s); }
-}
-.dsv-seq { display: grid; grid-template-columns: minmax(0, 1.25fr) minmax(0, 1fr); gap: 18px; align-items: start; margin-top: 10px; }
-.dsv-svgbox { overflow-x: auto; border: 1px solid var(--line); border-radius: var(--radius); background: var(--panel); padding: 8px; }
-.dsv svg { display: block; max-width: 100%; height: auto; }
-.dsv svg text { fill: var(--ink); font-family: var(--font-sans); }
-.dsv svg .dsv-t-mute { fill: var(--mute); } .dsv svg .dsv-t-bad { fill: var(--bad); font-weight: 700; }
-.dsv svg .dsv-t-on { fill: var(--info-foreground); font-weight: 700; }
-.dsv svg .dsv-life { stroke: var(--line); stroke-width: 1.5; stroke-dasharray: 4 4; }
-.dsv svg .dsv-lockbox { fill: var(--bg); stroke: var(--ink); stroke-width: 1.5; }
-.dsv svg .dsv-arrow { stroke: var(--ink); stroke-width: 2; fill: none; }
-.dsv svg .dsv-arrow-bad { stroke: var(--bad); stroke-width: 2; stroke-dasharray: 6 4; fill: none; }
-.dsv svg .dsv-blocked { stroke: var(--bad); stroke-width: 5; }
-.dsv svg .dsv-banner { fill: var(--bad-bg); stroke: var(--bad); stroke-width: 1.5; }
-.dsv svg .dsv-grid { stroke: var(--soft); stroke-width: 1; } .dsv svg .dsv-axis { stroke: var(--line); stroke-width: 1.5; }
-.dsv svg .dsv-area { fill: var(--bad-bg); } .dsv svg .dsv-linep { stroke: var(--bad); stroke-width: 2.5; fill: none; }
-.dsv svg .dsv-pt { fill: var(--bg); stroke: var(--bad); stroke-width: 2.5; } .dsv svg .dsv-pt:hover { fill: var(--bad); }
-.dsv-steps { list-style: none; counter-reset: dsvs; margin: 0; padding: 0 !important; font-size: 13px; }
-.dsv-steps li { counter-increment: dsvs; position: relative; padding: 6px 8px 6px 34px; border-top: 1px dashed var(--line); }
-.dsv-steps li:first-child { border-top: 0; }
-.dsv-steps li::before { content: counter(dsvs); position: absolute; left: 4px; top: 7px; width: 20px; height: 20px; border-radius: 50%;
-  background: var(--primary); color: var(--primary-foreground); font-size: 11px; font-weight: 700; text-align: center; line-height: 20px; }
-.dsv-steps .dsv-sub { display: block; font-size: 12px; color: var(--mute); }
-.dsv-tbl { width: 100%; border-collapse: collapse; font-size: 13px; margin: 6px 0; }
-.dsv-tbl th, .dsv-tbl td { border: 0; border-bottom: 1px solid var(--line); padding: 6px 8px; text-align: left; vertical-align: middle; background: none; }
-.dsv-tbl th { color: var(--mute); font-weight: 500; font-size: 12px; }
-.dsv-tbl tr.dsv-hot td:first-child { box-shadow: inset 4px 0 0 var(--bad); }
-.dsv-scroll { overflow-x: auto; }
-.dsv-scroll > .dsv-tbl { min-width: 560px; }   /* narrow screens scroll the table instead of squeezing it */
-.dsv-smp { display: inline-flex; gap: 2px; vertical-align: middle; }
-.dsv-smp i { display: inline-block; width: 16px; height: 16px; border-radius: 3px; font-style: normal; font-size: 10px; line-height: 16px;
-  text-align: center; color: var(--background); background: var(--unk); }
-.dsv-smp .dsv-st-R { background: var(--good); } .dsv-smp .dsv-st-S { background: var(--mute); }
-.dsv-smp .dsv-st-D { background: var(--warn); } .dsv-smp .dsv-st-Z, .dsv-smp .dsv-st-T { background: var(--bad); }
-.dsv-meter { display: inline-block; width: 70px; height: 8px; border-radius: 4px; background: var(--soft); vertical-align: middle; overflow: hidden; }
-.dsv-meter i { display: block; height: 100%; background: var(--accent); }
-.dsv-mem { display: flex; align-items: flex-end; gap: 0; overflow-x: auto; padding: 8px 2px 4px; }
-.dsv-seg { flex: 0 0 auto; }
-.dsv-seg > span { display: block; font-size: 12px; font-weight: 600; padding: 0 4px 3px; white-space: nowrap; }
-.dsv-seg-over > span { color: var(--bad); } .dsv-seg-buf > span { color: var(--buf-line); }
-.dsv-cells { display: flex; }
-.dsv-cell { width: 62px; height: 66px; border: 1px solid var(--line); margin-right: -1px; padding: 3px 4px; font-size: 11px; line-height: 1.25;
-  display: flex; flex-direction: column; justify-content: space-between; background: var(--bg); overflow: hidden; }
-.dsv-cell b { font-size: 12px; font-family: var(--font-mono); overflow-wrap: anywhere; }
-.dsv-cell small { color: var(--mute); font-size: 10px; white-space: nowrap; }
-.dsv-c-hdr { background: var(--hdr); } .dsv-c-buf { background: var(--buf); border-color: var(--buf-line); }
-.dsv-c-over { background: repeating-linear-gradient(135deg, var(--bad-bg), var(--bad-bg) 6px, var(--bg) 6px, var(--bg) 12px);
-  border-color: var(--bad); color: var(--bad); }
-.dsv-c-over small { color: var(--bad); }
-.dsv-c-gap { width: 96px; border-style: dashed; justify-content: center; text-align: center; color: var(--mute); }
-.dsv-c-rest { border-style: dashed; color: var(--mute); justify-content: center; text-align: center; }
-.dsv-wall { flex: 0 0 auto; align-self: stretch; width: 0; border-left: 3px solid var(--bad); margin: 0 5px 0 6px; position: relative; }
-.dsv-memaxis { display: flex; justify-content: space-between; font-size: 12px; color: var(--mute); margin: 2px 2px 0; }
-.dsv-ptr { display: flex; flex-wrap: wrap; align-items: stretch; gap: 8px; margin: 8px 0; }
-.dsv-box { border: 1.5px solid var(--line); border-radius: var(--radius); padding: 8px 12px; background: var(--panel); min-width: 150px; }
-.dsv-box small { display: block; color: var(--mute); font-size: 12px; }
-.dsv-box-bad { border-color: var(--bad); background: var(--bad-bg); }
-.dsv-arrowtxt { align-self: center; font-size: 12px; color: var(--mute); text-align: center; white-space: nowrap; }
-.dsv-arrowtxt b { display: block; font-size: 20px; line-height: 1; color: var(--ink); }
-.dsv-life { display: flex; flex-wrap: wrap; gap: 0; margin: 12px 0 4px; font-size: 13px; }
-.dsv-life div { padding: 5px 14px 5px 18px; background: var(--panel); border: 1px solid var(--line); margin-right: -1px; }
-.dsv-life div.dsv-on { background: var(--bad-bg); border-color: var(--bad); color: var(--bad); font-weight: 600; z-index: 1; }
-.dsv-life div.dsv-maybe { border-style: dashed; color: var(--mute); }
 @media (max-width: 760px) {
   .dsv .tiles { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .dsv .kv { grid-template-columns: minmax(0, 1fr); }
-  .dsv-seq { grid-template-columns: minmax(0, 1fr); }
   .dsv-ck dl { padding-left: 8px; grid-template-columns: minmax(0, 1fr); }
   .dsv-ck .collapsible { margin-left: 8px; }
 }
 @media print {
   .dsv { padding: 0; max-width: none; }
-  .dsv-r, .dsv-r + label, .dsv-steplbl, .dsv .masthead nav { display: none !important; }
-  .dsv [data-step], .dsv [data-step] > * { visibility: visible !important; opacity: 1 !important; animation: none !important; }
+  .dsv .masthead nav { display: none !important; }
   .dsv .dsv-scroll, .dsv .dsd-scroll, .dsv-svgbox, .dsv-mem { overflow: visible !important; }
   .dsv .dsv-scroll > .dsv-tbl, .dsv-detail-body table { min-width: 0 !important; table-layout: auto; }
   .dsv td, .dsv th, .dsv code { overflow-wrap: anywhere; word-break: break-word; }
 }
 """
 
-_MAX_STEPS = 16
-
-
-def _interaction_css() -> str:
-    """Stepping and filtering without any script: radio inputs drive sibling selectors.
-
-    An element that belongs to step k carries ``dsv-h1 .. dsv-h(k-1)`` (hidden while an earlier step is selected) and
-    ``dsv-c{k}`` (highlighted while step k is selected).
-    """
-    out = []
-    for j in range(1, _MAX_STEPS + 1):
-        r = f".dsv-r{j}:checked ~"
-        out.append(f"{r} .dsv-h{j}, {r} * .dsv-h{j} {{ visibility: hidden; }}")
-        out.append(f"{r} * li.dsv-h{j} {{ visibility: visible; opacity: .3; }}")
-        out.append(f"{r} * .dsv-cell.dsv-h{j} {{ visibility: visible; background: var(--bg) !important; "
-                   f"border-color: var(--line); }}")
-        out.append(f"{r} * .dsv-cell.dsv-h{j} > * {{ visibility: hidden; }}")
-        out.append(f"{r} * li.dsv-c{j} {{ border-color: var(--accent); background: var(--panel); }}")
-    return "\n".join(out)
+_MAX_STEPS = 16   # the theme's picture-stepping rules (extractor/web/ui/theme.css) cover steps 1.._MAX_STEPS
 
 
 class _Lx:
@@ -1312,7 +1206,7 @@ def build_visual_summary(result: Dict[str, Any], report: Optional[Dict[str, Any]
     findings = [f for f in (res.get("findings") or []) if isinstance(f, dict)]
     rows = comp["rows"]
     details = details or {}
-    parts = [theme_style(lx.lang), f'<style id="ds-report">{_CSS}{_interaction_css()}</style>',
+    parts = [theme_style(lx.lang), f'<style id="ds-report">{_CSS}</style>',
              f'<div class="dsv" lang="{lx.lang}">', _masthead(lx, title, res, comp)]
     for s in comp["sections"]:
         key = s["key"]
@@ -1376,16 +1270,9 @@ def load_theme() -> str:
     return css
 
 
-# the theme's Collapsible labels are Korean; an English report gets English ones in its inlined copy
-_COLLAPSIBLE_EN = (('content: "펼치기"', 'content: "Show"'), ('content: "접기"', 'content: "Hide"'))
-
-
 def theme_style(lang: str = "ko") -> str:
     """The theme as an inline ``<style>`` block (the report must open as one standalone file)."""
-    css = load_theme()
-    if lang == "en":
-        for a, b in _COLLAPSIBLE_EN:
-            css = css.replace(a, b)
+    css = load_theme()        # the Collapsible labels follow :lang() inside the theme itself
     return f'<style id="ds-theme">{css}</style>' if css else ""
 
 

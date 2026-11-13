@@ -148,8 +148,11 @@ h1 { font-size: 22px; } h2 { font-size: 15px; } h3 { font-size: 14px; } h4 { fon
 .collapsible { border: 1px solid var(--border); border-radius: var(--radius); background: var(--surface); }
 .collapsible > summary { list-style: none; cursor: pointer; display: flex; gap: 8px; align-items: center; padding: 9px 12px; font-size: 13px; font-weight: 500; }
 .collapsible > summary::-webkit-details-marker { display: none; }
-.collapsible > summary::after { content: "펼치기"; margin-left: auto; font-weight: 400; color: var(--muted-foreground); font-size: 12px; }
-.collapsible[open] > summary::after { content: "접기"; }
+.collapsible > summary::after { content: "Show"; margin-left: auto; font-weight: 400; color: var(--muted-foreground); font-size: 12px; }
+.collapsible[open] > summary::after { content: "Hide"; }
+/* the labels follow the language of the page (lang="ko" anywhere above); escaped so the file stays language-neutral */
+.collapsible:lang(ko) > summary::after { content: "\D3BC\CE58\AE30"; }
+.collapsible[open]:lang(ko) > summary::after { content: "\C811\AE30"; }
 .collapsible > .in { padding: 0 12px 12px; font-size: 13px; }
 .collapsible-plain { border: 0; background: transparent; }
 .collapsible-plain > summary { padding: 6px 2px; color: var(--muted-foreground); font-weight: 500; }
@@ -170,6 +173,180 @@ h1 { font-size: 22px; } h2 { font-size: 15px; } h3 { font-size: 14px; } h4 { fon
   --warn: var(--warning); --warn-bg: var(--warning-soft); --good: var(--success); --good-bg: var(--success-soft);
   --unk: var(--muted-foreground); --unk-bg: var(--muted); --buf: var(--info-soft); --buf-line: var(--info);
   --hdr: var(--muted); --accent: var(--info); font-family: var(--font-sans); }
+
+/* ---- Finding pictures (.dsv-*): drawn by the report renderer (extractor/report_visuals.py) and shown both in the
+   static report and in the live UI. Colours only through the bridge variables above. ---- */
+.dsv-keyfacts { list-style: none; padding-left: 0 !important; font-size: 13px; }
+.dsv-chip { display: inline-block; padding: 1px 8px; border-radius: 999px; font-size: 12px; border: 1px solid var(--line);
+  color: var(--mute); background: var(--panel); white-space: nowrap; }
+.dsv-chip-obs { color: var(--good); border-color: var(--good); } .dsv-chip-rec { color: var(--warn); border-color: var(--warn); }
+.dsv-chip-no { color: var(--unk); border-style: dashed; }
+.dsv-bar { display: flex; height: 6px; border-radius: 3px; overflow: hidden; background: var(--soft); margin: 8px 0 4px; }
+.dsv-bar i { display: block; height: 100%; background: var(--sc); }
+.dsv-s-FAIL { --sc: var(--bad); --sb: var(--bad-bg); } .dsv-s-PASS { --sc: var(--good); --sb: var(--good-bg); }
+.dsv-s-INCONCLUSIVE { --sc: var(--warn); --sb: var(--warn-bg); } .dsv-s-SKIPPED { --sc: var(--unk); --sb: var(--unk-bg); }
+.dsv-note { font-size: 13px; color: var(--mute); }
+.dsv-legend { display: flex; flex-wrap: wrap; gap: 4px 14px; font-size: 12px; color: var(--mute); margin: 8px 0 0; }
+.dsv-facts { margin: 8px 0 0; padding-left: 20px; font-size: 13px; } .dsv-facts li { margin: 3px 0; }
+.dsv-r { position: absolute; opacity: 0; width: 1px; height: 1px; margin: 0; pointer-events: none; }
+.dsv-r + label { display: inline-block; font-size: 12.5px; padding: 2px 10px; margin: 0 4px 8px 0; border-radius: calc(var(--radius) - 2px);
+  cursor: pointer; border: 1px solid var(--line); background: var(--bg); color: var(--ink); user-select: none; }
+.dsv-r + label:hover { background: var(--panel); }
+.dsv-r:checked + label { background: var(--primary); color: var(--primary-foreground); border-color: var(--primary); }
+.dsv-r:focus-visible + label { outline: 2px solid var(--ring); outline-offset: 2px; }
+.dsv-r + label .dsv-n { font-weight: 700; margin-left: 5px; }
+.dsv-steplbl { font-size: 12.5px; color: var(--mute); margin-right: 6px; }
+@keyframes dsv-appear { from { opacity: 0; } to { opacity: 1; } }
+@media (prefers-reduced-motion: no-preference) {
+  .dsv-rplay:checked ~ [data-step], .dsv-rplay:checked ~ * [data-step] { animation: dsv-appear .45s both; animation-delay: calc(var(--d) * 1.1s); }
+}
+.dsv-seq { display: grid; grid-template-columns: minmax(0, 1.25fr) minmax(0, 1fr); gap: 18px; align-items: start; margin-top: 10px; }
+.dsv-svgbox { overflow-x: auto; border: 1px solid var(--line); border-radius: var(--radius); background: var(--panel); padding: 8px; }
+.dsv svg { display: block; max-width: 100%; height: auto; }
+.dsv svg text { fill: var(--ink); font-family: var(--font-sans); }
+.dsv svg .dsv-t-mute { fill: var(--mute); } .dsv svg .dsv-t-bad { fill: var(--bad); font-weight: 700; }
+.dsv svg .dsv-t-on { fill: var(--info-foreground); font-weight: 700; }
+.dsv svg .dsv-life { stroke: var(--line); stroke-width: 1.5; stroke-dasharray: 4 4; }
+.dsv svg .dsv-lockbox { fill: var(--bg); stroke: var(--ink); stroke-width: 1.5; }
+.dsv svg .dsv-arrow { stroke: var(--ink); stroke-width: 2; fill: none; }
+.dsv svg .dsv-arrow-bad { stroke: var(--bad); stroke-width: 2; stroke-dasharray: 6 4; fill: none; }
+.dsv svg .dsv-blocked { stroke: var(--bad); stroke-width: 5; }
+.dsv svg .dsv-banner { fill: var(--bad-bg); stroke: var(--bad); stroke-width: 1.5; }
+.dsv svg .dsv-grid { stroke: var(--soft); stroke-width: 1; } .dsv svg .dsv-axis { stroke: var(--line); stroke-width: 1.5; }
+.dsv svg .dsv-area { fill: var(--bad-bg); } .dsv svg .dsv-linep { stroke: var(--bad); stroke-width: 2.5; fill: none; }
+.dsv svg .dsv-pt { fill: var(--bg); stroke: var(--bad); stroke-width: 2.5; } .dsv svg .dsv-pt:hover { fill: var(--bad); }
+.dsv-steps { list-style: none; counter-reset: dsvs; margin: 0; padding: 0 !important; font-size: 13px; }
+.dsv-steps li { counter-increment: dsvs; position: relative; padding: 6px 8px 6px 34px; border-top: 1px dashed var(--line); }
+.dsv-steps li:first-child { border-top: 0; }
+.dsv-steps li::before { content: counter(dsvs); position: absolute; left: 4px; top: 7px; width: 20px; height: 20px; border-radius: 50%;
+  background: var(--primary); color: var(--primary-foreground); font-size: 11px; font-weight: 700; text-align: center; line-height: 20px; }
+.dsv-steps .dsv-sub { display: block; font-size: 12px; color: var(--mute); }
+.dsv-tbl { width: 100%; border-collapse: collapse; font-size: 13px; margin: 6px 0; }
+.dsv-tbl th, .dsv-tbl td { border: 0; border-bottom: 1px solid var(--line); padding: 6px 8px; text-align: left; vertical-align: middle; background: none; }
+.dsv-tbl th { color: var(--mute); font-weight: 500; font-size: 12px; }
+.dsv-tbl tr.dsv-hot td:first-child { box-shadow: inset 4px 0 0 var(--bad); }
+.dsv-scroll { overflow-x: auto; }
+.dsv-scroll > .dsv-tbl { min-width: 560px; }   /* narrow screens scroll the table instead of squeezing it */
+.dsv-smp { display: inline-flex; gap: 2px; vertical-align: middle; }
+.dsv-smp i { display: inline-block; width: 16px; height: 16px; border-radius: 3px; font-style: normal; font-size: 10px; line-height: 16px;
+  text-align: center; color: var(--background); background: var(--unk); }
+.dsv-smp .dsv-st-R { background: var(--good); } .dsv-smp .dsv-st-S { background: var(--mute); }
+.dsv-smp .dsv-st-D { background: var(--warn); } .dsv-smp .dsv-st-Z, .dsv-smp .dsv-st-T { background: var(--bad); }
+.dsv-meter { display: inline-block; width: 70px; height: 8px; border-radius: 4px; background: var(--soft); vertical-align: middle; overflow: hidden; }
+.dsv-meter i { display: block; height: 100%; background: var(--accent); }
+.dsv-mem { display: flex; align-items: flex-end; gap: 0; overflow-x: auto; padding: 8px 2px 4px; }
+.dsv-seg { flex: 0 0 auto; }
+.dsv-seg > span { display: block; font-size: 12px; font-weight: 600; padding: 0 4px 3px; white-space: nowrap; }
+.dsv-seg-over > span { color: var(--bad); } .dsv-seg-buf > span { color: var(--buf-line); }
+.dsv-cells { display: flex; }
+.dsv-cell { width: 62px; height: 66px; border: 1px solid var(--line); margin-right: -1px; padding: 3px 4px; font-size: 11px; line-height: 1.25;
+  display: flex; flex-direction: column; justify-content: space-between; background: var(--bg); overflow: hidden; }
+.dsv-cell b { font-size: 12px; font-family: var(--font-mono); overflow-wrap: anywhere; }
+.dsv-cell small { color: var(--mute); font-size: 10px; white-space: nowrap; }
+.dsv-c-hdr { background: var(--hdr); } .dsv-c-buf { background: var(--buf); border-color: var(--buf-line); }
+.dsv-c-over { background: repeating-linear-gradient(135deg, var(--bad-bg), var(--bad-bg) 6px, var(--bg) 6px, var(--bg) 12px);
+  border-color: var(--bad); color: var(--bad); }
+.dsv-c-over small { color: var(--bad); }
+.dsv-c-gap { width: 96px; border-style: dashed; justify-content: center; text-align: center; color: var(--mute); }
+.dsv-c-rest { border-style: dashed; color: var(--mute); justify-content: center; text-align: center; }
+.dsv-wall { flex: 0 0 auto; align-self: stretch; width: 0; border-left: 3px solid var(--bad); margin: 0 5px 0 6px; position: relative; }
+.dsv-memaxis { display: flex; justify-content: space-between; font-size: 12px; color: var(--mute); margin: 2px 2px 0; }
+.dsv-ptr { display: flex; flex-wrap: wrap; align-items: stretch; gap: 8px; margin: 8px 0; }
+.dsv-box { border: 1.5px solid var(--line); border-radius: var(--radius); padding: 8px 12px; background: var(--panel); min-width: 150px; }
+.dsv-box small { display: block; color: var(--mute); font-size: 12px; }
+.dsv-box-bad { border-color: var(--bad); background: var(--bad-bg); }
+.dsv-arrowtxt { align-self: center; font-size: 12px; color: var(--mute); text-align: center; white-space: nowrap; }
+.dsv-arrowtxt b { display: block; font-size: 20px; line-height: 1; color: var(--ink); }
+.dsv-life { display: flex; flex-wrap: wrap; gap: 0; margin: 12px 0 4px; font-size: 13px; }
+.dsv-life div { padding: 5px 14px 5px 18px; background: var(--panel); border: 1px solid var(--line); margin-right: -1px; }
+.dsv-life div.dsv-on { background: var(--bad-bg); border-color: var(--bad); color: var(--bad); font-weight: 600; z-index: 1; }
+.dsv-life div.dsv-maybe { border-style: dashed; color: var(--mute); }
+@media (max-width: 760px) { .dsv-seq { grid-template-columns: minmax(0, 1fr); } }
+/* stepping through a picture without script: radio inputs drive sibling selectors (dsv-r<k>, dsv-h<k>, dsv-c<k>) */
+.dsv-r1:checked ~ .dsv-h1, .dsv-r1:checked ~ * .dsv-h1 { visibility: hidden; }
+.dsv-r1:checked ~ * li.dsv-h1 { visibility: visible; opacity: .3; }
+.dsv-r1:checked ~ * .dsv-cell.dsv-h1 { visibility: visible; background: var(--bg) !important; border-color: var(--line); }
+.dsv-r1:checked ~ * .dsv-cell.dsv-h1 > * { visibility: hidden; }
+.dsv-r1:checked ~ * li.dsv-c1 { border-color: var(--accent); background: var(--panel); }
+.dsv-r2:checked ~ .dsv-h2, .dsv-r2:checked ~ * .dsv-h2 { visibility: hidden; }
+.dsv-r2:checked ~ * li.dsv-h2 { visibility: visible; opacity: .3; }
+.dsv-r2:checked ~ * .dsv-cell.dsv-h2 { visibility: visible; background: var(--bg) !important; border-color: var(--line); }
+.dsv-r2:checked ~ * .dsv-cell.dsv-h2 > * { visibility: hidden; }
+.dsv-r2:checked ~ * li.dsv-c2 { border-color: var(--accent); background: var(--panel); }
+.dsv-r3:checked ~ .dsv-h3, .dsv-r3:checked ~ * .dsv-h3 { visibility: hidden; }
+.dsv-r3:checked ~ * li.dsv-h3 { visibility: visible; opacity: .3; }
+.dsv-r3:checked ~ * .dsv-cell.dsv-h3 { visibility: visible; background: var(--bg) !important; border-color: var(--line); }
+.dsv-r3:checked ~ * .dsv-cell.dsv-h3 > * { visibility: hidden; }
+.dsv-r3:checked ~ * li.dsv-c3 { border-color: var(--accent); background: var(--panel); }
+.dsv-r4:checked ~ .dsv-h4, .dsv-r4:checked ~ * .dsv-h4 { visibility: hidden; }
+.dsv-r4:checked ~ * li.dsv-h4 { visibility: visible; opacity: .3; }
+.dsv-r4:checked ~ * .dsv-cell.dsv-h4 { visibility: visible; background: var(--bg) !important; border-color: var(--line); }
+.dsv-r4:checked ~ * .dsv-cell.dsv-h4 > * { visibility: hidden; }
+.dsv-r4:checked ~ * li.dsv-c4 { border-color: var(--accent); background: var(--panel); }
+.dsv-r5:checked ~ .dsv-h5, .dsv-r5:checked ~ * .dsv-h5 { visibility: hidden; }
+.dsv-r5:checked ~ * li.dsv-h5 { visibility: visible; opacity: .3; }
+.dsv-r5:checked ~ * .dsv-cell.dsv-h5 { visibility: visible; background: var(--bg) !important; border-color: var(--line); }
+.dsv-r5:checked ~ * .dsv-cell.dsv-h5 > * { visibility: hidden; }
+.dsv-r5:checked ~ * li.dsv-c5 { border-color: var(--accent); background: var(--panel); }
+.dsv-r6:checked ~ .dsv-h6, .dsv-r6:checked ~ * .dsv-h6 { visibility: hidden; }
+.dsv-r6:checked ~ * li.dsv-h6 { visibility: visible; opacity: .3; }
+.dsv-r6:checked ~ * .dsv-cell.dsv-h6 { visibility: visible; background: var(--bg) !important; border-color: var(--line); }
+.dsv-r6:checked ~ * .dsv-cell.dsv-h6 > * { visibility: hidden; }
+.dsv-r6:checked ~ * li.dsv-c6 { border-color: var(--accent); background: var(--panel); }
+.dsv-r7:checked ~ .dsv-h7, .dsv-r7:checked ~ * .dsv-h7 { visibility: hidden; }
+.dsv-r7:checked ~ * li.dsv-h7 { visibility: visible; opacity: .3; }
+.dsv-r7:checked ~ * .dsv-cell.dsv-h7 { visibility: visible; background: var(--bg) !important; border-color: var(--line); }
+.dsv-r7:checked ~ * .dsv-cell.dsv-h7 > * { visibility: hidden; }
+.dsv-r7:checked ~ * li.dsv-c7 { border-color: var(--accent); background: var(--panel); }
+.dsv-r8:checked ~ .dsv-h8, .dsv-r8:checked ~ * .dsv-h8 { visibility: hidden; }
+.dsv-r8:checked ~ * li.dsv-h8 { visibility: visible; opacity: .3; }
+.dsv-r8:checked ~ * .dsv-cell.dsv-h8 { visibility: visible; background: var(--bg) !important; border-color: var(--line); }
+.dsv-r8:checked ~ * .dsv-cell.dsv-h8 > * { visibility: hidden; }
+.dsv-r8:checked ~ * li.dsv-c8 { border-color: var(--accent); background: var(--panel); }
+.dsv-r9:checked ~ .dsv-h9, .dsv-r9:checked ~ * .dsv-h9 { visibility: hidden; }
+.dsv-r9:checked ~ * li.dsv-h9 { visibility: visible; opacity: .3; }
+.dsv-r9:checked ~ * .dsv-cell.dsv-h9 { visibility: visible; background: var(--bg) !important; border-color: var(--line); }
+.dsv-r9:checked ~ * .dsv-cell.dsv-h9 > * { visibility: hidden; }
+.dsv-r9:checked ~ * li.dsv-c9 { border-color: var(--accent); background: var(--panel); }
+.dsv-r10:checked ~ .dsv-h10, .dsv-r10:checked ~ * .dsv-h10 { visibility: hidden; }
+.dsv-r10:checked ~ * li.dsv-h10 { visibility: visible; opacity: .3; }
+.dsv-r10:checked ~ * .dsv-cell.dsv-h10 { visibility: visible; background: var(--bg) !important; border-color: var(--line); }
+.dsv-r10:checked ~ * .dsv-cell.dsv-h10 > * { visibility: hidden; }
+.dsv-r10:checked ~ * li.dsv-c10 { border-color: var(--accent); background: var(--panel); }
+.dsv-r11:checked ~ .dsv-h11, .dsv-r11:checked ~ * .dsv-h11 { visibility: hidden; }
+.dsv-r11:checked ~ * li.dsv-h11 { visibility: visible; opacity: .3; }
+.dsv-r11:checked ~ * .dsv-cell.dsv-h11 { visibility: visible; background: var(--bg) !important; border-color: var(--line); }
+.dsv-r11:checked ~ * .dsv-cell.dsv-h11 > * { visibility: hidden; }
+.dsv-r11:checked ~ * li.dsv-c11 { border-color: var(--accent); background: var(--panel); }
+.dsv-r12:checked ~ .dsv-h12, .dsv-r12:checked ~ * .dsv-h12 { visibility: hidden; }
+.dsv-r12:checked ~ * li.dsv-h12 { visibility: visible; opacity: .3; }
+.dsv-r12:checked ~ * .dsv-cell.dsv-h12 { visibility: visible; background: var(--bg) !important; border-color: var(--line); }
+.dsv-r12:checked ~ * .dsv-cell.dsv-h12 > * { visibility: hidden; }
+.dsv-r12:checked ~ * li.dsv-c12 { border-color: var(--accent); background: var(--panel); }
+.dsv-r13:checked ~ .dsv-h13, .dsv-r13:checked ~ * .dsv-h13 { visibility: hidden; }
+.dsv-r13:checked ~ * li.dsv-h13 { visibility: visible; opacity: .3; }
+.dsv-r13:checked ~ * .dsv-cell.dsv-h13 { visibility: visible; background: var(--bg) !important; border-color: var(--line); }
+.dsv-r13:checked ~ * .dsv-cell.dsv-h13 > * { visibility: hidden; }
+.dsv-r13:checked ~ * li.dsv-c13 { border-color: var(--accent); background: var(--panel); }
+.dsv-r14:checked ~ .dsv-h14, .dsv-r14:checked ~ * .dsv-h14 { visibility: hidden; }
+.dsv-r14:checked ~ * li.dsv-h14 { visibility: visible; opacity: .3; }
+.dsv-r14:checked ~ * .dsv-cell.dsv-h14 { visibility: visible; background: var(--bg) !important; border-color: var(--line); }
+.dsv-r14:checked ~ * .dsv-cell.dsv-h14 > * { visibility: hidden; }
+.dsv-r14:checked ~ * li.dsv-c14 { border-color: var(--accent); background: var(--panel); }
+.dsv-r15:checked ~ .dsv-h15, .dsv-r15:checked ~ * .dsv-h15 { visibility: hidden; }
+.dsv-r15:checked ~ * li.dsv-h15 { visibility: visible; opacity: .3; }
+.dsv-r15:checked ~ * .dsv-cell.dsv-h15 { visibility: visible; background: var(--bg) !important; border-color: var(--line); }
+.dsv-r15:checked ~ * .dsv-cell.dsv-h15 > * { visibility: hidden; }
+.dsv-r15:checked ~ * li.dsv-c15 { border-color: var(--accent); background: var(--panel); }
+.dsv-r16:checked ~ .dsv-h16, .dsv-r16:checked ~ * .dsv-h16 { visibility: hidden; }
+.dsv-r16:checked ~ * li.dsv-h16 { visibility: visible; opacity: .3; }
+.dsv-r16:checked ~ * .dsv-cell.dsv-h16 { visibility: visible; background: var(--bg) !important; border-color: var(--line); }
+.dsv-r16:checked ~ * .dsv-cell.dsv-h16 > * { visibility: hidden; }
+.dsv-r16:checked ~ * li.dsv-c16 { border-color: var(--accent); background: var(--panel); }
+@media print {
+  .dsv-r, .dsv-r + label, .dsv-steplbl { display: none !important; }
+  .dsv [data-step], .dsv [data-step] > * { visibility: visible !important; opacity: 1 !important; animation: none !important; }
+}
 
 /* ---- Print (static report) ---- */
 @media print { body { background: var(--print-background); } .card { box-shadow: none; break-inside: avoid; } .no-print { display: none !important; } }
