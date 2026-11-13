@@ -40,11 +40,18 @@ VERDICT_KO = {"CONFIRMED_FAULT": "확인된 결함", "PROBABLE_FAULT": "결함 �
 
 def make_one(gt, out_dir, langs, tmp):
     binary = rb.build_target(gt, tmp)
-    proc = rb._launch(binary, gt, repeat_slots=len(langs))
     rows = []
+    # A target that keeps growing (leak, mapping growth, thread growth) gets a fresh process per language, as the
+    # benchmark's --repeat does: the second diagnosis of one ageing leak target ran out of heap-walk budget.
+    fresh_per_lang = gt["kind"] in rb.GROWTH_KINDS
+    proc = rb._launch(binary, gt, repeat_slots=1 if fresh_per_lang else len(langs))
     try:
         rb._wait_ready(proc, gt)
-        for lang in langs:
+        for i, lang in enumerate(langs):
+            if fresh_per_lang and i:
+                rb._kill(proc)
+                proc = rb._launch(binary, gt, repeat_slots=1)
+                rb._wait_ready(proc, gt)
             md = os.path.join(out_dir, f"{gt['id']}.{lang}.md")
             page = os.path.join(out_dir, f"{gt['id']}.{lang}.html")
             res = export_incident_report(pid=proc.pid, companion_elf_path=binary, symptom=gt["symptom"],
