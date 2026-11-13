@@ -10,8 +10,30 @@ on real processes. It replaces self-declared completion: a low score is a valid 
     python3 benchmarks/diagnosis_accuracy/run_benchmark.py --only deadlock_pipeline spin_flag --output /tmp/r.json
     python3 benchmarks/diagnosis_accuracy/run_benchmark.py --symptom generic   # every target gets "general health check"
 
+    python3 benchmarks/diagnosis_accuracy/run_benchmark.py --repeat 20 --only spin_yield ok_sawtooth   # repeat-verdict agreement
+
 Needs gcc and permission to read same-user process memory. About 20 s on this host. Exit status is non-zero only if
 the runner crashes. Tests of the machinery (not of accuracy): `python3 -m unittest tests/test_diagnosis_accuracy_benchmark.py`.
+
+## Diagnosis time and repeat-verdict agreement (additive; scoring is unchanged)
+
+- Timing, always on. Per row: `diagnose_s` (wall time of the first `diagnose` call, as before) and `checks`, a list of
+  `{check_id, recipe_id, name, status, duration_s}` for every executed check, copied from the engine's own
+  `checks_run[].duration_s` (no engine change). Top level `timing`: `diagnose_s` {mean, max, n} and `per_check`
+  {check_id: {name, mean_s, max_s, n}} sorted slowest first; `host_loadavg` is `os.getloadavg()` at the end of the run.
+  Only the checks that ran for a target appear, so `n` differs per check; with `--symptom generic` only the always-run
+  default checks (14-15 per target) appear, which is the cleanest view of their cost. Timings depend on host load:
+  results files made on a shared host say so in the commit/report, and `host_loadavg` is recorded for that purpose.
+- `--repeat N` (default 1 = off, normal run costs the same): the target is built and launched once and `diagnose` is
+  called N times against the same live process, one after another. The row is scored from the first run only. Rows then
+  carry `repeat` {runs, requested, distribution {verdict: count}, modal_verdict, agreement_rate (share of runs equal to
+  the most common verdict, ties to the first seen), diagnose_s [per run]} and `check_runs` (per-run check timings, used for
+  the per-check statistics); a run that errors counts as verdict `ERROR`, a hang ends the repetition. Top level
+  `repeat_agreement`: `mean_agreement_rate` (mean over scored targets), `pooled_agreement_rate` (modal runs / all runs),
+  `fully_agreeing_targets`, and `per_target` (unscored targets listed but not in the overall figures). The results file name
+  gets a `-repeatN` suffix. Agreement measures stability of the verdict only, not correctness. Repeated calls on one
+  process also exercise the engine against a process it has already been diagnosed on; a fresh process per run is not used.
+  Cost: roughly N x the per-target diagnose time (3-15 s each), so 20 repeats of all 21 targets is about 30-60 min.
 
 ## Targets
 
