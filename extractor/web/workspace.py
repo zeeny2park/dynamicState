@@ -89,16 +89,11 @@ def main(argv: Optional[List[str]] = None) -> int:
     os.makedirs(corpus_dir, exist_ok=True)
     runtime = AgentRuntime(corpus_dir=corpus_dir)
 
-    workspace_static_dir = os.path.join(
-        os.path.dirname(os.path.abspath(__file__)),
-        "workspace_static",
-    )
-
+    # The root page is the new UI (extractor/web/ui/); the conversational workspace is at /legacy/workspace.
     server = run_server(
         runtime=runtime,
         host=args.host,
         port=args.port,
-        static_dir=workspace_static_dir,
     )
 
     if args.pid or args.process_name or args.debug_image:
@@ -122,8 +117,8 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     actual_port = server.server_address[1]
     print(f"[dynamicState Trace Workspace] Listening on http://{args.host}:{actual_port}")
-    print(f"[dynamicState Trace Workspace] Serving production UI from {workspace_static_dir}")
-    print("[dynamicState Trace Workspace] Legacy Web UI remains available via ./bin/dynamic-state-ui")
+    print(f"[dynamicState Trace Workspace] New UI: http://{args.host}:{actual_port}/")
+    print(f"[dynamicState Trace Workspace] Previous UIs: /legacy/ and /legacy/workspace")
     sys.stdout.flush()
 
     try:

@@ -69,7 +69,7 @@ for _ in $(seq 1 20); do
     code=$(python3 - <<'PY'
 import urllib.request
 try:
-    print(urllib.request.urlopen("http://127.0.0.1:18765/workspace", timeout=2).status)
+    print(urllib.request.urlopen("http://127.0.0.1:18765/legacy/workspace", timeout=2).status)
 except Exception:
     print(0)
 PY
@@ -78,7 +78,7 @@ PY
     sleep 0.5
 done
 kill "$WS" 2>/dev/null || true
-[ "$code" = "200" ] || { echo "workspace did not serve /workspace"; cat "$WORK/ws.log"; exit 1; }
-echo "workspace served /workspace"
+[ "$code" = "200" ] || { echo "workspace did not serve /legacy/workspace"; cat "$WORK/ws.log"; exit 1; }
+echo "workspace served /legacy/workspace"
 
 echo "README commands OK"

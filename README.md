@@ -28,7 +28,7 @@ dynamic-state diagnose -p $PID --json
 kill $PID
 ```
 
-From an AI agent, the same thing is one MCP call, `runtime_diagnose_process(pid, debug_image?, symptom?)`. The web UI/API has the same one-call entry: the "Diagnose" button on `/workspace`, or `POST /api/diagnose` with `{"pid", "debug_image"?, "symptom"?, "time_limit_s"?}` (session token required; returns `{"success": true, "result": {...}}`).
+From an AI agent, the same thing is one MCP call, `runtime_diagnose_process(pid, debug_image?, symptom?)`. The web UI/API has the same one-call entry: the diagnosis page at `/` (it starts `POST /api/diagnose/start` and shows each check as it finishes; events at `GET /api/diagnose/{job_id}/events`, same data as polling JSON at `.../status`, the report at `.../report?format=html|md|json&lang=ko|en`), or the synchronous `POST /api/diagnose` with `{"pid", "debug_image"?, "symptom"?, "time_limit_s"?}` (session token required; returns `{"success": true, "result": {...}}`).
 Configure your agent (Claude Desktop, Cursor, ...) with:
 
 ```json
@@ -128,12 +128,12 @@ budget, so a large heap over a slow link is reported as not checked rather than 
 
 Web UI (optional):
 
-<!-- check: skip (blocking server; checked by starting it and fetching /workspace) -->
+<!-- check: skip (blocking server; checked by starting it and fetching / and /legacy/workspace) -->
 ```bash
 dynamic-state-workspace --host 127.0.0.1 --port 8765
 ```
 
-Then open `http://127.0.0.1:8765/workspace`.
+Then open `http://127.0.0.1:8765/`. The previous interfaces remain at `/legacy/` (8-tab explorer) and `/legacy/workspace` (chat workspace); old `/workspace` links redirect there. Behind a reverse proxy under a path prefix (for example `/dynamicstate/`), every URL the pages use is relative, so no server option is needed.
 
 ## Supported targets and known limits
 

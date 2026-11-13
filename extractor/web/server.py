@@ -31,6 +31,9 @@ from extractor.static_analyzer import (
     LAYOUT_MUTATION_CAVEAT,
 )
 from extractor.watch_session import WatchSessionManager
+from extractor.web.diagnose_jobs import DiagnoseJobManager, is_valid_job_id
+
+_JOBS_INIT_LOCK = threading.Lock()
 
 
 def _to_json_serializable(val: Any) -> Any:
@@ -3736,13 +3739,10 @@ class WebApiAdapter:
     DIAGNOSE_MAX_TIME_LIMIT_S = 60.0
     DIAGNOSE_REMOTE_MAX_TIME_LIMIT_S = 300.0   # remote: every read is an SSH round trip
 
-    def diagnose_api(self, params: Dict[str, Any]) -> Dict[str, Any]:
-        """POST /api/diagnose: the one-call entry point (IMP-006). Calls the same diagnose() as MCP and CLI.
+    def _parse_diagnose_request(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        """Validate a diagnose request (shared by POST /api/diagnose and POST /api/diagnose/start).
 
-        Read-only: a PID in the request does not authorise any mutation. Runs synchronously; the request's
-        time_limit_s is capped at DIAGNOSE_MAX_TIME_LIMIT_S. An unreadable/nonexistent PID is an INCONCLUSIVE
-        result (cause in not_covered), not an HTTP error; a malformed request is INVALID_PARAM.
-        """
+        Returns an error dict (``success: False``) or ``{"success": True, "args": {...}}`` with the normalised arguments."""
         raw_pid = params.get("pid")
         if isinstance(raw_pid, bool) or raw_pid is None or not str(raw_pid).strip().isdigit() or int(str(raw_pid).strip()) <= 1:
             return {"success": False, "error": {"code": "INVALID_PARAM", "message": "pid must be an integer > 1"}}
@@ -3795,6 +3795,23 @@ class WebApiAdapter:
             symptom_fields = fields_from_mapping(params)
         except SymptomFieldError as exc:
             return {"success": False, "error": {"code": "INVALID_PARAM", "message": str(exc)}}
+        return {"success": True, "args": {
+            "pid": pid, "debug_image": debug_image, "symptom": symptom, "time_limit_s": time_limit_s,
+            "language": language, "remote_target": remote_target, "symptom_fields": symptom_fields}}
+
+    def diagnose_api(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        """POST /api/diagnose: the one-call entry point (IMP-006). Calls the same diagnose() as MCP and CLI.
+
+        Read-only: a PID in the request does not authorise any mutation. Runs synchronously; the request's
+        time_limit_s is capped at DIAGNOSE_MAX_TIME_LIMIT_S. An unreadable/nonexistent PID is an INCONCLUSIVE
+        result (cause in not_covered), not an HTTP error; a malformed request is INVALID_PARAM.
+        """
+        parsed = self._parse_diagnose_request(params)
+        if not parsed.get("success"):
+            return parsed
+        a = parsed["args"]
+        pid, debug_image, symptom, time_limit_s = a["pid"], a["debug_image"], a["symptom"], a["time_limit_s"]
+        language, remote_target, symptom_fields = a["language"], a["remote_target"], a["symptom_fields"]
         try:
             from extractor.human_report import diagnose_with_summary
             result, summary = diagnose_with_summary(
@@ -3805,6 +3822,22 @@ class WebApiAdapter:
             return {"success": True, "result": _to_json_serializable({**result, "human_summary": summary})}
         except Exception as e:
             return {"success": False, "error": {"code": "DIAGNOSE_ERROR", "message": str(e)}}
+
+    def diagnose_start_api(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        """POST /api/diagnose/start: the same validation and the same diagnose function as POST /api/diagnose, but run
+        in a worker thread; returns {job_id, investigation_id} at once (events: GET /api/diagnose/{job_id}/events)."""
+        parsed = self._parse_diagnose_request(params)
+        if not parsed.get("success"):
+            return parsed
+        return self.diagnose_jobs.start(parsed["args"])
+
+    @property
+    def diagnose_jobs(self) -> "DiagnoseJobManager":
+        with _JOBS_INIT_LOCK:
+            mgr = getattr(self, "_diagnose_jobs", None)
+            if mgr is None:
+                mgr = self._diagnose_jobs = DiagnoseJobManager(lambda: self.runtime.expert_diagnostic_engine, _to_json_serializable)
+            return mgr
 
     def start_investigation(self, params: Dict[str, Any]) -> Dict[str, Any]:
         """Multi-step investigation start (runtime investigation manager). Kept for its step-by-step
@@ -4420,25 +4453,34 @@ class DynamicStateRequestHandler(http.server.BaseHTTPRequestHandler):
         """Handle HEAD requests by processing GET headers without error."""
         self.do_GET()
 
-    def do_GET(self) -> None:
+    _LEGACY_API_ALIAS = re.compile(r"^/legacy(?:/workspace)?(?=/api(?:/|$))")
+
+    def _split_path(self) -> Tuple[str, str, Dict[str, List[str]]]:
+        """(path without trailing slash, raw path, query). ``/legacy/api`` and ``/legacy/workspace/api`` are aliases of
+        ``/api``: the legacy pages derive their API base from their own URL."""
         parsed = urllib.parse.urlparse(self.path)
-        path = parsed.path.rstrip("/")
-        query = urllib.parse.parse_qs(parsed.query)
+        raw = parsed.path
+        path = self._LEGACY_API_ALIAS.sub("", raw.rstrip("/"), count=1)
+        return path, raw, urllib.parse.parse_qs(parsed.query)
+
+    def do_GET(self) -> None:
+        path, raw_path, query = self._split_path()
 
         # 1. API routes
         if path.startswith("/api"):
             if not self._verify_api_request("GET", query):
                 return
+            if path == "/api/diagnose/jobs" or path.startswith("/api/diagnose/"):
+                self._handle_diagnose_job_get(path, query)
+                return
             self._handle_api_get(path, query)
             return
 
         # 2. Static files
-        self._serve_static(path)
+        self._serve_static(path, raw_path)
 
     def do_POST(self) -> None:
-        parsed = urllib.parse.urlparse(self.path)
-        path = parsed.path.rstrip("/")
-        query = urllib.parse.parse_qs(parsed.query)
+        path, _raw_path, query = self._split_path()
 
         if not path.startswith("/api"):
             self._send_json({"success": False, "error": {"code": "NOT_FOUND", "message": f"Route not found: {path}"}},
@@ -5106,6 +5148,11 @@ class DynamicStateRequestHandler(http.server.BaseHTTPRequestHandler):
                 self._send_json(adapter.get_xray_blueprint_api(body))
                 return
 
+            # POST /api/diagnose/start (non-blocking diagnosis; events via GET /api/diagnose/{job_id}/events)
+            if path == "/api/diagnose/start":
+                self._send_json(adapter.diagnose_start_api(body))
+                return
+
             # POST /api/diagnose (one-call diagnosis, IMP-006)
             if path == "/api/diagnose":
                 self._send_json(adapter.diagnose_api(body))
@@ -5255,39 +5302,50 @@ class DynamicStateRequestHandler(http.server.BaseHTTPRequestHandler):
             return html_bytes.replace(b"</head>", script_snippet + b"\n</head>", 1)
         return script_snippet + html_bytes
 
-    def _serve_static(self, path: str) -> None:
+    def _redirect(self, location: str) -> None:
+        self.send_response(301)
+        self.send_header("Location", location)   # relative on purpose: works under a reverse-proxy path prefix
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    def _serve_static(self, path: str, raw_path: Optional[str] = None) -> None:
         if not self._is_allowed_host():
             self.send_error(403, "Forbidden Host")
             return
+        raw_path = path if raw_path is None else raw_path
+        base = os.path.dirname(os.path.abspath(__file__))
+        # Old URLs: /workspace -> /legacy/workspace; /legacy -> /legacy/ (so its relative asset URLs resolve)
+        if path == "/workspace":
+            self._redirect("legacy/workspace" if raw_path == "/workspace" else "../legacy/workspace")
+            return
+        if path == "/legacy" and raw_path == "/legacy":
+            self._redirect("legacy/")
+            return
+        if path == "/legacy/workspace":
+            self._send_static_file(os.path.join(base, "workspace_static"), "index.html")
+            return
+        legacy_dir = os.path.join(base, "static")
+        if path == "/legacy" or path.startswith("/legacy/"):
+            rel_path = path[len("/legacy"):].lstrip("/")
+            if rel_path.startswith("static/"):
+                rel_path = rel_path[len("static/"):]
+            self._send_static_file(legacy_dir, rel_path or "index.html", spa_fallback=True)
+            return
+        explicit = getattr(self.server, "static_dir_explicit", False)
+        if path.startswith("/static/") and not explicit:
+            self._send_static_file(legacy_dir, path[len("/static/"):])    # old asset URLs keep working
+            return
+        # The root UI: extractor/web/ui/ by default, or the directory the server was started with.
+        rel_path = "index.html" if not path or path == "/" else (
+            path[len("/static/"):] if path.startswith("/static/") else path.lstrip("/"))
+        self._send_static_file(self.server.static_dir, rel_path, spa_fallback=explicit)
+
+    def _send_static_file(self, static_dir: str, rel_path: str, spa_fallback: bool = False) -> None:
         tok = getattr(self.server, "session_token", "")
-        if path in ("/workspace", "/workspace/"):
-            ws_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "workspace_static")
-            ws_index = os.path.join(ws_dir, "index.html")
-            if os.path.isfile(ws_index):
-                with open(ws_index, "rb") as f:
-                    content = self._inject_session_token_into_html(f.read())
-                self.send_response(200)
-                self.send_header("Content-Type", "text/html; charset=utf-8")
-                self.send_header("Content-Length", str(len(content)))
-                self.send_header("Cache-Control", "no-cache")
-                if tok:
-                    self.send_header("Set-Cookie", f"dynamicstate_session={tok}; Path=/; HttpOnly; SameSite=Strict")
-                self.end_headers()
-                self.wfile.write(content)
-                return
-        static_dir = self.server.static_dir
-        if not static_dir or not os.path.exists(static_dir):
+        static_dir = os.path.abspath(static_dir)
+        if not os.path.isdir(static_dir):
             self.send_error(404, "Static files directory not found")
             return
-
-        # Default to index.html
-        if not path or path == "/":
-            rel_path = "index.html"
-        elif path.startswith("/static/"):
-            rel_path = path[len("/static/"):]
-        else:
-            rel_path = path.lstrip("/")
-
         # Path traversal guard
         full_path = os.path.abspath(os.path.join(static_dir, rel_path))
         if os.path.commonpath([static_dir, full_path]) != static_dir:
@@ -5297,7 +5355,7 @@ class DynamicStateRequestHandler(http.server.BaseHTTPRequestHandler):
         if not os.path.isfile(full_path):
             # Fall back to index.html for client-side routing
             index_path = os.path.join(static_dir, "index.html")
-            if os.path.isfile(index_path):
+            if spa_fallback and os.path.isfile(index_path):
                 full_path = index_path
             else:
                 self.send_error(404, "File not found")
@@ -5321,7 +5379,8 @@ class DynamicStateRequestHandler(http.server.BaseHTTPRequestHandler):
             if is_html and tok:
                 self.send_header("Set-Cookie", f"dynamicstate_session={tok}; Path=/; HttpOnly; SameSite=Strict")
             self.end_headers()
-            self.wfile.write(content)
+            if self.command != "HEAD":
+                self.wfile.write(content)
         except (BrokenPipeError, ConnectionResetError):
             pass
         except Exception as exc:
@@ -5329,6 +5388,112 @@ class DynamicStateRequestHandler(http.server.BaseHTTPRequestHandler):
                 self.send_error(500, f"Error reading static file: {exc}")
             except (BrokenPipeError, ConnectionResetError):
                 pass
+
+    # -------------------------------------------------------------------------
+    # Diagnosis jobs: GET /api/diagnose/jobs | {job_id}/events | {job_id}/status | {job_id}/report
+    # -------------------------------------------------------------------------
+
+    def _job_error(self, status: int, code: str, message: str) -> None:
+        self._send_json({"success": False, "error": {"code": code, "message": message}}, status=status)
+
+    def _handle_diagnose_job_get(self, path: str, query: Dict[str, List[str]]) -> None:
+        mgr = self.server.adapter.diagnose_jobs
+        if path == "/api/diagnose/jobs":
+            self._send_json({"success": True, "jobs": mgr.list()})
+            return
+        parts = path.split("/")          # ['', 'api', 'diagnose', '<job_id>', '<action>']
+        job = mgr.get(parts[3]) if len(parts) == 5 else None
+        if job is None or parts[4] not in ("events", "status", "report"):
+            self._job_error(404, "NOT_FOUND", f"Route not found: {path}")
+            return
+        action = parts[4]
+        if action == "report":
+            self._send_job_report(mgr, job, query)
+            return
+        raw_after = (query.get("after") or [None])[0]
+        if raw_after is None:
+            raw_after = (self.headers.get("Last-Event-ID") or "").strip() or "0"
+        if not raw_after.isdigit() or len(raw_after) > 9:
+            self._job_error(400, "BAD_REQUEST", "after / Last-Event-ID must be a non-negative integer")
+            return
+        after = int(raw_after)
+        if action == "status":
+            self._send_json(mgr.status(job, after))
+            return
+        self._stream_job_events(job, after)
+
+    def _stream_job_events(self, job: Any, after: int) -> None:
+        try:
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+            self.send_header("Cache-Control", "no-cache, no-transform")
+            self.send_header("X-Accel-Buffering", "no")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.close_connection = True
+            if self.command == "HEAD":
+                return
+            self.wfile.write(b"retry: 2000\n\n")
+            self.wfile.flush()
+            last = after
+            while True:
+                events, finished = job.wait_for_events(last, 15.0)
+                if events:
+                    for ev in events:
+                        payload = json.dumps(ev, ensure_ascii=False, default=str)
+                        self.wfile.write(f"id: {ev['seq']}\nevent: {ev['type']}\ndata: {payload}\n\n".encode("utf-8"))
+                    last = events[-1]["seq"]
+                elif finished:
+                    break
+                else:
+                    self.wfile.write(b": keepalive\n\n")
+                self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            pass
+
+    _REPORT_TYPES = {"html": "text/html; charset=utf-8", "md": "text/markdown; charset=utf-8",
+                     "json": "application/json; charset=utf-8"}
+
+    def _send_job_report(self, mgr: Any, job: Any, query: Dict[str, List[str]]) -> None:
+        fmt = (query.get("format") or ["html"])[0].lower()
+        lang = (query.get("lang") or [None])[0]
+        if fmt not in self._REPORT_TYPES:
+            self._job_error(400, "BAD_REQUEST", "format must be html, md or json")
+            return
+        if lang is not None and lang not in ("ko", "en"):
+            self._job_error(400, "BAD_REQUEST", "lang must be 'ko' or 'en'")
+            return
+        state = job.summary()["state"]
+        if state == "running":
+            self._job_error(409, "NOT_FINISHED", "the diagnosis is still running")
+            return
+        if state != "done":
+            self._job_error(404, "NOT_FOUND", "the diagnosis ended with an error; there is no report")
+            return
+        try:
+            res = mgr.report(job, lang)
+        except Exception as exc:  # noqa: BLE001
+            self._job_error(500, "REPORT_ERROR", f"{type(exc).__name__}: {exc}")
+            return
+        if not res.get("success"):
+            err = res.get("error") or {}
+            self._job_error(410 if err.get("code") == "SESSION_GONE" else 500, err.get("code", "REPORT_ERROR"), err.get("message", ""))
+            return
+        body = str(res[fmt]).encode("utf-8")
+        try:
+            self.send_response(200)
+            self.send_header("Content-Type", self._REPORT_TYPES[fmt])
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Content-Disposition", "inline")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            if fmt == "html":    # the report is static markup and CSS: no script, no network
+                self.send_header("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'; img-src data:; sandbox")
+            self.end_headers()
+            if self.command != "HEAD":
+                self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
 
     def _send_json(self, data: Any, status: int = 200) -> None:
         try:
@@ -5359,10 +5524,15 @@ class DynamicStateWebServer(http.server.ThreadingHTTPServer):
         self,
         server_address: Tuple[str, int],
         runtime: AgentRuntime,
-        static_dir: str,
+        static_dir: Optional[str] = None,
         session_token: Optional[str] = None,
     ):
         super().__init__(server_address, DynamicStateRequestHandler)
+        # static_dir None: the new UI (extractor/web/ui/) is the root page and the old UIs live under /legacy/.
+        # An explicit static_dir is served as the root page instead (the dedicated workspace launcher does this).
+        self.static_dir_explicit = static_dir is not None
+        if static_dir is None:
+            static_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ui")
         self.runtime = runtime
         self.adapter = WebApiAdapter(runtime)
         self.static_dir = os.path.abspath(static_dir)
@@ -5383,9 +5553,6 @@ def run_server(
     session_token: Optional[str] = None,
 ) -> DynamicStateWebServer:
     """Instantiate and configure the HTTP server."""
-    if static_dir is None:
-        static_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
-
     server = DynamicStateWebServer((host, port), runtime, static_dir, session_token=session_token)
     return server
 

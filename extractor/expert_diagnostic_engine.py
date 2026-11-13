@@ -1196,6 +1196,9 @@ STEP_MARGIN_BEYOND_PLAN = 10
 class AdaptiveInvestigationSession:
     """Represents a single active or completed expert investigation session."""
 
+    # Optional read-only observer of the timeline (web UI progress events): callable(session, entry); never affects a diagnosis.
+    timeline_listener: Optional[Callable[["AdaptiveInvestigationSession", Dict[str, Any]], None]] = None
+
     def __init__(
         self,
         investigation_id: str,
@@ -1424,12 +1427,19 @@ class AdaptiveInvestigationSession:
 
     def _record_timeline_event(self, event_type: str, details: Dict[str, Any]) -> None:
         """Appends an event to the chronological timeline."""
-        self.timeline.append({
+        entry = {
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "state": self.state,
             "event_type": event_type,
             "details": details,
-        })
+        }
+        self.timeline.append(entry)
+        listener = self.timeline_listener
+        if listener is not None:
+            try:
+                listener(self, entry)
+            except Exception:  # noqa: BLE001 - an observer must never be able to affect a diagnosis
+                pass
 
     def pause(self) -> None:
         """Pauses the investigation session."""
@@ -3659,6 +3669,9 @@ class AdaptiveInvestigationSession:
 class ExpertDiagnosticEngine:
     """Session coordinator and registry for adaptive expert investigations."""
 
+    # Optional read-only hook: callable(session) -> timeline listener or None, called when a session is created.
+    session_listener_factory: Optional[Callable[[AdaptiveInvestigationSession], Any]] = None
+
     def __init__(self, corpus_dir: Optional[str] = None):
         self.corpus_dir = corpus_dir or "/tmp/dynamicstate_corpus"
         self._investigations_dir = os.path.join(self.corpus_dir, "investigations")
@@ -3704,6 +3717,12 @@ class ExpertDiagnosticEngine:
             symptom_fields=symptom_fields,
         )
         self.sessions[inv_id] = session
+        factory = self.session_listener_factory
+        if factory is not None:
+            try:
+                session.timeline_listener = factory(session)
+            except Exception:  # noqa: BLE001 - a read-only observer hook must never affect a diagnosis
+                pass
         return session
 
     def run_recipe(
