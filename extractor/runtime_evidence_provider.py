@@ -34,6 +34,25 @@ from .thread_sampler import (
 # Recipes whose inputs come from the per-thread time series (IMP-010)
 THREAD_SAMPLING_RECIPES = frozenset({"RECIPE_THREAD_STATE_ANOMALIES", "RECIPE_LONG_RUNNING_BLOCKED_THREADS"})
 
+# One lock inspection reads every mutex word first and each thread's futex wait afterwards.  A contended mutex being
+# handed on shows, for a moment, a thread still inside its futex wait while the word already reads unlocked (or
+# locked with the owner field not yet written): a waiter with no owner, i.e. an "incomplete lock graph", which makes
+# the deadlock / blocked-thread checks INCONCLUSIVE.  On a loaded host the woken waiter can sit on a run queue for
+# milliseconds, so the moment is not rare (measured: 2 of 200 inspections of a 4-thread hot mutex at load 5).
+# Before the graph is declared incomplete it is re-read after these gaps; it is incomplete only if every re-read
+# still has a waiter with no owner.  A persistent unresolved owner (undecodable layout, a real stall) is unchanged.
+UNRESOLVED_WAIT_REREAD_GAPS_S = (0.02, 0.05, 0.1)
+
+
+def unresolved_lock_waits(info: Any) -> List[Tuple[int, str]]:
+    """(tid, lock address) of every thread waiting on a lock whose owner is not resolved in this inspection."""
+    out: List[Tuple[int, str]] = []
+    for t in (info or {}).get("threads", []) if isinstance(info, dict) else []:
+        wol = t.get("waiting_on_lock") if isinstance(t, dict) else None
+        if wol and (not wol.get("held_by_tid") or wol.get("held_by_tid") <= 0):
+            out.append((int(t.get("tid") or 0), str(wol.get("lock_address"))))
+    return sorted(out)
+
 
 # Provenance constants
 PROVENANCE_LIVE_RUNTIME_CAPTURE = "LIVE_RUNTIME_CAPTURE"
@@ -1427,6 +1446,26 @@ class RuntimeEvidenceProvider:
         # Inspect thread callstacks and mutex locks using watch_manager
         try:
             callstacks_info = self._inspect_locks(pid, companion_elf)
+            transient_unresolved: List[List[Tuple[int, str]]] = []
+            if isinstance(callstacks_info, dict) and not callstacks_info.get("deadlock_detected"):
+                for gap in UNRESOLVED_WAIT_REREAD_GAPS_S:
+                    pending = unresolved_lock_waits(callstacks_info)
+                    if not pending:
+                        break
+                    transient_unresolved.append(pending)
+                    time.sleep(gap)
+                    try:
+                        again = self._inspect_locks(pid, companion_elf)
+                    except Exception:  # noqa: BLE001 - a failed re-read settles nothing: keep the last inspection
+                        break
+                    if not isinstance(again, dict) or again.get("error") or again.get("success") is False:
+                        break
+                    callstacks_info = again
+                    if again.get("deadlock_detected"):
+                        break   # a cycle goes through the persistence re-observation below like any first read
+                if transient_unresolved and not unresolved_lock_waits(callstacks_info):
+                    observation_data["transient_unresolved_lock_waits"] = [
+                        [{"tid": t, "lock_address": a} for t, a in p] for p in transient_unresolved]
             lock_series = LockObservationSeries()   # IMP-010: every successful inspection feeds a WaitForGraph
             lock_series.add_sample(1, callstacks_info)
             rec = RuntimeEvidenceRecord(
