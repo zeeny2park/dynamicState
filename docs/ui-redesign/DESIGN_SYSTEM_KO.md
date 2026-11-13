@@ -1,7 +1,7 @@
 # 공통 디자인 시스템과 화면 구성
 
 - **작성일**: 2026-11-13 · 브랜치 `feat/web-ui-redesign`
-- **파일**: `docs/ui-redesign/mock/theme.css` (토큰 + 컴포넌트, 14 KB, 의존성 없음), 쇼케이스 `mock/design-system.html`
+- **파일**: `extractor/web/ui/theme.css` (단일 원본. 목업 `mock/*.html` 도 이 파일을 직접 읽는다) (토큰 + 컴포넌트, 14 KB, 의존성 없음), 쇼케이스 `mock/design-system.html`
 - **근거**: shadcn/ui 스킬(`.claude/skills/shadcn`, `npx skills add shadcn-ui/ui`)의 토큰 규약(`customization.md`)과 스타일 선택 기준(`design-system.md`)
 
 ## 1. UX 통일성은 어떻게 유지되는가
