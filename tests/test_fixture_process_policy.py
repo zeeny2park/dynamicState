@@ -15,8 +15,6 @@ PY_ROOTS = ("tests", "benchmarks", "scripts", "examples")
 
 # (file, first argument as written) -> reason the direct Popen is legitimate.
 ALLOWED_POPEN = {
-    ("tests/support/fixture_process.py", "cmd"):
-        "the launcher itself: starts its own watchdog (which holds no fixture memory)",
     ("tests/test_fixture_process.py", '[sys.executable, "-c", RUNNER]'):
         "the runner under test: the test kills it on purpose to prove its fixture dies with it",
     ("tests/test_ebpf_integration.py", "probe_cmd"):

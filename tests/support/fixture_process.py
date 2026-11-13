@@ -97,7 +97,7 @@ class FixtureLifetimeExceeded(FixtureLimitExceeded):
 _WATCHDOG_SRC = r'''
 import os, sys, time, select, signal
 pid = int(sys.argv[1]); pfd = int(sys.argv[2]); rfd = int(sys.argv[3])
-limit = int(sys.argv[4]); deadline = float(sys.argv[5]); tick = float(sys.argv[6]); name = sys.argv[7]
+limit = int(sys.argv[4]); deadline = float(sys.argv[5]); tick = float(sys.argv[6]); name = sys.argv[7]; own = sys.argv[8] == "1"
 PAGE = os.sysconf("SC_PAGE_SIZE")
 for s in (signal.SIGINT, signal.SIGHUP, signal.SIGTERM):
     signal.signal(s, signal.SIG_IGN)
@@ -122,7 +122,7 @@ def procs():
 
 def tree():
     allp = procs()
-    members = {p for p, (st, pp, pg) in allp.items() if pg == pid and st != "Z"}
+    members = {p for p, (st, pp, pg) in allp.items() if (pg == pid if own else p == pid) and st != "Z"}
     changed = True
     while changed:
         changed = False
@@ -139,10 +139,11 @@ def rss(p):
         return 0
 
 def kill_all(extra=()):
-    try:
-        os.killpg(pid, signal.SIGKILL)
-    except OSError:
-        pass
+    if own:
+        try:
+            os.killpg(pid, signal.SIGKILL)
+        except OSError:
+            pass
     for p in set(tree()) | set(extra):
         try:
             os.kill(p, signal.SIGKILL)
@@ -277,14 +278,16 @@ class FixtureProcess(subprocess.Popen):
     _fx_res: Optional[int] = None
     _fx_wd: Optional[Any] = None
 
-    def __init__(self, args, *, max_rss_mib=None, max_lifetime_s=None, name=None, **kw):
+    def __init__(self, args, *, max_rss_mib=None, max_lifetime_s=None, name=None, own_session=True, **kw):
         user_preexec = kw.pop("preexec_fn", None)
-        kw.pop("start_new_session", None)
+        if kw.pop("start_new_session", True) is False:   # explicit opt-out keeps the caller's session/group
+            own_session = False
+        self._fx_own = bool(own_session)
         kw.pop("process_group", None)
         self.max_rss_mib, self.max_lifetime_s = _resolve_limits(args, max_rss_mib, max_lifetime_s)
         self.fixture_name = name or _exe_basename(args)
         parent_pid = os.getpid()
-        super().__init__(args, start_new_session=True,
+        super().__init__(args, start_new_session=self._fx_own,
                          preexec_fn=lambda: _child_setup(parent_pid, user_preexec), **kw)
         with _REG_LOCK:
             _REGISTRY[self.pid] = self
@@ -301,7 +304,7 @@ class FixtureProcess(subprocess.Popen):
             os.set_blocking(rr, False)
             cmd = [sys.executable, "-I", "-S", "-c", _WATCHDOG_SRC, str(self.pid), str(pr), str(rw),
                    str(int(self.max_rss_mib * 1048576)), repr(time.monotonic() + self.max_lifetime_s),
-                   repr(WATCHDOG_TICK_S), self.fixture_name]
+                   repr(WATCHDOG_TICK_S), self.fixture_name, "1" if self._fx_own else "0"]
             self._fx_wd = _REAL_POPEN(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                                            stderr=subprocess.DEVNULL, pass_fds=(pr, rw),
                                            start_new_session=True)
@@ -382,17 +385,18 @@ class FixtureProcess(subprocess.Popen):
 
 def _kill_group(pid: int) -> None:
     with contextlib.suppress(OSError):
-        os.killpg(pid, signal.SIGKILL)
+        if os.getpgid(pid) == pid:   # never signal a group we do not own (own_session=False keeps the caller's)
+            os.killpg(pid, signal.SIGKILL)
     with contextlib.suppress(OSError):
         os.kill(pid, signal.SIGKILL)
 
 
 def fixture_popen(args, *, max_rss_mib: Optional[float] = None, max_lifetime_s: Optional[float] = None,
-                  name: Optional[str] = None, **kw) -> FixtureProcess:
+                  name: Optional[str] = None, own_session: bool = True, **kw) -> FixtureProcess:
     """Start a contained fixture; drop-in replacement for ``subprocess.Popen`` (same kwargs and object API)."""
     _install_hooks()
     return _LAUNCHER.call(lambda: FixtureProcess(args, max_rss_mib=max_rss_mib, max_lifetime_s=max_lifetime_s,
-                                                 name=name, **kw))
+                                                 name=name, own_session=own_session, **kw))
 
 
 @contextlib.contextmanager

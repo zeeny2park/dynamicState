@@ -149,6 +149,15 @@ class LimitTests(unittest.TestCase):
         self.assertTrue(_wait_gone(child, 2.0), "grandchild survived the end of the fixture context")
 
 
+class SessionTests(unittest.TestCase):
+    def test_start_new_session_false_keeps_callers_group_and_is_never_group_killed(self):
+        with fixture_process(["sleep", "60"], start_new_session=False) as proc:
+            self.assertEqual(os.getpgid(proc.pid), os.getpgrp())
+            time.sleep(0.3)
+            self.assertIsNone(proc.poll())
+        self.assertIsNotNone(proc.returncode)   # killed individually; this test process is still alive
+
+
 class ThreadTests(unittest.TestCase):
     def test_launch_from_worker_thread_survives_thread_exit(self):
         box = {}
