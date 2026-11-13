@@ -80,7 +80,7 @@ test("the column only grows: each stage's cards are a prefix of the next stage's
       assert.deepStrictEqual(ids.slice(0, prev.length), prev, `${n} at event ${k}: ${ids} after ${prev}`);
       prev = ids;
     }
-    assert.deepStrictEqual(prev, ["banner", "tiles", "target", "findings", "checks", "notseen", "next", "report"], n);
+    assert.deepStrictEqual(prev, ["banner", "tiles", "target", "profile", "findings", "checks", "notseen", "next", "report"], n);
   }
 });
 
@@ -184,5 +184,28 @@ test("the idle screen: one button, the form fields, examples when the server is 
     const jobs = UI.renderIdle({ lang, form: {}, jobs: [{ job_id: "abc", pid: 42, target_name: "svc", state: "done",
       verdict: "HEALTHY", verdict_word: { ko: "점검한 범위 안에서 정상", en: "healthy within the checked scope" }, started_at: new Date().toISOString() }] });
     assert.ok(jobs.includes("?job=abc") && jobs.includes((lang === "ko" ? "점검한 범위 안에서 정상" : "healthy within the checked scope")));
+  }
+});
+
+test("the process profile card keeps its place: reserved from the plan, filled by the verdict, same words as the view", () => {
+  for (const n of NAMES) {
+    const d = load(n);
+    const planAt = d.events.findIndex((e) => e.type === "plan") + 1;
+    const ids = (html) => (html.match(/<(?:section|div) class="(?:card[^"]*|tiles)" id="([a-z]+)"/g) || []).map((x) => x.match(/id="([a-z]+)"/)[1]);
+    const early = UI.render(UI.reduce(d.events.slice(0, planAt), d.request), UIS("ko", { started: true }));
+    assert.ok(ids(early).indexOf("profile") === ids(early).indexOf("target") + 1, `${n}: reserved right after the target`);
+    assert.match(early, /id="profile"[\s\S]*판정이 나오면 채워집니다/);
+    for (const lang of ["ko", "en"]) {
+      const late = UI.render(UI.reduce(d.events, d.request), UIS(lang, { started: true }));
+      const V = d.events.filter((e) => e.type === "verdict")[0].data.view[lang].profile;
+      assert.strictEqual(nestedCards(late), 0, n);
+      const card = late.slice(late.indexOf('id="profile"'), late.indexOf('id="findings"'));
+      assert.ok(card.includes(V.title), `${n} ${lang}: title from the view`);
+      if (V.available) {
+        assert.ok(card.includes(V.html), `${n} ${lang}: the server's fragment, unchanged`);
+        assert.ok(card.includes("<details"), n);
+        assert.doesNotMatch(card, /판정이 나오면|Filled in when/);
+      }
+    }
   }
 });

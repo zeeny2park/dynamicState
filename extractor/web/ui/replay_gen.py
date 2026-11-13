@@ -24,9 +24,9 @@ OUT = os.path.join(HERE, "replay")
 
 # name -> (fixture, request shown in the form, what it demonstrates)
 REPLAYS: Dict[str, Tuple[str, Dict[str, Any], str]] = {
-    "deadlock": ("tests/fixtures/ko_report/deadlock_circular.json.gz",
+    "deadlock": ("tests/fixtures/profile/deadlock_pipeline.json.gz",
                  {"symptom": "서비스가 응답하지 않음"}, "confirmed fault with a picture"),
-    "healthy": ("tests/fixtures/ko_report/ok_idle_server.json.gz", {}, "healthy within the checked scope"),
+    "healthy": ("tests/fixtures/profile/ok_idle_server.json.gz", {}, "healthy within the checked scope"),
     "inconclusive": ("tests/fixtures/ko_report/request_threads.json.gz",
                      {"symptom": "요청 처리가 느려짐"}, "could not decide (budget ran out)"),
     "degraded": ("tests/fixtures/ko_report/lock_convoy.json.gz",

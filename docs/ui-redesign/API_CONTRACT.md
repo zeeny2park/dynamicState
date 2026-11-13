@@ -239,7 +239,11 @@ report code from the result with its inline report (the inline report itself is 
 `capability`/`capability_label`, `findings[]`, `detail_html` = the report check list's `<dl>`, `anchor`),
 `findings[]` (`n`, `category`, `status`, `severity`, `severity_word`, `status_word`, `tone`, `heading_html`,
 `recipe_ids`, `body_html` = the report's finding block — key facts, picture, text, reasoning, evidence — without its
-heading, `anchor`), `not_examined_html`, `next_html`. The pictures need no extra stylesheet: their rules are part of
+heading, `anchor`), `not_examined_html`, `next_html`, `profile` (`title`, `available`, `glance` = the one-line summary
+"스레드 N개 · RSS X · 힙 Y · 열린 파일 Z", `html` = the report's process-profile card body: the three-line summary and the
+whole profile in a collapsed Collapsible; `available` false and `html` empty when the diagnosis left nothing to profile; the
+card itself is reserved right after the target from the `plan` event on and shows a pending line until the verdict).
+The pictures need no extra stylesheet: their rules are part of
 the shared `extractor/web/ui/theme.css` (the "Finding pictures" section), which the UI loads and the report inlines.
 `notice` *(UI)*, optional: the target itself limited the diagnosis — `TARGET_EXITED` (a local process that was there at
 the start is gone at the end, or the engine found it gone), `PERMISSION_DENIED`, `TARGET_NOT_FOUND`,
@@ -279,3 +283,47 @@ Terminal. The diagnosis function raised (an unreadable target is NOT an error: i
 Nothing in the server depends on a path prefix: with `proxy_pass http://127.0.0.1:8081/;` under `/dynamicstate/` all of the
 above work as `/dynamicstate/`, `/dynamicstate/legacy/`, `/dynamicstate/api/...`, because every URL the pages and the
 redirects use is relative.
+
+## 9. The process profile (`process_profile`)
+
+What the diagnosis learned about the process itself, built by `extractor/process_profile.build_process_profile(result,
+report)` only from data the checks already left in the report (`actual_observations`, `section_b_target_context`,
+`target.abi`, `collection_impact`): no extra read of the target and no part in any verdict. It is the `process_profile`
+key of the diagnose result and of the report JSON, section 3 of the incident report (right after the target) and the
+`profile` card of the live UI. Words and pictures come from `extractor/profile_render.py` for all three, in the same
+order and wording.
+
+```json
+{"version": 1, "available": true,
+ "window": {"seconds": 1.0, "samples": 38},
+ "summary": {"threads": 2, "rss_kb": 1348, "heap_kb": 132, "heap_kind": "mapping", "fds": 5},
+ "runtime":   {"items": [{"key": "uptime|libc_version|cpus_allowed", "v": 2.4, "unit": "s", "basis": {"kind": "derived"}}]},
+ "threads":   {"count": {"v": 2, "basis": {"kind": "read"}},
+               "series": {"v": [2, 2, 2, 2, 2], "basis": {"kind": "series", "samples": 5, "window_s": 0.66}}, "trend": "stable",
+               "states": {"waiting": 2}, "detailed": 2, "listed": 2, "omitted": null,
+               "rows": [{"tid": 1, "name": "acceptor", "count": 1, "tids": [1], "state": "waiting", "samples": "SSSSS",
+                         "cpu_share": 0.0, "function": "acceptor", "location": "x.c:15", "source": "poll(...);",
+                         "waits_on": {"kind": "syscall|lock", "name": "ppoll"}, "basis": {"kind": "series", "samples": 5, "window_s": 0.66}}]},
+ "memory":    {"rss": {"v": 1348, "unit": "kB", "series": [...], "change_kb": 0, "peak_kb": 1348, "anon_kb": 92, "file_kb": 1256, "basis": {...}},
+               "heap": {"mapping_kb": {...}, "allocator": "glibc_ptmalloc", "walk": {"in_use_kb": 4374, "free_kb": 14999, ...},
+                        "growing_classes": [{"chunk_b": 560, "blocks": 7733}]},
+               "integrity": {"heap_status": "COMPLETED", "walk_status": "OK", "chunks": 3, "defects": 0, ...},
+               "address_space": {"total_kb": 10520, "categories": [{"key": "heap|thread_stacks|anon|main_stack|libs|exe|other", "kb": 132, "basis": {...}}]}},
+ "locks":     {"samples": 5, "items": [{"name": "m_out", "owner": {"tid": 3, "name": "flush"}, "waiters": [...], "seen_samples": 5, ...}]},
+ "resources": {"fds": {"v": 5, "limit": 1048576, "by_kind": {"pipe": 3, "file": 2}, "series": [...]}, "thread_limit": {...}},
+ "modules":   {"items": [{"role": "executable|loader|libc|library", "name": "...", "path": "..."}], "load_addresses": false},
+ "not_observed": [{"key": "heap_walk", "reason": "no_growth"}]}
+```
+
+- A section key exists only when something was observed for it; there is never an empty or guessed value. What is missing is
+  in `not_observed` (`key` + `reason`, plus counts for `thread_detail_partial`).
+- Every figure carries `basis`: `{"kind": "read"}` (one read), `{"kind": "series", "samples": n, "window_s": w}` (n reads over w
+  seconds; `window_s` may be null) or `{"kind": "derived"}`. Sizes are kB unless `unit`/the key name says bytes (`_b`).
+- `threads.count` is the last read (a growing process is larger than the end of the sampled window; `series` and `trend` are the
+  sampled window). Rows are groups of threads with the same name and state (`count`, first `tids`), at most 10, lock waiters
+  first; `omitted` counts the rest. `detailed < listed` means only some threads were sampled over the window.
+- `window` is the whole diagnosis (`section_b.observation_duration_sec`, `collection_impact.samples_collected`).
+
+Items that would naturally link to a legacy interactive tool later: locks (`name`, `address`) to the variable watch list;
+`growing_classes` and `heap.walk` to the pool/array scanner; `memory.address_space` categories and `modules` to the
+memory-range inspector; `memory.rss.series` / `threads.series` to the timeline compare.
