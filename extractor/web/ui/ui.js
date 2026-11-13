@@ -15,8 +15,7 @@
     ko: {
       title: "dynamicState · 진단", brand_sub: "진단", skip: "본문으로 건너뛰기",
       new: "새 진단", new_title: "다른 프로세스 진단", theme: "밝게 / 어둡게 전환", lang_btn: "KO",
-      lang_aria: "언어 전환: 지금 한국어, 누르면 English", tools: "도구",
-      legacy_ui: "기존 UI (레거시)", legacy_ws: "기존 워크스페이스 (레거시)",
+      lang_aria: "언어 전환: 지금 한국어, 누르면 English",
       hero_h: "실행 중인 프로세스를 멈추지 않고 진단합니다",
       hero_p: "PID 하나면 됩니다. 결과는 이 화면에 진행되는 대로 쌓이고, 끝나면 그대로 보고서가 됩니다.",
       mode_label: "대상 위치", local: "로컬", ssh: "SSH", target_label: "대상 프로세스",
@@ -89,8 +88,7 @@
     en: {
       title: "dynamicState · Diagnose", brand_sub: "diagnose", skip: "Skip to content",
       new: "New diagnosis", new_title: "Diagnose another process", theme: "Toggle light / dark", lang_btn: "EN",
-      lang_aria: "Switch language: now English, press for 한국어", tools: "Tools",
-      legacy_ui: "Previous UI (legacy)", legacy_ws: "Previous workspace (legacy)",
+      lang_aria: "Switch language: now English, press for 한국어",
       hero_h: "Diagnose a running process without stopping it",
       hero_p: "A PID is all it takes. Results build up on this page as they arrive; when it ends, the page is the report.",
       mode_label: "Target location", local: "Local", ssh: "SSH", target_label: "Target process",
@@ -1217,19 +1215,11 @@
     r.classList.toggle("dark", dark); r.classList.toggle("light", !dark);
     LS.set("ds-theme", dark ? "dark" : "light");
   }
-  function toggleMenu(open) {
-    var b = document.getElementById("btn-tools"), m = document.getElementById("tools-menu");
-    open = open == null ? m.hidden : open;
-    m.hidden = !open; b.setAttribute("aria-expanded", String(open));
-    if (open) m.querySelector("a").focus();
-  }
+
 
   document.addEventListener("click", function (ev) {
     var el = ev.target.closest("[data-act]");
-    if (!el) {
-      if (!ev.target.closest(".menu")) toggleMenu(false);
-      return;
-    }
+    if (!el) return;
     var act = el.getAttribute("data-act"), s;
     switch (act) {
       case "ck": {
@@ -1247,7 +1237,7 @@
       }
       case "mode": readForm(); ui.form.mode = el.getAttribute("data-mode"); ui.formError = ""; drawNow(); break;
       case "new": case "home":
-        ev.preventDefault(); toggleMenu(false); history.pushState(null, "", location.pathname); reset(); loadIdle(); drawNow();
+        ev.preventDefault(); history.pushState(null, "", location.pathname); reset(); loadIdle(); drawNow();
         var tgt = document.querySelector('#form input[name="target"]'); if (tgt) tgt.focus();
         break;
       case "theme": {
@@ -1256,7 +1246,6 @@
         break;
       }
       case "lang": readForm(); ui.lang = ui.lang === "ko" ? "en" : "ko"; LS.set("ds-lang", ui.lang); drawNow(); break;
-      case "tools": toggleMenu(); break;
       case "open-job": ev.preventDefault(); history.pushState(null, "", "?job=" + encodeURIComponent(el.getAttribute("data-job"))); route(); break;
       case "open-replay": ev.preventDefault(); history.pushState(null, "", "?replay=" + encodeURIComponent(el.getAttribute("data-replay"))); route(); break;
       case "replay-again": history.replaceState(null, "", "?replay=" + encodeURIComponent(ui.replay)); route(); break;
@@ -1287,13 +1276,7 @@
     start(Object.assign({}, f));
   });
   document.addEventListener("input", function (ev) { if (ev.target.name && ev.target.closest("#form")) ui.form[ev.target.name] = ev.target.value; });
-  document.addEventListener("keydown", function (ev) {
-    if (ev.key === "Escape") { var m = document.getElementById("tools-menu"); if (!m.hidden) { toggleMenu(false); document.getElementById("btn-tools").focus(); } }
-    if ((ev.key === "ArrowDown" || ev.key === "ArrowUp") && ev.target.closest("#tools-menu")) {
-      var items = Array.prototype.slice.call(document.querySelectorAll("#tools-menu a")), i = items.indexOf(ev.target);
-      items[(i + (ev.key === "ArrowDown" ? 1 : items.length - 1)) % items.length].focus(); ev.preventDefault();
-    }
-  });
+
   window.addEventListener("popstate", route);
   api.shell = { ui: ui, draw: draw, drawNow: drawNow, state: state, getJSON: getJSON, job: function () { return job; } };
   route();

@@ -86,7 +86,7 @@ def handle_get(h: Any, hub: X.ExploreHub, job: Any, rest: List[str], query: Dict
                 _stream_watch(h, ws, int(raw))
             return
         if len(rest) == 1 and act == "chips":
-            if job.summary()["state"] != "done" or not getattr(job, "result", None):
+            if job.summary()["state"] != "done":
                 raise X.ExploreError("NOT_FINISHED", "chips come with the verdict", 409)
             chips = x.chips()
             out = {n: XF.both(XF.chips_html, c, f"finding-{n}") for n, c in chips.items()}

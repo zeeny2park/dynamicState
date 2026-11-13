@@ -3928,6 +3928,22 @@ API_ROUTES: Tuple[Tuple[str, str], ...] = (
     ("GET", "/api/diagnose/{job_id}/events"),
     ("GET", "/api/diagnose/{job_id}/status"),
     ("GET", "/api/diagnose/{job_id}/report"),
+    # exploration of the job's target (extractor/web/explore_routes.py): reads only, bound to the job's pid
+    ("GET", "/api/diagnose/{job_id}/chips"),
+    ("GET", "/api/diagnose/{job_id}/thread/{tid}"),
+    ("GET", "/api/diagnose/{job_id}/threads"),
+    ("GET", "/api/diagnose/{job_id}/memory/maps"),
+    ("GET", "/api/diagnose/{job_id}/memory/range"),
+    ("GET", "/api/diagnose/{job_id}/files"),
+    ("GET", "/api/diagnose/{job_id}/modules"),
+    ("GET", "/api/diagnose/{job_id}/vars"),
+    ("GET", "/api/diagnose/{job_id}/value"),
+    ("GET", "/api/diagnose/{job_id}/lock"),
+    ("GET", "/api/diagnose/{job_id}/watch/events"),
+    ("GET", "/api/diagnose/{job_id}/watch/status"),
+    ("POST", "/api/diagnose/{job_id}/watch"),          # what the server-side sampler reads, how often (never writes)
+    ("POST", "/api/diagnose/{job_id}/watch/stop"),     # stops the server's own sampler, not the target
+    ("POST", "/api/diagnose/{job_id}/observation"),    # "Add to report": the job's report gets the observation
 )
 
 

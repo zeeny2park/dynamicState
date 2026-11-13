@@ -47,7 +47,10 @@ FORBIDDEN_SEGMENT = re.compile(
 
 # (method, pattern) -> {segment: reason}: a segment that matches FORBIDDEN_SEGMENT but names a server-side operation
 # (for example stopping the server's own sampler, never the target). Every entry needs its reason.
-ALLOWED_SEGMENTS = {}
+ALLOWED_SEGMENTS = {
+    ("POST", "/api/diagnose/{job_id}/watch/stop"): {
+        "stop": "stops the server's own observation sampler for that job; the target is never stopped or signalled"},
+}
 
 # Every POST lives under one of these prefixes (POSTs start or steer server-side work, never a write to the target).
 POST_PREFIXES = ("/api/diagnose",)
@@ -63,6 +66,23 @@ PROBES = {
     ("GET", "/api/diagnose/{job_id}/events"): ("/api/diagnose/{job_id}/events", None, {200}),
     ("GET", "/api/diagnose/{job_id}/status"): ("/api/diagnose/{job_id}/status", None, {200}),
     ("GET", "/api/diagnose/{job_id}/report"): ("/api/diagnose/{job_id}/report?format=json", None, {200}),
+    # exploration: the fake job's pid (4242) is not a live process of this test, so a read route answers 410
+    # TARGET_EXITED (or 409 without a debug image): the dispatch reached the route's handler, which refused to read
+    ("GET", "/api/diagnose/{job_id}/chips"): ("/api/diagnose/{job_id}/chips", None, {200}),
+    ("GET", "/api/diagnose/{job_id}/thread/{tid}"): ("/api/diagnose/{job_id}/thread/1", None, {404, 410}),
+    ("GET", "/api/diagnose/{job_id}/threads"): ("/api/diagnose/{job_id}/threads?name=x", None, {200, 410}),
+    ("GET", "/api/diagnose/{job_id}/memory/maps"): ("/api/diagnose/{job_id}/memory/maps", None, {200, 410}),
+    ("GET", "/api/diagnose/{job_id}/memory/range"): ("/api/diagnose/{job_id}/memory/range?addr=0x10000&len=16", None, {200, 410}),
+    ("GET", "/api/diagnose/{job_id}/files"): ("/api/diagnose/{job_id}/files", None, {200, 410}),
+    ("GET", "/api/diagnose/{job_id}/modules"): ("/api/diagnose/{job_id}/modules", None, {200, 410}),
+    ("GET", "/api/diagnose/{job_id}/vars"): ("/api/diagnose/{job_id}/vars?q=x", None, {200, 409}),
+    ("GET", "/api/diagnose/{job_id}/value"): ("/api/diagnose/{job_id}/value?expr=x", None, {200, 409, 410}),
+    ("GET", "/api/diagnose/{job_id}/lock"): ("/api/diagnose/{job_id}/lock?name=m", None, {404, 410}),
+    ("GET", "/api/diagnose/{job_id}/watch/events"): ("/api/diagnose/{job_id}/watch/events", None, {404}),
+    ("GET", "/api/diagnose/{job_id}/watch/status"): ("/api/diagnose/{job_id}/watch/status", None, {200}),
+    ("POST", "/api/diagnose/{job_id}/watch"): ("/api/diagnose/{job_id}/watch", {"items": [], "running": False}, {200}),
+    ("POST", "/api/diagnose/{job_id}/watch/stop"): ("/api/diagnose/{job_id}/watch/stop", {}, {200}),
+    ("POST", "/api/diagnose/{job_id}/observation"): ("/api/diagnose/{job_id}/observation", {"remove": True}, {200}),
 }
 
 # Paths of the removed UIs and their routes that wrote, stopped, ran commands or changed state, plus a few read routes

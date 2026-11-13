@@ -14,12 +14,6 @@
 .tchip .sep { color: var(--border); }
 .tchip .live { display: inline-flex; align-items: center; gap: 6px; color: var(--info); }
 .tchip .live i { width: 7px; height: 7px; border-radius: 50%; background: var(--info); animation: pulse 1.2s infinite; }
-.menu { position: relative; }
-.menu-list { position: absolute; right: 0; top: 36px; min-width: 220px; padding: 4px; display: flex; flex-direction: column;
-  background: var(--popover); color: var(--popover-foreground); box-shadow: var(--shadow-md); z-index: 20; }
-.menu-list[hidden] { display: none; }
-.menu-list a { padding: 7px 10px; border-radius: calc(var(--radius) - 2px); font-size: 13px; text-decoration: none; }
-.menu-list a:hover, .menu-list a:focus-visible { background: var(--accent); }
 .skip { position: absolute; left: -9999px; top: 8px; z-index: 30; }
 .skip:focus { left: 12px; background: var(--background); padding: 6px 10px; border: 1px solid var(--border); border-radius: var(--radius); }
 .noscript { max-width: 640px; margin: 64px auto; text-align: center; }
