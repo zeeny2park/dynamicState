@@ -29,6 +29,7 @@ from extractor.expert_diagnostic_engine import (
 from extractor.web import diagnose_jobs
 from extractor.web.diagnose_jobs import DiagnoseJobManager, is_valid_job_id
 from extractor.web.server import _to_json_serializable, run_server
+from tests.support.fixture_process import fixture_popen
 
 
 # ----------------------------------------------------------------------------------------- fakes
@@ -601,7 +602,7 @@ class TestLiveParity(ServerCase):
             with open(src, "w") as fh:
                 fh.write(LIVE_C)
             subprocess.run(["gcc", "-g", "-O0", src, "-o", exe], check=True)
-            proc = subprocess.Popen([exe], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+            proc = fixture_popen([exe], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
             time.sleep(0.3)
             req = {"pid": proc.pid, "debug_image": exe, "symptom": "health check", "time_limit_s": 10, "language": "en"}
             _, sync, _ = self.jreq("POST", "/api/diagnose", req)

@@ -145,7 +145,7 @@ class TestPhase21McpAndUiIntegration(unittest.TestCase):
         self.assertTrue(os.path.exists(out_md_path))
         with open(out_md_path, "r", encoding="utf-8") as f:
             content = f.read()
-            self.assertIn("dynamicState Expert Diagnostic Incident Report", content)
+            self.assertIn("dynamicState Zero-Stop Runtime Incident Report", content)
             self.assertIn(inv_id, content)
 
     def test_web_api_rest_endpoints(self):
