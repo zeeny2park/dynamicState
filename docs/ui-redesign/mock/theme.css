@@ -1,0 +1,174 @@
+/* dynamicState shared theme — shadcn/ui token vocabulary (style: nova — compact, hairlines, 6–8px radius),
+   written as plain CSS so the live UI (no build step, offline) and the static HTML report use ONE file.
+   Light = :root, dark = .dark (or the OS preference when no class is set). Status colors are the four
+   verdict/check states and are the only additions to the shadcn token set. */
+:root {
+  --background: oklch(1 0 0);            --foreground: oklch(0.145 0 0);
+  --card: oklch(1 0 0);                  --card-foreground: oklch(0.145 0 0);
+  --popover: oklch(1 0 0);               --popover-foreground: oklch(0.145 0 0);
+  --primary: oklch(0.205 0 0);           --primary-foreground: oklch(0.985 0 0);
+  --secondary: oklch(0.97 0 0);          --secondary-foreground: oklch(0.205 0 0);
+  --muted: oklch(0.97 0 0);              --muted-foreground: oklch(0.556 0 0);
+  --accent: oklch(0.97 0 0);             --accent-foreground: oklch(0.205 0 0);
+  --surface: oklch(0.985 0 0);           --surface-foreground: oklch(0.145 0 0);
+  --border: oklch(0.922 0 0);            --input: oklch(0.922 0 0);           --ring: oklch(0.708 0 0);
+  /* status (custom tokens, name / -foreground / -soft) */
+  --destructive: oklch(0.577 0.245 27.3);  --destructive-foreground: oklch(0.985 0 0);  --destructive-soft: oklch(0.962 0.028 25);
+  --warning: oklch(0.58 0.14 62);          --warning-foreground: oklch(0.985 0 0);      --warning-soft: oklch(0.97 0.04 85);
+  --success: oklch(0.52 0.14 150);         --success-foreground: oklch(0.985 0 0);      --success-soft: oklch(0.962 0.045 150);
+  --info: oklch(0.55 0.19 255);            --info-foreground: oklch(0.985 0 0);         --info-soft: oklch(0.955 0.03 255);
+  --chart-1: oklch(0.55 0.19 255); --chart-2: oklch(0.55 0.21 300); --chart-3: oklch(0.6 0.12 185);
+  --chart-4: oklch(0.72 0.17 70);  --chart-5: oklch(0.65 0.22 41);
+  --radius: 0.5rem;
+  --font-sans: -apple-system, "Segoe UI", "Noto Sans KR", "Apple SD Gothic Neo", Roboto, sans-serif;
+  --font-mono: ui-monospace, "JetBrains Mono", SFMono-Regular, Menlo, Consolas, monospace;
+  --shadow-xs: 0 1px 2px oklch(0 0 0 / .05);
+  --shadow-md: 0 8px 24px -12px oklch(0 0 0 / .25);
+  color-scheme: light;
+}
+.dark {
+  --background: oklch(0.145 0 0);        --foreground: oklch(0.985 0 0);
+  --card: oklch(0.205 0 0);              --card-foreground: oklch(0.985 0 0);
+  --popover: oklch(0.205 0 0);           --popover-foreground: oklch(0.985 0 0);
+  --primary: oklch(0.922 0 0);           --primary-foreground: oklch(0.205 0 0);
+  --secondary: oklch(0.269 0 0);         --secondary-foreground: oklch(0.985 0 0);
+  --muted: oklch(0.269 0 0);             --muted-foreground: oklch(0.708 0 0);
+  --accent: oklch(0.269 0 0);            --accent-foreground: oklch(0.985 0 0);
+  --surface: oklch(0.175 0 0);           --surface-foreground: oklch(0.985 0 0);
+  --border: oklch(1 0 0 / 10%);          --input: oklch(1 0 0 / 15%);         --ring: oklch(0.556 0 0);
+  --destructive: oklch(0.704 0.191 22.2);  --destructive-soft: oklch(0.28 0.06 25);
+  --warning: oklch(0.8 0.14 75);           --warning-soft: oklch(0.3 0.05 70);
+  --success: oklch(0.75 0.15 150);         --success-soft: oklch(0.27 0.05 150);
+  --info: oklch(0.72 0.15 255);            --info-soft: oklch(0.28 0.05 255);
+  --chart-1: oklch(0.65 0.17 255); --chart-2: oklch(0.68 0.18 300);
+  --shadow-xs: 0 1px 2px oklch(0 0 0 / .4);
+  --shadow-md: 0 8px 24px -12px oklch(0 0 0 / .7);
+  color-scheme: dark;
+}
+@media (prefers-color-scheme: dark) { :root:not(.light):not(.dark) {
+  --background: oklch(0.145 0 0); --foreground: oklch(0.985 0 0); --card: oklch(0.205 0 0); --card-foreground: oklch(0.985 0 0);
+  --popover: oklch(0.205 0 0); --popover-foreground: oklch(0.985 0 0); --primary: oklch(0.922 0 0); --primary-foreground: oklch(0.205 0 0);
+  --secondary: oklch(0.269 0 0); --secondary-foreground: oklch(0.985 0 0); --muted: oklch(0.269 0 0); --muted-foreground: oklch(0.708 0 0);
+  --accent: oklch(0.269 0 0); --accent-foreground: oklch(0.985 0 0); --surface: oklch(0.175 0 0); --surface-foreground: oklch(0.985 0 0);
+  --border: oklch(1 0 0 / 10%); --input: oklch(1 0 0 / 15%); --ring: oklch(0.556 0 0);
+  --destructive: oklch(0.704 0.191 22.2); --destructive-soft: oklch(0.28 0.06 25); --warning: oklch(0.8 0.14 75); --warning-soft: oklch(0.3 0.05 70);
+  --success: oklch(0.75 0.15 150); --success-soft: oklch(0.27 0.05 150); --info: oklch(0.72 0.15 255); --info-soft: oklch(0.28 0.05 255);
+  --chart-1: oklch(0.65 0.17 255); --chart-2: oklch(0.68 0.18 300); color-scheme: dark; } }
+
+/* ---- base ---- */
+*, *::before, *::after { box-sizing: border-box; }
+html, body { margin: 0; background: var(--background); color: var(--foreground);
+  font: 14px/1.55 var(--font-sans); -webkit-font-smoothing: antialiased; }
+code, kbd, .mono { font-family: var(--font-mono); font-size: .92em; }
+code { background: var(--muted); padding: 1px 5px; border-radius: calc(var(--radius) - 4px); overflow-wrap: anywhere; }
+a { color: var(--foreground); text-decoration: underline; text-underline-offset: 3px; text-decoration-color: var(--border); }
+a:hover { text-decoration-color: currentColor; }
+button { font: inherit; cursor: pointer; color: inherit; }
+h1, h2, h3, h4 { margin: 0; font-weight: 600; letter-spacing: -0.01em; line-height: 1.3; }
+h1 { font-size: 22px; } h2 { font-size: 15px; } h3 { font-size: 14px; } h4 { font-size: 13px; }
+.text-muted { color: var(--muted-foreground); } .text-sm { font-size: 13px; } .text-xs { font-size: 12px; }
+.hidden { display: none !important; }
+.sr-only { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); }
+:focus-visible { outline: 2px solid var(--ring); outline-offset: 2px; }
+
+/* ---- Button ---- */
+.btn { display: inline-flex; align-items: center; justify-content: center; gap: 6px; height: 32px; padding: 0 12px;
+  border-radius: calc(var(--radius) - 2px); font-size: 13px; font-weight: 500; border: 1px solid transparent;
+  background: var(--primary); color: var(--primary-foreground); white-space: nowrap; transition: background .15s, border-color .15s; }
+.btn:hover { background: color-mix(in oklch, var(--primary) 88%, var(--background)); }
+.btn-outline { background: var(--background); border-color: var(--border); color: var(--foreground); box-shadow: var(--shadow-xs); }
+.btn-outline:hover { background: var(--accent); }
+.btn-secondary { background: var(--secondary); color: var(--secondary-foreground); } .btn-secondary:hover { background: color-mix(in oklch, var(--secondary) 80%, var(--foreground) 5%); }
+.btn-ghost { background: transparent; color: var(--muted-foreground); } .btn-ghost:hover { background: var(--accent); color: var(--foreground); }
+.btn-destructive { background: var(--destructive); color: var(--destructive-foreground); }
+.btn-sm { height: 28px; padding: 0 10px; font-size: 12.5px; } .btn-lg { height: 38px; padding: 0 18px; font-size: 14px; }
+.btn[disabled] { opacity: .5; pointer-events: none; }
+
+/* ---- Input / ToggleGroup ---- */
+.input { height: 32px; border: 1px solid var(--input); border-radius: calc(var(--radius) - 2px); padding: 0 10px; min-width: 0;
+  background: transparent; font: inherit; font-size: 13px; color: var(--foreground); box-shadow: var(--shadow-xs); }
+.input::placeholder { color: var(--muted-foreground); }
+.input:focus { outline: none; border-color: var(--ring); box-shadow: 0 0 0 3px color-mix(in oklch, var(--ring) 35%, transparent); }
+.input-lg { height: 38px; font-size: 14px; }
+.toggle-group { display: inline-flex; border: 1px solid var(--border); border-radius: calc(var(--radius) - 2px); overflow: hidden; background: var(--background); }
+.toggle-group button { height: 30px; padding: 0 11px; border: 0; background: transparent; color: var(--muted-foreground); font-size: 13px; font-weight: 500; }
+.toggle-group button + button { border-left: 1px solid var(--border); }
+.toggle-group button[aria-pressed="true"] { background: var(--accent); color: var(--foreground); }
+.toggle-group-lg button { height: 36px; padding: 0 13px; }
+
+/* ---- Card ---- */
+.card { background: var(--card); color: var(--card-foreground); border: 1px solid var(--border);
+  border-radius: calc(var(--radius) + 4px); box-shadow: var(--shadow-xs); }
+.card-header { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; padding: 14px 20px 0; }
+.card-title { font-size: 14px; font-weight: 600; }
+.card-description { font-size: 12.5px; color: var(--muted-foreground); }
+.card-header .right { margin-left: auto; font-size: 12.5px; color: var(--muted-foreground); }
+.card-content { padding: 12px 20px 16px; }
+.card-footer { padding: 0 20px 16px; display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+.card-tone { border-left: 5px solid var(--tone); }
+
+/* ---- Badge ---- */
+.badge { display: inline-flex; align-items: center; gap: 5px; height: 22px; padding: 0 8px; border-radius: 999px;
+  font-size: 12px; font-weight: 500; border: 1px solid transparent; white-space: nowrap; background: var(--primary); color: var(--primary-foreground); }
+.badge-secondary { background: var(--secondary); color: var(--secondary-foreground); }
+.badge-outline { background: transparent; border-color: var(--border); color: var(--muted-foreground); }
+.badge-tone { background: var(--tone-soft); color: var(--tone); border-color: color-mix(in oklch, var(--tone) 35%, transparent); font-weight: 600; }
+.badge-lg { height: 26px; padding: 0 11px; font-size: 13px; }
+
+/* ---- Status vocabulary (the ONLY four states, same words/colors everywhere) ---- */
+.tone-fail, .tone-FAIL, .tone-CONFIRMED_FAULT { --tone: var(--destructive); --tone-soft: var(--destructive-soft); }
+.tone-warn, .tone-INCONCLUSIVE, .tone-PROBABLE_FAULT { --tone: var(--warning); --tone-soft: var(--warning-soft); }
+.tone-pass, .tone-PASS, .tone-HEALTHY { --tone: var(--success); --tone-soft: var(--success-soft); }
+.tone-skip, .tone-SKIPPED, .tone-unknown { --tone: var(--muted-foreground); --tone-soft: var(--muted); }
+.tone-info, .tone-RUNNING { --tone: var(--info); --tone-soft: var(--info-soft); }
+.status-icon { flex: none; width: 18px; height: 18px; border-radius: 50%; display: inline-flex; align-items: center; justify-content: center;
+  font-size: 11px; font-weight: 800; color: var(--background); background: var(--tone, var(--border)); }
+.status-icon.PENDING { background: var(--border); }
+.status-icon.RUNNING { background: transparent; border: 2px solid var(--info); border-top-color: transparent; animation: spin .8s linear infinite; }
+.status-icon.SKIPPED { background: var(--muted); color: var(--muted-foreground); }
+
+/* ---- Progress / Separator / Spinner / Skeleton / Alert / Table / Kbd ---- */
+.progress { height: 4px; background: var(--muted); border-radius: 2px; overflow: hidden; }
+.progress > i { display: block; height: 100%; background: var(--primary); border-radius: 2px; transition: width .45s ease; }
+.progress-stack { display: flex; height: 6px; border-radius: 3px; overflow: hidden; background: var(--muted); }
+.progress-stack > i { display: block; height: 100%; }
+.separator { height: 1px; background: var(--border); border: 0; margin: 0; }
+.spinner { width: 14px; height: 14px; border: 2px solid var(--border); border-top-color: var(--foreground); border-radius: 50%; animation: spin .8s linear infinite; }
+.skeleton { background: var(--muted); border-radius: calc(var(--radius) - 4px); animation: pulse 1.4s ease-in-out infinite; }
+.alert { display: flex; gap: 10px; padding: 12px 14px; border: 1px solid var(--border); border-radius: var(--radius); background: var(--card); font-size: 13px; }
+.alert-tone { border-color: color-mix(in oklch, var(--tone) 40%, transparent); background: var(--tone-soft); }
+.table { width: 100%; border-collapse: collapse; font-size: 13px; }
+.table th { text-align: left; font-weight: 500; color: var(--muted-foreground); padding: 6px 8px; border-bottom: 1px solid var(--border); }
+.table td { padding: 8px; border-bottom: 1px solid var(--border); vertical-align: top; }
+.table tr:last-child td { border-bottom: 0; }
+.kbd { display: inline-block; padding: 0 5px; border: 1px solid var(--border); border-bottom-width: 2px; border-radius: 4px; font-size: 11px; background: var(--muted); }
+
+/* ---- Collapsible (details) ---- */
+.collapsible { border: 1px solid var(--border); border-radius: var(--radius); background: var(--surface); }
+.collapsible > summary { list-style: none; cursor: pointer; display: flex; gap: 8px; align-items: center; padding: 9px 12px; font-size: 13px; font-weight: 500; }
+.collapsible > summary::-webkit-details-marker { display: none; }
+.collapsible > summary::after { content: "펼치기"; margin-left: auto; font-weight: 400; color: var(--muted-foreground); font-size: 12px; }
+.collapsible[open] > summary::after { content: "접기"; }
+.collapsible > .in { padding: 0 12px 12px; font-size: 13px; }
+.collapsible-plain { border: 0; background: transparent; }
+.collapsible-plain > summary { padding: 6px 2px; color: var(--muted-foreground); font-weight: 500; }
+.collapsible-plain > summary::before { content: "▸"; font-size: 11px; } .collapsible-plain[open] > summary::before { content: "▾"; }
+.collapsible-plain > summary::after { content: none; }
+
+/* ---- Motion ---- */
+@keyframes spin { to { transform: rotate(360deg); } }
+@keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: .45; } }
+@keyframes rise { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
+.rise { animation: rise .3s ease both; }
+@media (prefers-reduced-motion: reduce) { *, *::before, *::after { animation: none !important; transition: none !important; } }
+
+/* ---- Bridge for the existing report renderer (extractor/report_visuals.py, .dsv-* classes):
+   maps the report's private variables onto the shared tokens so the same markup takes the theme unchanged. ---- */
+.dsv { --bg: var(--card); --panel: var(--surface); --ink: var(--foreground); --mute: var(--muted-foreground);
+  --line: var(--border); --soft: var(--muted); --bad: var(--destructive); --bad-bg: var(--destructive-soft);
+  --warn: var(--warning); --warn-bg: var(--warning-soft); --good: var(--success); --good-bg: var(--success-soft);
+  --unk: var(--muted-foreground); --unk-bg: var(--muted); --buf: var(--info-soft); --buf-line: var(--info);
+  --hdr: var(--muted); --accent: var(--info); font-family: var(--font-sans); }
+
+/* ---- Print (static report) ---- */
+@media print { body { background: #fff; } .card { box-shadow: none; break-inside: avoid; } .no-print { display: none !important; } }

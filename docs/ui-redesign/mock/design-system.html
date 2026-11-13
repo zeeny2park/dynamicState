@@ -1,0 +1,82 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>dynamicState 디자인 시스템</title>
+<link rel="stylesheet" href="theme.css">
+<style>
+main{max-width:920px;margin:0 auto;padding:28px 20px 80px;display:flex;flex-direction:column;gap:16px}
+.sec h2{margin-bottom:10px}
+.sw{display:grid;grid-template-columns:repeat(6,1fr);gap:8px}
+.sw div{border:1px solid var(--border);border-radius:var(--radius);overflow:hidden;font-size:11px}
+.sw i{display:block;height:44px}
+.sw span{display:block;padding:5px 7px;font-family:var(--font-mono);color:var(--muted-foreground)}
+.rowf{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+.cols{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+.type p{margin:4px 0}
+.hdr{display:flex;align-items:center;gap:12px;flex-wrap:wrap}
+.hdr .grow{flex:1}
+</style></head>
+<body>
+<main>
+ <div class="hdr"><h1>dynamicState 디자인 시스템</h1><span class="badge badge-outline">theme.css · shadcn 토큰 · style nova</span><span class="grow"></span>
+  <button class="btn btn-outline btn-sm" onclick="document.documentElement.classList.toggle('dark')">다크 전환</button></div>
+ <p class="text-muted" style="margin:0">라이브 UI와 정적 HTML 보고서가 이 한 파일을 공유한다. 아래 모든 요소는 토큰만 참조하며, 원색 값은 어디에도 없다.</p>
+
+ <section class="card sec"><div class="card-header"><h2 class="card-title">1. 색 토큰</h2><span class="card-description">name / name-foreground / name-soft</span></div>
+  <div class="card-content" style="display:flex;flex-direction:column;gap:10px">
+   <div class="sw">
+    <div><i style="background:var(--background)"></i><span>background</span></div><div><i style="background:var(--card)"></i><span>card</span></div>
+    <div><i style="background:var(--surface)"></i><span>surface</span></div><div><i style="background:var(--muted)"></i><span>muted</span></div>
+    <div><i style="background:var(--border)"></i><span>border</span></div><div><i style="background:var(--primary)"></i><span>primary</span></div>
+   </div>
+   <div class="sw">
+    <div><i style="background:var(--destructive)"></i><span>destructive · 이상/확정</span></div><div><i style="background:var(--warning)"></i><span>warning · 판단 불가/가능</span></div>
+    <div><i style="background:var(--success)"></i><span>success · 통과/정상</span></div><div><i style="background:var(--muted-foreground)"></i><span>muted-fg · 실행 안 함</span></div>
+    <div><i style="background:var(--info)"></i><span>info · 진행 중</span></div><div><i style="background:var(--chart-1)"></i><span>chart-1 · 스레드</span></div>
+   </div>
+  </div></section>
+
+ <section class="card sec"><div class="card-header"><h2 class="card-title">2. 상태 어휘</h2><span class="card-description">판정과 검사가 쓰는 같은 네 가지 상태 + 진행 중. 단어·색·아이콘이 화면과 보고서에서 같다</span></div>
+  <div class="card-content"><table class="table">
+   <tr><th>상태</th><th>검사 행</th><th>배지</th><th>판정</th><th>뜻</th></tr>
+   <tr><td>FAIL</td><td><span class="status-icon FAIL tone-fail">✖</span></td><td><span class="badge badge-tone tone-fail">이상 발견</span></td><td><span class="badge badge-tone tone-fail badge-lg">판정: CONFIRMED_FAULT</span></td><td>검사가 찾던 이상을 발견함</td></tr>
+   <tr><td>INCONCLUSIVE</td><td><span class="status-icon INCONCLUSIVE tone-warn">?</span></td><td><span class="badge badge-tone tone-warn">판단 불가</span></td><td><span class="badge badge-tone tone-warn badge-lg">판정: PROBABLE_FAULT</span></td><td>실행했지만 답을 내지 못함. 정상이라는 근거가 아님</td></tr>
+   <tr><td>PASS</td><td><span class="status-icon PASS tone-pass">✔</span></td><td><span class="badge badge-tone tone-pass">통과</span></td><td><span class="badge badge-tone tone-pass badge-lg">판정: HEALTHY</span></td><td>끝까지 실행했고 아무것도 발견하지 못함</td></tr>
+   <tr><td>SKIPPED</td><td><span class="status-icon SKIPPED">–</span></td><td><span class="badge badge-tone tone-skip">실행 안 함</span></td><td><span class="badge badge-tone tone-skip badge-lg">판정: INCONCLUSIVE</span></td><td>실행하지 않음. 정상이라는 근거가 아님</td></tr>
+   <tr><td>RUNNING</td><td><span class="status-icon RUNNING"></span></td><td><span class="badge badge-tone tone-info"><span class="spinner" style="border-top-color:var(--info)"></span>진단 중</span></td><td>—</td><td>지금 실행 중 (라이브 UI에만 있음)</td></tr>
+  </table></div></section>
+
+ <section class="card sec"><div class="card-header"><h2 class="card-title">3. 컴포넌트</h2><span class="card-description">shadcn/ui 이름을 그대로 쓴다. React 없이 같은 모양의 CSS 클래스</span></div>
+  <div class="card-content" style="display:flex;flex-direction:column;gap:14px">
+   <div><div class="text-xs text-muted" style="margin-bottom:6px">Button — default · outline · secondary · ghost · destructive · sm · lg · disabled</div>
+    <div class="rowf"><button class="btn">진단</button><button class="btn btn-outline">Markdown</button><button class="btn btn-secondary">요약 복사</button><button class="btn btn-ghost">새 진단</button><button class="btn btn-destructive">세션 종료</button><button class="btn btn-outline btn-sm">작게</button><button class="btn btn-lg">크게</button><button class="btn" disabled>비활성</button></div></div>
+   <div><div class="text-xs text-muted" style="margin-bottom:6px">Input · ToggleGroup</div>
+    <div class="rowf"><div class="toggle-group"><button aria-pressed="true">로컬</button><button aria-pressed="false">SSH</button></div><input class="input mono" style="width:260px" placeholder="PID 또는 프로세스 이름"><input class="input" style="width:220px" placeholder="증상 (선택)"></div></div>
+   <div><div class="text-xs text-muted" style="margin-bottom:6px">Badge — default · secondary · outline · tone</div>
+    <div class="rowf"><span class="badge">기본</span><span class="badge badge-secondary">보조</span><span class="badge badge-outline">심각도 CRITICAL</span><span class="badge badge-outline mono">DEADLOCK_INDICATORS</span><span class="badge badge-tone tone-fail">확정된 근본 원인</span><span class="badge badge-tone tone-warn">의심 · 검증 중</span><span class="obs" style="font-size:11px;padding:0 6px;border-radius:999px;border:1px solid currentColor;color:var(--success)">관측</span><span style="font-size:11px;padding:0 6px;border-radius:999px;border:1px solid currentColor;color:var(--warning)">재구성</span></div></div>
+   <div class="cols">
+    <div><div class="text-xs text-muted" style="margin-bottom:6px">Progress · Progress stack · Skeleton · Spinner</div>
+     <div class="progress" style="margin-bottom:8px"><i style="width:62%"></i></div>
+     <div class="progress-stack" style="margin-bottom:8px"><i style="background:var(--destructive);width:12%"></i><i style="background:var(--warning);width:8%"></i><i style="background:var(--success);width:21%"></i></div>
+     <div class="rowf"><div class="skeleton" style="width:160px;height:14px"></div><div class="skeleton" style="width:60px;height:14px"></div><span class="spinner"></span></div></div>
+    <div><div class="text-xs text-muted" style="margin-bottom:6px">Alert (tone) · Kbd</div>
+     <div class="alert alert-tone tone-warn" style="margin-bottom:8px">디버그 이미지가 없어 판단하지 못했습니다. <code>--debug-image</code>로 같은 Build ID의 ELF를 주세요.</div>
+     <div class="text-sm">단축키: <span class="kbd">Ctrl</span> <span class="kbd">K</span> 프로세스 찾기 · <span class="kbd">R</span> 다시 진단</div></div>
+   </div>
+   <div><div class="text-xs text-muted" style="margin-bottom:6px">Card (header · description · right · content · footer) · Card tone (판정 배너) · Collapsible</div>
+    <div class="cols">
+     <div class="card card-tone tone-fail"><div class="card-header"><h3 class="card-title">발견된 문제</h3><span class="card-description">1</span><span class="right">보조 텍스트</span></div><div class="card-content text-sm">본문. 카드 안의 카드는 쓰지 않는다. 상세는 아래 Collapsible로.</div>
+      <div class="card-footer"><button class="btn btn-sm">주 동작</button><button class="btn btn-outline btn-sm">보조</button></div></div>
+     <div style="display:flex;flex-direction:column;gap:8px"><details class="collapsible"><summary>근거 <span class="text-muted" style="font-weight:400">스레드별 샘플 · 스택</span></summary><div class="in text-muted">해당 항목의 근거만 여기에.</div></details>
+      <details class="collapsible collapsible-plain"><summary><b style="color:var(--foreground)">실행 안 함 14</b> 정상이라는 근거가 아님</summary><div class="in text-muted">…</div></details>
+      <table class="table"><tr><th>스레드</th><th>CPU</th><th>머문 위치</th></tr><tr><td><code>ingest</code></td><td>0%</td><td><code>deadlock_pipeline.c:15</code></td></tr></table></div>
+    </div></div>
+  </div></section>
+
+ <section class="card sec"><div class="card-header"><h2 class="card-title">4. 타이포그래피 · 간격 · 반경</h2></div>
+  <div class="card-content cols type">
+   <div><p style="font-size:22px;font-weight:600">제목 22 / 600 — 페이지 제목</p><p style="font-size:16px">문장 16 — 판정 결론 한 문장</p><p style="font-size:15px;font-weight:600">카드 제목 15 / 600</p><p>본문 14 / 1.55</p><p class="text-sm text-muted">보조 13 — 설명, 검사 한 줄 결과</p><p class="text-xs text-muted">캡션 12 — 타일 라벨, 배지</p><p><code>mono 13 — pid, 경로, 심볼, ms</code></p></div>
+   <div class="text-sm"><p><b>간격</b>: 카드 사이 12px, 카드 안 20px 가로 · 14/16px 세로, 행 7px, 인라인 gap 8–10px.</p><p><b>반경</b>: <code>--radius 8px</code>. 카드 12px, 버튼·입력 6px, 코드 4px, 배지 999px.</p><p><b>선</b>: 1px <code>--border</code> 헤어라인만. 그림자는 카드 xs, 폼·팝오버 md 두 단계.</p><p><b>폭</b>: 콘텐츠 한 열 920px. 760px 아래에서 타일 2열, 발견 카드 1열.</p><p><b>모션</b>: 추가되는 카드 rise .3s, 진행 바 .45s. <code>prefers-reduced-motion</code>이면 없음.</p></div>
+  </div></section>
+</main>
+</body></html>
