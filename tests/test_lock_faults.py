@@ -133,6 +133,18 @@ class TestSelfDeadlockRule(unittest.TestCase):
         s[0]["waits"] = []
         self.assertEqual(_run(lf.RECIPE_SELF_DEADLOCK, _obs(s)).status, dr.RECIPE_STATUS_CONTRADICTED)
 
+    def test_thread_that_is_scheduled_between_samples_is_not_stuck(self):
+        # a busy lock handed on between threads: the waiter is its own owner in a sample only because the owner word was
+        # read just after its futex wait ended; its context-switch count moved, so it is not a self-deadlock
+        def mk(sw):
+            s = _samples([(1, "main"), (W1, "r")], [_lock(owner=W1, waiters=(W1,))], [_wait(W1, "r", owner=W1)])
+            for smp, v in zip(s, sw):
+                smp["switches"] = {str(W1): v}
+            return s
+        self.assertEqual(_run(lf.RECIPE_SELF_DEADLOCK, _obs(mk([40, 52]))).status, dr.RECIPE_STATUS_CONTRADICTED)
+        self.assertEqual(_run(lf.RECIPE_SELF_DEADLOCK, _obs(mk([40, 40]))).status, dr.RECIPE_STATUS_SUPPORTED)
+        self.assertEqual(_run(lf.RECIPE_SELF_DEADLOCK, _obs(mk([None, None]))).status, dr.RECIPE_STATUS_SUPPORTED)
+
     def test_other_owner_is_a_normal_wait(self):
         self.assertEqual(_run(lf.RECIPE_SELF_DEADLOCK, HEALTHY).status, dr.RECIPE_STATUS_CONTRADICTED)
 

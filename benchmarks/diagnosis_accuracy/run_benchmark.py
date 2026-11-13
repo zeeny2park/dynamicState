@@ -51,10 +51,11 @@ KIND_CATEGORIES: Dict[str, frozenset] = {
     "long_stall": frozenset({"PROCESS_INSTABILITY"}),
     "mapping_growth": frozenset({"MAPPING_GROWTH"}),   # memory growth outside malloc (mmap, custom pool)
     "heap_retention": frozenset({"HEAP_RETENTION"}),   # fragmentation: a degradation, its targets are unscored
+    "lock_contention": frozenset({"LOCK_CONTENTION"}),  # a degradation: its targets are unscored
     "orphan_lock": frozenset({"ORPHAN_LOCK"}),
     "self_deadlock": frozenset({"SELF_DEADLOCK"}),
 }
-# `long_stall` and `heap_retention` stay here only so unscored rows can be labelled and described; they never
+# `long_stall`, `heap_retention` and `lock_contention` stay here only so unscored rows can be labelled and described; they never
 # enter a total.
 DEFECT_KINDS = tuple(KIND_CATEGORIES)
 # A ground-truth record may carry "scored": false (+ "scored_reason"). Such targets are still built, run and
