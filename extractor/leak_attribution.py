@@ -158,24 +158,41 @@ def cheap_trend(samples: Sequence[Dict[str, Any]], cfg: MemoryObservationConfig)
         steps_ok = all(b - a >= -cfg.trend_step_tolerance_kb for a, b in zip(series, series[1:]))
         return steps_ok and series[-1] - series[0] >= cfg.trend_min_growth_kb
 
-    def max_rise(series: List[int]) -> int:
-        lo, best = None, 0
+    def max_move(series: List[int], sign: int) -> int:
+        """Largest rise (sign 1) or fall (sign -1) between any earlier and later sample."""
+        ref, best = None, 0
         for v in series:
-            lo = v if lo is None else min(lo, v)
-            best = max(best, v - lo)
+            ref = v if ref is None else (min(ref, v) if sign > 0 else max(ref, v))
+            best = max(best, (v - ref) * sign)
         return best
 
     if ss:
         out["rss_growth_kb"] = ss[-1]["rss_kb"] - ss[0]["rss_kb"]
         out["anon_rw_growth_kb"] = ss[-1]["anon_rw_kb"] - ss[0]["anon_rw_kb"]
         out["indicates_growth"] = grows(out["rss_kb_series"]) or grows(out["anon_rw_kb_series"])
-        # A rise of at least the trend resolution that is (partly) given back within the window is not "no
-        # growth": memory DID grow in the window, and one rise-and-fall cannot tell a periodic working set from
-        # a periodic working set with a leak under it (both rise and fall).  The cheap trend cannot clear it.
-        out["max_rise_kb"] = max(max_rise(out["rss_kb_series"]), max_rise(out["anon_rw_kb_series"]))
-        out["rose_and_fell"] = (not out["indicates_growth"] and len(ss) >= 3
-                                and out["max_rise_kb"] >= cfg.trend_min_growth_kb)
+        # The cheap trend clears growth only for a series that stayed flat within its resolution.  A series that
+        # moved by at least the resolution without a growth trend (rose and fell back, or only fell) is periodic or
+        # transient use, and one window of it cannot tell a periodic working set from one with a leak under it
+        # (both rise and fall; a window may also see only the fall of a cycle): the heap walks decide.
+        rs, an = out["rss_kb_series"], out["anon_rw_kb_series"]
+        out["max_rise_kb"] = max(max_move(rs, 1), max_move(an, 1))
+        out["max_fall_kb"] = max(max_move(rs, -1), max_move(an, -1))
+        out["unsettled"] = (not out["indicates_growth"] and len(ss) >= 3
+                            and max(out["max_rise_kb"], out["max_fall_kb"]) >= cfg.trend_min_growth_kb)
+        out["rose_and_fell"] = bool(out["unsettled"] and out["max_rise_kb"] >= cfg.trend_min_growth_kb
+                                    and out["max_fall_kb"] >= cfg.trend_min_growth_kb)
     return out
+
+
+def _movement_text(trend: Dict[str, Any], cfg: MemoryObservationConfig) -> str:
+    rise, fall = float(trend.get("max_rise_kb") or 0), float(trend.get("max_fall_kb") or 0)
+    win = float(trend.get("window_s") or 0.0)
+    if trend.get("rose_and_fell"):
+        return "rose by %.1f MiB and fell back by %.1f MiB within %.2f s" % (rise / 1024.0, fall / 1024.0, win)
+    if fall >= cfg.trend_min_growth_kb:
+        return "fell by %.1f MiB within %.2f s (memory released; the rise before or after it was not observed)" % (
+            fall / 1024.0, win)
+    return "rose by %.1f MiB with drops in between within %.2f s" % (rise / 1024.0, win)
 
 
 # --------------------------------------------------------------------------------------------- census
@@ -754,17 +771,15 @@ def not_judged_explanation(inv: Dict[str, Any], trend: Dict[str, Any],
         head = ("memory growth not judged: fewer than %d heap walks completed, so whether in-use memory grows could "
                 "not be measured" % cfg.min_walks)
     rss = trend.get("rss_kb_series") or []
-    if trend.get("rose_and_fell") and rss:
-        out.update(rose_and_fell=True, rise_kb=trend.get("max_rise_kb"), window_s=trend.get("window_s"))
-        tail = (". The /proc samples rose by %.1f MiB and fell back within %.2f s: one rise and fall cannot tell a "
-                "periodic working set from one with a leak under it, which rises and falls too"
-                % (float(trend.get("max_rise_kb") or 0) / 1024.0, float(trend.get("window_s") or 0.0)))
+    out.update(unsettled=bool(trend.get("unsettled")), rose_and_fell=bool(trend.get("rose_and_fell")),
+               rise_kb=trend.get("max_rise_kb"), fall_kb=trend.get("max_fall_kb"), window_s=trend.get("window_s"))
+    if trend.get("unsettled") and rss:
+        tail = (". The /proc samples %s: one window of memory that rises and falls cannot tell a periodic working "
+                "set from one with a leak under it, which rises and falls too" % _movement_text(trend, cfg))
     elif trend.get("indicates_growth") and rss:
-        out["rose_and_fell"] = False
         tail = (". The /proc samples grew by %+d KB over %.2f s without falling back"
                 % (int(trend.get("rss_growth_kb") or 0), float(trend.get("window_s") or 0.0)))
     else:
-        out["rose_and_fell"] = False
         tail = (". The /proc samples alone cannot answer a leak question: a leak into memory the allocator already "
                 "holds does not move RSS")
     out["text"] = head + tail          # one limitation, no "; " inside: it is quoted as the reason
@@ -845,9 +860,9 @@ def attach_memory_observation(provider: Any, recipe: Any, pid: int, companion_el
         if trend["indicates_growth"]:
             reason = "cheap /proc trend shows growth (RSS %+d KB, anonymous mappings %+d KB over %.2f s)" % (
                 trend.get("rss_growth_kb", 0), trend.get("anon_rw_growth_kb", 0), trend["window_s"])
-        elif trend.get("rose_and_fell"):
-            reason = ("cheap /proc trend rose by %d KB and fell back within %.2f s: a rise and fall cannot tell "
-                      "periodic use from growth under it" % (trend["max_rise_kb"], trend["window_s"]))
+        elif trend.get("unsettled"):
+            reason = ("cheap /proc trend %s: memory that moves without a growth trend cannot be cleared from /proc "
+                      "alone" % _movement_text(trend, cfg))
         else:
             reason = _memory_interest(rid, classification, cfg)
         if reason:
