@@ -41,7 +41,7 @@ bash "$WORK/readme_blocks.sh"
 
 echo "== skipped blocks: narrower checks =="
 dynamic-state connect --help | grep -q -- "--auto-deploy-collector"
-dynamic-state server --help | grep -q -- "--allow-mutation"
+dynamic-state server --help | grep -q -- "--port"
 
 python3 - "$REPO/README.md" <<'PY'
 import json, re, shutil, subprocess, sys
@@ -63,13 +63,13 @@ assert "runtime_diagnose_process" in resp["result"]["instructions"], "instructio
 print("MCP server answers initialize with the skill as instructions")
 PY
 
-python3 -m tests.support.fixture_process -- dynamic-state-workspace --host 127.0.0.1 --port 18765 --corpus "$WORK/corpus" > "$WORK/ws.log" 2>&1 &
+python3 -m tests.support.fixture_process -- dynamic-state server --host 127.0.0.1 --port 18765 --corpus "$WORK/corpus" > "$WORK/ws.log" 2>&1 &
 WS=$!
 for _ in $(seq 1 20); do
     code=$(python3 - <<'PY'
 import urllib.request
 try:
-    print(urllib.request.urlopen("http://127.0.0.1:18765/legacy/workspace", timeout=2).status)
+    print(urllib.request.urlopen("http://127.0.0.1:18765/", timeout=2).status)
 except Exception:
     print(0)
 PY
@@ -78,7 +78,7 @@ PY
     sleep 0.5
 done
 kill "$WS" 2>/dev/null || true
-[ "$code" = "200" ] || { echo "workspace did not serve /legacy/workspace"; cat "$WORK/ws.log"; exit 1; }
-echo "workspace served /legacy/workspace"
+[ "$code" = "200" ] || { echo "the web UI server did not serve /"; cat "$WORK/ws.log"; exit 1; }
+echo "the web UI server served /"
 
 echo "README commands OK"

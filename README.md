@@ -122,18 +122,20 @@ budget, so a large heap over a slow link is reported as not checked rather than 
 - **Read-only and zero-stop by default.** Reads use `process_vm_readv` and `/proc`; the process is never paused or written to.
   `collection_impact.measured_stop_ms` reports the measured stop time.
 - **Needs explicit approval:** any stop-mode capture (`allow_stop`, CONSISTENT/GDB mode) and any state change
-  (checkpoint, restore, transition, explore, replay). The runtime is read-only unless started with `--allow-mutation` (`dynamic-state server`).
-- **Web UI/API:** the REST API requires a per-run session token (injected into the page the server itself serves) and binds to 127.0.0.1 by default.
+  (checkpoint, restore, transition, explore, replay). The runtime is read-only unless constructed with `allow_mutation=True`.
+- **Web UI/API:** read-only towards the target: no route writes memory, stops the process, runs a command or changes
+  state (the route table is `API_ROUTES` in `extractor/web/server.py`). The REST API requires a per-run session token
+  (injected into the page the server itself serves) and binds to 127.0.0.1 by default.
 - Observation budgets (bytes, wall clock, samples) bound every diagnosis.
 
 Web UI (optional):
 
-<!-- check: skip (blocking server; checked by starting it and fetching / and /legacy/workspace) -->
+<!-- check: skip (blocking server; checked by starting it and fetching /) -->
 ```bash
-dynamic-state-workspace --host 127.0.0.1 --port 8765
+dynamic-state server --host 127.0.0.1 --port 8765
 ```
 
-Then open `http://127.0.0.1:8765/` (the same as `python3 -m extractor.web.workspace --host 127.0.0.1 --port 8765`). `/` is the diagnosis page (`extractor/web/ui/`): enter a PID or a process name, optionally a symptom and a debug ELF, press **진단 / Diagnose**; the page fills in as the diagnosis runs and, when it ends, is the report, with a link to the full HTML report (also Markdown and JSON). Korean by default, English with the `KO/EN` button; light/dark follows the OS or the theme button. `/?replay=deadlock` (also `healthy`, `inconclusive`, `degraded`) replays a saved diagnosis without any target, for demos. The previous interfaces remain at `/legacy/` (8-tab explorer) and `/legacy/workspace` (chat workspace); old `/workspace` links redirect there; the "Tools ▾" menu links to them. Behind a reverse proxy under a path prefix (for example `/dynamicstate/`), every URL the pages use is relative, so no server option is needed; if the proxy buffers the event stream the page falls back to polling by itself (the server also sends `X-Accel-Buffering: no` for nginx). The HTTP contract is `docs/ui-redesign/API_CONTRACT.md`.
+Then open `http://127.0.0.1:8765/` (the same as `python3 -m extractor.web --host 127.0.0.1 --port 8765`). `/` is the diagnosis page (`extractor/web/ui/`): enter a PID or a process name, optionally a symptom and a debug ELF, press **진단 / Diagnose**; the page fills in as the diagnosis runs and, when it ends, is the report, with a link to the full HTML report (also Markdown and JSON). Korean by default, English with the `KO/EN` button; light/dark follows the OS or the theme button. `/?replay=deadlock` (also `healthy`, `inconclusive`, `degraded`) replays a saved diagnosis without any target, for demos. The previous interfaces (the 8-tab explorer at `/legacy/` and the chat workspace at `/legacy/workspace`) were removed; their old URLs redirect to `/`. Behind a reverse proxy under a path prefix (for example `/dynamicstate/`), every URL the pages use is relative, so no server option is needed; if the proxy buffers the event stream the page falls back to polling by itself (the server also sends `X-Accel-Buffering: no` for nginx). The HTTP contract is `docs/ui-redesign/API_CONTRACT.md`.
 
 ## Supported targets and known limits
 

@@ -1,5 +1,9 @@
 # dynamicState — Real-World Web UI Human Validation Report
 
+> **Historical record.** The 8-tab web UI and the REST routes validated here (`/api/runtime`, `/api/states`,
+> `/api/mutation`, `/api/checkpoint`, `/api/restore`, `/api/state-graph`, ...) were removed on 2026-11-13; the web server is
+> now read-only (see `docs/ui-redesign/API_CONTRACT.md` section 8). The runtime functions behind them remain.
+
 **Document Status**: COMPLETE & VERIFIED  
 **Assessment Verdict**: `PHASE_6_READY`  
 **Execution Target**: Production-like C++ Workload ([`examples/sample_prod.cpp`](file:///home/ubuntu/workspace/ut/examples/sample_prod.cpp) + [`examples/libhelper.c`](file:///home/ubuntu/workspace/ut/examples/libhelper.c))  
