@@ -326,6 +326,143 @@ T: Dict[str, Tuple[str, str]] = {
     "d_hdr": ("thread --waits--> lock --held by--> thread", "스레드 --기다림--> 락 --잡고 있는 쪽--> 스레드"),
     "d_waits": ("--waits-->", "--기다림-->"),
     "d_held": ("--held by-->", "--잡고 있는 쪽-->"),
+    # ------------------------------------------------------------------------------------------ common outline
+    # Every report (summary, incident Markdown, incident HTML; every verdict) has these sections in this order; a
+    # section with nothing to say is left out and the rest are numbered consecutively (see ``compose``).
+    "s_conclusion": ("Conclusion", "결론"),
+    "s_findings": ("What was found", "발견한 문제"),
+    "s_hypothesis": ("The hypothesis you asked to check", "요청한 가설 검증"),
+    "s_next": ("What to do next", "다음에 할 일"),
+    "s_scope": ("What was checked", "검사 범위"),
+    "s_method": ("How the diagnosis was done and what it cost the target", "진단 방법과 대상에 준 영향"),
+    "s_repro": ("Reproducibility", "재현 정보"),
+    "s_reference": ("Reference", "참고 자료"),
+    # conclusion: the verdict in words, then what it means
+    "v_line": ("**Verdict: {word}** ({code}). {meaning}", "**판정: {word}** ({code}). {meaning}"),
+    "v_CONFIRMED_FAULT": ("confirmed fault", "확인된 결함"),
+    "v_PROBABLE_FAULT": ("probable fault", "결함 추정"),
+    "v_FAULT": ("probable fault", "결함 추정"),
+    "v_DEGRADED": ("degraded, not a fault", "성능 저하 (결함 아님)"),
+    "v_HEALTHY": ("healthy within the checked scope", "점검한 범위 안에서 정상"),
+    "v_INCONCLUSIVE": ("could not decide", "판단 불가"),
+    "v_ABORTED": ("aborted", "중단됨"),
+    "vm_CONFIRMED_FAULT": ("The evidence collected establishes the problem.", "확보한 증거가 문제를 입증합니다."),
+    "vm_PROBABLE_FAULT": ("The evidence points to a problem but does not fully prove it.",
+                          "증거가 문제를 가리키지만 완전히 입증하지는 못합니다."),
+    "vm_FAULT": ("The evidence points to a problem but does not fully prove it.",
+                 "증거가 문제를 가리키지만 완전히 입증하지는 못합니다."),
+    "vm_DEGRADED": ("Something slows the process down, but nothing is broken.",
+                    "프로세스를 느리게 하는 것이 있지만 고장 난 것은 없습니다."),
+    "vm_HEALTHY": ("Nothing is claimed outside the checked scope.", "점검한 범위 밖에 대해서는 판단하지 않습니다."),
+    "vm_INCONCLUSIVE": ("The checks gave no answer; this does not mean the process is fine.",
+                        "검사가 답을 내지 못했습니다. 문제가 없다는 뜻이 아닙니다."),
+    "vm_ABORTED": ("The diagnosis stopped before it could answer; this does not mean the process is fine.",
+                   "진단이 답을 내기 전에 멈췄습니다. 문제가 없다는 뜻이 아닙니다."),
+    "c_more2": (" {n} more finding(s) are described under '{sec}'.", " 그 밖의 발견 {n}건은 '{sec}'에 있습니다."),
+    "c_healthy_short": ("{who} is healthy within the checked scope: all {n} baseline checks ran to completion and "
+                        "found nothing. Not checked: {nc}.",
+                        "{who}은(는) 점검한 범위 안에서 정상입니다. 기본 검사 {n}개가 모두 끝까지 실행되었고 아무것도 "
+                        "발견하지 못했습니다. 점검하지 못한 것: {nc}."),
+    "nc_short_long_wait": ("whether the long wait of {n} thread(s) is expected", "스레드 {n}개의 긴 대기가 정상인지"),
+    "nc_short_symptom": ("{n} symptom-specific check(s) that reached no result", "결론을 내지 못한 증상별 추가 검사 {n}개"),
+    "nc_short_outside": ("data races, program-logic errors and other defects no baseline check looks for",
+                         "데이터 레이스, 프로그램 논리 오류처럼 기본 검사가 찾지 않는 결함"),
+    "c_healthy_noscope2": ("The checks that ran found no problem in {who}; this does not prove the process is fine "
+                           "(see '{sec}' for what was not examined).",
+                           "{who}에서 실행된 검사로는 문제가 발견되지 않았습니다. 다만 이것이 문제가 없다는 증명은 "
+                           "아니며, 확인하지 못한 항목은 '{sec}'에 있습니다."),
+    # findings
+    "f_head": ("Finding {i}: {label}", "발견 {i}: {label}"),
+    "f_certainty": ("**Certainty**: {status}; severity: {sev}.", "**확실성**: {status}, 심각도 {sev}."),
+    "f_found_by": ("**Found by**: {checks}.", "**찾은 검사**: {checks}."),
+    "f_related": ("**Related checks**: {checks}.", "**관련 검사**: {checks}."),
+    "f_records": (" Evidence records: {n}.", " 근거 기록 {n}건."),
+    "f_why": ("**Why this conclusion**", "**판단 근거**"),
+    "sev_CRITICAL": ("critical", "치명적"), "sev_HIGH": ("high", "높음"), "sev_MEDIUM": ("medium", "중간"),
+    "sev_WARNING": ("warning", "경고"), "sev_LOW": ("low", "낮음"), "sev_INFO": ("informational", "참고"),
+    # next steps
+    "n_asan": ("To catch the faulty access at the moment it happens, rebuild with AddressSanitizer "
+               "(`-fsanitize=address -g`) and reproduce the problem in a test environment.",
+               "잘못된 접근이 일어나는 순간을 잡으려면 AddressSanitizer(`-fsanitize=address -g`)로 다시 빌드해 시험 "
+               "환경에서 문제를 재현해 보세요."),
+    "n_healthy2": ("Nothing needs fixing based on these checks. If a symptom persists, describe it more specifically "
+                   "and run again, and keep in mind what '{sec}' lists as not examined.",
+                   "이 검사 결과로는 고칠 것이 없습니다. 증상이 계속되면 더 구체적으로 알려 다시 실행하고, '{sec}'에 "
+                   "확인하지 못한 것으로 적힌 항목도 함께 고려하세요."),
+    "n_incon_nc2": ("Several items under '{sec}' were not examined; resolving those is the shortest way to a "
+                    "conclusion.",
+                    "'{sec}'에 확인하지 못한 항목이 있습니다. 그것들을 해결하는 것이 결론에 이르는 가장 빠른 "
+                    "길입니다."),
+    # scope (the one definition of "checks": run = found + clean + could not judge; not run is separate)
+    "s_counts": ("{run} checks ran: {found} found a problem, {clean} came back clean and {undecided} could not judge.",
+                 "검사 {run}개를 실행했습니다. 이상 발견 {found}개, 이상 없음 {clean}개, 판단하지 못함 {undecided}개입니다."),
+    "s_counts_none": ("No check ran.", "실행된 검사가 없습니다."),
+    "s_notrun": (" {n} more check(s) were not run.", " 실행하지 않은 검사가 {n}개 더 있습니다."),
+    "s_caveat": ("A check that could not judge, or was not run, is not evidence that the process is fine.",
+                 "판단하지 못했거나 실행하지 않은 검사는 문제가 없다는 근거가 아닙니다."),
+    "s_healthy": ("What the healthy verdict covers: the {n} baseline checks ran to completion and found nothing. "
+                  "What is listed below as could not judge, not run or not examined is outside the verdict.",
+                  "정상 판정이 다루는 범위: 기본 검사 {n}개가 끝까지 실행되어 아무것도 발견하지 못했다는 것입니다. "
+                  "아래에서 판단하지 못함, 실행하지 않음, 확인하지 못한 것으로 적힌 항목은 이 판정에 포함되지 않습니다."),
+    "g_FAIL": ("Found a problem", "이상 발견"),
+    "g_INCONCLUSIVE": ("Could not judge", "판단하지 못함"),
+    "g_PASS": ("Clean", "이상 없음"),
+    "g_SKIPPED": ("Not run", "실행하지 않음"),
+    "g_other": ("Also not examined", "그 밖에 확인하지 못한 것"),
+    "g_fail_row": ("{name}: looks for {what}; it is the basis of finding {fi}.",
+                   "{name}: 이 검사가 찾는 것은 '{what}'이며, 발견 {fi}의 근거입니다."),
+    "g_fail_row_nf": ("{name}: looks for {what}.", "{name}: 이 검사가 찾는 것은 '{what}'입니다."),
+    "g_baseline": ("Baseline checks ({n})", "기본 검사 ({n}개)"),
+    "g_extra": ("Other checks ({n})", "그 밖의 검사 ({n}개)"),
+    "g_why_cap": ("needs a capability that is not available here ({cap})", "여기서 쓸 수 없는 기능({cap})이 필요함"),
+    "g_why_none": ("the check recorded no reason", "검사가 이유를 기록하지 않음"),
+    "g_why_status": ("ended as {st}", "결과가 {st}임"),
+    "g_not_planned": ("not selected for this symptom", "이번 증상에 선택되지 않음"),
+    "g_not_executed": ("planned but not executed before the investigation ended", "계획했지만 조사가 끝날 때까지 실행되지 않음"),
+    "st_NOT_APPLICABLE": ("not applicable", "해당 없음"), "st_ERROR": ("error", "오류"),
+    "st_UNSUPPORTED": ("unsupported", "지원 안 됨"), "st_TIMEOUT": ("timed out", "시간 초과"),
+    "st_INCONCLUSIVE": ("inconclusive", "판단 불가"),
+    # method and cost
+    "m_target": ("Target: {who}{abi}, debug image {img}.", "대상: {who}{abi}, 디버그 이미지 {img}."),
+    "m_target_noimg": ("Target: {who}{abi}, no debug image was used.", "대상: {who}{abi}, 디버그 이미지 없음."),
+    "m_build": (" Build ID {b}.", " 빌드 ID {b}."),
+    "m_zero": ("The process was read while it kept running and was never paused (measured stop time {ms}; capture "
+               "mode {mode}).",
+               "프로세스가 실행되는 동안 읽었고 한 번도 멈추지 않았습니다 (측정된 정지 시간 {ms}, 수집 방식 {mode})."),
+    "m_stop": ("The process was paused for {ms} in total (measured; capture mode {mode}).",
+               "프로세스가 모두 {ms} 동안 일시 정지되었습니다 (측정값, 수집 방식 {mode})."),
+    "m_time": ("The observation took {obs} and collected {s} samples.", "관측에 {obs}가 걸렸고 샘플 {s}회를 모았습니다."),
+    "m_total": (" The whole diagnosis took {tot}.", " 진단 전체에는 {tot}가 걸렸습니다."),
+    "m_bytes": ("Data read from the target: {b}.", "대상에서 읽은 데이터: {b}."),
+    "m_cpu": ("CPU used by the diagnosis: {ms} (the whole diagnosing process including analysis, so an upper bound of "
+              "what reading cost).",
+              "진단이 쓴 CPU: {ms} (분석까지 포함한 진단 프로세스 전체이므로 읽기 비용의 상한입니다)."),
+    "m_cpu_other": ("CPU used by the diagnosis: {ms} (basis {basis}).", "진단이 쓴 CPU: {ms} (산정 기준 {basis})."),
+    "m_target_cpu": ("In the same window the target itself used {ms} of CPU and the machine was {pct}% busy; that is "
+                     "the target's own activity, not caused by the diagnosis.",
+                     "같은 구간에 대상 자신은 CPU를 {ms} 썼고 시스템 전체 CPU 사용률은 {pct}%였습니다. 이것은 대상 "
+                     "자체의 활동이며 진단이 일으킨 것이 아닙니다."),
+    "m_collector": ("Collector process on the target: CPU {cpu}, peak memory {rss}.",
+                    "대상 쪽 수집 프로세스: CPU {cpu}, 최대 메모리 {rss}."),
+    "m_budget": ("The observation budget ran out, so the result is partial ({why}).",
+                 "관측 예산이 소진되어 결과가 부분적입니다 ({why})."),
+    "m_ids": ("Investigation id {inv}.", "조사 ID {inv}."),
+    "m_report": (" Full report: {p}.", " 전체 보고서: {p}."),
+    "m_generated": ("Report generated {ts}.", "보고서 생성 시각: {ts}."),
+    "m_none": ("Nothing was collected from the target, so there is no measurement.",
+               "대상에서 수집된 것이 없어 측정값이 없습니다."),
+    # reference
+    "r_where": ("Where the detail is", "상세 기록의 위치"),
+    "r_where_intro": ("The detailed records (in English) are attached to each part of the HTML report and are in "
+                      "the JSON result:",
+                      "상세 기록(영문)은 HTML 보고서의 각 부분에 붙어 있고 JSON 결과에도 있습니다:"),
+    "p_verdict": ("How the verdict was derived", "판정 근거"),
+    "p_finding": ("Finding {i}", "발견 {i}"),
+    "p_checks": ("Each check's result", "검사별 결과"),
+    "p_scope": ("Check totals and limitations", "검사 집계와 제한 사항"),
+    "p_method": ("Target, collection and plan", "대상, 수집, 계획"),
+    "p_line": ("{what}: HTML {anchor}; JSON {keys}.", "{what}: HTML {anchor}, JSON {keys}."),
+    "seconds": ("{x} s", "{x}초"),
 }
 
 VERDICT_WORD = {
@@ -371,18 +508,18 @@ GLOSSARY: Dict[str, Tuple[str, str, str, str]] = {
                  "무중단(zero-stop)", "프로세스가 계속 실행되는 상태에서 읽었고, 한 번도 멈추지 않았다는 뜻."),
     "debug": ("debug image", "the build of the program that still carries variable and line information (DWARF).",
               "디버그 이미지", "변수와 줄 정보(DWARF)가 남아 있는 프로그램 빌드."),
-    "verdict": ("confirmed / probable / could not decide", "confirmed = proven by evidence, probable = likely but "
-                "not proven, could not decide = the checks gave no answer (this is not 'healthy').",
-                "확정 / 추정 / 판단 불가", "확정 = 증거로 입증됨, 추정 = 가능성 높으나 미입증, 판단 불가 = 검사가 답을 "
-                "주지 못함(건강하다는 뜻이 아님)."),
+    "verdict": ("confirmed / probable / could not decide", "confirmed = proven by the evidence, probable = likely but "
+                "not fully proven, could not decide = the checks gave no answer (this does not mean the process is fine).",
+                "확정 / 추정 / 판단 불가", "확정(확인된 결함, 확정된 근본 원인) = 증거로 입증됨, 추정(결함 추정, 추정 원인) "
+                "= 가능성이 높으나 완전히 입증되지 않음, 판단 불가 = 검사가 답을 내지 못함(문제가 없다는 뜻이 아님)."),
     # the same line for a HEALTHY result (the healthy term is only defined where the verdict is HEALTHY)
-    "verdict_healthy": ("confirmed / probable / healthy / could not decide", "confirmed = proven by evidence, "
-                        "probable = likely but not proven, healthy = every baseline check ran to completion and found "
-                        "nothing (only within the checked scope; what was not checked is listed), could not decide = "
-                        "the checks gave no answer.",
-                        "확정 / 추정 / 정상 / 판단 불가", "확정 = 증거로 입증됨, 추정 = 가능성 높으나 미입증, 정상 = 모든 "
-                        "기본 검사가 끝까지 실행되어 아무것도 발견하지 못함(점검한 범위 안에서만이며, 점검하지 못한 "
-                        "것은 따로 적음), 판단 불가 = 검사가 답을 주지 못함."),
+    "verdict_healthy": ("confirmed / probable / healthy / could not decide", "confirmed = proven by the evidence, "
+                        "probable = likely but not fully proven, healthy = every baseline check ran to completion and "
+                        "found nothing (only within the checked scope; what was not checked is listed), could not "
+                        "decide = the checks gave no answer.",
+                        "확정 / 추정 / 정상 / 판단 불가", "확정 = 증거로 입증됨, 추정 = 가능성이 높으나 완전히 입증되지 "
+                        "않음, 정상 = 모든 기본 검사가 끝까지 실행되어 아무것도 발견하지 못함(점검한 범위 안에서만이며, "
+                        "점검하지 못한 것은 따로 적음), 판단 불가 = 검사가 답을 내지 못함."),
 }
 
 _STATUS_WORD = {"inconclusive": ("inconclusive", "판단 불가"), "error": ("error", "오류"),
@@ -661,14 +798,21 @@ def _render_thread(ctx: _Ctx, f: Dict[str, Any], report: Optional[Dict[str, Any]
     return {"lines": lines, "spins": spins, "rows": rows, "kinds": kinds}
 
 
-def _cat_label(ctx: _Ctx, cat: str) -> str:
+def _cat_word(ctx: _Ctx, cat: str) -> Optional[str]:
+    """The plain name of a finding category in the report language, or None when it has none."""
     from .report_registry import category_label
     reg = category_label(cat)
     if reg:
-        return reg[ctx.i] + f" [{cat}]"
+        return reg[ctx.i]
     if cat in CATEGORY_LABEL:
-        return CATEGORY_LABEL[cat][ctx.i] + f" [{cat}]"
-    return _c(cat)
+        return CATEGORY_LABEL[cat][ctx.i]
+    return None
+
+
+def _cat_label(ctx: _Ctx, cat: str) -> str:
+    """The category name in words with its identifier in code font after it (the identifier alone when unnamed)."""
+    word = _cat_word(ctx, cat)
+    return f"{word} ({_c(cat)})" if word else _c(cat)
 
 
 def _status_word(ctx: _Ctx, st: str, severity: Any = None) -> str:
@@ -798,15 +942,25 @@ def _baseline_open_reason(ctx: _Ctx, res: Dict[str, Any]) -> str:
 
 
 def _healthy_sentence(ctx: _Ctx, who: str, res: Dict[str, Any]) -> str:
+    """The HEALTHY conclusion: the claim, its scope, and (in the same sentence) what was not checked, named briefly.
+    The full wording of every not-checked item is in the scope section."""
     scope = res.get("healthy_scope") if isinstance(res.get("healthy_scope"), dict) else {}
     if not scope.get("healthy"):
-        return ctx.t("c_healthy_noscope", who=who)
+        return ctx.t("c_healthy_noscope2", who=who, sec=ctx.t("s_scope"))
     from .healthy_verdict import display_label
-    labels = [display_label(x, bool(ctx.i)) for x in scope.get("not_checked") or []]
-    shown = "; ".join(labels[:3]) or "-"
-    if len(labels) > 3:
-        shown += ctx.t("c_healthy_more", n=len(labels) - 3)
-    return ctx.t("c_healthy", who=who, n=len(scope.get("checked") or []), nc=shown)
+    shown: List[str] = []
+    for x in scope.get("not_checked") or []:
+        kind = x.get("kind")
+        items = [s for s in str(x.get("item") or "").split(",") if s]
+        if kind == "long_wait_not_judged":
+            shown.append(ctx.t("nc_short_long_wait", n=len(items) or 1))
+        elif kind == "symptom_checks_without_result":
+            shown.append(ctx.t("nc_short_symptom", n=len(items) or 1))
+        elif kind == "outside_baseline":
+            shown.append(ctx.t("nc_short_outside"))
+        else:
+            shown.append(display_label(x, bool(ctx.i)))
+    return ctx.t("c_healthy_short", who=who, n=len(scope.get("checked") or []), nc="; ".join(shown) or "-")
 
 
 def _conclusion(ctx: _Ctx, res: Dict[str, Any], renders: List[Dict[str, Any]]) -> str:
@@ -827,8 +981,14 @@ def _conclusion(ctx: _Ctx, res: Dict[str, Any], renders: List[Dict[str, Any]]) -
     key = {"CONFIRMED_FAULT": "c_fault_conf", "DEGRADED": "c_degraded"}.get(v, "c_fault_prob")
     s = ctx.t(key, who=who, what=what)
     if len(findings) > 1:
-        s += ctx.t("c_more", n=len(findings) - 1)
+        s += ctx.t("c_more2", n=len(findings) - 1, sec=ctx.t("s_findings"))
     return s
+
+
+def _verdict_line(ctx: _Ctx, v: str) -> str:
+    """The verdict in words, its identifier, and one sentence on what it means."""
+    v = v if f"v_{v}" in T else "INCONCLUSIVE"
+    return ctx.t("v_line", word=ctx.t(f"v_{v}"), code=_c(v), meaning=ctx.t(f"vm_{v}"))
 
 
 def _one_line(ctx: _Ctx, f: Dict[str, Any], r: Dict[str, Any]) -> str:
@@ -866,7 +1026,7 @@ def _one_line(ctx: _Ctx, f: Dict[str, Any], r: Dict[str, Any]) -> str:
                     else f"스레드 {_c(s.get('name'))}이(가) " + (f"{_c(loc)}의 " if loc else "") + f"{_c(fn)}에서 공회전 중")
     kinds = _by_kind(f)
     names = [_c(n) for k in ("variable", "function", "thread_name", "lock") for n in kinds.get(k, [])][:4]
-    lab = _cat_label(ctx, str(cat))
+    lab = _cat_word(ctx, str(cat)) or _c(cat)
     if names:
         return f"{lab} ({_join(names)})"
     return lab + (" (no names attached)" if en else " (이름이 붙지 않음)")
@@ -876,57 +1036,148 @@ def _thread_rows_from(r: Dict[str, Any]) -> Dict[int, Dict[str, Any]]:
     return r.get("rows") or {}
 
 
-def _section2(ctx: _Ctx, res: Dict[str, Any], renders: List[Dict[str, Any]]) -> List[str]:
-    findings = res.get("findings") or []
-    out: List[str] = []
-    if not findings:
-        out.append(ctx.t("w_none"))
-        return out
-    for i, (f, r) in enumerate(zip(findings, renders), 1):
-        out.append("**" + ctx.t("w_finding", i=i, cat=_cat_label(ctx, str(f.get("category"))),
-                                status=_status_word(ctx, str(f.get("status")), f.get("severity")), sev=f.get("severity")) + "**")
+# ------------------------------------------------------------------------------------------ check table
+# One definition of "checks" for every view (summary, Markdown, HTML hero, HTML check list): a row per recipe the
+# diagnosis considered.  ``group`` is FAIL (found a problem), PASS (clean), INCONCLUSIVE (ran but could not judge:
+# inconclusive, error, not applicable, unsupported, ...) or SKIPPED (not run).  run = FAIL + PASS + INCONCLUSIVE.
+CHECK_GROUPS = ("FAIL", "INCONCLUSIVE", "PASS", "SKIPPED")
+_NOT_RUN = ("", "SKIPPED", "NOT_EXECUTED", "NOT_RUN", "NOT_PLANNED")
+
+
+def check_group(status: Any) -> str:
+    s = str(status or "").upper()
+    if s in ("PASS", "FAIL"):
+        return s
+    return "SKIPPED" if s in _NOT_RUN else "INCONCLUSIVE"
+
+
+def check_rows(res: Dict[str, Any], report: Optional[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Every check the diagnosis considered, one row per recipe id, in the order of the detailed report."""
+    rows: List[Dict[str, Any]] = []
+    seen = set()
+    run = [c for c in (res.get("checks_run") or []) if isinstance(c, dict)]
+    # the result's own check statuses are what the verdict was computed from; the report adds the detail
+    run_status = {str(c.get("recipe_id")): c.get("status") for c in run if c.get("recipe_id")}
+    detailed = _checks(report)
+    have = {str(c.get("recipe_id")) for c in detailed}
+    for c in detailed + [c for c in run if str(c.get("recipe_id")) not in have]:
+        rid = str(c.get("recipe_id") or c.get("check_id") or "")
+        if not rid or rid in seen:
+            continue
+        seen.add(rid)
+        obs = c.get("actual_observations") if isinstance(c.get("actual_observations"), dict) else {}
+        raw = str(run_status.get(rid, c.get("status")) or "").upper()
+        rows.append({"rid": rid, "status": check_group(raw), "raw_status": raw, "name": c.get("name"),
+                     "domain": c.get("technical_rationale"), "interp": c.get("technical_interpretation"),
+                     "limits": [str(x) for x in (c.get("limitations") or [])] + [str(x) for x in (c.get("missing_evidence") or [])],
+                     "dur": c.get("duration_seconds", c.get("duration_s")), "check_id": c.get("check_id"),
+                     "required": c.get("is_required"), "n_ev": len(c.get("supporting_evidence_ids") or []),
+                     "cap": obs.get("missing_capability"), "err": c.get("error_details"), "planned": True})
+    for n in res.get("not_covered") or []:
+        if isinstance(n, dict) and n.get("kind") == "recipes_not_planned":
+            for rid in str(n.get("item") or "").split(","):
+                rid = rid.strip()
+                if rid and rid not in seen:
+                    seen.add(rid)
+                    rows.append({"rid": rid, "status": "SKIPPED", "raw_status": "NOT_PLANNED", "planned": False,
+                                 "limits": []})
+    return rows
+
+
+def check_counts(rows: List[Dict[str, Any]]) -> Dict[str, int]:
+    """run / found / clean / undecided / not_run: the counts every view shows."""
+    n = {g: sum(1 for r in rows if r["status"] == g) for g in CHECK_GROUPS}
+    return {"run": n["FAIL"] + n["PASS"] + n["INCONCLUSIVE"], "found": n["FAIL"], "clean": n["PASS"],
+            "undecided": n["INCONCLUSIVE"], "not_run": n["SKIPPED"]}
+
+
+def recipe_meta(rid: str) -> Optional[Tuple[str, str, str, str, str]]:
+    """(domain, name en, name ko, looks-for en, looks-for ko) of a check, from its registration or the built-in table."""
+    from .report_visuals import _recipe_meta
+    return _recipe_meta(rid)
+
+
+def check_name(rid: str, i: int, fallback: Any = None) -> str:
+    meta = recipe_meta(rid)
+    if meta:
+        return meta[1 + i]
+    return str(fallback or rid)
+
+
+def check_label(rid: str, i: int, fallback: Any = None) -> str:
+    """A check named in words with its id in code font after it: ``힙 메타데이터 무결성 (`RECIPE_...`)``."""
+    name = check_name(rid, i, None)
+    return f"{name} ({_c(rid)})" if name != str(rid) else _c(rid)
+
+
+def _undecided_reason(ctx: _Ctx, r: Dict[str, Any], reasons: Dict[str, List[str]]) -> str:
+    if not r.get("planned", True):
+        return ctx.t("g_not_planned")
+    if r["status"] == "SKIPPED":
+        interp = str(r.get("interp") or "")
+        if interp and interp != "Check executed":
+            return ko_text(interp, ctx.i).rstrip(".")
+        return ctx.t("g_not_executed")
+    if r.get("cap"):
+        return ctx.t("g_why_cap", cap=_c(r["cap"]))
+    texts = [ko_text(x, ctx.i) for x in reasons.get(r["rid"], []) + r.get("limits", [])]
+    if r.get("err"):
+        texts.append(ko_text(str(r["err"]), ctx.i))
+    if texts:
+        return "; ".join(dict.fromkeys(texts))
+    raw = r.get("raw_status") or ""
+    if raw and raw != "INCONCLUSIVE" and f"st_{raw}" in T:
+        return ctx.t("g_why_status", st=ctx.t(f"st_{raw}"))
+    return ctx.t("g_why_none")
+
+
+def _by_domain(ctx: _Ctx, rows: List[Dict[str, Any]]) -> List[str]:
+    """Compact grouped list: one line per domain, checks named in words with the id after each."""
+    from .report_visuals import _DOMAIN_ORDER, _L
+    groups: Dict[str, List[str]] = {}
+    for r in rows:
+        dom = (recipe_meta(r["rid"]) or ("OTHER",))[0]
+        groups.setdefault(dom if dom in _DOMAIN_ORDER else "OTHER", []).append(check_label(r["rid"], ctx.i, r.get("name")))
+    return [f"- {_L['dom_' + d][ctx.i]}: {_join(groups[d])}" for d in _DOMAIN_ORDER if d in groups]
+
+
+# ------------------------------------------------------------------------------------------ sections
+def _finding_blocks(ctx: _Ctx, res: Dict[str, Any], renders: List[Dict[str, Any]], report: Optional[Dict[str, Any]],
+                    rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Per finding: heading, the facts line (certainty, severity, which check found it), the registered or generic
+    text (unchanged), the wait-for diagram, and the category-specific observation and inference lines."""
+    status_of = {r["rid"]: r["status"] for r in rows}
+    out = []
+    for i, (f, r) in enumerate(zip(res.get("findings") or [], renders), 1):
+        sev = str(f.get("severity") or "").upper()
+        sev_w = ctx.t(f"sev_{sev}") if f"sev_{sev}" in T else (_c(sev) if sev else "-")
+        facts = [ctx.t("f_certainty", status=_status_word(ctx, str(f.get("status")), f.get("severity")), sev=sev_w)]
+        rids = [str(x) for x in (f.get("recipe_ids") or [])]
+        found = [x for x in rids if status_of.get(x) == "FAIL"]
+        ev = len(f.get("evidence_ids") or [])
+        if found or rids:
+            line = ctx.t("f_found_by" if found else "f_related",
+                         checks=_join([check_label(x, ctx.i) for x in (found or rids)]))
+            facts.append(line + (ctx.t("f_records", n=ev) if ev else ""))
+        body: List[str] = []
         if not (f.get("subjects") or f.get("subject_details")):
-            out.append(ctx.t("w_noname"))
-            if not r.get("registered"):     # a registered text (report_registry) states what was observed
-                continue
-        out.extend(r["lines"])
+            body.append(ctx.t("w_noname"))
+        if (f.get("subjects") or f.get("subject_details")) or r.get("registered"):
+            body.extend(r["lines"])
+        diagram = []
         if r.get("diagram"):
-            out.append("")
-            out.append(f"**{ctx.t('h2_wait')}**")
-            out.append("```")
-            out.append(ctx.t("d_hdr"))
-            out.extend(r["diagram"])
-            out.append("```")
-        out.append("")
-    while out and out[-1] == "":
-        out.pop()
+            diagram = [f"**{ctx.t('h2_wait')}**", "```", ctx.t("d_hdr")] + list(r["diagram"]) + ["```"]
+        out.append({"i": i, "heading": ctx.t("f_head", i=i, label=_cat_label(ctx, str(f.get("category")))),
+                    "facts": facts, "body": body, "diagram": diagram, "why": _finding_why(ctx, f, r)})
     return out
 
 
-def _check_counts(res: Dict[str, Any]) -> Tuple[int, int, int, int]:
-    ch = res.get("checks_run") or []
-    p = sum(1 for c in ch if c.get("status") == "PASS")
-    fl = sum(1 for c in ch if c.get("status") == "FAIL")
-    return len(ch), p, fl, len(ch) - p - fl
-
-
-def _section3(ctx: _Ctx, res: Dict[str, Any], renders: List[Dict[str, Any]], report: Optional[Dict[str, Any]]) -> List[str]:
-    ran, p, fl, inc = _check_counts(res)
-    findings = res.get("findings") or []
-    out: List[str] = []
-    if ran == 0:
-        out.append(ctx.t("y_noruns"))
-        return [f"1. {x}" for x in out]
-    if not findings:
-        out.append(ctx.t("y_checks_none", ran=ran, pass_=p, fail=fl, inc=inc))
-        if res.get("verdict") in ("INCONCLUSIVE", "ABORTED"):
-            out.append(ctx.t("y_incon"))
-        return [f"{i}. {x}" for i, x in enumerate(out, 1)]
-    f, r = findings[0], renders[0]
-    ids = _join([_c(x) for x in (f.get("recipe_ids") or [])]) or "-"
-    out.append(ctx.t("y_checks", ran=ran, pass_=p, fail=fl, inc=inc, ids=ids))
+def _finding_why(ctx: _Ctx, f: Dict[str, Any], r: Dict[str, Any]) -> List[str]:
+    """What was observed and what was inferred from it, for the categories the frame knows (else nothing: a
+    registered text already says it)."""
     cat = f.get("category")
-    if cat == "DEADLOCK_INDICATORS":
+    out: List[str] = []
+    if cat == "DEADLOCK_INDICATORS" and r.get("info"):
         info = r["info"]
         if info.get("samples") and info.get("window"):
             out.append(ctx.t("y_dl_obs", n=info["samples"], win=info["window"]))
@@ -944,38 +1195,51 @@ def _section3(ctx: _Ctx, res: Dict[str, Any], renders: List[Dict[str, Any]], rep
         out.append(ctx.t("y_leak_infer", path=_c(g["path"])))
     elif cat == "PROCESS_INSTABILITY" and r.get("spins"):
         out.append(ctx.t("y_spin_infer"))
-    else:
-        out.append(ctx.t("y_generic", n=len(f.get("evidence_ids") or [])))
-    if f.get("evidence_ids"):
-        out.append(ctx.t("y_evidence", n=len(f["evidence_ids"]), conf=round(float(res.get("confidence") or 0) * 100)))
-    return [f"{i}. {x}" for i, x in enumerate(out[:5], 1)]
+    return out
 
 
-def _abi_text(res: Dict[str, Any]) -> str:
-    abi = (res.get("target") or {}).get("abi")
-    if isinstance(abi, dict) and abi.get("architecture"):
-        return f" ({abi['architecture']}/{abi.get('libc') or '?'})"
-    return ""
+def _section2(ctx: _Ctx, blocks: List[Dict[str, Any]]) -> List[str]:
+    out: List[str] = []
+    for b in blocks:
+        out += [f"### {b['heading']}", ""] + [f"- {x}" for x in b["facts"]] + [""]
+        if b["body"]:
+            out += b["body"] + [""]
+        if b["diagram"]:
+            out += b["diagram"] + [""]
+        if b["why"]:
+            out += [ctx.t("f_why"), ""] + [f"{n}. {x}" for n, x in enumerate(b["why"], 1)] + [""]
+    while out and out[-1] == "":
+        out.pop()
+    return out
 
 
-def _section4(ctx: _Ctx, res: Dict[str, Any]) -> List[str]:
-    v = str(res.get("verdict"))
-    conf = round(float(res.get("confidence") or 0) * 100)
-    out = [ctx.t("k_verdict", v=f"{v} - {ctx.t(VERDICT_WORD.get(v, 'k_incon'))}", conf=conf)]
-    ctx.term("verdict_healthy" if v == "HEALTHY" else "verdict")
-    for f in res.get("findings") or []:
-        out.append(f"- {_cat_label(ctx, str(f.get('category')))}: {_status_word(ctx, str(f.get('status')), f.get('severity'))}")
-    scope = res.get("healthy_scope") if isinstance(res.get("healthy_scope"), dict) else {}
-    if v == "HEALTHY" and scope.get("healthy") and scope.get("checked"):
-        out += ["", ctx.t("k_checked")]
-        from .healthy_verdict import display_what
-        out += [f"- {display_what(x, bool(ctx.i))} ({_c(x.get('recipe_id'))})" for x in scope["checked"]]
-    nc = res.get("not_covered") or []
-    if not nc:
-        out.append(ctx.t("k_none"))
-        return out
-    out.append("")
-    out.append(ctx.t("k_notexam"))
+def _pointer(ctx: _Ctx, what: str, anchor: str, keys: List[str]) -> str:
+    return "- " + ctx.t("p_line", what=what, anchor=_c(anchor), keys=", ".join(_c(k) for k in keys))
+
+
+def _where_lines(ctx: _Ctx, blocks: List[Dict[str, Any]]) -> List[str]:
+    """Per part of the report, where its detailed records are: the anchor of the collapsed block in the HTML report
+    and the keys of the JSON result (the Markdown report carries no detail by default)."""
+    out = [ctx.t("r_where_intro"), "",
+           _pointer(ctx, ctx.t("p_verdict"), "#verdict-detail",
+                    ["verdict", "healthy_scope", "report.section_a_executive_summary", "report.section_i_final_conclusions"])]
+    for b in blocks:
+        out.append(_pointer(ctx, ctx.t("p_finding", i=b["i"]), f"#finding-{b['i']}-detail",
+                            [f"findings[{b['i'] - 1}]", "report.section_e_findings_and_root_cause"]))
+    out += [_pointer(ctx, ctx.t("p_checks"), "#check-<RECIPE_ID>-detail",
+                     ["checks_run", "report.section_d_detailed_inspection_results.checks[]"]),
+            _pointer(ctx, ctx.t("p_scope"), "#scope-detail", ["not_covered", "report.section_h_limitations_and_unverified"]),
+            _pointer(ctx, ctx.t("p_method"), "#method-detail",
+                     ["target", "collection_impact", "report.section_b_target_context",
+                      "report.section_c_diagnostic_strategy", "report.section_g_evidence_and_provenance"])]
+    return out
+
+
+def _not_examined_lines(ctx: _Ctx, res: Dict[str, Any]) -> List[str]:
+    """not_covered items that are not about one check (those are in the check groups), in plain words."""
+    nc = [n for n in (res.get("not_covered") or []) if isinstance(n, dict)
+          and not str(n.get("kind")).startswith("check_") and n.get("kind") != "recipes_not_planned"]
+    out: List[str] = []
     groups: Dict[str, List[Dict[str, Any]]] = {}
     for n in nc:
         groups.setdefault(str(n.get("kind")), []).append(n)
@@ -994,11 +1258,6 @@ def _section4(ctx: _Ctx, res: Dict[str, Any]) -> List[str]:
             line = ctx.t("nc_remote_limitation", items="; ".join(_c(ko_text(r, ctx.i)) for r in raws) or _join(names))
         elif kind == "unsupported_on_target":
             line = ctx.t("nc_unsupported_on_target", abi=_abi_text(res), items=_join(names))
-        elif kind.startswith("check_"):
-            line = ctx.t("nc_check", st=_STATUS_WORD.get(kind[6:], (kind[6:],) * 2)[ctx.i], items=_join(names))
-        elif kind == "recipes_not_planned":
-            ids = [x for n in items for x in str(n.get("item")).split(",") if x]
-            line = ctx.t("nc_recipes_not_planned", n=len(ids), items=_join([_c(x) for x in ids]))
         elif kind == "long_wait_not_judged":
             line = ctx.t("nc_long_wait_not_judged", items=_join(names))
         elif kind == "baseline_check_not_run":
@@ -1007,19 +1266,102 @@ def _section4(ctx: _Ctx, res: Dict[str, Any]) -> List[str]:
             line = ctx.t(f"nc_{kind}", items=_join(names))
         elif kind == "limitation":
             line = ctx.t("nc_limitation") + " " + "; ".join(_c(ko_text(r, ctx.i)) for r in raws)
-        elif kind in T and f"nc_{kind}" in T:
-            line = ctx.t(f"nc_{kind}")
         elif f"nc_{kind}" in T:
             line = ctx.t(f"nc_{kind}")
+            if kind in ("budget_exhausted", "leak_owner_limited", "abi_detection_failed", "report_not_saved",
+                        "not_executed") and raws:
+                line += ctx.t("nc_orig", raw=_c(ko_text(raws[0], ctx.i)))
         else:
             line = ctx.t("nc_other", kind=_c(kind)) + " " + _join(names)
-        if (f"nc_{kind}" in T and kind in ("budget_exhausted", "leak_owner_limited", "abi_detection_failed",
-                                          "report_not_saved", "not_executed")) and raws:
-            line += ctx.t("nc_orig", raw=_c(ko_text(raws[0], ctx.i)))
-        elif kind in ("unsupported_on_target",) or kind.startswith("check_"):
-            pass
         out.append(f"- {line}")
+    scope = res.get("healthy_scope") if isinstance(res.get("healthy_scope"), dict) else {}
+    if res.get("verdict") == "HEALTHY" and scope.get("healthy"):
+        # what the HEALTHY verdict does not cover and is not listed elsewhere (docs/HEALTHY_VERDICT.md)
+        from .healthy_verdict import display_label
+        for x in scope.get("not_checked") or []:
+            if x.get("kind") not in ("long_wait_not_judged", "symptom_checks_without_result") \
+                    and x.get("kind") not in groups:
+                out.append(f"- {display_label(x, bool(ctx.i))}")
     return out
+
+
+def _scope_head(ctx: _Ctx, res: Dict[str, Any], rows: List[Dict[str, Any]]) -> List[str]:
+    """The counts sentence (the one place the check totals are stated) and, for HEALTHY, what the verdict covers."""
+    cnt = check_counts(rows)
+    head = ctx.t("s_counts", **cnt) if cnt["run"] else ctx.t("s_counts_none")
+    if cnt["not_run"]:
+        head += ctx.t("s_notrun", n=cnt["not_run"])
+    out = [head + " " + ctx.t("s_caveat")]
+    scope = res.get("healthy_scope") if isinstance(res.get("healthy_scope"), dict) else {}
+    if res.get("verdict") == "HEALTHY" and scope.get("healthy"):
+        out.append(ctx.t("s_healthy", n=len(scope.get("checked") or [])))
+    return out
+
+
+def _section4(ctx: _Ctx, res: Dict[str, Any], rows: List[Dict[str, Any]]) -> List[str]:
+    """What was checked: the counts once, then the checks grouped by outcome (named in words, id after), then what
+    else was not examined.  'Not checked' is never presented as 'fine'."""
+    out: List[str] = []
+    for x in _scope_head(ctx, res, rows):
+        out += [x, ""]
+    out.pop()
+    scope = res.get("healthy_scope") if isinstance(res.get("healthy_scope"), dict) else {}
+    baseline = [str(x.get("recipe_id")) for x in scope.get("checked") or []]
+    linked: Dict[str, int] = {}
+    for i, f in enumerate(res.get("findings") or [], 1):
+        for rid in f.get("recipe_ids") or []:
+            linked.setdefault(str(rid), i)
+    reasons: Dict[str, List[str]] = {}
+    for n in res.get("not_covered") or []:
+        if isinstance(n, dict) and str(n.get("kind")).startswith("check_") \
+                and str(n.get("reason") or "") not in ("", "Check executed"):
+            reasons.setdefault(str(n.get("item")), []).append(str(n["reason"]))
+    for g in CHECK_GROUPS:
+        grp = [r for r in rows if r["status"] == g]
+        if not grp:
+            continue
+        out += ["", f"### {ctx.t('g_' + g)} ({len(grp)})", ""]
+        if g == "FAIL":
+            for r in grp:
+                meta = recipe_meta(r["rid"])
+                what = meta[3 + ctx.i] if meta else ""
+                name = check_label(r["rid"], ctx.i, r.get("name"))
+                if r["rid"] in linked:
+                    out.append("- " + ctx.t("g_fail_row", name=name, what=what or "-", fi=linked[r["rid"]]))
+                else:
+                    out.append("- " + ctx.t("g_fail_row_nf", name=name, what=what or "-"))
+        elif g in ("INCONCLUSIVE", "SKIPPED"):
+            by_reason: Dict[str, List[str]] = {}
+            for r in grp:
+                by_reason.setdefault(_undecided_reason(ctx, r, reasons), []).append(check_label(r["rid"], ctx.i, r.get("name")))
+            if g == "SKIPPED" and len(by_reason) == 1:
+                why = next(iter(by_reason))
+                out.append(f"{why[:1].upper()}{why[1:]}:" if ctx.i == 0 else f"{why}:")
+                out += _by_domain(ctx, grp)
+            else:
+                for why, names in by_reason.items():
+                    out.append(f"- {_join(names)}: {why}")
+        else:  # PASS
+            if baseline and res.get("verdict") == "HEALTHY":
+                base = [r for r in grp if r["rid"] in baseline]
+                extra = [r for r in grp if r["rid"] not in baseline]
+                out.append(f"{ctx.t('g_baseline', n=len(base))}:")
+                out += _by_domain(ctx, base)
+                if extra:
+                    out += ["", f"{ctx.t('g_extra', n=len(extra))}:"] + _by_domain(ctx, extra)
+            else:
+                out += _by_domain(ctx, grp)
+    other = _not_examined_lines(ctx, res)
+    if other:
+        out += ["", f"### {ctx.t('g_other')}", ""] + other
+    return out
+
+
+def _abi_text(res: Dict[str, Any]) -> str:
+    abi = (res.get("target") or {}).get("abi")
+    if isinstance(abi, dict) and abi.get("architecture"):
+        return f" ({abi['architecture']}/{abi.get('libc') or '?'})"
+    return ""
 
 
 def _section5(ctx: _Ctx, res: Dict[str, Any], renders: List[Dict[str, Any]]) -> List[str]:
@@ -1037,33 +1379,100 @@ def _section5(ctx: _Ctx, res: Dict[str, Any], renders: List[Dict[str, Any]]) -> 
         if "target_unreadable" not in kinds:
             out.append("- " + ctx.t("n_incon_stop"))
             if len(res.get("not_covered") or []) > 1:
-                out.append("- " + ctx.t("n_incon_nc"))
+                out.append("- " + ctx.t("n_incon_nc2", sec=ctx.t("s_scope")))
         return out
     if v == "HEALTHY" and not findings:
-        return [ctx.t("n_healthy")]
+        return [ctx.t("n_healthy2", sec=ctx.t("s_scope"))]
     for i, (f, r) in enumerate(zip(findings, renders), 1):
-        steps = _finding_next(ctx, f, r)
+        steps = list(r.get("next") or []) if r.get("registered") else []   # a registered text may give its own steps
+        steps += [s for s in _finding_next(ctx, f, r) if s not in steps]
+        if str(f.get("category")) in _ASAN_CATEGORIES and str(f.get("severity") or "").upper() != "INFO":
+            steps.append(ctx.t("n_asan"))
         if len(findings) > 1:
-            out.append(f"**{_cat_label(ctx, str(f.get('category')))}**")
+            out += ["" if out else "", f"**{ctx.t('f_head', i=i, label=_cat_word(ctx, str(f.get('category'))) or _c(f.get('category')))}**"]
         out.extend(f"{n}. {s}" for n, s in enumerate(steps, 1))
+    while out and out[0] == "":
+        out.pop(0)
     return out
 
 
-def _section6(ctx: _Ctx, res: Dict[str, Any]) -> List[str]:
+# memory-safety findings: the engine's one category-specific remediation worth keeping (its other checklist items
+# are generic and stay in the JSON ``remediation_checklist``)
+_ASAN_CATEGORIES = ("MEMORY_CORRUPTION", "USE_AFTER_FREE", "INVALID_DOUBLE_FREE", "STACK_CORRUPTION")
+
+
+def fmt_ms(ms: Any, i: int) -> str:
+    """A duration in sensible units: whole milliseconds below one second, seconds with one decimal above."""
+    try:
+        v = float(ms)
+    except (TypeError, ValueError):
+        return "-"
+    if v < 1000:
+        return f"{v:.0f} ms"
+    return T["seconds"][i].format(x=f"{v / 1000.0:.1f}")
+
+
+def fmt_bytes(n: Any) -> str:
+    """A byte count in B / KB / MB (1 KB = 1024 bytes)."""
+    try:
+        v = float(n)
+    except (TypeError, ValueError):
+        return "-"
+    if v < 1024:
+        return f"{int(v)} B"
+    if v < 1024 * 1024:
+        return f"{v / 1024:.0f} KB"
+    return f"{v / 1048576:.1f} MB"
+
+
+def _section6(ctx: _Ctx, res: Dict[str, Any], extra: Optional[Dict[str, Any]] = None) -> List[str]:
+    """How the diagnosis was done and what it cost: target identity, zero-stop statement, duration, data read."""
+    extra = extra or {}
+    t = res.get("target") or {}
+    who = _who(ctx, t)
+    abi = _abi_text(res).strip()
+    abi = ", " + abi[1:-1] if abi else ""
+    out = [ctx.t("m_target", who=who, abi=abi, img=_c(t["debug_image"])) if t.get("debug_image")
+           else ctx.t("m_target_noimg", who=who, abi=abi)]
+    if extra.get("build_id"):
+        out[-1] += ctx.t("m_build", b=_c(extra["build_id"]))
     ci = res.get("collection_impact") or {}
     if not ci or ci.get("capture_mode") is None and ci.get("bytes_read") is None:
-        out = [ctx.t("i_none")]
+        out.append(ctx.t("m_none"))
     else:
         ctx.term("zerostop")
-        out = [ctx.t("i_mode", mode=_c(ci.get("capture_mode")))]
-        ms = ci.get("measured_stop_ms")
-        out.append(ctx.t("i_zero" if ci.get("zero_stop") else "i_stop", ms=_num(ms)))
-        out.append(ctx.t("i_bytes", b=_num(ci.get("bytes_read"))))
-        out.append(ctx.t("i_wall", ms=_num(ci.get("wall_clock_ms")), s=_num(ci.get("samples_collected"))))
+        ms = fmt_ms(ci.get("measured_stop_ms") or 0.0, ctx.i)
+        out.append(ctx.t("m_zero" if ci.get("zero_stop") else "m_stop", ms=ms, mode=_c(ci.get("capture_mode"))))
+        if ci.get("wall_clock_ms") is not None:
+            line = ctx.t("m_time", obs=fmt_ms(ci.get("wall_clock_ms"), ctx.i), s=_num(ci.get("samples_collected")))
+            if isinstance(res.get("duration_s"), (int, float)):
+                line += ctx.t("m_total", tot=fmt_ms(float(res["duration_s"]) * 1000.0, ctx.i))
+            out.append(line)
+        if ci.get("bytes_read") is not None:
+            out.append(ctx.t("m_bytes", b=fmt_bytes(ci.get("bytes_read"))))
+        if ci.get("impact_measured"):
+            if ci.get("attributable_cpu_ms") is not None:
+                basis = ci.get("attributable_basis")
+                out.append(ctx.t("m_cpu", ms=fmt_ms(ci["attributable_cpu_ms"], ctx.i)) if basis == "diagnosing_process_cpu"
+                           else ctx.t("m_cpu_other", ms=fmt_ms(ci["attributable_cpu_ms"], ctx.i), basis=_c(basis)))
+            if ci.get("target_cpu_ms_during_window") is not None and ci.get("system_cpu_busy_fraction") is not None:
+                out.append(ctx.t("m_target_cpu", ms=fmt_ms(ci["target_cpu_ms_during_window"], ctx.i),
+                                 pct=round(float(ci["system_cpu_busy_fraction"]) * 100)))
+            if ci.get("collector_cpu_ms") is not None or ci.get("collector_max_rss_kb") is not None:
+                rss = ci.get("collector_max_rss_kb")
+                out.append(ctx.t("m_collector", cpu=fmt_ms(ci.get("collector_cpu_ms"), ctx.i),
+                                 rss=fmt_bytes(float(rss) * 1024) if rss is not None else "-"))
         if ci.get("budget_exhausted"):
-            out.append(ctx.t("i_budget"))
+            out.append(ctx.t("m_budget", why=_c(ci.get("budget_exhaustion_reason") or "-")))
+    ids = ""
+    if res.get("investigation_id"):
+        ids = ctx.t("m_ids", inv=_c(res["investigation_id"]))
     if res.get("report_path"):
-        out.append(ctx.t("i_report", p=_c(res["report_path"])))
+        ids = (ids + ctx.t("m_report", p=_c(res["report_path"]))).strip()
+    if ids:
+        out.append(ids)
+    if extra.get("generated"):
+        out.append(ctx.t("m_generated", ts=extra["generated"]))
     return [f"- {x}" for x in out]
 
 
@@ -1101,18 +1510,10 @@ def _symptom_note(ctx: _Ctx, res: Dict[str, Any]) -> List[str]:
         return []
     why = {"no_match": "sym_why_no_match", "weak_evidence": "sym_why_weak",
            "conflicting_classes": "sym_why_conflict"}.get(str(si.get("reason")), "sym_why_no_match")
-    return [ctx.t("sym_unclear", why=ctx.t(why)), ""]
+    return [ctx.t("sym_unclear", why=ctx.t(why))]
 
 
-def render_human_report(result: Dict[str, Any], report: Optional[Dict[str, Any]] = None, lang: str = "en") -> str:
-    """Render the human summary (Markdown) of a ``DiagnoseResult`` dict.  ``lang`` is ``"en"`` or ``"ko"``."""
-    if lang not in SUPPORTED_LANGS:
-        raise ValueError(f"lang must be one of {SUPPORTED_LANGS}, got {lang!r}")
-    res = dict(result or {})
-    report = report if isinstance(report, dict) else (res.get("report") if isinstance(res.get("report"), dict) else None)
-    ctx = _Ctx(lang)
-    findings = [f for f in (res.get("findings") or []) if isinstance(f, dict)]
-    res["findings"] = findings
+def _render_findings(ctx: _Ctx, findings: List[Dict[str, Any]], report: Optional[Dict[str, Any]]) -> List[Dict[str, Any]]:
     renders: List[Dict[str, Any]] = []
     for f in findings:
         cat = f.get("category")
@@ -1128,7 +1529,7 @@ def render_human_report(result: Dict[str, Any], report: Optional[Dict[str, Any]]
             r = _render_thread(ctx, f, report)
         else:
             kinds = _by_kind(f)
-            lines = [ctx.t("w_gen_cat", cat=_cat_label(ctx, str(cat)))]
+            lines = []
             for key, kk, fmt in (("variable", "w_vars", _c), ("thread_name", "w_threads", _c), ("thread", "w_tids", str),
                                  ("function", "w_funcs", _c), ("source_location", "w_locs", _c), ("lock", "w_locks", _c),
                                  ("resource", "w_res", _c)):
@@ -1139,21 +1540,89 @@ def render_human_report(result: Dict[str, Any], report: Optional[Dict[str, Any]]
                 lines.append("- " + ctx.t("w_obs", x=ko_text(obs, ctx.i)))
             r = {"lines": lines, "kinds": kinds}
         renders.append(r)
+    return renders
 
-    concl = _conclusion(ctx, res, renders)
-    sym_note = _symptom_note(ctx, res)
-    parts = [f"# {ctx.t('title', proc=(_c(res.get('target', {}).get('process_name')) if (res.get('target') or {}).get('process_name') else ctx.t('unknown_proc')), pid=(res.get('target') or {}).get('pid'))}",
-             "", f"## {ctx.t('h1')}", "", concl, ""] + sym_note + [
-             f"## {ctx.t('h2')}", ""]
-    parts += _section2(ctx, res, renders)
-    parts += ["", f"## {ctx.t('h3')}", ""] + _section3(ctx, res, renders, report)
-    parts += ["", f"## {ctx.t('h4')}", ""] + _section4(ctx, res)
-    parts += ["", f"## {ctx.t('h5')}", ""] + _section5(ctx, res, renders)
-    parts += ["", f"## {ctx.t('h6')}", ""] + _section6(ctx, res)
+
+SECTION_ORDER = ("conclusion", "findings", "hypothesis", "next", "scope", "method", "reproducibility", "reference")
+_SECTION_TITLE = {"conclusion": "s_conclusion", "findings": "s_findings", "hypothesis": "s_hypothesis",
+                  "next": "s_next", "scope": "s_scope", "method": "s_method", "reproducibility": "s_repro",
+                  "reference": "s_reference"}
+
+
+def compose(result: Dict[str, Any], report: Optional[Dict[str, Any]] = None, lang: str = "en", *,
+            pointers: bool = False, method_extra: Optional[Dict[str, Any]] = None,
+            extra_sections: Optional[Dict[str, List[str]]] = None) -> Dict[str, Any]:
+    """The common outline of every report, as data: ``sections`` is a list of ``{key, title, lines}`` in the order
+    of ``SECTION_ORDER`` (sections with nothing to say are left out); ``blocks`` are the per-finding parts, ``rows``
+    and ``counts`` the one check table.  Markdown and HTML are both rendered from this.
+
+    ``extra_sections`` supplies the incident-report-only parts (``hypothesis``, ``reproducibility``) as Markdown lines.
+    """
+    if lang not in SUPPORTED_LANGS:
+        raise ValueError(f"lang must be one of {SUPPORTED_LANGS}, got {lang!r}")
+    res = dict(result or {})
+    report = report if isinstance(report, dict) else (res.get("report") if isinstance(res.get("report"), dict) else None)
+    ctx = _Ctx(lang)
+    findings = [f for f in (res.get("findings") or []) if isinstance(f, dict)]
+    res["findings"] = findings
+    renders = _render_findings(ctx, findings, report)
+    rows = check_rows(res, report)
+    verdict = str(res.get("verdict") or "INCONCLUSIVE")
+    ctx.term("verdict_healthy" if verdict == "HEALTHY" else "verdict")
+    concl = [_verdict_line(ctx, verdict), "", _conclusion(ctx, res, renders)]
+    sym = _symptom_note(ctx, res)
+    if sym:
+        concl += [""] + sym
+    blocks = _finding_blocks(ctx, res, renders, report, rows)
+    extra_sections = extra_sections or {}
+    body: Dict[str, List[str]] = {
+        "conclusion": concl,
+        "findings": _section2(ctx, blocks) if blocks else [],
+        "hypothesis": list(extra_sections.get("hypothesis") or []),
+        "next": _section5(ctx, res, renders),
+        "scope": _section4(ctx, res, rows),
+        "method": _section6(ctx, res, method_extra),
+        "reproducibility": list(extra_sections.get("reproducibility") or []),
+    }
+    ref: List[str] = []
     g = _glossary(ctx, res)
     if g:
-        parts += ["", f"## {ctx.t('hg')}", ""] + g
-    return "\n".join(parts) + "\n"
+        ref += [f"### {ctx.t('hg')}", ""] + g
+    if pointers:
+        ref += ([""] if ref else []) + [f"### {ctx.t('r_where')}", ""] + _where_lines(ctx, blocks)
+    body["reference"] = ref
+    sections = [{"key": k, "title": ctx.t(_SECTION_TITLE[k]), "lines": body[k]} for k in SECTION_ORDER if body.get(k)]
+    for n, s in enumerate(sections, 1):
+        s["number"] = n
+        s["heading"] = f"{n}. {s['title']}"
+    return {"lang": lang, "ctx": ctx, "res": res, "report": report, "renders": renders, "blocks": blocks, "rows": rows,
+            "counts": check_counts(rows), "verdict": verdict, "verdict_line": concl[0], "conclusion": concl[2],
+            "symptom_note": sym, "glossary": g, "sections": sections,
+            "scope_head": _scope_head(ctx, res, rows), "not_examined": _not_examined_lines(ctx, res)}
+
+
+def sections_markdown(comp: Dict[str, Any], level: int = 2) -> List[str]:
+    """The numbered sections of a composition as Markdown lines (``##`` sections, ``###`` parts inside)."""
+    out: List[str] = []
+    for s in comp["sections"]:
+        out += ["#" * level + " " + s["heading"], ""] + s["lines"] + [""]
+    return out
+
+
+def render_human_report(result: Dict[str, Any], report: Optional[Dict[str, Any]] = None, lang: str = "en") -> str:
+    """Render the human summary (Markdown) of a ``DiagnoseResult`` dict.  ``lang`` is ``"en"`` or ``"ko"``.
+
+    It is the common outline (``compose``) under a one-line title; the incident report uses the same sections."""
+    comp = compose(result, report, lang)
+    res = comp["res"]
+    ctx = comp["ctx"]
+    t = res.get("target") or {}
+    title = ctx.t("title", proc=_c(t["process_name"]) if t.get("process_name") else ctx.t("unknown_proc"),
+                  pid=t.get("pid"))
+    lines = [f"# {title}", ""] + sections_markdown(comp)
+    while lines and lines[-1] == "":
+        lines.pop()
+    return "\n".join(lines) + "\n"
 
 
 def diagnose_with_summary(pid: int, debug_image: Optional[str] = None, symptom: Optional[str] = None,
@@ -1577,6 +2046,13 @@ def ko_text(s: Any, i: int) -> str:
 
 
 def conclusion_sentence(summary_md: str) -> str:
-    """The text of section 1 (the conclusion) of a human summary, on one line; "" when absent."""
+    """The conclusion of a report (section 1 without its leading verdict line and detail pointer), on one line;
+    "" when absent."""
     m = re.search(r"^## 1\.[^\n]*\n+(.*?)(?:\n+## |\Z)", summary_md or "", re.S | re.M)
-    return " ".join(m.group(1).split()) if m else ""
+    if not m:
+        return ""
+    paras = [p for p in re.split(r"\n\s*\n", m.group(1).strip()) if p.strip()]
+    if len(paras) > 1 and paras[0].startswith("**"):
+        paras = paras[1:]                       # the verdict line ("**Verdict: ...**"); the hero shows it as a badge
+    paras = [p for p in paras if not p.startswith("_")]   # a pointer to the detailed records
+    return " ".join(" ".join(paras).split())

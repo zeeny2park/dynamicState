@@ -14,8 +14,10 @@ What the detector exempts (an English *sentence* is a run of at least ``MIN_WORD
   * words shorter than two letters.
 A run of fewer than ``MIN_WORDS`` words (``tcache bin``, ``struct node``) is a technical term, not a sentence.
 
-Known gap, not checked here: the collapsed "detailed report (sections A-I)" block of the HTML report
-(``DiagnosticReport.to_html``) is an English engineering appendix with raw record dumps; it has no localisation yet.
+Exempt on purpose: the detailed (A-I) records are English.  They are attached to the part of the HTML report they
+belong to, each in a ``<details class="dsv-detail">`` block whose body is ``<div class="dsv-detail-body">...</div>
+<!--/dsv-detail-body-->``.  Exactly those bodies are removed before checking; the ``<summary>`` label of every detail
+block and everything around it is checked like the rest of the report.
 """
 import gzip
 import json
@@ -86,10 +88,16 @@ def _render(name, lang):
         out = export_incident_report(pid=1234, language=lang)
     finally:
         ede.diagnose = original
-    html = out["report_html"]
+    return out, without_detail(out["report_html"])
+
+
+DETAIL_BODY = re.compile(r'(?s)<div class="dsv-detail-body"[^>]*>.*?</div><!--/dsv-detail-body-->')
+
+
+def without_detail(html):
+    """The HTML body with exactly the English detail-record bodies removed (labels and everything else kept)."""
     body = html[html.find("<body>"):]
-    visual = body[:body.find('<details class="dsv-detail"')]
-    return out, visual
+    return DETAIL_BODY.sub(" ", body)
 
 
 NAMES = sorted(f[:-8] for f in os.listdir(FIXTURES) if f.endswith(".json.gz"))
@@ -124,7 +132,10 @@ class TestKoreanReportHasNoEnglishSentences(unittest.TestCase):
     def test_english_report_is_still_english(self):
         out, _ = _render("overflow_ring", "en")
         self.assertIn("is a heap buffer with 72 usable bytes", out["human_summary"])
-        self.assertIn("## 1. Target Identity & Zero-Stop Telemetry", out["report_markdown"])
+        md = out["report_markdown"]
+        for h in ("## 1. Conclusion", "## 2. What was found", "## 3. What to do next", "## 4. What was checked",
+                  "## 5. How the diagnosis was done and what it cost the target", "## 6. Reference"):
+            self.assertIn(h, md)
 
     def test_verdicts_are_the_saved_ones(self):
         for name in NAMES:
@@ -132,6 +143,23 @@ class TestKoreanReportHasNoEnglishSentences(unittest.TestCase):
             for lang in ("en", "ko"):
                 out, _ = _render(name, lang)
                 self.assertEqual(out["diagnosis"]["verdict"], saved["verdict"])
+
+
+class TestDetailExemptionIsExact(unittest.TestCase):
+    def test_only_detail_bodies_are_removed_and_their_labels_are_checked(self):
+        out, visual = _render("overflow_ring", "ko")
+        html = out["report_html"]
+        n_blocks = html.count('<details class="dsv-detail"')
+        self.assertGreater(n_blocks, 5)                                   # verdict, finding, checks, scope, method
+        self.assertEqual(n_blocks, html.count("<!--/dsv-detail-body-->"))  # every block marks the end of its body
+        self.assertEqual(visual.count('<details class="dsv-detail"'), n_blocks)  # the blocks and labels stay
+        self.assertIn("이 발견의 상세 근거", visual)
+        self.assertIn("이 검사의 상세 결과", visual)
+        self.assertNotIn("Executive Summary", visual)                     # the English records are gone
+        self.assertIn("Executive Summary", html)
+        # an English sentence placed in a label would be caught
+        bad = html.replace("이 발견의 상세 근거 (영문)", "detailed evidence for this finding")
+        self.assertTrue(english_sentences(without_detail(bad)))
 
 
 class TestKoText(unittest.TestCase):

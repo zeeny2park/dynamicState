@@ -43,8 +43,9 @@ _L: Dict[str, Tuple[str, str]] = {
     "nav_summary": ("Plain-language summary", "쉬운 말 요약"),
     "nav_detail": ("Detailed report", "상세 보고서"),
     "verdict": ("Verdict", "판정"),
-    "confidence": ("Confidence", "신뢰도"),
     "checks": ("Checks", "검사"),
+    "checks_run": ("Checks run", "실행한 검사"),
+    "checks_not_run": ("+ {n} not run", "실행하지 않은 검사 {n}개 별도"),
     "stop_time": ("Target stop time", "대상 정지 시간"),
     "zero_stop": ("never paused", "한 번도 멈추지 않음"),
     "bytes_read": ("Data read", "읽은 데이터"),
@@ -68,6 +69,7 @@ _L: Dict[str, Tuple[str, str]] = {
     "step_play": ("▶ Play", "▶ 재생"), "step_all": ("Show all", "전체 보기"),
     "step_of": ("Step", "단계"), "step_hint": ("Select a step to see the state at that moment.", "단계를 선택하면 그 시점의 상태를 볼 수 있습니다."),
     "evidence": ("Evidence", "근거"),
+    "as_text": ("The same, as text", "같은 내용을 글로 보기"),
     "subjects": ("Named in the evidence", "근거에 나온 이름"),
     "where": ("Where", "위치"),
     # deadlock
@@ -177,14 +179,14 @@ _L: Dict[str, Tuple[str, str]] = {
     "ck_intro": ("Every check the diagnosis considered, by outcome. Select a row for what it looks for and what it found.",
                  "진단이 고려한 모든 검사를 결과별로 정리했습니다. 행을 선택하면 무엇을 확인하는 검사이고 무엇이 나왔는지 볼 수 있습니다."),
     "ck_all": ("All", "전체"),
-    "ck_FAIL": ("Problem found", "이상 발견"), "ck_PASS": ("Passed", "통과"),
-    "ck_INCONCLUSIVE": ("Could not decide", "판단 불가"), "ck_SKIPPED": ("Not run", "실행 안 함"),
+    "ck_FAIL": ("Found a problem", "이상 발견"), "ck_PASS": ("Clean", "이상 없음"),
+    "ck_INCONCLUSIVE": ("Could not judge", "판단하지 못함"), "ck_SKIPPED": ("Not run", "실행하지 않음"),
     "ck_ERROR": ("Error", "오류"),
     "ck_FAIL_hint": ("the check found what it looks for", "검사가 찾던 이상을 발견함"),
     "ck_PASS_hint": ("ran to completion and found nothing", "끝까지 실행했고 아무것도 발견하지 못함"),
-    "ck_INCONCLUSIVE_hint": ("ran but could not reach an answer; not evidence of health",
-                             "실행했지만 답을 내지 못함. 정상이라는 근거가 아님"),
-    "ck_SKIPPED_hint": ("not executed; not evidence of health", "실행하지 않음. 정상이라는 근거가 아님"),
+    "ck_INCONCLUSIVE_hint": ("ran but could not reach an answer; not evidence that the process is fine",
+                             "실행했지만 답을 내지 못함. 문제가 없다는 근거가 아님"),
+    "ck_SKIPPED_hint": ("not executed; not evidence that the process is fine", "실행하지 않음. 문제가 없다는 근거가 아님"),
     "ck_ERROR_hint": ("the check itself failed", "검사 자체가 실패함"),
     "ck_what": ("Looks for", "확인하는 것"), "ck_result": ("Result", "결과"),
     "ck_why": ("Why no answer", "답을 내지 못한 이유"), "ck_time": ("Time", "소요 시간"),
@@ -198,6 +200,13 @@ _L: Dict[str, Tuple[str, str]] = {
     "dom_CONCURRENCY": ("Threads and locks", "스레드와 락"), "dom_MEMORY_GROWTH": ("Memory growth", "메모리 증가"),
     "dom_MEMORY_INTEGRITY": ("Memory integrity", "메모리 무결성"), "dom_ABNORMAL_STATE": ("Program state", "프로그램 상태"),
     "dom_OTHER": ("Other", "기타"),
+    # collapsed blocks of detailed records (the records themselves are in English)
+    "d_verdict": ("How the verdict was derived (detailed records, English)", "판정 근거 상세 (상세 기록, 영문)"),
+    "d_finding": ("Detailed evidence for this finding (English)", "이 발견의 상세 근거 (영문)"),
+    "d_check": ("Detailed result of this check (English)", "이 검사의 상세 결과 (영문)"),
+    "d_scope": ("Check totals and limitations (detailed records, English)", "검사 집계와 제한 사항 (상세 기록, 영문)"),
+    "d_method": ("Target, collection and plan (detailed records, English)", "대상·수집·계획 상세 (상세 기록, 영문)"),
+    "d_other": ("Other detailed records (English)", "그 밖의 상세 기록 (영문)"),
 }
 
 # recipe id -> (domain, name en, name ko, looks-for en, looks-for ko)
@@ -252,7 +261,7 @@ _RECIPES: Dict[str, Tuple[str, str, str, str, str]] = {
 }
 
 _DOMAIN_ORDER = ("CONCURRENCY", "MEMORY_INTEGRITY", "MEMORY_GROWTH", "ABNORMAL_STATE", "OTHER")
-_STATUS_ORDER = ("FAIL", "ERROR", "INCONCLUSIVE", "PASS", "SKIPPED")
+_STATUS_ORDER = ("FAIL", "INCONCLUSIVE", "PASS", "SKIPPED")   # = human_report.CHECK_GROUPS
 _STATUS_ICON = {"FAIL": "✖", "PASS": "✔", "INCONCLUSIVE": "?", "SKIPPED": "–", "ERROR": "!"}
 _THREAD_COLORS = ("#2563eb", "#9333ea", "#0d9488", "#c2410c", "#be185d", "#4d7c0f")
 _VERDICT_TONE = {"CONFIRMED_FAULT": "bad", "FAULT": "bad", "PROBABLE_FAULT": "warn", "DEGRADED": "warn",
@@ -288,7 +297,7 @@ _CSS = """
 .dsv-chip-obs { color: var(--good); border-color: var(--good); } .dsv-chip-rec { color: var(--warn); border-color: var(--warn); }
 .dsv-chip-no { color: var(--unk); border-style: dashed; }
 .dsv-concl { font-size: 17px; margin: 10px 0 14px; }
-.dsv-tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 10px; }
+.dsv-tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; }
 .dsv-tile { background: var(--panel); border: 1px solid var(--soft); border-radius: 8px; padding: 10px 12px; }
 .dsv-tile b { display: block; font-size: 20px; line-height: 1.3; }
 .dsv-tile span { font-size: 12px; color: var(--mute); }
@@ -397,9 +406,36 @@ details.dsv-ck > summary:hover { background: var(--panel); }
 .dsv-ck dl { display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: 4px 14px; margin: 0; padding: 4px 14px 12px 44px; font-size: 13px; }
 .dsv-ck dt { color: var(--mute); } .dsv-ck dd { margin: 0; overflow-wrap: anywhere; }
 .dsv-nc { font-size: 13px; padding-left: 20px; } .dsv-nc li { margin: 3px 0; overflow-wrap: anywhere; }
-details.dsv-detail { max-width: 1100px; margin: 0 auto 24px; padding: 0; border: 1px solid #cbd5e1; border-radius: 10px; background: transparent; }
-details.dsv-detail > summary { cursor: pointer; padding: 12px 18px; font: 600 16px/1.4 -apple-system, "Segoe UI", "Noto Sans KR", sans-serif; }
-details.dsv-detail > .report-card { border: 0; box-shadow: none; max-width: none; border-top: 1px solid #cbd5e1; border-radius: 0 0 10px 10px; }
+/* outline: one section per part of the report, numbered like the Markdown report */
+.dsv-head { margin: 8px 0 4px; }
+.dsv-sec > h2 { font-size: 20px; margin: 30px 0 10px; padding: 0 0 4px; border-bottom: 1px solid var(--soft); }
+.dsv-sec h3 { font-size: 16px; margin: 14px 0 6px; }
+.dsv-text p, .dsv-card > p { margin: 6px 0; }
+.dsv-text ol, .dsv-text ul, .dsv-card > ul, .dsv-card > ol { padding-left: 22px; margin: 6px 0; }
+.dsv-text pre, .dsv-card pre { background: var(--panel); border: 1px solid var(--soft); border-radius: 6px; padding: 8px 10px; overflow-x: auto; font-size: 12px; }
+.dsv-keyfacts { list-style: none; padding-left: 0 !important; }
+.dsv-tile-sub { display: block; }
+details.dsv-ckgroup { margin: 10px 0; }
+details.dsv-ckgroup > summary { cursor: pointer; display: flex; align-items: baseline; flex-wrap: wrap; gap: 8px; font-weight: 600; padding: 6px 0; }
+details.dsv-ckgroup > summary small { font-weight: 400; color: var(--mute); font-size: 12px; }
+/* detailed records (English) attached to the part they belong to */
+details.dsv-detail { margin: 10px 0 2px; border: 1px dashed var(--line); border-radius: 8px; background: var(--panel); }
+details.dsv-detail > summary { cursor: pointer; padding: 6px 12px; font-size: 13px; color: var(--accent); }
+.dsv-detail-body { padding: 4px 12px 10px; font-size: 12px; overflow-wrap: anywhere; }
+.dsv-detail-body h4 { font-size: 13px; margin: 10px 0 4px; }
+.dsv-detail-body p { margin: 4px 0; }
+.dsv-detail-body .dsd-scroll { overflow-x: auto; }
+.dsv-detail-body table { border-collapse: collapse; width: 100%; min-width: 520px; margin: 4px 0; }
+.dsv-detail-body th, .dsv-detail-body td { border: 1px solid var(--soft); padding: 4px 6px; text-align: left; vertical-align: top; }
+.dsv-detail-body td code { white-space: pre-wrap; word-break: break-all; }
+.dsv-detail-body .dsd-pre { white-space: pre-wrap; word-break: break-all; }
+.dsv-ck .dsv-detail { margin: 0 14px 10px 44px; }
+@media (max-width: 600px) {
+  .dsv-card { padding: 14px 14px; }
+  .dsv-ck dl { padding-left: 14px; grid-template-columns: minmax(0, 1fr); }
+  .dsv-ck .dsv-detail { margin: 0 8px 10px 8px; }
+  .dsv-title { font-size: 19px; }
+}
 @media print {
   .dsv-r, .dsv-r + label, .dsv-steplbl, .dsv-nav { display: none !important; }
   .dsv-card { break-inside: avoid; }
@@ -426,9 +462,6 @@ def _interaction_css() -> str:
                    f"border-color: var(--line); }}")
         out.append(f"{r} * .dsv-cell.dsv-h{j} > * {{ visibility: hidden; }}")
         out.append(f"{r} * li.dsv-c{j} {{ border-color: var(--accent); background: var(--panel); }}")
-    for st in _STATUS_ORDER:
-        r = f".dsv-f-{st}:checked ~ .dsv-ckgroups"
-        out.append(f'{r} .dsv-ckgroup:not(.dsv-s-{st}) {{ display: none; }}')
     return "\n".join(out)
 
 
@@ -995,7 +1028,23 @@ _VIZ = {"DEADLOCK_INDICATORS": _viz_deadlock, "MEMORY_CORRUPTION": _viz_overflow
         "USE_AFTER_FREE": _viz_uaf, "PROCESS_INSTABILITY": _viz_thread}
 
 
-def _finding_card(lx: _Lx, i: int, f: Dict[str, Any], report: Optional[Dict[str, Any]]) -> str:
+def _md_html(lines: List[str]) -> str:
+    """Markdown lines of the composition as HTML (the summary's own converter; everything escaped)."""
+    from .human_report import markdown_to_html
+    return markdown_to_html("\n".join(lines))
+
+
+def _detail(lx: _Lx, key: str, body: str, anchor: str) -> str:
+    """A collapsed block of detailed records (English) next to the part it belongs to.  The label is in the report
+    language; the body is marked so that the language test exempts exactly the detail and nothing around it."""
+    if not body:
+        return ""
+    return (f'<details class="dsv-detail" id="{E(anchor)}"><summary>{E(lx.t(key))}</summary>'
+            f'<div class="dsv-detail-body" lang="en">{body}</div><!--/dsv-detail-body--></details>')
+
+
+def _finding_card(lx: _Lx, i: int, f: Dict[str, Any], report: Optional[Dict[str, Any]],
+                  block: Optional[Dict[str, Any]] = None, detail: str = "") -> str:
     cat = str(f.get("category"))
     reg = category_label(cat)
     label = reg[lx.i] if reg else (CATEGORY_LABEL[cat][lx.i] if cat in CATEGORY_LABEL else cat)
@@ -1018,15 +1067,34 @@ def _finding_card(lx: _Lx, i: int, f: Dict[str, Any], report: Optional[Dict[str,
     desc = str(f.get("description") or "")
     if not viz and desc:
         facts = f"<li>{E(ko_text(desc, lx.i))}</li>" + facts
-    return (f'<section class="dsv-card dsv-tone-{tone}" id="dsv-finding-{i}"><div class="dsv-fhead">'
-            f'<h3>{E(lx.t("finding", i=i))}: {E(label)}</h3><span class="dsv-badge">{E(st_word)}</span>'
-            f'<span class="dsv-chip">{E(lx.t("severity"))} {E(str(f.get("severity") or "-"))}</span>'
-            f'<span class="dsv-chip dsv-mono">{E(cat)}</span></div>'
-            + (f'<p class="dsv-note">{E(lx.t("subjects"))}: {" ".join(chips)}</p>' if chips else "")
-            + viz
-            + (f'<details class="dsv-ck dsv-s-SKIPPED"><summary><span class="dsv-ck-name">{E(lx.t("evidence"))}</span></summary>'
-               f'<ul class="dsv-facts" style="padding:4px 14px 12px 34px">{facts}</ul></details>' if facts else "")
-            + "</section>")
+    head = (f'<h3>{E(lx.t("finding", i=i))}: {E(label)} {_code(cat)}</h3>' if block is None
+            else f'<h3>{_inline_html(block["heading"])}</h3>')
+    parts = [f'<section class="dsv-card dsv-tone-{tone}" id="finding-{i}"><span id="dsv-finding-{i}"></span>'
+             f'<div class="dsv-fhead">{head}<span class="dsv-badge">{E(st_word)}</span></div>']
+    if block is not None:
+        parts.append('<ul class="dsv-facts dsv-keyfacts">' + "".join(f"<li>{_inline_html(x)}</li>" for x in block["facts"]) + "</ul>")
+        if block["body"] and not viz:
+            parts.append(f'<div class="dsv-text">{_md_html(block["body"])}</div>')
+        elif not block["body"] and chips:
+            parts.append(f'<p class="dsv-note">{E(lx.t("subjects"))}: {" ".join(chips)}</p>')
+    elif chips:
+        parts.append(f'<p class="dsv-note">{E(lx.t("subjects"))}: {" ".join(chips)}</p>')
+    parts.append(viz)
+    if block is not None and block["body"] and viz:
+        # the picture states the same facts; the text stays one click away (said once on screen)
+        parts.append(f'<details class="dsv-ck dsv-s-SKIPPED dsv-astext"><summary><span class="dsv-ck-name">'
+                     f'{E(lx.t("as_text"))}</span></summary><div class="dsv-text" style="padding:0 14px 8px">'
+                     f'{_md_html(block["body"])}</div></details>')
+    if block is not None and block["diagram"] and not viz:
+        parts.append(_md_html(block["diagram"]))
+    if block is not None and block["why"]:
+        parts.append(f'<div class="dsv-text">{_md_html([T["f_why"][lx.i], ""] + [f"{n}. {x}" for n, x in enumerate(block["why"], 1)])}</div>')
+    if facts:
+        parts.append(f'<details class="dsv-ck dsv-s-SKIPPED"><summary><span class="dsv-ck-name">{E(lx.t("evidence"))}</span></summary>'
+                     f'<ul class="dsv-facts" style="padding:4px 14px 12px 34px">{facts}</ul></details>')
+    parts.append(_detail(lx, "d_finding", detail, f"finding-{i}-detail"))
+    parts.append("</section>")
+    return "".join(parts)
 
 
 # ------------------------------------------------------------------------------------------------ check list
@@ -1036,70 +1104,40 @@ def _recipe_meta(rid: str) -> Optional[Tuple[str, str, str, str, str]]:
 
 
 def _norm_status(s: Any) -> str:
-    s = str(s or "").upper()
-    if s in ("PASS", "FAIL", "INCONCLUSIVE", "ERROR"):
-        return s
-    return "SKIPPED"
+    from .human_report import check_group
+    return check_group(s)
 
 
 def _check_rows(res: Dict[str, Any], report: Optional[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    rows: List[Dict[str, Any]] = []
-    seen = set()
-    run = [c for c in (res.get("checks_run") or []) if isinstance(c, dict)]
-    # the result's own check statuses are what the verdict was computed from; the report adds the detail
-    run_status = {str(c.get("recipe_id")): c.get("status") for c in run if c.get("recipe_id")}
-    detailed = _checks(report)
-    have = {str(c.get("recipe_id")) for c in detailed}
-    for c in detailed + [c for c in run if str(c.get("recipe_id")) not in have]:
-        rid = str(c.get("recipe_id") or c.get("check_id") or "")
-        if not rid or rid in seen:
-            continue
-        seen.add(rid)
-        obs = c.get("actual_observations") if isinstance(c.get("actual_observations"), dict) else {}
-        rows.append({"rid": rid, "status": _norm_status(run_status.get(rid, c.get("status"))), "name": c.get("name"),
-                     "domain": c.get("technical_rationale"), "interp": c.get("technical_interpretation"),
-                     "limits": [str(x) for x in (c.get("limitations") or [])] + [str(x) for x in (c.get("missing_evidence") or [])],
-                     "dur": c.get("duration_seconds", c.get("duration_s")), "check_id": c.get("check_id"),
-                     "required": c.get("is_required"), "n_ev": len(c.get("supporting_evidence_ids") or []),
-                     "cap": obs.get("missing_capability"), "err": c.get("error_details"), "planned": True})
-    for n in res.get("not_covered") or []:
-        if isinstance(n, dict) and n.get("kind") == "recipes_not_planned":
-            for rid in str(n.get("item") or "").split(","):
-                rid = rid.strip()
-                if rid and rid not in seen:
-                    seen.add(rid)
-                    rows.append({"rid": rid, "status": "SKIPPED", "planned": False, "limits": []})
-    return rows
+    """The one check table (``human_report.check_rows``): every view counts from it."""
+    from .human_report import check_rows
+    return check_rows(res, report)
 
 
-def _checklist(lx: _Lx, res: Dict[str, Any], report: Optional[Dict[str, Any]], findings: List[Dict[str, Any]]) -> str:
-    rows = _check_rows(res, report)
+def _checklist(lx: _Lx, res: Dict[str, Any], report: Optional[Dict[str, Any]], findings: List[Dict[str, Any]],
+               comp: Optional[Dict[str, Any]] = None, details: Optional[Dict[str, Any]] = None) -> str:
+    """The scope part: counts once, then the checks grouped by outcome (clean and not-run collapsed), each row with
+    what it looks for, what it found or why it could not judge, and its own detailed result."""
+    from .human_report import _undecided_reason, check_counts, check_label
+    from .human_report import _Ctx as _HCtx
+    hctx = (comp or {}).get("ctx") or _HCtx(lx.lang)
+    details = details or {}
+    rows = (comp or {}).get("rows") or _check_rows(res, report)
     reasons: Dict[str, List[str]] = {}
-    other_nc: List[Dict[str, Any]] = []
     for n in res.get("not_covered") or []:
-        if not isinstance(n, dict):
-            continue
-        if n.get("kind") == "check_inconclusive":
-            if str(n.get("reason") or "") not in ("", "Check executed"):
-                reasons.setdefault(str(n.get("item")), []).append(str(n["reason"]))
-        elif n.get("kind") != "recipes_not_planned":
-            other_nc.append(n)
+        if isinstance(n, dict) and str(n.get("kind") or "").startswith("check_") \
+                and str(n.get("reason") or "") not in ("", "Check executed"):
+            reasons.setdefault(str(n.get("item")), []).append(str(n["reason"]))
     linked: Dict[str, List[int]] = {}
     for i, f in enumerate(findings, 1):
         for rid in f.get("recipe_ids") or []:
             linked.setdefault(str(rid), []).append(i)
-    counts = {s: sum(1 for r in rows if r["status"] == s) for s in _STATUS_ORDER}
-    total = len(rows)
-    head = f'<h2 id="dsv-checks">{E(lx.t("ck_title"))}</h2>'
+    cnt = check_counts(rows)
     if not rows:
-        return head + f'<div class="dsv-card"><p>{E(lx.t("ck_none"))}</p></div>'
-    bar = "".join(f'<i class="dsv-s-{s}" style="width:{counts[s] * 100 / total:.2f}%" title="{E(lx.t("ck_" + s))}: {counts[s]}"></i>'
-                  for s in _STATUS_ORDER if counts[s])
-    tools = [f'<input class="dsv-r" type="radio" name="dsv-ckf" id="dsv-ckf-all" checked>'
-             f'<label for="dsv-ckf-all">{E(lx.t("ck_all"))}<span class="dsv-n">{total}</span></label>']
-    tools += [f'<input class="dsv-r dsv-f-{s}" type="radio" name="dsv-ckf" id="dsv-ckf-{s}">'
-              f'<label for="dsv-ckf-{s}">{_STATUS_ICON[s]} {E(lx.t("ck_" + s))}<span class="dsv-n">{counts[s]}</span></label>'
-              for s in _STATUS_ORDER if counts[s]]
+        return f'<div class="dsv-card"><p>{E(lx.t("ck_none"))}</p></div>'
+    total = len(rows)
+    bar = "".join(f'<i class="dsv-s-{s}" style="width:{sum(1 for r in rows if r["status"] == s) * 100 / total:.2f}%" '
+                  f'title="{E(lx.t("ck_" + s))}"></i>' for s in _STATUS_ORDER if any(r["status"] == s for r in rows))
     groups: List[str] = []
     for s in _STATUS_ORDER:
         grp = [r for r in rows if r["status"] == s]
@@ -1112,117 +1150,140 @@ def _checklist(lx: _Lx, res: Dict[str, Any], report: Optional[Dict[str, Any]], f
             name = meta[1 + lx.i] if meta else str(r.get("name") or r["rid"])
             what = meta[3 + lx.i] if meta else ""
             dom = meta[0] if meta else (str(r.get("domain")) if ("dom_" + str(r.get("domain"))) in _L else "OTHER")
-            why: List[str] = []
-            if s in ("INCONCLUSIVE", "SKIPPED", "ERROR"):
-                if not r.get("planned", True):
-                    why.append(E(lx.t("ck_not_planned")))
-                if r.get("cap"):
-                    why.append(lx.h("ck_need_cap", cap=r["cap"]))
-                why += [E(ko_text(x, lx.i)) for x in reasons.get(r["rid"], [])] + [E(ko_text(x, lx.i)) for x in r.get("limits", [])]
-                if r.get("err"):
-                    why.append(E(ko_text(str(r["err"]), lx.i)))
-                if not why and s != "SKIPPED":
-                    why.append(E(lx.t("ck_no_reason")))
+            why = _undecided_reason(hctx, r, reasons) if s in ("INCONCLUSIVE", "SKIPPED") else ""
             interp = str(r.get("interp") or "")
             has_interp = bool(interp) and interp != "Check executed"
             interp = ko_text(interp, lx.i)
-            line = interp if (has_interp and s in ("FAIL", "PASS")) else ""
-            if not line and why:
-                line = re.sub(r"<[^>]+>", "", why[0])
-                line = html.unescape(line)
+            line = interp if (has_interp and s in ("FAIL", "PASS")) else re.sub(r"`", "", why)
             dl = []
             if what:
                 dl.append((lx.t("ck_what"), E(what)))
-            if has_interp:
+            if has_interp and s in ("FAIL", "PASS"):
                 dl.append((lx.t("ck_result"), E(interp)))
             if why:
-                dl.append((lx.t("ck_why"), "<br>".join(dict.fromkeys(why))))
+                dl.append((lx.t("ck_why"), _inline_html(why)))
             if linked.get(r["rid"]):
-                dl.append((lx.t("ck_linked"), " ".join(f'<a href="#dsv-finding-{i}">{E(lx.t("finding", i=i))}</a>' for i in linked[r["rid"]])))
+                dl.append((lx.t("ck_linked"), " ".join(f'<a href="#finding-{i}">{E(lx.t("finding", i=i))}</a>' for i in linked[r["rid"]])))
             if r.get("n_ev"):
                 dl.append((lx.t("ck_evidence"), str(r["n_ev"])))
             if isinstance(r.get("dur"), (int, float)) and r.get("planned", True) and s != "SKIPPED":
                 dl.append((lx.t("ck_time"), f"{float(r['dur']) * 1000:.0f} ms"))
             dl.append((lx.t("ck_id"), _code(r["rid"]) + (f' <span class="dsv-chip">{E(lx.t("ck_required"))}</span>' if r.get("required") else "")))
-            items.append(f'<details class="dsv-ck dsv-s-{s}" data-status="{s}"><summary><span class="dsv-dot" aria-hidden="true">{_STATUS_ICON[s]}</span>'
+            items.append(f'<details class="dsv-ck dsv-s-{s}" data-status="{s}" id="check-{E(r["rid"])}"><summary><span class="dsv-dot" aria-hidden="true">{_STATUS_ICON[s]}</span>'
                          f'<span class="dsv-ck-main"><span><span class="dsv-ck-name">{E(name)}</span> '
                          f'<span class="dsv-chip">{E(lx.t("dom_" + dom))}</span></span>'
                          + (f'<span class="dsv-ck-line">{E(line[:160])}</span>' if line else "") + "</span></summary><dl>"
-                         + "".join(f"<dt>{E(k)}</dt><dd>{v}</dd>" for k, v in dl) + "</dl></details>")
-        groups.append(f'<div class="dsv-ckgroup dsv-s-{s}"><h4><span class="dsv-dot" aria-hidden="true">{_STATUS_ICON[s]}</span>'
-                      f'{E(lx.t("ck_" + s))} ({len(grp)}) <small>{E(lx.t("ck_" + s + "_hint"))}</small></h4>{"".join(items)}</div>')
+                         + "".join(f"<dt>{E(k)}</dt><dd>{v}</dd>" for k, v in dl) + "</dl>"
+                         + _detail(lx, "d_check", (details.get("checks") or {}).get(r["rid"], ""), f"check-{r['rid']}-detail")
+                         + "</details>")
+        opened = " open" if s in ("FAIL", "INCONCLUSIVE") else ""
+        groups.append(f'<details class="dsv-ckgroup dsv-s-{s}"{opened}><summary><span class="dsv-dot" aria-hidden="true">{_STATUS_ICON[s]}</span>'
+                      f'{E(lx.t("ck_" + s))} ({len(grp)}) <small>{E(lx.t("ck_" + s + "_hint"))}</small></summary>{"".join(items)}</details>')
+    head_lines = (comp or {}).get("scope_head") or []
+    nc_lines = (comp or {}).get("not_examined") or []
     nc_html = ""
-    if other_nc:
-        lis = "".join(f"<li>{_code(n.get('item') or n.get('kind'))}: {E(ko_text(str(n.get('reason') or ''), lx.i))}</li>" for n in other_nc[:20])
-        nc_html = f'<h4>{E(lx.t("nc_title"))}</h4><ul class="dsv-nc">{lis}</ul>'
-    return (head + f'<div class="dsv-card dsv-checklist"><p class="dsv-note">{E(lx.t("ck_intro"))}</p>'
-            f'<div class="dsv-bar">{bar}</div>{"".join(tools)}<div class="dsv-ckgroups">{"".join(groups)}</div>{nc_html}</div>')
+    if nc_lines:
+        nc_html = f'<h3>{E(T["g_other"][lx.i])}</h3>' + _md_html(nc_lines)
+    head = "".join(f"<p>{_inline_html(x)}</p>" for x in head_lines if x) or \
+        f'<p>{E(T["s_counts"][lx.i].format(**cnt))}</p>'
+    return (f'<div class="dsv-card dsv-checklist">{head}<div class="dsv-bar">{bar}</div>'
+            f'<div class="dsv-ckgroups">{"".join(groups)}</div>{nc_html}'
+            + _detail(lx, "d_scope", details.get("scope", ""), "scope-detail") + "</div>")
 
 
 # ------------------------------------------------------------------------------------------------ header
-def _hero(lx: _Lx, title: str, res: Dict[str, Any], rows: List[Dict[str, Any]], summary_md: str) -> str:
+def _hero(lx: _Lx, title: str, res: Dict[str, Any], rows: List[Dict[str, Any]], summary_md: str = "",
+          comp: Optional[Dict[str, Any]] = None, details: Optional[Dict[str, Any]] = None) -> str:
+    """The conclusion part: the verdict in words, the conclusion sentence, a few key figures."""
+    from .human_report import check_counts, conclusion_sentence as _cs, fmt_bytes, fmt_ms
     verdict = str(res.get("verdict") or "INCONCLUSIVE")
     tone = _VERDICT_TONE.get(verdict, "unk")
-    word = T[VERDICT_WORD[verdict]][lx.i] if verdict in VERDICT_WORD else ""
-    word = word.split(":")[0].split(";")[0]
-    concl = conclusion_sentence(summary_md)
+    vkey = verdict if f"v_{verdict}" in T else "INCONCLUSIVE"
+    concl = (comp or {}).get("conclusion") or _cs(summary_md)
     impact = res.get("collection_impact") if isinstance(res.get("collection_impact"), dict) else {}
     tiles = []
-    if isinstance(res.get("confidence"), (int, float)):
-        tiles.append(f'<div class="dsv-tile"><span>{E(lx.t("confidence"))}</span><b>{round(float(res["confidence"]) * 100)}%</b></div>')
     if rows:
-        counts = [(s, sum(1 for r in rows if r["status"] == s)) for s in _STATUS_ORDER]
-        bar = "".join(f'<i class="dsv-s-{s}" style="width:{n * 100 / len(rows):.2f}%"></i>' for s, n in counts if n)
-        txt = " · ".join(f"{_STATUS_ICON[s]} {n}" for s, n in counts if n)
-        tiles.append(f'<div class="dsv-tile"><span>{E(lx.t("checks"))}</span><b>{len(rows)}</b><div class="dsv-bar">{bar}</div>'
-                     f'<span>{E(txt)}</span></div>')
+        c = check_counts(rows)
+        bar = "".join(f'<i class="dsv-s-{s}" style="width:{sum(1 for r in rows if r["status"] == s) * 100 / len(rows):.2f}%"></i>'
+                      for s in _STATUS_ORDER if any(r["status"] == s for r in rows))
+        txt = " · ".join(f"{_STATUS_ICON[s]} {lx.t('ck_' + s)} {n}" for s, n in
+                         (("FAIL", c["found"]), ("INCONCLUSIVE", c["undecided"]), ("PASS", c["clean"])) if n)
+        tiles.append(f'<div class="dsv-tile"><span>{E(lx.t("checks_run"))}</span><b>{c["run"]}</b><div class="dsv-bar">{bar}</div>'
+                     f'<span>{E(txt)}</span>' + (f'<span class="dsv-tile-sub">{E(lx.t("checks_not_run", n=c["not_run"]))}</span>'
+                                                 if c["not_run"] else "") + '</div>')
     if isinstance(impact.get("measured_stop_ms"), (int, float)):
         stop = float(impact["measured_stop_ms"])
-        tiles.append(f'<div class="dsv-tile"><span>{E(lx.t("stop_time"))}</span><b>{_fnum(stop)} ms</b>'
+        tiles.append(f'<div class="dsv-tile"><span>{E(lx.t("stop_time"))}</span><b>{E(fmt_ms(stop, lx.i))}</b>'
                      + (f'<span>{E(lx.t("zero_stop"))}</span>' if stop == 0 and impact.get("zero_stop") else "") + "</div>")
     if isinstance(impact.get("bytes_read"), (int, float)):
-        tiles.append(f'<div class="dsv-tile"><span>{E(lx.t("bytes_read"))}</span><b>{E(_size(impact["bytes_read"]))}</b></div>')
+        tiles.append(f'<div class="dsv-tile"><span>{E(lx.t("bytes_read"))}</span><b>{E(fmt_bytes(impact["bytes_read"]))}</b></div>')
     if isinstance(res.get("duration_s"), (int, float)):
-        tiles.append(f'<div class="dsv-tile"><span>{E(lx.t("duration"))}</span><b>{float(res["duration_s"]):.1f} s</b></div>')
-    target = res.get("target") if isinstance(res.get("target"), dict) else {}
-    who = ""
-    if target.get("process_name") or target.get("pid") is not None:
-        who = (f'<p class="dsv-note">{_code(target.get("process_name") or "?")} · pid {E(str(target.get("pid")))}'
-               + (f' · {E(str((target.get("abi") or {}).get("architecture")))}' if isinstance(target.get("abi"), dict)
-                  and (target.get("abi") or {}).get("architecture") else "") + "</p>")
-    nav = [("#dsv-findings", "nav_findings"), ("#dsv-checks", "nav_checks"), ("#human-summary", "nav_summary"),
-           ("#dsv-detail", "nav_detail")]
-    return (f'<section class="dsv-card dsv-hero dsv-tone-{tone}" id="dsv-glance">'
-            f'<h1 class="dsv-title">{E(title)}</h1>{who}'
-            f'<p><span class="dsv-badge">{E(lx.t("verdict"))}: {E(verdict)}</span>'
-            + (f' <span class="dsv-note">{E(word)}</span>' if word else "") + "</p>"
-            + (f'<p class="dsv-concl">{_inline_html(concl)}</p>' if concl else "")
-            + f'<div class="dsv-tiles">{"".join(tiles)}</div>'
-            + '<nav class="dsv-nav">' + "".join(f'<a href="{h}">{E(lx.t(k))}</a>' for h, k in nav) + "</nav></section>")
+        tiles.append(f'<div class="dsv-tile"><span>{E(lx.t("duration"))}</span><b>{E(fmt_ms(float(res["duration_s"]) * 1000, lx.i))}</b></div>')
+    sym = "".join(f'<p class="dsv-note">{_inline_html(x)}</p>' for x in (comp or {}).get("symptom_note") or [])
+    return (f'<div class="dsv-card dsv-hero dsv-tone-{tone}" id="dsv-glance">'
+            f'<p><span class="dsv-badge">{E(T["v_line"][lx.i].split("{word}")[0].strip("* "))} {E(T["v_" + vkey][lx.i])}</span> '
+            f'{_code(verdict)} <span class="dsv-note">{E(T["vm_" + vkey][lx.i])}</span></p>'
+            + (f'<p class="dsv-concl">{_inline_html(concl)}</p>' if concl else "") + sym
+            + (f'<div class="dsv-tiles">{"".join(tiles)}</div>' if tiles else "")
+            + "</div>" + _detail(lx, "d_verdict", (details or {}).get("verdict", ""), "verdict-detail"))
+
+
+_SEC_ID = {"conclusion": "sec-conclusion", "findings": "dsv-findings", "hypothesis": "sec-hypothesis",
+           "next": "sec-next", "scope": "dsv-checks", "method": "sec-method", "reproducibility": "sec-reproducibility",
+           "reference": "sec-reference"}
 
 
 def build_visual_summary(result: Dict[str, Any], report: Optional[Dict[str, Any]] = None, lang: str = "en",
-                         title: str = "", summary_md: str = "") -> str:
-    """HTML fragment (style, verdict header, finding cards with pictures, check list)."""
+                         title: str = "", summary_md: str = "", *, comp: Optional[Dict[str, Any]] = None,
+                         details: Optional[Dict[str, Any]] = None, subtitle: str = "") -> str:
+    """The HTML body of the report: the common outline (``human_report.compose``), each part with its picture or
+    check list, and the detailed records of each part in a collapsed block next to it (``details``, from
+    ``report_detail.partition``).  No script."""
+    from .human_report import compose
     lx = _Lx(lang if lang in ("en", "ko") else "en")
     res = dict(result or {})
     report = report if isinstance(report, dict) else (res.get("report") if isinstance(res.get("report"), dict) else None)
+    if comp is None:
+        comp = compose(res, report, lx.lang)
     findings = [f for f in (res.get("findings") or []) if isinstance(f, dict)]
-    rows = _check_rows(res, report)
-    parts = [f"<style>{_CSS}{_interaction_css()}</style>", f'<div class="dsv" lang="{lx.lang}">', _hero(lx, title, res, rows, summary_md),
-             f'<h2 id="dsv-findings">{E(lx.t("nav_findings"))}</h2>']
-    if findings:
-        parts += [_finding_card(lx, i, f, report) for i, f in enumerate(findings, 1)]
-    else:
-        key = "no_findings" if str(res.get("verdict")) == "HEALTHY" else "no_decision"
-        parts.append(f'<div class="dsv-card"><p>{E(lx.t(key))}</p></div>')
-    parts.append(_checklist(lx, res, report, findings))
+    rows = comp["rows"]
+    details = details or {}
+    nav = "".join(f'<a href="#{_SEC_ID[s["key"]]}">{E(s["heading"])}</a>' for s in comp["sections"])
+    parts = [f"<style>{_CSS}{_interaction_css()}</style>", f'<div class="dsv" lang="{lx.lang}">',
+             f'<header class="dsv-head"><h1 class="dsv-title">{E(title)}</h1>'
+             + (f'<p class="dsv-note">{_inline_html(subtitle)}</p>' if subtitle else "")
+             + f'<nav class="dsv-nav">{nav}</nav></header>']
+    for s in comp["sections"]:
+        key = s["key"]
+        parts.append(f'<section class="dsv-sec" id="{_SEC_ID[key]}"><h2>{E(s["heading"])}</h2>')
+        if key == "conclusion":
+            parts.append(_hero(lx, title, res, rows, summary_md, comp, details))
+        elif key == "findings":
+            parts += [_finding_card(lx, i, f, report, b, (details.get("findings") or {}).get(i, ""))
+                      for i, (f, b) in enumerate(zip(findings, comp["blocks"]), 1)]
+        elif key == "scope":
+            parts.append(_checklist(lx, res, report, findings, comp, details))
+        elif key == "method":
+            parts.append(f'<div class="dsv-card">{_md_html([x for x in s["lines"] if not x.startswith("_")])}'
+                         + _detail(lx, "d_method", details.get("method", ""), "method-detail") + "</div>")
+        elif key == "reproducibility":
+            parts.append(f'<div class="dsv-card">{_md_html(s["lines"])}</div>')
+        elif key == "reference":
+            # the "where is the detail" list is for the Markdown reader; here each part carries its own detail
+            where = f"### {T['r_where'][lx.i]}"
+            body = s["lines"][:s["lines"].index(where)] if where in s["lines"] else s["lines"]
+            parts.append(f'<div class="dsv-card">{_md_html(body)}'
+                         + _detail(lx, "d_other", details.get("other", ""), "other-detail") + "</div>")
+        else:
+            parts.append(f'<div class="dsv-card">{_md_html(s["lines"])}</div>')
+        parts.append("</section>")
     parts.append("</div>")
     return "\n".join(parts)
 
 
 def wrap_detail(report_html: str, label: str) -> str:
-    """Put the long A-I report card of ``DiagnosticReport.to_html`` inside a collapsed block."""
+    """Put the long A-I report card of ``DiagnosticReport.to_html`` inside a collapsed block (kept for callers of
+    the whole-document detail; the incident report attaches the detail per part instead)."""
     start = report_html.find('<div class="report-card">')
     end = report_html.rfind("</body>")
     if start < 0 or end < start:

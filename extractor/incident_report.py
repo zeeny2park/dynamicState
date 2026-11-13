@@ -43,76 +43,109 @@ _LABELS = {
 }
 
 
-# Fixed wording of the Markdown incident report, (en, ko) per key like ``human_report.T``.  Engine-produced text that
-# is quoted in it (finding descriptions, limitations, remediation steps) goes through ``human_report.ko_text``.
+# Fixed wording of the incident-report-only parts, (en, ko) per key like ``human_report.T``.  The common outline
+# itself (conclusion, findings, next steps, scope, method, reference) comes from ``human_report.compose``.
 _MD: Dict[str, Any] = {
-    "h1": ("## 1. Target Identity & Zero-Stop Telemetry", "## 1. 대상 정보와 무중단 수집 측정"),
-    "pid": ("- **PID**: `{pid}` (`{name}`)", "- **PID**: `{pid}` (`{name}`)"),
-    "elf": ("- **Companion ELF**: `{x}`", "- **동반 ELF**: `{x}`"),
-    "build": ("- **Build ID**: `{x}`", "- **빌드 ID**: `{x}`"),
-    "inv": ("- **Investigation**: `{x}`", "- **조사 ID**: `{x}`"),
-    "mode": ("- **Collection Mode**: `{x}`", "- **수집 방식**: `{x}`"),
-    "stop": ("- **Process Stop Duration**: `{ms}ms` (Measured)", "- **프로세스 정지 시간**: `{ms}ms` (측정값)"),
-    "status": ("- **Overall Status**: `{v}` (Health Score: `{s}/100`)", "- **종합 상태**: `{v}` (건강 점수: `{s}/100`)"),
-    "status_na": ("- **Overall Status**: `{v}` (Health Score: `N/A — {why}`)", "- **종합 상태**: `{v}` (건강 점수: `해당 없음 — {why}`)"),
-    "why_incon": ("Inconclusive", "판단 불가"), "why_unscored": ("not scored", "점수 없음"),
-    "gen": ("- **Generated At**: `{x}`", "- **생성 시각**: `{x}`"),
-    "h2": ("## 2. Root-Cause Findings", "## 2. 근본 원인 발견"),
-    "th": ("| Severity | Category | Status | Subjects | Description |", "| 심각도 | 범주 | 상태 | 대상 | 설명 |"),
-    "incon": ("- Diagnostic inspection inconclusive: collection failed or target memory was unreadable.",
-              "- 진단 점검이 판단 불가로 끝났습니다: 수집에 실패했거나 대상 메모리를 읽을 수 없었습니다."),
-    "lim": ("  - Limitation: `{x}`", "  - 제한 사항: `{x}`"),
-    "healthy": ("- Healthy within the checked scope: every baseline check ran to completion and found nothing.",
-                "- 점검한 범위 안에서는 정상입니다: 기본 검사가 모두 끝까지 실행되었고 아무것도 발견하지 못했습니다."),
-    "checked": ("  - Checked: {what} (`{rid}`)", "  - 점검함: {what} (`{rid}`)"),
-    "notchecked": ("  - Not checked: {x}", "  - 점검하지 못함: {x}"),
-    "nofault": ("- No fault was found by the checks that ran.", "- 실행된 검사에서는 결함이 발견되지 않았습니다."),
-    "h3": ("## 3. Hypothesis Verification (`{v}` · Confidence `{c}%`)", "## 3. 가설 검증 (`{v}` · 신뢰도 `{c}%`)"),
     "hyp": ("- **Hypothesis**: {x}", "- **가설**: {x}"),
+    "hyp_result": ("- **Result**: {v}", "- **결과**: {v}"),
     "hyp_note": ("- This verifies the stated assertions only; it does not change the diagnosis verdict above.",
                  "- 이 검증은 명시한 단언만 확인하며, 위의 진단 판정을 바꾸지 않습니다."),
-    "hyp_th": ("| Assertion | Resolved Expression | Observed Value | Expected | Passed |",
-               "| 단언 | 해석된 식 | 관측값 | 기대값 | 통과 |"),
-    "pass": ("PASS", "통과"), "fail": ("FAIL", "실패"),
-    "h4": ("## 4. Checks Run", "## 4. 실행한 검사"),
-    "h5": ("## 5. Remediation Checklist", "## 5. 조치 체크리스트"),
-    "rem_incon": ("Investigation inconclusive: the collection failed or parts of the target could not be examined "
-                  "({lims}). Verify target process accessibility and read permissions, then re-run.",
-                  "조사가 판단 불가로 끝났습니다: 수집에 실패했거나 대상의 일부를 확인하지 못했습니다 ({lims}). "
-                  "대상 프로세스에 접근할 수 있는지와 읽기 권한을 확인한 뒤 다시 실행하세요."),
-    "rem_healthy": ("No remediation needed within the checked scope: every baseline check ran to completion and found nothing.",
-                    "점검한 범위 안에서는 조치가 필요 없습니다: 기본 검사가 모두 끝까지 실행되었고 아무것도 발견하지 못했습니다."),
-    "rem_notchecked": ("Not checked (outside the healthy scope): {x}.", "점검하지 못함 (정상 판정 범위 밖): {x}."),
-    "rem_none": ("No fault was found by the checks that ran; see 'What could not be examined'.",
-                 "실행된 검사에서는 결함이 발견되지 않았습니다. '확인하지 못한 것'을 참고하세요."),
+    "hyp_th": ("| Assertion | Resolved Expression | Observed Value | Expected | Result |",
+               "| 단언 | 해석된 식 | 관측값 | 기대값 | 결과 |"),
+    "pass": ("passed", "통과"), "fail": ("failed", "실패"),
+    "appendix": ("Detailed records, by report part (English)", "보고서 부분별 상세 기록 (영문)"),
+    "ap_verdict": ("Conclusion: how the verdict was derived", "결론: 판정 근거"),
+    "ap_finding": ("Finding {i}", "발견 {i}"),
+    "ap_check": ("Check {x}", "검사 {x}"),
+    "ap_scope": ("Scope: check totals and limitations", "검사 범위: 검사 집계와 제한 사항"),
+    "ap_method": ("Method: target, collection and plan", "진단 방법: 대상, 수집, 계획"),
+    "ap_other": ("Other detailed records", "그 밖의 상세 기록"),
 }
 
 
-_HTML_CSS = """
-.ds-summary { max-width: 860px; margin: 24px auto; padding: 16px 24px; border: 1px solid #cbd5e1; border-radius: 8px;
-  background: #ffffff; color: #0f172a; font: 15px/1.6 -apple-system, "Segoe UI", "Noto Sans KR", sans-serif; }
-.ds-summary h1, .ds-summary h2, .ds-summary h3 { line-height: 1.3; }
-.ds-summary code, .ds-summary pre { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 13px; }
-.ds-summary code { background: #f1f5f9; padding: 1px 4px; border-radius: 3px; }
-.ds-summary pre { background: #f1f5f9; padding: 12px; border-radius: 6px; overflow-x: auto; }
-.ds-summary pre code { background: none; padding: 0; }
-.ds-verdict { font-weight: 600; }
-.ds-detail-title { max-width: 860px; margin: 16px auto; }
-@media (prefers-color-scheme: dark) {
-  .ds-summary { background: #0f172a; color: #e2e8f0; border-color: #334155; }
-  .ds-summary code, .ds-summary pre { background: #1e293b; }
+# The JSON ``remediation_checklist`` of a result without a finding-specific step (not shown in the report body).
+_REM: Dict[str, Any] = {
+    "incon": ("Investigation inconclusive: the collection failed or parts of the target could not be examined "
+              "({lims}). Verify target process accessibility and read permissions, then re-run.",
+              "조사가 판단 불가로 끝났습니다: 수집에 실패했거나 대상의 일부를 확인하지 못했습니다 ({lims}). "
+              "대상 프로세스에 접근할 수 있는지와 읽기 권한을 확인한 뒤 다시 실행하세요."),
+    "healthy": ("No remediation needed within the checked scope: every baseline check ran to completion and found nothing.",
+                "점검한 범위 안에서는 조치가 필요 없습니다: 기본 검사가 모두 끝까지 실행되었고 아무것도 발견하지 못했습니다."),
+    "notchecked": ("Not checked (outside the healthy scope): {x}.", "점검하지 못함 (정상 판정 범위 밖): {x}."),
+    "none": ("No fault was found by the checks that ran; see 'What could not be examined'.",
+             "실행된 검사에서는 결함이 발견되지 않았습니다. '확인하지 못한 것'을 참고하세요."),
 }
+
+
+def _generated_at() -> str:
+    """Local time of the report with the timezone stated once (``2026-11-13 17:42:05 KST (UTC+09:00)``)."""
+    now = datetime.now().astimezone()
+    off = now.strftime("%z")
+    off = f"{off[:3]}:{off[3:]}" if off else ""
+    tz = now.tzname() or ""
+    if off in ("+00:00", "-00:00"):
+        return f"{now:%Y-%m-%d %H:%M:%S} UTC"
+    return f"{now:%Y-%m-%d %H:%M:%S} {tz} (UTC{off})".replace("  ", " ")
+
+
+def _hypothesis_lines(hyp_res: Optional[Dict[str, Any]], li: int) -> List[str]:
+    """The optional hypothesis verification the caller asked for (its own part; never the verdict)."""
+    if hyp_res is None:
+        return []
+    out = [_MD["hyp"][li].format(x=hyp_res.get("hypothesis")),
+           _MD["hyp_result"][li].format(v=f"`{hyp_res.get('verdict')}`"),
+           _MD["hyp_note"][li], "", _MD["hyp_th"][li], "| :--- | :--- | :--- | :--- | :--- |"]
+    for ar in hyp_res.get("assertion_results", []):
+        out.append(f"| `{ar.get('assertion')}` | `{ar.get('resolved_expression')}` | `{ar.get('observed_value')}` | "
+                   f"`{ar.get('expected')}` | **{_MD['pass' if ar.get('passed') else 'fail'][li]}** |")
+    return out
+
+
+def _reproducibility_section(res: Dict[str, Any], report: Optional[Dict[str, Any]], language: str) -> List[str]:
+    """RESERVED SLOT for the reproducibility section (``extractor/reproducibility.py``, added separately).
+
+    Return its Markdown lines here; ``human_report.compose`` places them as the "Reproducibility / 재현 정보"
+    section after "How the diagnosis was done" and before "Reference", in the Markdown and the HTML report alike.
+    Empty: the section is left out."""
+    return []
+
+
+def _detail_appendix_markdown(parts: Dict[str, Any], comp: Dict[str, Any], li: int) -> List[str]:
+    """Opt-in Markdown appendix of the detailed records, organised by report part (not as one A-I sequence)."""
+    from .diagnostic_report import detail_record_markdown
+    from .human_report import check_label
+    rec = parts.get("records") or {}
+    out = [f"## {_MD['appendix'][li]}", ""]
+
+    def block(title: str, records: Any) -> None:
+        items = [r for r in (records or []) if r]
+        if not items:
+            return
+        out.extend([f"### {title}", ""])
+        for r in items:
+            out.extend(detail_record_markdown(", ".join(sorted(r.keys())) if isinstance(r, dict) else "-", r))
+    block(_MD["ap_verdict"][li], rec.get("verdict"))
+    for i, r in sorted((rec.get("findings") or {}).items()):
+        block(_MD["ap_finding"][li].format(i=i), [{k: v} for k, v in r.items() if v])
+    for rid, r in (rec.get("checks") or {}).items():
+        block(_MD["ap_check"][li].format(x=check_label(rid, li)), [{k: v} for k, v in r.items() if v])
+    block(_MD["ap_scope"][li], rec.get("scope"))
+    block(_MD["ap_method"][li], rec.get("method"))
+    block(_MD["ap_other"][li], [x for x in (rec.get("other") or []) if any(v for v in x.values())])
+    return out
+
+
+_PAGE_CSS = """
+html { -webkit-text-size-adjust: 100%; }
+body { margin: 0; padding: 16px; background: #f1f5f9; color: #0f172a; }
+@media (prefers-color-scheme: dark) { body { background: #020617; color: #e2e8f0; } }
 """
 
 
-def _summary_section(lang: str, verdict: str, summary_md: str) -> str:
-    from .human_report import markdown_to_html
-    lb = _LABELS[lang]
-    body = markdown_to_html(summary_md, heading_offset=1) if summary_md else f"<p>{html.escape(lb['no_summary'])}</p>"
-    return (f'<style>{_HTML_CSS}</style>\n<section class="ds-summary" lang="{lang}" id="human-summary">\n'
-            f'<h2>{html.escape(lb["summary"])}</h2>\n'
-            f'<p class="ds-verdict">{html.escape(lb["verdict"])}: <code>{html.escape(verdict)}</code></p>\n'
-            f'{body}\n</section>\n')
+def _page(title: str, lang: str, body: str) -> str:
+    return ("<!DOCTYPE html>\n<html lang=\"" + lang + "\"><head>\n<meta charset=\"utf-8\">\n"
+            "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n"
+            f"<title>{html.escape(title)}</title>\n<style>{_PAGE_CSS}</style>\n</head>\n<body>\n{body}\n</body>\n</html>\n")
 
 
 def _limitation_text(nc: Dict[str, Any]) -> str:
@@ -160,12 +193,28 @@ def _demote_headings(md: str) -> List[str]:
 
 
 def _html_fallback(title: str, verdict: str, summary_md: str, lang: str = "en", human_md: str = "") -> str:
-    return (
-        f"<!DOCTYPE html>\n<html lang=\"{lang}\"><head><meta charset=\"utf-8\"><title>" + html.escape(title)
-        + "</title></head><body>"
-        f"<h1>{html.escape(title)}</h1>\n{_summary_section(lang, verdict, human_md)}"
-        f"<pre>{html.escape(summary_md)}</pre></body></html>\n"
-    )
+    """Plain page used only when the structured page could not be built: the Markdown report, escaped."""
+    from .human_report import markdown_to_html
+    return _page(title, lang, f'<main class="ds-fallback" lang="{lang}" data-verdict="{html.escape(verdict)}">'
+                 + markdown_to_html(summary_md) + "</main>")
+
+
+def _compose_markdown(title: str, comp: Dict[str, Any], appendix: List[str]) -> str:
+    """The incident report in Markdown: title, then the common outline, then (opt-in) the detail appendix."""
+    from .human_report import sections_markdown
+    lines = [f"# {title}", ""] + sections_markdown(comp) + appendix
+    while lines and lines[-1] == "":
+        lines.pop()
+    return "\n".join(lines) + "\n"
+
+
+def _compose_html(title: str, comp: Dict[str, Any], res: Dict[str, Any], report: Optional[Dict[str, Any]],
+                  language: str, parts: Dict[str, Any]) -> str:
+    """The incident report in HTML: the same outline, each part with its picture/check list and its own collapsed
+    detailed records."""
+    from .report_visuals import build_visual_summary
+    body = build_visual_summary(res, report, language, title=title, comp=comp, details=parts)
+    return _page(title, language, body)
 
 
 def _write(path_in: Optional[str], content: str, file_type: str, forbid_same_as: Optional[str] = None):
@@ -213,8 +262,13 @@ def export_incident_report(
     hypothesis_verifier: Optional[Callable[..., Dict[str, Any]]] = None,
     pre_limitations: Optional[List[str]] = None,
     language: str = "en",
+    markdown_detail: bool = False,
 ) -> Dict[str, Any]:
-    """Diagnose ``pid`` once with ``diagnose()`` and render the incident report (Markdown, HTML, JSON)."""
+    """Diagnose ``pid`` once with ``diagnose()`` and render the incident report (Markdown, HTML, JSON).
+
+    The Markdown and the HTML follow the same outline (``human_report.compose``).  The detailed (A-I) records are
+    attached to the part of the HTML report they explain (``report_detail.partition``); the Markdown points to them,
+    and ``markdown_detail=True`` appends them to the Markdown as well, organised by report part."""
     t0 = time.monotonic_ns()
     if language not in ("en", "ko"):
         raise ValueError(f"language must be 'en' or 'ko', got {language!r}")
@@ -268,20 +322,20 @@ def export_incident_report(
     if pre_limitations and verdict not in FAULT_VERDICTS:
         verdict = VERDICT_INCONCLUSIVE  # the target itself could not be resolved
     findings = [_finding_row(f, remediation_checklist) for f in (res.get("findings") or []) if isinstance(f, dict)]
+    # ``remediation_checklist`` is kept in the JSON result; the reader-facing "what to do next" is built from the
+    # findings (human_report), because the engine's checklist is generic for most categories
     if verdict == VERDICT_INCONCLUSIVE:
         remediation_checklist = [
-            _MD["rem_incon"][li].format(lims="; ".join(_ko_limitation(x, li) for x in limitations[:3]))
+            _REM["incon"][li].format(lims="; ".join(_ko_limitation(x, li) for x in limitations[:3]))
         ] + [x for x in remediation_checklist if "within expected parameters" not in x]
     elif verdict == VERDICT_HEALTHY:
-        # HEALTHY rule (extractor.healthy_verdict): the claim is limited to the baseline scope; say what was not checked
         from .healthy_verdict import display_label
         not_checked = [display_label(x, bool(li)) for x in (res.get("healthy_scope") or {}).get("not_checked") or []]
-        remediation_checklist = [
-            _MD["rem_healthy"][li]
-        ] + ([_MD["rem_notchecked"][li].format(x="; ".join(not_checked))] if not_checked else [])
+        remediation_checklist = [_REM["healthy"][li]] + (
+            [_REM["notchecked"][li].format(x="; ".join(not_checked))] if not_checked else [])
     elif not remediation_checklist:
-        remediation_checklist.append(_MD["rem_none"][li])
-    health_score = health_score_for(verdict, findings)
+        remediation_checklist.append(_REM["none"][li])
+    health_score = health_score_for(verdict, findings)   # JSON only: a fixed deduction per severity, not a measurement
 
     # 2. optional hypothesis verification (its own section; never the verdict)
     hyp_res: Optional[Dict[str, Any]] = None
@@ -299,82 +353,30 @@ def export_incident_report(
     target = res.get("target") or {}
     eff_pid = target.get("pid") or pid
     eff_elf = target.get("debug_image") or companion_elf_path
-    now_iso = datetime.now(timezone.utc).isoformat()
-    na = _MD["why_incon" if verdict == VERDICT_INCONCLUSIVE else "why_unscored"][li]
-    status_line = (_MD["status"][li].format(v=verdict, s=health_score) if health_score is not None
-                   else _MD["status_na"][li].format(v=verdict, why=na))
-    md = [
-        f"# {title}", "",
-        _MD["h1"][li],
-        _MD["pid"][li].format(pid=eff_pid, name=target.get('process_name') or process_name or 'target'),
-        _MD["elf"][li].format(x=eff_elf),
-        _MD["build"][li].format(x=build_id or 'N/A'),
-        _MD["inv"][li].format(x=res.get('investigation_id') or 'N/A'),
-        _MD["mode"][li].format(x=collection_mode),
-        _MD["stop"][li].format(ms=f"{stop_ms:.2f}"),
-        *impact_summary_lines(impact, language),
-        status_line,
-        _MD["gen"][li].format(x=now_iso), "",
-        _MD["h2"][li],
-    ]
-    if findings:
-        md.append(_MD["th"][li])
-        md.append("| :--- | :--- | :--- | :--- | :--- |")
-        for f in findings:
-            md.append(f"| **{f.get('severity')}** | `{f.get('category')}` | {f.get('status')} | "
-                      f"{', '.join('`%s`' % s for s in (f.get('subjects') or [])[:6]) or '-'} | "
-                      f"{ko_text(f.get('description') or '-', li)} |")
-    elif verdict == VERDICT_INCONCLUSIVE:
-        md.append(_MD["incon"][li])
-        for lim in limitations[:12]:
-            md.append(_MD["lim"][li].format(x=_ko_limitation(lim, li)))
-    elif verdict == VERDICT_HEALTHY:
-        from .healthy_verdict import display_label, display_what
-        scope = res.get("healthy_scope") or {}
-        md.append(_MD["healthy"][li])
-        for c in scope.get("checked") or []:
-            md.append(_MD["checked"][li].format(what=display_what(c, bool(li)), rid=c.get('recipe_id')))
-        for x in scope.get("not_checked") or []:
-            md.append(_MD["notchecked"][li].format(x=display_label(x, bool(li))))
-    else:
-        md.append(_MD["nofault"][li])
-    if summary_md:
-        md += ["", f"### {_LABELS[language]['diag_summary']}", ""] + _demote_headings(summary_md)
-    if hyp_res is not None:
-        md += ["", _MD["h3"][li].format(v=hyp_res.get('verdict'),
-                                        c=round(float(hyp_res.get('confidence_score') or 0.0) * 100, 1)),
-               _MD["hyp"][li].format(x=hyp_res.get('hypothesis')),
-               _MD["hyp_note"][li], "",
-               _MD["hyp_th"][li],
-               "| :--- | :--- | :--- | :--- | :--- |"]
-        for ar in hyp_res.get("assertion_results", []):
-            md.append(f"| `{ar.get('assertion')}` | `{ar.get('resolved_expression')}` | `{ar.get('observed_value')}` | "
-                      f"`{ar.get('expected')}` | **{_MD['pass' if ar.get('passed') else 'fail'][li]}** |")
-    md += ["", _MD["h4"][li]]
-    for c in (res.get("checks_run") or [])[:30]:
-        md.append(f"- `{c.get('recipe_id')}`: {c.get('status')}")
-    md += ["", _MD["h5"][li]]
-    md += [f"{i}. [ ] {ko_text(step, li)}" for i, step in enumerate(remediation_checklist, start=1)]
-    report_markdown = "\n".join(md) + "\n"
+
+    # 3. one composition of the common outline, rendered as Markdown and as HTML
+    from .human_report import compose
+    view = dict(res, verdict=verdict)
+    if not view.get("target"):
+        view["target"] = {"pid": eff_pid, "process_name": process_name, "debug_image": eff_elf}
+    elif process_name and not target.get("process_name"):
+        view["target"] = dict(target, process_name=process_name)
+    comp = compose(view, report, language, pointers=True,
+                   method_extra={"build_id": build_id, "generated": _generated_at()},
+                   extra_sections={"hypothesis": _hypothesis_lines(hyp_res, li),
+                                   "reproducibility": _reproducibility_section(view, report, language)})
+    from .report_detail import partition
+    parts = partition(view, report, comp["rows"])
+    appendix = _detail_appendix_markdown(parts, comp, li) if markdown_detail else []
+    report_markdown = _compose_markdown(title, comp, appendix)
 
     report_html: Optional[str] = None
     if template_path and os.path.exists(template_path):
         with open(template_path, "r", encoding="utf-8") as tf:
             report_html = tf.read().replace("{{VERDICT}}", verdict)
-    elif report is not None:
+    else:
         try:
-            from .diagnostic_report import DiagnosticReport
-            from .report_visuals import build_visual_summary, wrap_detail
-            base_html = wrap_detail(DiagnosticReport.from_dict(report).to_html(), _LABELS[language]["detail"])
-            try:
-                visual = build_visual_summary(res, report, language, title=title, summary_md=summary_md)
-            except Exception:  # noqa: BLE001 - the pictures are an addition; the report must still be written
-                visual = f"<h1>{html.escape(title)}</h1>"
-            report_html = base_html.replace(
-                "<body>", f"<body>\n{visual}\n{_summary_section(language, verdict, summary_md)}", 1)
-            report_html = report_html.replace("<html>", f'<html lang="{language}">', 1)
-            report_html = report_html.replace(
-                "<head>", '<head>\n<meta name="viewport" content="width=device-width, initial-scale=1">', 1)
+            report_html = _compose_html(title, comp, view, report, language, parts)
         except Exception:  # noqa: BLE001 - fall back to the plain rendering below
             report_html = None
     if report_html is None:
