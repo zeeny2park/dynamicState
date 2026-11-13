@@ -448,6 +448,9 @@ def run_target(gt: Dict[str, Any], tmp: str, diagnose_fn: Callable, symptom_mode
                              "error": f"diagnose did not return within {DIAGNOSE_TIMEOUT_S:.0f}s (hang)"})
                 break  # the hung thread still uses the target; do not call again
             runs.append({"result": box.get("result"), "error": box.get("error"), "diagnose_s": run_s})
+            # Each diagnosis leaves tens of MB of session and report files in the corpus; the benchmark only uses the
+            # returned result, so drop them per run (35 targets x 20 repeats filled a 45 GB disk otherwise).
+            shutil.rmtree(os.path.join(tmp, "corpus"), ignore_errors=True)
         result, error, diag_s = runs[0]["result"], runs[0]["error"], runs[0]["diagnose_s"]
     except (RuntimeError, OSError) as exc:
         error = f"target setup failed: {exc}"
