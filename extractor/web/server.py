@@ -32,6 +32,7 @@ from extractor.static_analyzer import (
 )
 from extractor.watch_session import WatchSessionManager
 from extractor.web.diagnose_jobs import DiagnoseJobManager, is_valid_job_id
+from extractor.web import explore_routes
 
 _JOBS_INIT_LOCK = threading.Lock()
 
@@ -3836,7 +3837,8 @@ class WebApiAdapter:
         with _JOBS_INIT_LOCK:
             mgr = getattr(self, "_diagnose_jobs", None)
             if mgr is None:
-                mgr = self._diagnose_jobs = DiagnoseJobManager(lambda: self.runtime.expert_diagnostic_engine, _to_json_serializable)
+                mgr = self._diagnose_jobs = DiagnoseJobManager(lambda: self.runtime.expert_diagnostic_engine, _to_json_serializable,
+                                                               corpus_dir=getattr(self.runtime, "corpus_dir", None))
             return mgr
 
     def start_investigation(self, params: Dict[str, Any]) -> Dict[str, Any]:
@@ -4521,6 +4523,15 @@ class DynamicStateRequestHandler(http.server.BaseHTTPRequestHandler):
                 return
             body = parsed_body
 
+        parts = path.split("/")          # ['', 'api', 'diagnose', '<job_id>', '<action>', ...]
+        if path.startswith("/api/diagnose/") and 5 <= len(parts) <= 6 and parts[4] in explore_routes.POST_ACTIONS:
+            mgr = self.server.adapter.diagnose_jobs
+            job = mgr.get(parts[3])
+            if job is None:
+                self._job_error(404, "NOT_FOUND", f"Route not found: {path}")
+                return
+            explore_routes.handle_post(self, mgr.explore, mgr, job, parts[4:], body)
+            return
         self._handle_api_post(path, body)
 
     # -------------------------------------------------------------------------
@@ -5407,7 +5418,14 @@ class DynamicStateRequestHandler(http.server.BaseHTTPRequestHandler):
         if path == "/api/diagnose/jobs":
             self._send_json({"success": True, "jobs": mgr.list()})
             return
-        parts = path.split("/")          # ['', 'api', 'diagnose', '<job_id>', '<action>']
+        parts = path.split("/")          # ['', 'api', 'diagnose', '<job_id>', '<action>', ...]
+        if 5 <= len(parts) <= 6 and parts[4] in explore_routes.GET_ACTIONS:     # job-bound exploration (read-only)
+            job = mgr.get(parts[3])
+            if job is None:
+                self._job_error(404, "NOT_FOUND", f"Route not found: {path}")
+                return
+            explore_routes.handle_get(self, mgr.explore, job, parts[4:], query)
+            return
         job = mgr.get(parts[3]) if len(parts) == 5 else None
         if job is None or parts[4] not in ("events", "status", "report"):
             self._job_error(404, "NOT_FOUND", f"Route not found: {path}")

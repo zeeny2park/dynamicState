@@ -51,6 +51,7 @@ def build_view(result: Dict[str, Any], lang: str, report: Optional[Dict[str, Any
     from extractor import human_report as hr
     from extractor import report_visuals as rv
     from extractor.diagnostic_recipes import CAPABILITY_DESCRIPTIONS
+    from extractor.web.ui import explore_fragments as xf
 
     if lang not in LANGS:
         raise ValueError(f"lang must be one of {LANGS}")
@@ -88,6 +89,9 @@ def build_view(result: Dict[str, Any], lang: str, report: Optional[Dict[str, Any
             item["capability"] = cap
             item["capability_label"] = CAPABILITY_DESCRIPTIONS.get(cap, (cap, cap))[i]
         item["findings"] = [n for n, f in enumerate(findings, 1) if rid in [str(x) for x in f.get("recipe_ids") or []]]
+        if kind == "run":
+            meta = rv._recipe_meta(rid)
+            item["related_html"] = xf.check_chips_html(lang, meta[0] if meta else "")
         checks.append(item)
 
     # ---- findings: the report's card body (picture, facts, why, evidence) under the UI's own heading

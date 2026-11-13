@@ -585,9 +585,11 @@
         return open[k] && (depth || 0) < 6 ? '<div class="dt-in" data-k="dt-' + k + '">' + slotBody(k, s, ui, (depth || 0) + 1) + "</div>" : "";
       });
   }
-  function slotBody(k, s, ui, depth) {
-    var x = (root.DSX && root.DSX.slot) ? root.DSX.slot(k, s, ui, depth) : "";
-    return x || "";
+  function slotBody(k, s, ui, depth) { return hook("slot", k, s, ui, depth); }
+  /* the exploration module (explore.js) draws what the server's fragments and the observation need; without it, nothing */
+  function hook(name) {
+    var X = root.DSX;
+    return X && typeof X[name] === "function" ? X[name].apply(null, Array.prototype.slice.call(arguments, 1)) || "" : "";
   }
   /* the process profile: the place is reserved from the plan stage; the content is the server's (view.profile) */
   function renderProfile(s, ui) {
@@ -648,7 +650,7 @@
       var inner;
       if (vf) {
         inner = '<div class="fbody dsv" lang="' + lang + '" data-static="f' + f.n + "-" + lang + '">' + vf.body_html + "</div>" +
-          link(reportHref(s, ui, vf.anchor), tr(lang, "f_detail"));
+          hook("findingChips", f.n, s, ui) + link(reportHref(s, ui, vf.anchor), tr(lang, "f_detail"));
       } else if (s.verdict) {          // no view from the server: the result's own words (engine English)
         inner = '<div class="prose" lang="en">' + (f.description ? "<p>" + esc(f.description) + "</p>" : "") +
           (f.observed.length ? '<ul>' + f.observed.slice(0, 4).map(function (o) { return "<li>" + esc(o) + "</li>"; }).join("") + "</ul>" : "") + "</div>" +
@@ -688,7 +690,8 @@
       var dt = "";
       if (open) {
         if (vc && vc.detail_html) {
-          dt = '<div class="ckdetail dsv" lang="' + lang + '">' + vc.detail_html + "</div>" + link(reportHref(s, ui, vc.anchor), tr(lang, "ck_detail"));
+          dt = '<div class="ckdetail dsv" lang="' + lang + '">' + vc.detail_html + "</div>" + (s.verdict && vc.related_html ? vc.related_html : "") +
+            link(reportHref(s, ui, vc.anchor), tr(lang, "ck_detail"));
         } else {
           dt = (DONE[st] && line ? "<p>" + esc(line) + "</p>" : "") + '<p class="text-muted">' + esc(tr(lang, "ck_wait_detail")) + "</p>" +
             '<p class="rid">' + esc(tr(lang, "ck_id")) + " <code>" + esc(rid) + "</code></p>";
@@ -752,6 +755,7 @@
       '</span></div><div class="card-content">' + (ns || '<p class="empty">' + esc(tr(lang, "notseen_none")) + "</p>") + "</div></section>";
     out += '<section class="card" id="next" aria-labelledby="h-next"><div class="card-header"><h2 class="card-title" id="h-next">' + esc(tr(lang, "next_h")) +
       '</h2></div><div class="card-content">' + (V && V.next_html ? '<div class="prose">' + V.next_html + "</div>" : '<p class="empty">' + esc(tr(lang, "next_none")) + "</p>") + "</div></section>";
+    out += hook("observe", s, ui);
     var T = tilesOf(s, lang), href = reportHref(s, ui, "");
     var urls = v.report_urls || {};
     var mdHref = urls.md ? urls.md + "&lang=" + lang : "", jsHref = urls.json || "";
@@ -789,7 +793,7 @@
     var live = !s.verdict && !s.error;
     return "<b>" + esc(g.process_name || "?") + '</b><span class="sep">·</span><span>pid ' + esc(g.pid) + "</span>" +
       (g.architecture ? '<span class="sep opt-hide">·</span><span class="opt-hide">' + esc(g.architecture) + "</span>" : "") +
-      (live ? '<span class="sep">·</span><span class="live"><i aria-hidden="true"></i>' + esc(tr(ui.lang, "running")) + "</span>" : "");
+      (live ? '<span class="sep">·</span><span class="live"><i aria-hidden="true"></i>' + esc(tr(ui.lang, "running")) + "</span>" : hook("chipStatus", s, ui));
   }
 
   function ago(iso, lang, now) {
@@ -884,7 +888,7 @@
 
   var api = { STR: STR, reduce: reduce, render: render, renderIdle: renderIdle, renderChip: renderChip, announce: announce,
     sortEvents: sortEvents, groupOf: groupOf, counts: counts, fmtMs: fmtMs, fmtBytes: fmtBytes, stageIndex: stageIndex,
-    PHASES: PHASES, viewOf: viewOf };
+    PHASES: PHASES, viewOf: viewOf, fillSlots: fillSlots, backLink: backLink, tr: tr, esc: esc, L: L };
   if (typeof module !== "undefined" && module.exports) module.exports = api;
   root.DSUI = api;
   if (typeof document === "undefined") return;
@@ -1003,6 +1007,7 @@
     if (!t0) t0 = Date.now() - (typeof e.t === "number" ? e.t : 0);
     draw();
     if (e.type === "verdict" || e.type === "error") closeStream();
+    if (e.type === "verdict" && job && !ui.replay && root.DSX && root.DSX.onVerdict) root.DSX.onVerdict(job);
   }
 
   /* ---- server: start, SSE, polling fallback, reconnect from the last seq ---- */
@@ -1290,5 +1295,6 @@
     }
   });
   window.addEventListener("popstate", route);
+  api.shell = { ui: ui, draw: draw, drawNow: drawNow, state: state, getJSON: getJSON, job: function () { return job; } };
   route();
 })(typeof window !== "undefined" ? window : globalThis);

@@ -39,6 +39,14 @@ def _process_name(pid: int) -> Optional[str]:
         return None
 
 
+def _start_ticks(pid: int) -> Optional[int]:
+    try:
+        with open(f"/proc/{int(pid)}/stat", "r", encoding="utf-8", errors="replace") as fh:
+            return int(fh.read().rsplit(")", 1)[1].split()[19])
+    except (OSError, IndexError, ValueError):
+        return None
+
+
 def _reason_code(reason: str) -> str:
     """The engine's own words for an unusable local target (``_preflight_target``) as an error code."""
     r = reason or ""
@@ -91,6 +99,9 @@ class DiagnoseJob:
         self.pid: int = params["pid"]
         self.remote_host: Optional[str] = (params.get("remote_target") or {}).get("remote_host")
         self.target_name: Optional[str] = None if self.remote_host else _process_name(self.pid)
+        # the process's start time: exploration refuses to read a pid that now belongs to another process
+        self.start_ticks: Optional[int] = None if self.remote_host else _start_ticks(self.pid)
+        self.observation: Optional[Dict[str, Any]] = None     # "Add to report": the user's observation, in the report only
         self.language: str = params.get("language") or "en"
         self.params = params
         self.investigation_id: Optional[str] = None
@@ -317,10 +328,12 @@ class _TimelineTranslator:
 
 class DiagnoseJobManager:
     def __init__(self, engine_getter: Callable[[], Any], serialize: Callable[[Any], Any],
-                 diagnose_fn: Optional[Callable[..., Tuple[Dict[str, Any], str]]] = None):
+                 diagnose_fn: Optional[Callable[..., Tuple[Dict[str, Any], str]]] = None, corpus_dir: Optional[str] = None):
         self._engine_getter = engine_getter
         self._serialize = serialize
         self._diagnose_fn = diagnose_fn
+        self._corpus_dir = corpus_dir
+        self._explore: Any = None
         self._lock = threading.Lock()
         self._jobs: "OrderedDict[str, DiagnoseJob]" = OrderedDict()
         self._running_by_target: Dict[Tuple[str, int], str] = {}
@@ -430,6 +443,25 @@ class DiagnoseJobManager:
         finished = [jid for jid, j in self._jobs.items() if j.state != "running"]
         for jid in finished[:max(0, len(finished) - MAX_FINISHED_JOBS)]:
             del self._jobs[jid]
+        if self._explore is not None:
+            self._explore.prune(list(self._jobs))
+
+    # -- exploration (extractor/web/explore.py): read-only, bound to a job's target
+    @property
+    def explore(self) -> Any:
+        with self._lock:
+            if self._explore is None:
+                import tempfile
+                from extractor.web.explore import ExploreHub
+                corpus = self._corpus_dir or os.path.join(tempfile.gettempdir(), "dynamicstate-explore")
+                self._explore = ExploreHub(corpus)
+            return self._explore
+
+    def set_observation(self, job: DiagnoseJob, observation: Optional[Dict[str, Any]]) -> None:
+        """"Add to report": the next report of this job carries the observation as its own section (or none)."""
+        with job.report_lock:
+            job.observation = observation
+            job.reports.clear()
 
     def get(self, job_id: str) -> Optional[DiagnoseJob]:
         if not is_valid_job_id(job_id):
