@@ -321,7 +321,10 @@ def _request2chunk(req: int) -> int:
     return max(32, (req + 8 + 15) & ~15)
 
 
-_TYPE_SIZE_CACHE: Dict[int, Dict[int, List[str]]] = {}
+# The size-class table is stored on the DWARF index object itself (not in a module dict keyed by ``id(idx)``): Python
+# reuses ids after garbage collection, so in a long-lived process an index of a different binary could inherit the
+# table of a collected one.  The table now lives and dies with the index it was built from.
+_TYPE_SIZE_ATTR = "_leak_attribution_type_size_table"
 
 
 def candidate_types(analysis: Any, chunk_size: int) -> List[str]:
@@ -330,7 +333,7 @@ def candidate_types(analysis: Any, chunk_size: int) -> List[str]:
     if an is None or not an.modules:
         return []
     idx = an.modules[0][1]
-    table = _TYPE_SIZE_CACHE.get(id(idx))
+    table = getattr(idx, _TYPE_SIZE_ATTR, None)
     if table is None:
         table = {}
         for t in getattr(idx, "types_by_die", {}).values():
@@ -339,7 +342,10 @@ def candidate_types(analysis: Any, chunk_size: int) -> List[str]:
                 label = ("struct " if t.tag == "DW_TAG_structure_type" else "class ") + t.name
                 if label not in lst:
                     lst.append(label)
-        _TYPE_SIZE_CACHE[id(idx)] = table
+        try:
+            setattr(idx, _TYPE_SIZE_ATTR, table)
+        except (AttributeError, TypeError):   # an index that cannot take attributes: rebuilt per call, never shared
+            pass
     return list(table.get(int(chunk_size), []))
 
 
