@@ -344,6 +344,7 @@ T: Dict[str, Tuple[str, str]] = {
     "s_conclusion": ("Conclusion", "결론"),
     "s_findings": ("What was found", "발견된 문제"),
     "s_target": ("Target", "대상"),
+    "s_profile": ("Process profile", "프로세스 프로필"),
     "s_not_examined": ("Not examined", "확인하지 못한 것"),
     "s_hypothesis": ("The hypothesis you asked to check", "요청한 가설 검증"),
     "s_next": ("What to do next", "다음에 할 일"),
@@ -1685,13 +1686,23 @@ def _render_findings(ctx: _Ctx, findings: List[Dict[str, Any]], report: Optional
 # verdict -> tiles -> target -> findings -> checks -> not examined -> next steps, then the report-only reference
 # material.  "tiles" has no heading (the Markdown shows its four figures as one line at the end of the conclusion);
 # every other key is a section.  The live UI's tests compare their card order against this constant.
-REPORT_SECTION_ORDER = ("conclusion", "tiles", "target", "findings", "checks", "not_examined", "next",
+REPORT_SECTION_ORDER = ("conclusion", "tiles", "target", "profile", "findings", "checks", "not_examined", "next",
                         "hypothesis", "method", "reproducibility", "reference")
 SECTION_ORDER = tuple(k for k in REPORT_SECTION_ORDER if k != "tiles")
-_SECTION_TITLE = {"conclusion": "s_conclusion", "target": "s_target", "findings": "s_findings",
+_SECTION_TITLE = {"conclusion": "s_conclusion", "target": "s_target", "profile": "s_profile", "findings": "s_findings",
                   "checks": "s_scope", "not_examined": "s_not_examined", "next": "s_next",
                   "hypothesis": "s_hypothesis", "method": "s_method", "reproducibility": "s_repro",
                   "reference": "s_reference"}
+
+
+def profile_of(res: Dict[str, Any], report: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """The process profile of a result: built from its report (the same data the checks left), else the one the
+    result carries (a result saved without its report)."""
+    from .process_profile import build_process_profile
+    prof = build_process_profile(res, report) if report else {}
+    if not prof.get("available") and isinstance(res.get("process_profile"), dict):
+        return res["process_profile"]
+    return prof
 
 
 def compose(result: Dict[str, Any], report: Optional[Dict[str, Any]] = None, lang: str = "en", *,
@@ -1718,6 +1729,8 @@ def compose(result: Dict[str, Any], report: Optional[Dict[str, Any]] = None, lan
             repro = {}
     findings = [f for f in (res.get("findings") or []) if isinstance(f, dict)]
     res["findings"] = findings
+    from .profile_render import profile_lines
+    profile = profile_of(res, report)
     renders = _render_findings(ctx, findings, report)
     rows = check_rows(res, report)
     verdict = str(res.get("verdict") or "INCONCLUSIVE")
@@ -1732,6 +1745,7 @@ def compose(result: Dict[str, Any], report: Optional[Dict[str, Any]] = None, lan
     body: Dict[str, List[str]] = {
         "conclusion": concl + ([""] + glance if glance else []),
         "target": _section_target(ctx, res, report, repro),
+        "profile": profile_lines(profile, lang),
         "findings": _section2(ctx, blocks) if blocks else [],
         "checks": _section4(ctx, res, rows),
         "not_examined": _section_not_examined(ctx, res, rows),
@@ -1755,7 +1769,7 @@ def compose(result: Dict[str, Any], report: Optional[Dict[str, Any]] = None, lan
     return {"lang": lang, "ctx": ctx, "res": res, "report": report, "renders": renders, "blocks": blocks, "rows": rows,
             "counts": check_counts(rows), "verdict": verdict, "verdict_line": concl[0], "conclusion": concl[2],
             "symptom_note": sym, "glossary": g, "sections": sections, "glance": glance_parts(ctx, res, rows),
-            "repro": repro,
+            "repro": repro, "profile": profile,
             "scope_head": _scope_head(ctx, res, rows), "not_examined": _not_examined_lines(ctx, res)}
 
 

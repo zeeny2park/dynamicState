@@ -3886,6 +3886,11 @@ class ExpertDiagnosticEngine:
 #                          was used and the report says so), confidence_level (HIGH|LOW), confidence, reason
 #                          (clear|no_match|weak_evidence|conflicting_classes), primary_category, broad_plan,
 #                          scores, competing_class, text_class, fields}; {} when the run ended before classification.
+#   process_profile  dict  what the diagnosis learned about the process itself, from data it already collected
+#                          (extractor.process_profile.build_process_profile; docs/ui-redesign/API_CONTRACT.md):
+#                          {version, available, window, summary, runtime, threads, memory, locks, resources, modules,
+#                           not_observed}; a section is present only when something was observed for it; {} when the
+#                          run ended before any check ran.  The same dict is the report's ``process_profile`` key.
 DIAGNOSE_SCHEMA_VERSION = "1"
 DIAGNOSE_DEFAULT_SYMPTOM = "general health check"
 
@@ -3935,6 +3940,7 @@ class DiagnoseResult:
     schema_version: str = DIAGNOSE_SCHEMA_VERSION
     healthy_scope: Dict[str, Any] = field(default_factory=dict)
     symptom_interpretation: Dict[str, Any] = field(default_factory=dict)
+    process_profile: Dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
         return json.loads(json.dumps(asdict(self), default=str))
@@ -4518,6 +4524,13 @@ def _diagnose_run(
             rec, capture_mode=sec_b.get("collection_mode"), measured_stop_ms=stop_ms,
             bytes_read=int(getattr(metrics, "bytes_read", 0) or 0), budget_exhausted=exhausted,
             exhaustion_reason=getattr(metrics, "exhaustion_reason", None)))
+
+        try:
+            from .process_profile import build_process_profile
+            res.process_profile = build_process_profile({"target": res.target, "collection_impact": res.collection_impact}, report)
+            report["process_profile"] = res.process_profile
+        except Exception:  # noqa: BLE001 - the profile is a presentation of data already collected; never a failure
+            res.process_profile = {}
 
         try:
             rep_dir = os.path.join(engine.corpus_dir, "reports")

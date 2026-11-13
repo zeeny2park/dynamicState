@@ -120,13 +120,18 @@ def build_view(result: Dict[str, Any], lang: str, report: Optional[Dict[str, Any
         tiles["duration"] = {"value": hr.fmt_ms(float(res["duration_s"]) * 1000, i)}
 
     next_lines = next((s["lines"] for s in comp["sections"] if s["key"] == "next"), [])
+    from extractor import profile_render as pr
+    prof = comp.get("profile") or {}
+    profile = {"title": pr.Lx(lang).t("title"), "available": bool(prof.get("available")),
+               "glance": pr.glance_text(pr.Lx(lang), prof) if prof.get("available") else "",
+               "html": pr.profile_html(prof, lang) if prof.get("available") else ""}
     return {
         "version": VIEW_VERSION, "lang": lang, "verdict": verdict, "tone": VERDICT_TONE.get(verdict, "skip"),
         "verdict_word": hr.T[f"v_{vkey}"][i], "verdict_meaning": hr.T[f"vm_{vkey}"][i],
         "conclusion_html": hr._inline_html(comp["conclusion"]),
         "symptom_html": [hr._inline_html(x) for x in comp.get("symptom_note") or [] if x],
         "scope_html": " ".join(hr._inline_html(x) for x in comp.get("scope_head") or [] if x),
-        "tiles": tiles, "checks": checks, "findings": fviews,
+        "tiles": tiles, "checks": checks, "findings": fviews, "profile": profile,
         "not_examined_html": rv._md_html(comp.get("not_examined") or []) if comp.get("not_examined") else "",
         "next_html": rv._md_html(next_lines) if next_lines else "",
     }

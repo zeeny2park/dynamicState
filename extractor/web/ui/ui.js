@@ -41,6 +41,8 @@
       tile_checks: "검사", tile_stop: "대상 정지 시간", tile_bytes: "읽은 데이터", tile_time: "소요 시간",
       after_plan: "계획 후 표시", never_stopped: "한 번도 멈추지 않음", budget: "예산 {s}초",
       target_h: "대상", target_desc: "연결됨 · 읽기 전용",
+      profile_h: "프로세스 프로필", profile_pending: "판정이 나오면 채워집니다.", profile_pending_t: "지금까지 확인한 스레드 {n}개.",
+      profile_none: "이 진단에는 프로세스를 설명할 데이터가 남지 않았습니다.",
       k_proc: "프로세스", k_arch: "아키텍처", k_exe: "실행 파일", k_build: "Build ID", k_debug: "디버그 정보",
       k_transport: "전송", match: "일치", mismatch: "불일치", debug_none: "없음 (심볼만 사용)",
       transport_local: "로컬", transport_ssh: "SSH (원격 수집기)",
@@ -113,6 +115,8 @@
       tile_checks: "Checks", tile_stop: "Target stop time", tile_bytes: "Data read", tile_time: "Time taken",
       after_plan: "shown once planned", never_stopped: "never paused", budget: "budget {s} s",
       target_h: "Target", target_desc: "attached · read-only",
+      profile_h: "Process profile", profile_pending: "Filled in when the verdict arrives.", profile_pending_t: "{n} threads seen so far.",
+      profile_none: "The diagnosis left no data to profile this process.",
       k_proc: "Process", k_arch: "Architecture", k_exe: "Executable", k_build: "Build ID", k_debug: "Debug info",
       k_transport: "Transport", match: "match", mismatch: "MISMATCH", debug_none: "none (symbols only)",
       transport_local: "local", transport_ssh: "SSH (remote collector)",
@@ -570,6 +574,22 @@
       kv(tr(lang, "k_transport"), tp) + "</dl></div></section>";
   }
 
+  /* the process profile: the place is reserved from the plan stage; the content is the server's (view.profile) */
+  function renderProfile(s, ui) {
+    if (!s.plan && !s.verdict) return "";
+    var lang = ui.lang, V = viewOf(s, lang), P = V && V.profile, body, desc = "";
+    if (P && P.available) {
+      body = P.html;
+    } else if (P) {
+      body = '<p class="empty">' + esc(tr(lang, "profile_none")) + "</p>";
+    } else {
+      var n = s.target && s.target.threads;
+      body = '<p class="empty">' + esc(tr(lang, "profile_pending")) + (n ? " " + esc(tr(lang, "profile_pending_t", { n: n })) : "") + "</p>";
+    }
+    return '<section class="card" id="profile" aria-labelledby="h-profile"><div class="card-header"><h2 class="card-title" id="h-profile">' +
+      esc((P && P.title) || tr(lang, "profile_h")) + "</h2>" + desc + '</div><div class="card-content">' + body + "</div></section>";
+  }
+
   function checkName(s, rid, lang) {
     var V = viewOf(s, lang);
     var vc = V && (V.checks || []).filter(function (c) { return c.rid === rid; })[0];
@@ -723,7 +743,7 @@
   function render(s, ui) {
     var started = s.count > 0 || ui.started;
     if (!started) return "";
-    return renderBanner(s, ui) + renderTiles(s, ui) + renderTarget(s, ui) + renderFindings(s, ui) + renderChecks(s, ui) + renderTail(s, ui) +
+    return renderBanner(s, ui) + renderTiles(s, ui) + renderTarget(s, ui) + renderProfile(s, ui) + renderFindings(s, ui) + renderChecks(s, ui) + renderTail(s, ui) +
       (ui.replay ? '<div class="replaybar no-print" role="region" aria-label="' + esc(tr(ui.lang, "replay_label")) + '"><span>' +
         esc(tr(ui.lang, "replay_label")) + ": <b>" + esc(ui.replay) + '</b> · <span class="text-muted">' + esc(tr(ui.lang, "replay_note")) +
         '</span></span><button type="button" class="btn btn-outline btn-sm" data-act="replay-again">' + esc(tr(ui.lang, "replay_again")) + "</button></div>" : "");

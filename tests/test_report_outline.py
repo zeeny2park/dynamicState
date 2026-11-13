@@ -179,11 +179,14 @@ class TestOutline(unittest.TestCase):
         # each thing is said once: the conclusion with the four figures, the target card (7 lines), the 30 checks
         # named once in grouped lines, what was not examined, one advice line, the method block, the short
         # reproducibility facts (the per-check table is in the HTML detail and the opt-in appendix) and the glossary:
-        # the whole body <= 100 lines and <= 800 words in Korean / 950 in English (English runs ~20 % more words).
+        # the whole body <= 100 lines and <= 800 words in Korean / 950 in English (English runs ~20 % more words),
+        # plus the process profile section (docs/ui-redesign/API_CONTRACT.md): a healthy full result adds at most 14
+        # lines (heading, blank, 12 bullets) and about 250 words in Korean / 300 in English, so the bound is
+        # 115 lines and 1050 / 1250 words.  The profile is a section the owner asked for, not repeated check lists.
         for name in ("ok_idle_server", "ok_scenario_a"):
-            for lang, words in (("ko", 800), ("en", 950)):
+            for lang, words in (("ko", 1050), ("en", 1250)):
                 md = _render_dict(_load(name), lang)["report_markdown"]
-                self.assertLessEqual(len(md.splitlines()), 100, (name, lang))
+                self.assertLessEqual(len(md.splitlines()), 115, (name, lang))
                 self.assertLessEqual(len(md.split()), words, (name, lang))
 
     def test_healthy_report_says_what_the_verdict_covers_and_what_was_not_checked(self):
@@ -299,9 +302,9 @@ class TestHumanSummary(unittest.TestCase):
     def test_summary_is_the_same_outline_without_incident_only_parts(self):
         d = _load("overflow_ring")
         s = render_human_report(d, d["report"], "en")
-        self.assertEqual(_md_h2(s), ["1. Conclusion", "2. Target", "3. What was found", "4. Checks", "5. Not examined",
-                                     "6. What to do next", "7. How the diagnosis was done and what it cost the target",
-                                     "8. Reference"])
+        self.assertEqual(_md_h2(s), ["1. Conclusion", "2. Target", "3. Process profile", "4. What was found", "5. Checks",
+                                     "6. Not examined", "7. What to do next",
+                                     "8. How the diagnosis was done and what it cost the target", "9. Reference"])
 
 
 class TestDesignSystem(unittest.TestCase):
@@ -319,7 +322,7 @@ class TestDesignSystem(unittest.TestCase):
     def test_card_order_is_the_exported_order(self):
         from extractor.human_report import REPORT_SECTION_ORDER, SECTION_ORDER
         from extractor.report_visuals import _SEC_ID
-        self.assertEqual(REPORT_SECTION_ORDER[:7], ("conclusion", "tiles", "target", "findings", "checks",
+        self.assertEqual(REPORT_SECTION_ORDER[:8], ("conclusion", "tiles", "target", "profile", "findings", "checks",
                                                     "not_examined", "next"))   # the design system's order
         self.assertEqual(SECTION_ORDER, tuple(k for k in REPORT_SECTION_ORDER if k != "tiles"))
         for name, lang, out in self._pages():

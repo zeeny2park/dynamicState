@@ -26,10 +26,10 @@ FIXTURES = os.path.join(ROOT, "tests", "fixtures", "real_runtime")
 # the common outline (human_report.compose); a fault report has every section, so these are its numbers
 # the common outline in the design system's card order (human_report.REPORT_SECTION_ORDER); a fault report has every
 # section, so these are its numbers
-HEADERS_EN = ["1. Conclusion", "2. Target", "3. What was found", "4. Checks", "5. Not examined", "6. What to do next",
-              "7. How the diagnosis was done and what it cost the target", "8. Reference"]
-HEADERS_KO = ["1. 결론", "2. 대상", "3. 발견된 문제", "4. 검사", "5. 확인하지 못한 것", "6. 다음에 할 일",
-              "7. 진단 방법과 대상에 준 영향", "8. 참고 자료"]
+HEADERS_EN = ["1. Conclusion", "2. Target", "3. Process profile", "4. What was found", "5. Checks", "6. Not examined",
+              "7. What to do next", "8. How the diagnosis was done and what it cost the target", "9. Reference"]
+HEADERS_KO = ["1. 결론", "2. 대상", "3. 프로세스 프로필", "4. 발견된 문제", "5. 검사", "6. 확인하지 못한 것", "7. 다음에 할 일",
+              "8. 진단 방법과 대상에 준 영향", "9. 참고 자료"]
 TITLES = {"target": ("Target", "대상"), "findings": ("What was found", "발견된 문제"),
           "next": ("What to do next", "다음에 할 일"), "scope": ("Checks", "검사"),
           "not_examined": ("Not examined", "확인하지 못한 것"),

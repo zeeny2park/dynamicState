@@ -133,9 +133,9 @@ class TestKoreanReportHasNoEnglishSentences(unittest.TestCase):
         out, _ = _render("overflow_ring", "en")
         self.assertIn("is a heap buffer with 72 usable bytes", out["human_summary"])
         md = out["report_markdown"]
-        for h in ("## 1. Conclusion", "## 2. Target", "## 3. What was found", "## 4. Checks", "## 5. Not examined",
-                  "## 6. What to do next", "## 7. How the diagnosis was done and what it cost the target",
-                  "## 8. Reproducibility", "## 9. Reference"):
+        for h in ("## 1. Conclusion", "## 2. Target", "## 3. Process profile", "## 4. What was found", "## 5. Checks",
+                  "## 6. Not examined", "## 7. What to do next", "## 8. How the diagnosis was done and what it cost the target",
+                  "## 9. Reproducibility", "## 10. Reference"):
             self.assertIn(h, md)
 
     def test_verdicts_are_the_saved_ones(self):

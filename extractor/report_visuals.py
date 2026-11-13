@@ -462,7 +462,7 @@ def facts_list(items: List[str]) -> str:
 
 
 def series_chart(xs: List[float], ys: List[float], title: str, x_label: str, y_label: str,
-                 tips: Optional[List[str]] = None, unit: str = "") -> str:
+                 tips: Optional[List[str]] = None, unit: str = "", x_fmt: str = "+{:.2f}") -> str:
     """Zero-based area chart of an observed series (at least two points); labels are escaped here."""
     if len(xs) < 2 or len(xs) != len(ys):
         return ""
@@ -484,7 +484,7 @@ def series_chart(xs: List[float], ys: List[float], title: str, x_label: str, y_l
     for i, (a, b) in enumerate(zip(xs, ys)):
         tip = f"<title>{E(tips[i])}</title>" if tips and i < len(tips) else ""
         s.append(f'<circle class="dsv-pt" cx="{px(a):.1f}" cy="{py(b):.1f}" r="5">{tip}</circle>'
-                 f'<text class="dsv-t-mute" x="{px(a):.1f}" y="{h - mb + 16}" text-anchor="middle" font-size="11">+{a - x0:.2f}</text>')
+                 f'<text class="dsv-t-mute" x="{px(a):.1f}" y="{h - mb + 16}" text-anchor="middle" font-size="11">{E(x_fmt.format(a - x0))}</text>')
     for i, anchor in ((0, "start"), (len(ys) - 1, "end")):
         s.append(f'<text x="{px(xs[i]) + (8 if i == 0 else -8):.1f}" y="{py(ys[i]) - 10:.1f}" text-anchor="{anchor}" '
                  f'font-size="12" font-weight="700">{ys[i]:,.0f}{E(unit)}</text>')
@@ -493,12 +493,14 @@ def series_chart(xs: List[float], ys: List[float], title: str, x_label: str, y_l
     return f'<div class="dsv-svgbox">{"".join(s)}</div>'
 
 
-def share_bars(items: List[Tuple[str, float]], unit: str = "") -> str:
-    """Horizontal bars for a few labelled quantities (label escaped here)."""
+def share_bars(items: List[Tuple[str, float]], unit: str = "", *, words: bool = False,
+               fmt: Optional[Any] = None) -> str:
+    """Horizontal bars for a few labelled quantities (label escaped here; ``words``: the labels are words, not
+    identifiers, so they are not set in code font; ``fmt``: how a value is written, default number + ``unit``)."""
     top = max((v for _, v in items), default=0) or 1.0
-    rows = "".join(f'<tr><td>{_code(k)}</td><td style="width:60%"><span class="dsv-meter" style="width:100%">'
+    rows = "".join(f'<tr><td>{E(k) if words else _code(k)}</td><td style="width:60%"><span class="dsv-meter" style="width:100%">'
                    f'<i style="width:{max(0.0, min(100.0, v * 100 / top)):.0f}%"></i></span></td>'
-                   f'<td>{_fnum(v)}{E(unit)}</td></tr>' for k, v in items)
+                   f'<td>{E(fmt(v)) if fmt else _fnum(v) + E(unit)}</td></tr>' for k, v in items)
     return f'<div class="dsv-scroll"><table class="dsv-tbl"><tbody>{rows}</tbody></table></div>' if rows else ""
 
 
@@ -1185,7 +1187,8 @@ def _kv(lines: List[str]) -> str:
 
 
 # the HTML id of each block of human_report.REPORT_SECTION_ORDER
-_SEC_ID = {"conclusion": "sec-conclusion", "tiles": "sec-tiles", "target": "sec-target", "findings": "dsv-findings",
+_SEC_ID = {"conclusion": "sec-conclusion", "tiles": "sec-tiles", "target": "sec-target", "profile": "sec-profile",
+           "findings": "dsv-findings",
            "checks": "dsv-checks", "not_examined": "sec-not-examined", "next": "sec-next", "hypothesis": "sec-hypothesis",
            "method": "sec-method", "reproducibility": "reproducibility", "reference": "sec-reference"}
 
@@ -1215,6 +1218,9 @@ def build_visual_summary(result: Dict[str, Any], report: Optional[Dict[str, Any]
             parts.append(_tiles(lx, res, rows, comp))
         elif key == "target":
             parts.append(_card(_SEC_ID[key], s["title"], _kv(s["lines"])))
+        elif key == "profile":
+            from .profile_render import profile_html
+            parts.append(_card(_SEC_ID[key], s["title"], profile_html(comp.get("profile") or {}, lx.lang)))
         elif key == "findings":
             body = "".join(_finding_card(lx, i, f, report, b, (details.get("findings") or {}).get(i, ""))
                            for i, (f, b) in enumerate(zip(findings, comp["blocks"]), 1))
