@@ -96,7 +96,7 @@ class TestIncidentHtml(unittest.TestCase):
     def test_en_html_is_english(self):
         out = export_incident_report(pid=self.proc.pid, companion_elf_path=self.binary, corpus_dir=self.corpus)
         pre = self._check_html(out["report_html"], "en")
-        self.assertIn("1. Conclusion", pre)
+        self.assertIn(">Conclusion</h2>", pre)                         # the banner's title (the cards carry no numbers)
         self.assertNotRegex(pre, "[가-힣]")
         self.assertEqual(out["language"], "en")
         with self.assertRaises(ValueError):
