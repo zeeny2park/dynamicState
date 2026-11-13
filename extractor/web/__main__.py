@@ -27,8 +27,6 @@ def main():
     parser.add_argument("--mode", type=str, default="LOW_IMPACT",
                         choices=["CONSISTENT", "LOW_IMPACT"],
                         help="Initial observation mode (default: LOW_IMPACT)")
-    parser.add_argument("--allow-mutation", action="store_true", default=False,
-                        help="Explicitly enable live state-changing operations (checkpoint/restore/transition/explore/replay); without it the runtime is read-only regardless of --mode")
     parser.add_argument("--binary", type=str, default=None,
                         help="Path to target binary (optional)")
     parser.add_argument("--debug-image", type=str, default=None,
@@ -41,18 +39,17 @@ def main():
     # Initialize AgentRuntime with corpus
     corpus_dir = os.path.abspath(args.corpus)
     os.makedirs(corpus_dir, exist_ok=True)
-    eff_mode = "CONSISTENT" if getattr(args, "allow_mutation", False) else args.mode
-    runtime = AgentRuntime(corpus_dir=corpus_dir, observation_mode=eff_mode, allow_mutation=getattr(args, "allow_mutation", False))
+    # The web server is read-only towards the target (no route writes, stops, restores or runs commands), so it has no
+    # --allow-mutation: the runtime it wraps always keeps the read-only default.
+    runtime = AgentRuntime(corpus_dir=corpus_dir, observation_mode=args.mode)
 
     server = run_server(runtime=runtime, host=args.host, port=args.port)
 
     url = f"http://{args.host}:{args.port}"
     print("========================================")
     print(" dynamicState Web UI")
-    print(f" {url}/            (diagnosis UI)")
-    print(f" {url}/legacy/      (previous 8-tab UI)")
-    print(f" {url}/legacy/workspace  (previous chat workspace)")
-    print(" Mode: " + runtime.observation_mode + (" (mutation enabled)" if runtime.allow_mutation else " (read-only)"))
+    print(f" {url}/")
+    print(" Mode: " + runtime.observation_mode + " (read-only)")
     print(" Corpus: " + corpus_dir)
     print(" Press Ctrl+C to terminate.")
     print("========================================")

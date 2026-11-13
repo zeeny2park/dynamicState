@@ -68,7 +68,6 @@ sequenceDiagram
     participant Target as Embedded Target Board
     participant HostGDB as Host GDB / gdb-multiarch
     participant DynState as Host dynamicState Engine
-    participant Browser as Host Web Browser (Optional)
 
     Target->>Target: Start gdbserver :2345 /app/sensor_node (PID 412)
     DynState->>HostGDB: Launch GDB with python script & load sensor_node.debug
@@ -76,10 +75,6 @@ sequenceDiagram
     Target-->>HostGDB: Inferior stopped at main / checkpoint
     HostGDB->>DynState: Extract ExecutionContext & Semantic Object Graph
     DynState->>DynState: Build State state_000001 (Hash & Corpus)
-    opt Human Inspection
-        Browser->>DynState: GET /api/runtime & /api/states/state_000001/objects
-        DynState-->>Browser: JSON payload -> Render Memory Explorer
-    end
 ```
 
 #### Step-by-Step Instructions
@@ -284,16 +279,13 @@ def run_server_loop(server: DynamicStateWebServer):
 ## 5. Command-Line Reference
 
 ```bash
-# 1. Launch Web UI server with active GDB controller:
-python3 -m extractor server --host 127.0.0.1 --port 8080 --binary /app/target --debug-image /app/target.debug
+# 1. Launch the web UI server (the read-only diagnosis page; it diagnoses live processes by PID):
+python3 -m extractor server --host 127.0.0.1 --port 8080
 
-# 2. Launch Web UI server in offline viewing mode for an existing state corpus:
-python3 -m extractor server --host 127.0.0.1 --port 8080 --corpus /path/to/corpus_dir
-
-# 3. Capture zero-Python memory dump on embedded target:
+# 2. Capture zero-Python memory dump on embedded target:
 ./scripts/target_capture.sh <PID> [output_directory]
 
-# 4. Run full test suite including GDB compatibility:
+# 3. Run full test suite including GDB compatibility:
 python3 -m unittest discover tests
 ```
 

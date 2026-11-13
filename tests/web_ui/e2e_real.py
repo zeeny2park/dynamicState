@@ -196,7 +196,7 @@ def main() -> int:
             fh.write(EXITING_C)
         bins["exits_soon"] = build(tmp, "exits_soon", src)
         port = free_port()
-        server = fixture_popen([sys.executable, "-m", "extractor.web.workspace", "--host", "127.0.0.1", "--port", str(port),
+        server = fixture_popen([sys.executable, "-m", "extractor.web", "--host", "127.0.0.1", "--port", str(port),
                                 "--corpus", os.path.join(tmp, "corpus")], cwd=ROOT, stdout=subprocess.DEVNULL,
                                stderr=subprocess.DEVNULL, name="dynamicstate-server", max_rss_mib=1400)
         base = f"http://127.0.0.1:{port}/"

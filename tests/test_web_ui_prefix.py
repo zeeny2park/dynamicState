@@ -60,7 +60,8 @@ class TestBehindBufferingPrefixProxy(unittest.TestCase):
                 self.assertFalse(ref.startswith(b"/"), "a root-absolute URL escapes the prefix")
                 self.assertEqual(self.get(ref.decode())[0], 200)
         self.assertEqual(self.get("replay/index.json")[0], 200)
-        self.assertEqual(self.get("legacy/")[0], 200)
+        st, hd, _ = self.get("legacy/")              # the removed old UI: a relative redirect that stays under the prefix
+        self.assertEqual((st, hd.get("location")), (301, "../"))
         for private in ("view.py", "replay_gen.py", "__init__.py", "__pycache__/view.cpython-312.pyc"):
             with self.subTest(private=private):
                 self.assertEqual(self.get(private)[0], 404, "the UI directory serves page assets only")

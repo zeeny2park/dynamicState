@@ -10,7 +10,7 @@ Verifies all 11 required scenarios:
 7. Diff distinguishes changed, unchanged, unreadable, missing, and unknown values.
 8. Evidence provenance survives capture -> snapshot -> variable view -> diff -> investigation.
 9. Static candidates are not promoted to validated causal functions without independent evidence.
-10. Browser-level E2E test covers: connect target -> inspect maps/threads -> select a variable -> capture twice -> compare values -> inspect provenance.
+10. The explorer journey through the web adapter: connect target -> inspect maps/threads -> select a variable -> capture twice -> compare values -> investigate.
 11. Regression tests for existing MCP/CLI/API/investigation behavior.
 """
 
@@ -21,13 +21,9 @@ import shutil
 import struct
 import subprocess
 import tempfile
-import threading
 import time
 from typing import Any, Dict, Optional, Tuple
 import unittest
-import urllib.error
-import urllib.parse
-import urllib.request
 
 from extractor.agent_runtime import AgentRuntime
 from extractor.capture_backend import ProcessVmCaptureBackend
@@ -45,7 +41,7 @@ from extractor.investigation import (
 )
 from extractor.target_adapter import LocalTargetAdapter
 from extractor.watch_session import WatchItem, WatchSessionManager, read_process_memory_slice
-from extractor.web.server import WebApiAdapter, run_server
+from extractor.web.server import WebApiAdapter
 from tests.support.fixture_process import fixture_popen
 
 
@@ -88,20 +84,13 @@ class TestPhase28MemoryExplorerUX(unittest.TestCase):
         # 3. Start live target process
         cls.proc, cls.oracle = cls._start_target_process(cls.stripped_bin)
 
-        # 4. Start ephemeral web server
+        # 4. Runtime and the web adapter (the functions the removed legacy explorer reached over HTTP)
         cls.corpus_dir = os.path.join(cls.work_dir, "corpus")
         cls.server_runtime = AgentRuntime(corpus_dir=cls.corpus_dir)
-        cls.server_thread = None
-        cls.server_port = None
-        cls._start_web_server()
+        cls.web_adapter = WebApiAdapter(cls.server_runtime)
 
     @classmethod
     def tearDownClass(cls):
-        if hasattr(cls, "server") and cls.server:
-            try:
-                cls.server.shutdown()
-            except Exception:
-                pass
         cls._stop_target_process(cls.proc)
         shutil.rmtree(cls.work_dir, ignore_errors=True)
 
@@ -148,37 +137,6 @@ class TestPhase28MemoryExplorerUX(unittest.TestCase):
         cls.proc.stdin.write(cmd.strip() + "\n")
         cls.proc.stdin.flush()
         return cls.proc.stdout.readline().strip()
-
-    @classmethod
-    def _start_web_server(cls):
-        cls.server = run_server(runtime=cls.server_runtime, host="127.0.0.1", port=0)
-        cls.server_port = cls.server.server_address[1]
-        cls.server_thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
-        cls.server_thread.start()
-        time.sleep(0.1)
-
-    def _http_get(self, path: str) -> Tuple[int, Dict[str, Any]]:
-        url = f"http://127.0.0.1:{self.server_port}{path}"
-        req = urllib.request.Request(url, headers={"X-Session-Token": self.server.session_token}, method="GET")
-        try:
-            with urllib.request.urlopen(req, timeout=5.0) as resp:
-                data = json.loads(resp.read().decode("utf-8"))
-                return resp.status, data
-        except urllib.error.HTTPError as e:
-            data = json.loads(e.read().decode("utf-8"))
-            return e.code, data
-
-    def _http_post(self, path: str, payload: Dict[str, Any]) -> Tuple[int, Dict[str, Any]]:
-        url = f"http://127.0.0.1:{self.server_port}{path}"
-        body = json.dumps(payload).encode("utf-8")
-        req = urllib.request.Request(url, data=body, headers={"Content-Type": "application/json", "X-Session-Token": self.server.session_token}, method="POST")
-        try:
-            with urllib.request.urlopen(req, timeout=5.0) as resp:
-                data = json.loads(resp.read().decode("utf-8"))
-                return resp.status, data
-        except urllib.error.HTTPError as e:
-            data = json.loads(e.read().decode("utf-8"))
-            return e.code, data
 
     # =========================================================================
     # Test 1: Target setup validation
@@ -593,29 +551,27 @@ class TestPhase28MemoryExplorerUX(unittest.TestCase):
     # Test 10: Browser-level E2E journey
     # =========================================================================
     def test_10_browser_level_e2e_journey(self):
-        """Full simulated browser E2E journey: connect -> inspect -> select -> capture twice -> compare -> investigate."""
+        """The explorer journey through the web adapter: connect -> inspect -> select -> capture twice -> compare -> investigate."""
         # 1. Connect and validate target (Step 1)
-        status, val_res = self._http_post("/api/investigation/validate-target", {
+        adapter = self.web_adapter
+        val_res = adapter.validate_target({
             "pid": self.proc.pid,
             "debug_image": self.debug_bin
         })
-        self.assertEqual(status, 200)
         self.assertTrue(val_res["data"]["valid"])
 
         # 2. Inspect runtime maps and threads (Step 2)
-        status, map_res = self._http_get(f"/api/watch/memory-map?pid={self.proc.pid}&companion_elf={urllib.parse.quote(self.debug_bin)}")
-        self.assertEqual(status, 200)
+        map_res = adapter.get_watch_memory_map(self.proc.pid, companion_elf=self.debug_bin)
         self.assertGreater(len(map_res["data"]["mappings"]), 0)
         self.assertGreaterEqual(len(map_res["data"]["threads"]), 1)
 
         # 3. Inspect bounded range
         seq_addr = hex(self.oracle["sequence"])
-        status, rng_res = self._http_get(f"/api/target/inspect-range?pid={self.proc.pid}&address={seq_addr}&size=64&companion_elf={urllib.parse.quote(self.debug_bin)}")
-        self.assertEqual(status, 200)
+        rng_res = adapter.inspect_memory_range({"pid": str(self.proc.pid), "address": seq_addr, "size": "64"})
         self.assertEqual(rng_res["data"]["status"], "OBSERVED")
 
         # 4. Create watch session with selected variables (Step 3)
-        status, sess_res = self._http_post("/api/watch/session/create", {
+        sess_res = adapter.create_watch_session({
             "pid": self.proc.pid,
             "companion_elf": self.debug_bin,
             "interval_ms": 1000,
@@ -639,58 +595,35 @@ class TestPhase28MemoryExplorerUX(unittest.TestCase):
                 }
             ]
         })
-        self.assertEqual(status, 200)
         sid = sess_res["data"]["session_id"]
 
         # 5. Capture snapshot 1 (Baseline)
-        status, cap1_res = self._http_post(f"/api/watch/session/{sid}/capture", {})
-        self.assertEqual(status, 200)
+        cap1_res = adapter.capture_watch_session(sid)
         seq_1 = cap1_res["data"]["seq"]
 
         # 6. Mutate process state
         self._send_target_cmd("SET sequence 7777")
 
         # 7. Capture snapshot 2
-        status, cap2_res = self._http_post(f"/api/watch/session/{sid}/capture", {})
-        self.assertEqual(status, 200)
+        cap2_res = adapter.capture_watch_session(sid)
         seq_2 = cap2_res["data"]["seq"]
         self.assertGreater(seq_2, seq_1)
 
         # 8. Compare snapshots (Step 4)
-        status, cmp_res = self._http_post(f"/api/watch/session/{sid}/compare", {
+        cmp_res = adapter.compare_watch_observations(sid, {
             "seq_a": seq_1,
             "seq_b": seq_2
         })
-        self.assertEqual(status, 200)
         summary = cmp_res["data"]["summary"]
         self.assertEqual(summary["changed_count"], 1)
         self.assertEqual(summary["unchanged_count"], 1)
 
         # 9. Hand off to Investigation (Step 5)
-        status, inv_res = self._http_post("/api/investigation/start", {
+        inv_res = adapter.start_investigation({
             "goal": f"Investigate sequence mutation from snapshot #{seq_1} to #{seq_2} in session {sid}",
             "session_id": sid
         })
-        self.assertEqual(status, 200)
         self.assertIn("investigation_id", inv_res["data"])
-
-        # 10. Verify static web UI assets contain Phase 28 workflow markup and scripts
-        req_index = urllib.request.Request(f"http://127.0.0.1:{self.server_port}/legacy/")
-        with urllib.request.urlopen(req_index, timeout=5.0) as resp:
-            html = resp.read().decode("utf-8")
-        self.assertIn("tab-target-setup", html)
-        self.assertIn("tab-runtime-explorer", html)
-        self.assertIn("tab-watch-list", html)
-        self.assertIn("tab-timeline-compare", html)
-        self.assertIn("card-bounded-inspector", html)
-
-        req_js = urllib.request.Request(f"http://127.0.0.1:{self.server_port}/static/app.js")
-        with urllib.request.urlopen(req_js, timeout=5.0) as resp:
-            js = resp.read().decode("utf-8")
-        self.assertIn("handleValidateTarget", js)
-        self.assertIn("handleInspectMemoryRange", js)
-        self.assertIn("handleExecuteSnapshotCompare", js)
-        self.assertIn("handleCaptureSnapshotNow", js)
 
         # Restore sequence
         self._send_target_cmd("SET sequence 42")
@@ -699,20 +632,18 @@ class TestPhase28MemoryExplorerUX(unittest.TestCase):
     # Test 11: Regression tests for existing MCP/CLI/API/investigation behavior
     # =========================================================================
     def test_11_regression_existing_api_and_runtime(self):
-        """Verify existing API routes and data structures function without regressions."""
+        """Verify existing adapter functions and data structures work without regressions."""
         # 11a. Runtime overview
-        status, ov = self._http_get("/api/runtime")
-        self.assertEqual(status, 200)
+        adapter = self.web_adapter
+        ov = adapter.get_runtime_info()
         self.assertTrue(ov.get("success", False))
 
         # 11b. Watch sessions list
-        status, sess_list = self._http_get("/api/watch/sessions")
-        self.assertEqual(status, 200)
+        sess_list = adapter.list_watch_sessions({})
         self.assertTrue(sess_list.get("success", False))
 
         # 11c. LLM status check
-        status, llm = self._http_get("/api/llm/status")
-        self.assertEqual(status, 200)
+        llm = adapter.get_llm_status()
         self.assertIn("provider_type", llm.get("data", {}))
 
 

@@ -4,6 +4,8 @@
 - **브랜치 / worktree**: `feat/web-ui-redesign` · `/home/ubuntu/workspace/ut-webui` (기준 `feat/visual-incident-report` `bba6cf7`)
 - **상태**: **구현됨** (2026-11-13, `stage1/integ`). 단계 A·B·C 모두 반영: 새 UI `extractor/web/ui/` 가 `/`, 서버의 진단 작업
   API(`start` / `events` / `status` / `jobs` / `report`), 레거시는 `/legacy/`. HTTP 계약은 `API_CONTRACT.md` 하나.
+  **이후**: 레거시 두 벌(`/legacy/`, `/legacy/workspace`)과 그 전용 라우트는 2026-11-13 제거(`EXPLORE_PROPOSAL_KO.md` 9장);
+  옛 주소는 `/` 로 301. 아래의 레거시 관련 서술은 당시 기록이다.
   구현에서 정한 것 (목업·이 문서보다 우선):
   - **신뢰도 타일과 수치 없음.** 판정 단계마다 고정값이라 측정이 아니므로 화면·보고서 어디에도 표시하지 않는다. 타일은 4개
     (검사 · 대상 정지 시간 · 읽은 데이터 · 소요 시간).

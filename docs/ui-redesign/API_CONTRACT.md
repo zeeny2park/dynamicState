@@ -7,7 +7,7 @@ or a plain relative string such as `api/diagnose/jobs`). The public demo is serv
 
 ## 0. Common rules
 
-- Every `/api/...` endpoint below passes the same guards as the existing API: allowed `Host`, loopback-only `Origin`
+- Every `/api/...` endpoint below passes the same guards: allowed `Host`, loopback-only `Origin`
   (if any), and the per-run session token. The token reaches the page in two ways: the served `index.html` gets
   `window.__DYNAMICSTATE_SESSION_TOKEN__` injected (and `fetch` is already wrapped to send `X-Session-Token`), and an
   HttpOnly cookie `dynamicstate_session` is set. **`EventSource` cannot set headers, so SSE and report links rely on the
@@ -269,20 +269,33 @@ Terminal. The diagnosis function raised (an unreadable target is NOT an error: i
 - Replays (`extractor/web/ui/replay/*.json`, `?replay=<name>`) are recorded event streams in exactly this wire shape,
   made from saved results by `python3 -m extractor.web.ui.replay_gen` with the same builders.
 
-## 8. Routing (stage C)
+## 8. Routing
+
+The web server is **read-only towards the target**: no route writes target memory, stops or signals the target, runs a
+command, or mutates / checkpoints / restores state. The authoritative route table is `API_ROUTES` in
+`extractor/web/server.py`; `tests/test_web_readonly_routes.py` enumerates it, rejects any route whose path looks like
+writing, stopping, running commands, mutating or restoring, checks that every `/api/...` literal under `extractor/web/`
+is in the table, and probes the removed paths for 404.
 
 | URL | Content |
 |---|---|
-| `/` , `/index.html`, `/ui.css`, `/ui.js`, any file in `extractor/web/ui/` | the new UI (relative URLs inside) |
-| `/legacy/`  (`/legacy` redirects to `legacy/`) | the old 8-tab UI; its assets resolve as `/legacy/static/app.js` etc. |
-| `/legacy/workspace` | the old workspace (chat) UI |
-| `/workspace` | redirect to `legacy/workspace` (old bookmarks) |
-| `/api/...` | unchanged paths. `/legacy/api/...` and `/legacy/workspace/api/...` are aliases (the legacy pages derive their API base from their own URL) |
-| `/static/...` | legacy assets (unchanged, kept so existing links work) |
+| `/` , `/index.html`, `/ui.css`, `/ui.js`, page assets in `extractor/web/ui/` (`.html .css .js .json .svg .png .ico`) | the UI (relative URLs inside) |
+| `GET api/health` | `{"status": "ok", "version", "timestamp", "mode"}` |
+| `GET api/target/processes?process_name=&remote_host=&ssh_user=&ssh_port=&ssh_key=` | process listing (sections 1 and 7: name to pid) |
+| `POST api/diagnose`, `POST api/diagnose/start`, `GET api/diagnose/jobs`, `GET api/diagnose/{job_id}/events`, `.../status`, `.../report` | sections 1 to 5 |
+| any other `/api/...` | 404 `NOT_FOUND` |
+| `/legacy`, `/legacy/...`, `/workspace`, `/workspace/...` (the removed 8-tab UI and chat workspace) | 301 to the root UI with a **relative** `Location` (`./`, `../`, ...) |
+| `/static/...` (the removed UI's assets) | 404 |
+
+The previous 8-tab UI (`/legacy/`), the chat workspace (`/legacy/workspace`, `/workspace`, `dynamic-state-workspace`)
+and every route only they used (`/api/watch/*`, `/api/investigation/*`, `/api/investigations*`, `/api/workspace/chat`,
+`/api/mutation*`, `/api/transition(s)`, `/api/checkpoint`, `/api/restore`, `/api/snapshot(s)`, `/api/states`,
+`/api/state-graph`, `/api/state-lab/tree`, `/api/runtime*`, `/api/capabilities`, `/api/explore`, `/api/observe`,
+`/api/capture`, `/api/llm/status`, `/api/target/inspect-range`, `/api/target/deploy-collector`, ...) were removed, with
+the `/legacy/api/...` aliases. The Python functions behind them stay where MCP, the CLI or tests use them.
 
 Nothing in the server depends on a path prefix: with `proxy_pass http://127.0.0.1:8081/;` under `/dynamicstate/` all of the
-above work as `/dynamicstate/`, `/dynamicstate/legacy/`, `/dynamicstate/api/...`, because every URL the pages and the
-redirects use is relative.
+above work as `/dynamicstate/`, `/dynamicstate/api/...`, because every URL the page and the redirects use is relative.
 
 ## 9. The process profile (`process_profile`)
 
@@ -324,6 +337,12 @@ order and wording.
   first; `omitted` counts the rest. `detailed < listed` means only some threads were sampled over the window.
 - `window` is the whole diagnosis (`section_b.observation_duration_sec`, `collection_impact.samples_collected`).
 
-Items that would naturally link to a legacy interactive tool later: locks (`name`, `address`) to the variable watch list;
+Items that would naturally link to an exploration view later: locks (`name`, `address`) to the variable watch list;
 `growing_classes` and `heap.walk` to the pool/array scanner; `memory.address_space` categories and `modules` to the
 memory-range inspector; `memory.rss.series` / `threads.series` to the timeline compare.
+
+## 10. Exploration routes (job-bound)
+
+*To be written with the job-bound exploration routes (`/api/diagnose/{job_id}/...`). Each route added here is also added
+to `API_ROUTES` in `extractor/web/server.py`; the read-only rule of section 8 applies.*
+

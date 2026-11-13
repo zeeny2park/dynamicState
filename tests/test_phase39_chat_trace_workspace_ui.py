@@ -1,29 +1,24 @@
-"""Phase 39 (Phase 9): Minimalist Gemini-Style Chat + Progressive Trace Workspace UI Tests.
+"""Phase 39 (Phase 9): chat-to-trace-card translation of the web adapter.
 
-Verifies:
-1. Existing Web UI (`extractor/web/static`) remains intact while `extractor/web/workspace.py`
-   and `bin/dynamic-state-workspace` serve the new Chat + Trace Workspace UI.
-2. `POST /api/workspace/chat` translates natural-language prompts into zero-stop process
-   inspections and returns structured `trace_cards` (`POOL_MAP`, `THREAD_OWNER`, `XRAY_BLUEPRINT`, `SYMBOL_EVAL`).
+`WebApiAdapter.workspace_chat_api` translates natural-language prompts into zero-stop process inspections and returns
+structured `trace_cards` (`POOL_MAP`, `THREAD_OWNER`, `XRAY_BLUEPRINT`, `SYMBOL_EVAL`). (The chat workspace page and its
+HTTP route were removed with the legacy UI; the function is still exercised here.)
 """
 
-import json
 import os
 import shutil
 import subprocess
 import tempfile
 import time
 import unittest
-import urllib.request
 
 from extractor.agent_runtime import AgentRuntime
-from extractor.web.server import WebApiAdapter, run_server
-from extractor.web.workspace import get_workspace_static_dir
+from extractor.web.server import WebApiAdapter
 from tests.support.fixture_process import fixture_popen
 
 
 class TestPhase39ChatTraceWorkspaceUI(unittest.TestCase):
-    """End-to-end tests for the new Conversational Process Trace Workspace UI and API."""
+    """workspace_chat_api against a live target."""
 
     @classmethod
     def setUpClass(cls) -> None:
@@ -110,26 +105,6 @@ int main() {
             except Exception:
                 cls.proc.kill()
         shutil.rmtree(cls.tmp_dir, ignore_errors=True)
-
-    def test_01_workspace_static_and_legacy_ui_coexist(self) -> None:
-        """Both legacy static UI and new workspace_static UI exist and serve cleanly over HTTP."""
-        ws_dir = get_workspace_static_dir()
-        self.assertTrue(os.path.isfile(os.path.join(ws_dir, "index.html")))
-
-        rt = AgentRuntime(corpus_dir=os.path.join(self.tmp_dir, "corpus_http"))
-        srv = run_server(runtime=rt, host="127.0.0.1", port=0, static_dir=ws_dir)
-        port = srv.server_address[1]
-        import threading
-        th = threading.Thread(target=srv.serve_forever, daemon=True)
-        th.start()
-        try:
-            with urllib.request.urlopen(f"http://127.0.0.1:{port}/", timeout=5) as resp:
-                html = resp.read().decode("utf-8")
-            self.assertIn("dynamicState Workspace", html)
-            self.assertIn("Process Trace Workspace", html)
-        finally:
-            srv.shutdown()
-            srv.server_close()
 
     def test_02_workspace_chat_api_pool_map_and_thread_owner(self) -> None:
         """`workspace_chat_api` translates Korean natural-language prompts into POOL_MAP and THREAD_OWNER trace cards."""

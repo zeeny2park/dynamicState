@@ -41,7 +41,31 @@ bash "$WORK/readme_blocks.sh"
 
 echo "== skipped blocks: narrower checks =="
 dynamic-state connect --help | grep -q -- "--auto-deploy-collector"
-dynamic-state server --help | grep -q -- "--allow-mutation"
+dynamic-state server --help | grep -q -- "--port"
+
+echo "== agent skill: install from the installed package, every command it names exists =="
+dynamic-state skill install --dir "$WORK/skills"
+test -f "$WORK/skills/diagnose-process/SKILL.md"
+test -f "$WORK/skills/diagnose-process/MANUAL_SCENARIOS.md"
+(mkdir "$WORK/proj" && cd "$WORK/proj" && dynamic-state skill install --project && test -f .claude/skills/diagnose-process/SKILL.md)
+! dynamic-state skill install --dir "$WORK/skills" 2> /dev/null   # refuses to overwrite
+dynamic-state skill install --dir "$WORK/skills" --force
+dynamic-state skill show | grep -q "dynamic-state diagnose"
+dynamic-state skill show --transport mcp | grep -q "runtime_diagnose_process"
+python3 - "$WORK/skills/diagnose-process/SKILL.md" <<'PY'
+import re, subprocess, sys
+text = open(sys.argv[1], encoding="utf-8").read()
+assert text.startswith("---\nname: diagnose-process\n"), "installed skill has no frontmatter"
+subs = set()
+for span in re.findall(r"`(dynamic-state [^`]+)`", text):
+    m = re.match(r"dynamic-state ([a-z][a-z-]*)(?: (install|path|show))?", span)
+    if m:
+        subs.add(tuple(x for x in m.groups() if x))
+assert len(subs) >= 8, subs
+for sub in sorted(subs):
+    subprocess.run(["dynamic-state", *sub, "--help"], check=True, capture_output=True)
+print("skill commands exist:", ", ".join(" ".join(s) for s in sorted(subs)))
+PY
 
 python3 - "$REPO/README.md" <<'PY'
 import json, re, shutil, subprocess, sys
@@ -63,13 +87,13 @@ assert "runtime_diagnose_process" in resp["result"]["instructions"], "instructio
 print("MCP server answers initialize with the skill as instructions")
 PY
 
-python3 -m tests.support.fixture_process -- dynamic-state-workspace --host 127.0.0.1 --port 18765 --corpus "$WORK/corpus" > "$WORK/ws.log" 2>&1 &
+python3 -m tests.support.fixture_process -- dynamic-state server --host 127.0.0.1 --port 18765 --corpus "$WORK/corpus" > "$WORK/ws.log" 2>&1 &
 WS=$!
 for _ in $(seq 1 20); do
     code=$(python3 - <<'PY'
 import urllib.request
 try:
-    print(urllib.request.urlopen("http://127.0.0.1:18765/legacy/workspace", timeout=2).status)
+    print(urllib.request.urlopen("http://127.0.0.1:18765/", timeout=2).status)
 except Exception:
     print(0)
 PY
@@ -78,7 +102,7 @@ PY
     sleep 0.5
 done
 kill "$WS" 2>/dev/null || true
-[ "$code" = "200" ] || { echo "workspace did not serve /legacy/workspace"; cat "$WORK/ws.log"; exit 1; }
-echo "workspace served /legacy/workspace"
+[ "$code" = "200" ] || { echo "the web UI server did not serve /"; cat "$WORK/ws.log"; exit 1; }
+echo "the web UI server served /"
 
 echo "README commands OK"

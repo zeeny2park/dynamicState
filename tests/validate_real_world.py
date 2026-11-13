@@ -1,21 +1,14 @@
-"""Real-world Web UI Human Validation Test Suite.
+"""Real-world validation script (manual; not a unittest).
 
-Validates the complete dynamicState runtime flow on a realistic production-like workload:
+Validates the LOW_IMPACT runtime flow on a realistic production-like workload:
 1. Stripped PIE target binary with external unstripped debug image and linked shared library.
 2. LOW_IMPACT observation via process_vm_readv on running multi-threaded process.
 3. Offline DWARF semantic reconstruction with zero process stopping.
 4. Capability boundaries (rejection of mutations, continue, checkpoints in LOW_IMPACT mode).
 5. Debug image mismatch detection and rejection.
-6. CONSISTENT observation under live GDB attached to target inferior.
-7. Semantic Object Graph inspection (nested structs, pointers, circular references, globals).
-8. Mutation candidate discovery, ranking, and boundary generation.
-9. Real typed mutation execution and inferior continuation.
-10. State transition analysis, semantic diff, and facts/evidence generation.
-11. State Hash invariance across ASLR/addresses and sensitivity to semantic state changes.
-12. Branch-safe exploration with checkpoint-restore isolation across sibling branches.
-13. Failure representation (CRASHED / SIGSEGV).
-14. State Graph construction for Web UI visualization.
-15. Verification of all Web UI REST API endpoints.
+
+(The CONSISTENT-mode GDB step drove the removed web mutation routes, /api/mutation, /api/checkpoint, /api/restore
+and so on, and went with them.)
 """
 
 import json
@@ -197,41 +190,12 @@ def validate_low_impact_mode(meta, results):
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
-def validate_consistent_gdb_mode(meta, results):
-    """Run GDB batch session with sample_prod_stripped, load debug image, and execute scenario."""
-    print("\n=== Validating CONSISTENT Observation Mode under Live GDB ===")
-    gdb_results_path = os.path.join(tempfile.gettempdir(), "real_world_gdb_results.json")
-    if os.path.exists(gdb_results_path):
-        os.remove(gdb_results_path)
-
-    cmd = [
-        "gdb", "-q", "-nx", "-batch",
-        "-ex", "set confirm off",
-        "-ex", "set python print-stack full",
-        "-ex", f"file {meta['app_stripped']}",
-        "-ex", f"source {os.path.join(ROOT_DIR, 'gdb', 'extract_state.py')}",
-        "-ex", f"load-debug-image {meta['app_dbg']}",
-        "-ex", "set args 10",
-        "-ex", "break runtime_state_checkpoint",
-        "-ex", "run",
-        "-ex", f"python\nimport sys\nsys.path.insert(0, '{ROOT_DIR}')\nfrom tests.real_world_gdb_scenario import run_gdb_validation_scenario\nassert run_gdb_validation_scenario('{gdb_results_path}')\n"
-    ]
-
-    subprocess.check_call(cmd)
-    assert os.path.exists(gdb_results_path), "GDB results file not found"
-    with open(gdb_results_path) as f:
-        gdb_res = json.load(f)
-    results["consistent"] = gdb_res
-    print("[CONSISTENT] Live GDB validation completed successfully.")
-
-
 if __name__ == "__main__":
     b_dir = tempfile.mkdtemp(prefix="dynstate_val_build_")
     try:
         workload_meta = build_workload(b_dir)
         results = {"metadata": workload_meta}
         validate_low_impact_mode(workload_meta, results)
-        validate_consistent_gdb_mode(workload_meta, results)
 
         final_out_dir = os.path.join(ROOT_DIR, "docs")
         os.makedirs(final_out_dir, exist_ok=True)

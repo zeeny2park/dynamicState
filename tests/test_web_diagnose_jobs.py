@@ -1,5 +1,6 @@
 """Web UI server side: non-blocking diagnosis jobs (start / events / status / jobs / report), the read-only engine
-timeline listener, the new routing (`/`, `/legacy/`, `/legacy/workspace`) and the security checks on the new endpoints.
+timeline listener, the routing (`/` is the only UI; the removed pages `/legacy/...` and `/workspace` redirect to it) and
+the security checks on the new endpoints.
 
 Most tests use a fake diagnose function and a fake session (no live process); one live test diagnoses a small
 compiled fixture through start/events and through the synchronous endpoint and compares the verdicts.
@@ -408,32 +409,35 @@ class TestListenerCannotBreakDiagnosis(unittest.TestCase):
 
 # ----------------------------------------------------------------------------------------- routing
 class TestRouting(ServerCase):
-    def test_root_is_new_ui_and_legacy_moved(self):
+    def test_root_is_the_ui_and_the_removed_pages_redirect_to_it(self):
         st, hd, body = self.request("GET", "/", token=False)
         self.assertEqual(st, 200)
         self.assertIn(b"dynamicState", body)
         self.assertIn(self.server.session_token.encode(), body)
         self.assertIn(f"dynamicstate_session={self.server.session_token}", hd["set-cookie"])
         self.assertNotIn(b"runtime-summary-bar", body)
-        st, _, legacy = self.request("GET", "/legacy/", token=False)
-        self.assertEqual(st, 200)
-        self.assertIn(b"runtime-summary-bar", legacy)
-        st, _, ws = self.request("GET", "/legacy/workspace", token=False)
-        self.assertEqual(st, 200)
-        self.assertIn(b"dynamicState Workspace", ws)
-        self.assertEqual(self.request("GET", "/legacy/workspace/", token=False)[0], 200)
+        for path in ("/legacy", "/legacy/", "/legacy/workspace", "/legacy/workspace/", "/workspace", "/workspace/"):
+            st, hd, body = self.request("GET", path, token=False)
+            self.assertEqual(st, 301, path)
+            self.assertEqual(body, b"", path)            # the old pages are gone, not served under another name
 
-    def test_legacy_assets_and_api_aliases_resolve(self):
-        self.assertEqual(self.request("GET", "/legacy/static/app.js", token=False)[0], 200)
-        self.assertEqual(self.request("GET", "/legacy/static/app.css", token=False)[0], 200)
-        self.assertEqual(self.request("GET", "/static/app.js", token=False)[0], 200)      # old URL kept
-        for p in ("/api/health", "/legacy/api/health", "/legacy/workspace/api/health"):
-            st, body, _ = self.jreq("GET", p)
-            self.assertEqual((st, body.get("status")), (200, "ok"), p)
-        self.assertEqual(self.request("GET", "/legacy/api/health", token=False)[0], 401)
+    def test_removed_assets_and_api_aliases_are_gone(self):
+        for path in ("/static/app.js", "/static/app.css", "/static/index.html", "/static/ui.js"):
+            self.assertEqual(self.request("GET", path, token=False)[0], 404, path)
+        st, body, _ = self.jreq("GET", "/api/health")
+        self.assertEqual((st, body.get("status")), (200, "ok"))
+        # /legacy/api and /legacy/workspace/api were aliases of /api: a GET is now just an old page URL (redirect,
+        # never the API) and a POST is 404, with or without a token.
+        for p in ("/legacy/api/health", "/legacy/workspace/api/health"):
+            st, _hd, body = self.request("GET", p)
+            self.assertEqual((st, body), (301, b""), p)
+        for p in ("/legacy/api/diagnose", "/legacy/workspace/api/diagnose", "/legacy/api/diagnose/start"):
+            st, out, _ = self.jreq("POST", p, {"pid": os.getpid()})
+            self.assertEqual((st, out["error"]["code"]), (404, "NOT_FOUND"), p)
 
     def test_redirects_are_relative_so_a_path_prefix_works(self):
-        for path, loc in (("/legacy", "legacy/"), ("/workspace", "legacy/workspace"), ("/workspace/", "../legacy/workspace")):
+        for path, loc in (("/legacy", "./"), ("/legacy/", "../"), ("/legacy/workspace", "../"), ("/legacy/workspace/", "../../"),
+                          ("/workspace", "./"), ("/workspace/", "../"), ("/legacy/static/app.js", "../../")):
             st, hd, _ = self.request("GET", path, token=False)
             self.assertEqual((st, hd["location"]), (301, loc), path)
             self.assertFalse(hd["location"].startswith("/"))
