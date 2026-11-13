@@ -191,7 +191,6 @@ from .typed_evidence import (
     FAMILY_DEADLOCK,
     FAMILY_GROWTH,
     FAMILY_STATE,
-    POLARITY_CONTRADICTS,
     POLARITY_SUPPORTS,
     attach_typed_evidence,
     criteria_family,
