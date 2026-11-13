@@ -18,6 +18,7 @@ MAX_FINISHED_JOBS = 20
 MAX_RUNNING_JOBS = 4
 SESSION_WAIT_S = 3.0
 VERIFICATION_RESULTS_CAP = 10
+WATCH_INTERVAL_S = 0.05
 JOB_ID_CHARS = frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-")
 JOB_ID_LEN = 22
 
@@ -112,6 +113,32 @@ class _TimelineTranslator:
         self.serialize = serialize
         self.started_steps: set = set()
         self.provisional_keys: set = set()
+        self._lock = threading.Lock()      # keeps check_start before check_done for a step
+
+    def watch_running_steps(self, session: Any) -> None:
+        """The engine marks a step RUNNING but records no timeline entry for it, so a small read-only thread
+        watches the plan and announces each step when it is seen running (latency <= WATCH_INTERVAL_S)."""
+
+        def loop() -> None:
+            while self.job.state == "running":
+                try:
+                    steps = self._steps(session)
+                    for index, st in enumerate(steps):
+                        if st.status == "RUNNING":
+                            self._announce(st.step_id, st.recipe_id, st.recipe_name, index, len(steps))
+                except Exception:  # noqa: BLE001
+                    pass
+                time.sleep(WATCH_INTERVAL_S)
+
+        threading.Thread(target=loop, name=f"watch-{self.job.job_id[:6]}", daemon=True).start()
+
+    def _announce(self, step_id: str, recipe_id: str, name: Optional[str], index: Optional[int], total: int) -> None:
+        with self._lock:
+            if step_id in self.started_steps:
+                return
+            self.started_steps.add(step_id)
+            self.job.emit("check_start", {"step_id": step_id, "recipe_id": recipe_id, "name": name,
+                                          "index": index, "total": total})
 
     def __call__(self, session: Any, entry: Dict[str, Any]) -> None:
         try:
@@ -126,18 +153,6 @@ class _TimelineTranslator:
     def _steps(session: Any) -> List[Any]:
         plan = getattr(session, "plan", None)
         return list(getattr(plan, "steps", None) or [])
-
-    def _step_row(self, step: Any, index: Optional[int]) -> Dict[str, Any]:
-        return {"step_id": step.step_id, "recipe_id": step.recipe_id, "name": step.recipe_name,
-                "index": index, "total": None}
-
-    def _announce_next(self, session: Any, index: int) -> None:
-        steps = self._steps(session)
-        if 0 <= index < len(steps) and steps[index].step_id not in self.started_steps:
-            st = steps[index]
-            self.started_steps.add(st.step_id)
-            self.job.emit("check_start", {"step_id": st.step_id, "recipe_id": st.recipe_id, "name": st.recipe_name,
-                                          "index": index, "total": len(steps)})
 
     # -- timeline handlers
     def _on_PROBLEM_CLASSIFIED(self, session: Any, d: Dict[str, Any]) -> None:
@@ -164,19 +179,22 @@ class _TimelineTranslator:
         self.job.emit("plan", {"total_steps": plan.get("total_steps", len(steps)),
                                "rationale": plan.get("plan_rationale", d.get("rationale", "")),
                                "estimated_overhead_ms": plan.get("estimated_overhead_ms"), "steps": steps})
-        self._announce_next(session, int(plan.get("current_step_index", 0) or 0))
 
     def _on_STEP_EXECUTED(self, session: Any, d: Dict[str, Any]) -> None:
         steps = self._steps(session)
         step_id, recipe_id = d.get("step_id"), d.get("recipe_id")
+        if not step_id or not recipe_id:
+            return
         index = next((i for i, s in enumerate(steps) if s.step_id == step_id), None)
         check = next((c for c in reversed(list(getattr(session, "checks", []))) if c.recipe_id == recipe_id), None)
         name = (check.name if check is not None and check.name else None) or (steps[index].recipe_name if index is not None else recipe_id)
-        if step_id not in self.started_steps:
-            self.started_steps.add(step_id)
-            self.job.emit("check_start", {"step_id": step_id, "recipe_id": recipe_id, "name": name,
-                                          "index": index, "total": len(steps)})
+        self._announce(step_id, recipe_id, name, index, len(steps))
         status = check.status if check is not None else None
+        with self._lock:
+            self._emit_check_done(session, d, steps, step_id, recipe_id, check, name, index, status)
+
+    def _emit_check_done(self, session: Any, d: Dict[str, Any], steps: List[Any], step_id: str, recipe_id: str,
+                         check: Any, name: Optional[str], index: Optional[int], status: Optional[str]) -> None:
         self.job.emit("check_done", self.serialize({
             "step_id": step_id, "recipe_id": recipe_id, "check_id": getattr(check, "check_id", None), "name": name,
             "status": status, "duration_ms": getattr(check, "duration_ms", None),
@@ -196,10 +214,6 @@ class _TimelineTranslator:
                     "key": key, "recipe_id": recipe_id, "check_id": getattr(check, "check_id", None), "name": name,
                     "category": st.category, "domain": st.domain,
                     "summary": getattr(check, "technical_interpretation", ""), "status": "provisional"}))
-        plan = getattr(session, "plan", None)
-        if plan is not None:
-            nxt = (index + 1) if index is not None else int(getattr(plan, "current_step_index", 0)) + 1
-            self._announce_next(session, nxt)
 
     def _on_HYPOTHESES_VERIFIED(self, session: Any, d: Dict[str, Any]) -> None:
         act = list(getattr(session, "active_hypotheses", []) or [])
@@ -235,7 +249,9 @@ class DiagnoseJobManager:
             job.investigation_id = getattr(session, "investigation_id", None)
             job.session = session
             job.session_ready.set()
-            return _TimelineTranslator(job, self._serialize)
+            translator = _TimelineTranslator(job, self._serialize)
+            translator.watch_running_steps(session)
+            return translator
 
         engine.session_listener_factory = factory
         self._hooked_engine = engine

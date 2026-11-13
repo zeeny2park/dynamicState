@@ -106,7 +106,7 @@ The body is the report itself, not wrapped in the `{"success": ...}` envelope. A
 
 ## 6. Events
 
-Order of events in a normal diagnosis: `classified`, `target`, `plan`, then per check `check_start`, `check_done`
+Order of events in a normal diagnosis: `classified`, `target`, `plan`, then per check `check_start`, `check_done` (checks run in the engine's order, which replanning can change from the `plan` order)
 (and, the first time a check FAILs in a category, `finding_provisional`), then `verified`, then `verdict`. Note that the
 engine classifies the symptom **before** it assesses the target, so `classified` precedes `target` (the proposal's table
 lists them the other way round). The UI should not depend on the relative order of `classified` and `target`.
@@ -144,13 +144,14 @@ Excluded recipes ("not executed") are not part of the plan the engine exposes at
 engine adds when a check supports a hypothesis) is not re-sent: a `check_start`/`check_done` for a `recipe_id` that was
 not in `plan.steps` is a follow-up check and should be appended to the list.
 ### `check_start`
-Best effort and derived: sent when the engine finishes the previous check (or the plan) for the step it will run next.
-Because the engine does not signal the start of a step itself, a replan may make it name a step that is not run next;
-`check_done` is authoritative and is always preceded by a `check_start` for the same `step_id` (the server sends one
-right before it if needed).
+Sent when a read-only watcher on the session's plan sees the engine mark a step RUNNING (the engine records no timeline
+entry for that, so the latency is up to about 50 ms). A check faster than that gets its `check_start` immediately before
+its `check_done`: for every `check_done` there is exactly one earlier `check_start` with the same `step_id`.
 ```json
 {"step_id": "step_3", "recipe_id": "RECIPE_THREAD_WAIT_GRAPH", "name": "Thread wait graph", "index": 2, "total": 24}
 ```
+`index` is the 0-based position in the current plan (`null` for a follow-up not in the plan), `total` the current plan length.
+
 ### `check_done`
 Source: `STEP_EXECUTED` and the last entry of `session.get_checks()`.
 ```json
