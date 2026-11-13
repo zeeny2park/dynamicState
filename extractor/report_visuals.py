@@ -1009,6 +1009,12 @@ def _finding_card(lx: _Lx, i: int, f: Dict[str, Any], report: Optional[Dict[str,
     if facts:
         parts.append(f'<details class="collapsible"><summary>{E(lx.t("evidence"))}</summary>'
                      f'<ul class="dsv-facts in">{facts}</ul></details>')
+    if block is not None and block.get("cands"):
+        # static location candidates (never observed): the facts line names them, the reasons are one click away
+        parts.append(f'<details class="collapsible dsv-cands" id="finding-{i}-candidates"><summary>'
+                     f'{E(T["f_cands_head"][lx.i])}</summary><div class="in dsv-text">'
+                     f'{_md_html([T["f_cands_note"][lx.i], ""] + [f"{n}. {x}" for n, x in enumerate(block["cands"], 1)])}'
+                     f'</div></details>')
     parts.append(_detail(lx, "d_finding", detail, f"finding-{i}-detail"))
     parts.append("</div>")
     return "".join(parts)

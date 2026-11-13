@@ -394,6 +394,15 @@ T: Dict[str, Tuple[str, str]] = {
     "f_related": ("**Related checks**: {checks}.", "**관련 검사**: {checks}."),
     "f_records": (" Evidence records: {n}.", " 근거 기록 {n}건."),
     "f_why": ("**Why this conclusion**", "**판단 근거**"),
+    # static location candidates (extractor.static_location_candidates): statically derived, never observed
+    "f_cands": ("**Location candidates** (static analysis, not observed): {locs}.",
+                "**위치 후보**(정적 분석, 관측 아님): {locs}."),
+    "f_cands_head": ("Location candidates (static analysis, not observed)", "위치 후보 (정적 분석, 관측 아님)"),
+    "f_cands_note": ("Chosen from the debug information and the source text, not seen at runtime; they do not "
+                     "confirm where the defect happened. Ranked by how directly they relate to the finding.",
+                     "디버그 정보와 소스 코드로 고른 후보이며 실행 중에 본 위치가 아닙니다. 결함이 생긴 위치를 확인한 "
+                     "것도 아닙니다. 발견과 얼마나 직접 이어지는지에 따라 순위를 매겼습니다."),
+    "f_cand_item": ("`{loc}` in `{fn}`: `{stmt}`. Why: {why}.", "`{loc}`(`{fn}`): `{stmt}`. 고른 이유: {why}."),
     "sev_CRITICAL": ("critical", "치명적"), "sev_HIGH": ("high", "높음"), "sev_MEDIUM": ("medium", "중간"),
     "sev_WARNING": ("warning", "경고"), "sev_LOW": ("low", "낮음"), "sev_INFO": ("informational", "참고"),
     # next steps
@@ -1230,11 +1239,30 @@ def _finding_blocks(ctx: _Ctx, res: Dict[str, Any], renders: List[Dict[str, Any]
             body.append(ctx.t("w_noname"))
         if (f.get("subjects") or f.get("subject_details")) or r.get("registered"):
             body.extend(r["lines"])
+        cands = location_candidate_lines(ctx, f)
+        if cands:
+            facts.append(ctx.t("f_cands", locs=_join([f"`{c['location']}`" for c in
+                                                      (f.get("location_candidates") or {}).get("candidates")])))
         diagram = []
         if r.get("diagram"):
             diagram = [f"**{ctx.t('h2_wait')}**", "```", ctx.t("d_hdr")] + list(r["diagram"]) + ["```"]
         out.append({"i": i, "heading": ctx.t("f_head", i=i, label=_cat_label(ctx, str(f.get("category")))),
-                    "facts": facts, "body": body, "diagram": diagram, "why": _finding_why(ctx, f, r)})
+                    "facts": facts, "body": body, "diagram": diagram, "why": _finding_why(ctx, f, r),
+                    "cands": cands})
+    return out
+
+
+def location_candidate_lines(ctx: _Ctx, f: Dict[str, Any]) -> List[str]:
+    """The finding's static location candidates as numbered list items (Markdown, report language); [] when the
+    finding has none.  They are candidates, never the confirmed location: the heading and note say so."""
+    lc = f.get("location_candidates") if isinstance(f.get("location_candidates"), dict) else {}
+    out = []
+    for c in lc.get("candidates") or []:
+        if not isinstance(c, dict) or not c.get("location"):
+            continue
+        why = c.get("reason_ko") if ctx.i == 1 and c.get("reason_ko") else c.get("reason")
+        stmt = str(c.get("statement") or "").replace("`", "'")
+        out.append(ctx.t("f_cand_item", loc=c["location"], fn=c.get("function") or "?", stmt=stmt, why=why or "-"))
     return out
 
 
@@ -1274,6 +1302,9 @@ def _section2(ctx: _Ctx, blocks: List[Dict[str, Any]]) -> List[str]:
             out += b["diagram"] + [""]
         if b["why"]:
             out += [ctx.t("f_why"), ""] + [f"{n}. {x}" for n, x in enumerate(b["why"], 1)] + [""]
+        if b.get("cands"):
+            out += [f"**{ctx.t('f_cands_head')}**", "", ctx.t("f_cands_note"), ""] + [
+                f"{n}. {x}" for n, x in enumerate(b["cands"], 1)] + [""]
     while out and out[-1] == "":
         out.pop()
     return out

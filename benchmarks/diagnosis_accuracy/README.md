@@ -97,6 +97,13 @@ made the call is not observable from memory.
   `full` = all declared variables/locks/threads found (functions only if nothing else is declared); `partial` = some name
   of any class found. Per-class detail is in `names_by_class`.
 - Location: a `file:line` subject with the same file name and a line within +-3 of any listed ground-truth location.
+  Only subjects count (what the diagnosis observed and named); static candidates never do.
+- Location candidates (separate metric, roadmap stage 3): the matching findings' `location_candidates.candidates`
+  (statically derived from DWARF + source text, labelled "not observed", ranked, at most 3; see
+  `extractor/static_location_candidates.py`). Per row `location_candidate_rank` = best rank of a candidate within the
+  same +-3 lines of a ground-truth location (None if none), `location_candidate_hit`; totals
+  `location_candidate_hit` ("candidates contain the true location") and `location_candidate_rank1`. Printed on their
+  own line and as the table's `cand` column (`#rank`); they are never added to `location_match`.
 - Also recorded: verdict, categories, subjects, `not_covered` kinds, wall time, capture mode, measured stop time;
   `non_zero_stop` flags any non-zero-stop collection. A `diagnose` exception or hang becomes a row with `error`.
 
