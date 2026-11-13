@@ -1,0 +1,197 @@
+{
+  "_comment": "Development set of the symptom paraphrase regression (stage 2). Each group is one problem described in different words. phrases[0] is the reference: every other phrase must yield the same planned-check set as it, and the group's expected_class. The held-out quarter lives in symptom_paraphrases_heldout.json and is not used while tuning the classifier.",
+  "groups": [
+    {"id": "memory_growth", "expected_class": "memory_growth", "phrases": [
+      "memory leak suspected, the heap keeps growing",
+      "memory usage of this process keeps growing",
+      "RSS goes up all the time and never comes down",
+      "it eats more and more memory the longer it runs",
+      "is this thing leaking memory?",
+      "memory usage looks high, is it leaking?",
+      "메모리 누수가 의심됩니다",
+      "프로세스 메모리가 계속 늘어나요",
+      "메모리 사용량이 점점 증가하는데 확인해줘",
+      "시간이 지날수록 메모리를 계속 잡아먹네"
+    ]},
+    {"id": "hang_deadlock", "expected_class": "hang_deadlock", "phrases": [
+      "the process hangs, probably a deadlock",
+      "the service stopped responding",
+      "the process seems stuck, please check",
+      "it froze and nothing happens anymore",
+      "requests are not being processed anymore",
+      "are the worker threads deadlocked?",
+      "프로세스가 멈췄습니다",
+      "서비스가 응답이 없어요",
+      "데드락인 것 같습니다",
+      "갑자기 먹통이 됐어. 뭐가 문제야?"
+    ]},
+    {"id": "cpu_spin", "expected_class": "cpu_spin", "phrases": [
+      "this process uses a full CPU core while doing nothing useful",
+      "CPU usage is stuck at 100%",
+      "one thread is busy-looping",
+      "the process is spinning and burning CPU",
+      "this process uses a lot of CPU, is something wrong?",
+      "high CPU load but no real work gets done",
+      "CPU를 100% 사용하고 있어요",
+      "프로세스가 CPU를 계속 잡아먹고 있습니다",
+      "스레드 하나가 무한 루프 도는 것 같아",
+      "아무 일도 안 하는데 CPU 점유율만 높습니다"
+    ]},
+    {"id": "crash_corruption", "expected_class": "crash_corruption", "phrases": [
+      "segfault in the process, looks like memory corruption",
+      "this program crashes sometimes and data looks wrong",
+      "this program shows occasional strange data and I suspect memory corruption",
+      "random crashes with SIGSEGV",
+      "the data gets garbled and the program sometimes segfaults",
+      "something is overwriting memory",
+      "세그폴트가 발생합니다",
+      "메모리가 오염된 것 같아요",
+      "가끔 프로그램이 죽고 데이터가 이상해",
+      "메모리 손상이 의심됩니다. 크래시가 납니다"
+    ]},
+    {"id": "use_after_free", "expected_class": "use_after_free", "phrases": [
+      "use after free suspected",
+      "a dangling pointer is being dereferenced",
+      "the code touches an object after it was freed",
+      "looks like a use-after-free bug",
+      "reading memory that has already been freed",
+      "해제 후 사용 버그가 의심돼요",
+      "해제된 객체를 참조하고 있는 것 같습니다",
+      "이미 free한 포인터를 다시 쓰는 것 같아",
+      "댄글링 포인터 문제인가요?"
+    ]},
+    {"id": "double_free", "expected_class": "double_free", "phrases": [
+      "double free suspected",
+      "the same buffer is freed twice",
+      "free() called two times on one pointer",
+      "glibc aborts with double free detected",
+      "looks like a double-free bug",
+      "이중 해제가 의심됩니다",
+      "같은 메모리를 두 번 해제하는 것 같아요",
+      "더블 프리 버그인가요?",
+      "free를 두 번 호출하는 것 같아"
+    ]},
+    {"id": "stack_corruption", "expected_class": "stack_corruption", "phrases": [
+      "stack corruption suspected",
+      "the stack got smashed and the return address is garbage",
+      "stack overflow in a worker thread",
+      "stack canary check failed",
+      "the call stack looks trashed",
+      "스택이 깨진 것 같습니다",
+      "스택 손상이 의심돼요",
+      "스택 오버플로우가 난 것 같아",
+      "스택 카나리 오류가 떠요"
+    ]},
+    {"id": "data_race", "expected_class": "data_race", "phrases": [
+      "data race suspected on a shared counter",
+      "looks like a race condition between threads",
+      "two threads write the same variable without a lock",
+      "unsynchronized access to shared state",
+      "values get torn when threads access them at the same time",
+      "데이터 레이스가 의심됩니다",
+      "경쟁 상태인 것 같아요",
+      "락 없이 여러 스레드가 같은 변수를 건드리는 것 같아",
+      "동시 접근 때문에 값이 꼬입니다"
+    ]},
+    {"id": "thread_growth", "expected_class": "thread_growth", "phrases": [
+      "the number of threads of this process keeps increasing",
+      "the thread count of this process is going up all the time",
+      "it leaks threads",
+      "more and more threads are being created and never exit",
+      "thread leak suspected",
+      "스레드 수가 계속 늘어납니다",
+      "스레드가 계속 생성되기만 하고 종료가 안 돼요",
+      "스레드 누수가 의심돼",
+      "프로세스의 스레드 개수가 점점 증가해요"
+    ]},
+    {"id": "fd_leak", "expected_class": "fd_leak", "phrases": [
+      "file descriptor leak suspected",
+      "the number of open files keeps growing",
+      "fd count goes up and never drops",
+      "we are leaking sockets",
+      "too many open files after running for a while",
+      "파일 디스크립터가 계속 늘어납니다",
+      "fd 누수가 의심돼요",
+      "열린 파일 수가 점점 증가해",
+      "소켓이 닫히지 않고 쌓여요"
+    ]},
+    {"id": "slow_contended", "expected_class": "slow_contended", "phrases": [
+      "the process feels slow, check for lock problems",
+      "requests are slow, is something wrong with locking?",
+      "high lock contention suspected",
+      "latency is bad and threads queue up on a mutex",
+      "everything got sluggish under load",
+      "응답이 너무 느려요",
+      "락 경합 때문에 느려지는 것 같습니다",
+      "요청 처리가 점점 느려져. 락 문제인가?",
+      "버벅거려요"
+    ]},
+    {"id": "process_instability", "expected_class": "process_instability", "phrases": [
+      "the process is unstable and keeps restarting",
+      "it dies every few hours and gets restarted",
+      "flapping process, it keeps exiting",
+      "the service is flaky",
+      "the process keeps terminating on its own",
+      "프로세스가 불안정합니다",
+      "서비스가 자꾸 재시작돼요",
+      "간헐적으로 종료되는 것 같아",
+      "프로세스가 자주 죽어요"
+    ]},
+    {"id": "variable_anomaly", "expected_class": "variable_anomaly", "phrases": [
+      "a counter has an unexpected value",
+      "a variable jumped to a wrong value",
+      "the value is out of range",
+      "a boundary value looks violated",
+      "a global changes suddenly for no reason",
+      "카운터 값이 이상합니다",
+      "변수 값이 갑자기 튀어요",
+      "예상치 못한 값이 들어가 있어",
+      "값이 범위를 벗어났어요"
+    ]},
+    {"id": "state_transition", "expected_class": "state_transition", "phrases": [
+      "unexpected state transition",
+      "the state machine entered an invalid state",
+      "an illegal transition happened in the state machine",
+      "the connection went from closed straight to established",
+      "state machine bug suspected",
+      "상태 전이 오류가 있습니다",
+      "상태 머신이 잘못된 상태로 들어갔어요",
+      "유효하지 않은 상태로 바뀌는 것 같아",
+      "불법 전이가 의심됩니다"
+    ]},
+    {"id": "state_inconsistency", "expected_class": "state_inconsistency", "phrases": [
+      "the internal state is inconsistent",
+      "an invariant is violated",
+      "two related fields disagree with each other",
+      "the buffer state contradicts the counters",
+      "mismatched state between the producer and the consumer view",
+      "내부 상태가 일치하지 않습니다",
+      "불변식이 깨진 것 같아요",
+      "서로 연관된 값들이 모순돼 있어",
+      "상태 불일치가 있는 것 같습니다"
+    ]},
+    {"id": "resource_exhaustion", "expected_class": "resource_exhaustion", "phrases": [
+      "we are running out of resources",
+      "resource exhaustion suspected",
+      "the process hit its resource limits",
+      "out of sockets and no more handles available",
+      "quota exceeded errors keep showing up",
+      "리소스가 고갈되고 있습니다",
+      "자원 부족으로 보여요",
+      "소켓이 부족해서 새 연결을 못 받아",
+      "리소스 한도에 걸린 것 같아"
+    ]},
+    {"id": "health_check", "expected_class": "health_check", "phrases": [
+      "general health check",
+      "check whether this process is healthy",
+      "is this process OK?",
+      "any problems with this process?",
+      "just take a look at it and tell me if something is wrong",
+      "overall check please",
+      "프로세스 상태를 점검해줘",
+      "이 프로세스에 문제가 있는지 봐주세요",
+      "전체적으로 이상 유무를 확인해줘",
+      "종합 분석 부탁해"
+    ]}
+  ]
+}
