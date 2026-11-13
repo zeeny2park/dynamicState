@@ -85,8 +85,55 @@ class TestRealBrowserRun(unittest.TestCase):
         px = self.r["runs"]["proxy"]
         self.assertTrue(px["done"], px)
         self.assertGreaterEqual(px["status_polls"], 1)
-        self.assertEqual(px["static"], ["/theme.css", "/ui.css", "/ui.js"])
+        self.assertEqual(px["static"], ["/explore.js", "/theme.css", "/ui.css", "/ui.js"])
         self.assertEqual(px["http_errors"], [])
+
+    # ---- exploration (docs/ui-redesign/EXPLORE_PROPOSAL_KO.md 10, done conditions of E2-E4)
+    def test_e2_chips_open_the_stack_and_the_range_within_a_second(self):
+        dl, ov = self.r["explore"]["deadlock"], self.r["explore"]["overflow"]
+        self.assertEqual(dl["chips"], ["스레드 ingest", "락 m_out", "스레드 flush", "락 m_in"])
+        self.assertLess(dl["chip_to_stack_s"], 1.0)
+        self.assertEqual(dl["frame"], "ingest")              # the frame the finding points at is selected
+        self.assertTrue(dl["back_link"])
+        self.assertLess(dl["chip_to_lock_s"], 1.0)
+        self.assertEqual(dl["lock_rows"], 2)                 # owner and waiter
+        self.assertLess(ov["chip_to_range_s"], 1.0)
+        self.assertEqual((ov["over_bytes"], ov["buf_bytes"]), (24, 72))
+        self.assertLessEqual(len([c for c in ov["chips"] if not c.startswith("+")]), 4)
+
+    def test_e2_profile_rows_open_in_place_and_many_threads_are_grouped(self):
+        h, th = self.r["explore"]["healthy"], self.r["explore"]["threads"]
+        self.assertEqual(h["thread_rows"], 3)
+        for k in ("thread_stack_s", "maps_s", "value_s"):
+            self.assertLess(h[k], 1.0, k)
+        self.assertGreaterEqual(th["groups"], 1)
+        self.assertEqual(th["members_first"], 20)
+        self.assertGreater(th["members_more"], th["members_first"])
+
+    def test_e3_a_tracked_counter_changes_every_sample_and_exit_stops_watching(self):
+        h, dl = self.r["explore"]["healthy"], self.r["explore"]["deadlock"]
+        self.assertTrue(h["counter_increases_every_sample"], h["counter_spark"])
+        n, secs = h["samples_in_span"]
+        self.assertLessEqual(abs(n - secs), 1.5)             # about one sample per second at the 1 s interval
+        self.assertEqual(h["half_second"][0], 0.5)
+        self.assertIn("handled[0]", h["compare_changed"])
+        self.assertEqual((h["exit"]["state"], h["exit"]["reason"]), ("stopped", "target_exited"))
+        self.assertTrue(h["exit"]["last_kept"] and h["exit"]["alert"])
+        self.assertIn("대상 종료", h["exit"]["chip"])
+        self.assertTrue(dl["watch_flat"] and dl["watch_changes"] == 0)     # a deadlocked mutex never changes
+        self.assertEqual(dl["paused"], "paused")
+
+    def test_e4_pool_grid_refreshes_at_its_interval_and_the_report_gets_the_section(self):
+        p, ov = self.r["explore"]["pool"], self.r["explore"]["overflow"]
+        g = p["pool"]
+        self.assertEqual((g["cells"], g["dom_cells"], g["legend_sum"], g["per_cell"]), (4096, 4096, 4096, 1))
+        self.assertEqual(g["bytes_per_sample"], 196608)
+        n, secs = g["samples_in_span"]
+        self.assertLessEqual(abs(n - secs), 1.5)
+        self.assertEqual((p["selected"], p["keyboard_selected"]), (1337, 1337 + 1 + 64))
+        self.assertEqual(p["filter"], "4")
+        self.assertEqual(p["report"], {"pool_cells": 4096, "rest_equal": True})
+        self.assertEqual((ov["report_section"], ov["report_rest_equal"], ov["report_has_script"]), (1, True, False))
 
 
 if __name__ == "__main__":

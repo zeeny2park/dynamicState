@@ -7,7 +7,7 @@ or a plain relative string such as `api/diagnose/jobs`). The public demo is serv
 
 ## 0. Common rules
 
-- Every `/api/...` endpoint below passes the same guards as the existing API: allowed `Host`, loopback-only `Origin`
+- Every `/api/...` endpoint below passes the same guards: allowed `Host`, loopback-only `Origin`
   (if any), and the per-run session token. The token reaches the page in two ways: the served `index.html` gets
   `window.__DYNAMICSTATE_SESSION_TOKEN__` injected (and `fetch` is already wrapped to send `X-Session-Token`), and an
   HttpOnly cookie `dynamicstate_session` is set. **`EventSource` cannot set headers, so SSE and report links rely on the
@@ -269,20 +269,33 @@ Terminal. The diagnosis function raised (an unreadable target is NOT an error: i
 - Replays (`extractor/web/ui/replay/*.json`, `?replay=<name>`) are recorded event streams in exactly this wire shape,
   made from saved results by `python3 -m extractor.web.ui.replay_gen` with the same builders.
 
-## 8. Routing (stage C)
+## 8. Routing
+
+The web server is **read-only towards the target**: no route writes target memory, stops or signals the target, runs a
+command, or mutates / checkpoints / restores state. The authoritative route table is `API_ROUTES` in
+`extractor/web/server.py`; `tests/test_web_readonly_routes.py` enumerates it, rejects any route whose path looks like
+writing, stopping, running commands, mutating or restoring, checks that every `/api/...` literal under `extractor/web/`
+is in the table, and probes the removed paths for 404.
 
 | URL | Content |
 |---|---|
-| `/` , `/index.html`, `/ui.css`, `/ui.js`, any file in `extractor/web/ui/` | the new UI (relative URLs inside) |
-| `/legacy/`  (`/legacy` redirects to `legacy/`) | the old 8-tab UI; its assets resolve as `/legacy/static/app.js` etc. |
-| `/legacy/workspace` | the old workspace (chat) UI |
-| `/workspace` | redirect to `legacy/workspace` (old bookmarks) |
-| `/api/...` | unchanged paths. `/legacy/api/...` and `/legacy/workspace/api/...` are aliases (the legacy pages derive their API base from their own URL) |
-| `/static/...` | legacy assets (unchanged, kept so existing links work) |
+| `/` , `/index.html`, `/ui.css`, `/ui.js`, page assets in `extractor/web/ui/` (`.html .css .js .json .svg .png .ico`) | the UI (relative URLs inside) |
+| `GET api/health` | `{"status": "ok", "version", "timestamp", "mode"}` |
+| `GET api/target/processes?process_name=&remote_host=&ssh_user=&ssh_port=&ssh_key=` | process listing (sections 1 and 7: name to pid) |
+| `POST api/diagnose`, `POST api/diagnose/start`, `GET api/diagnose/jobs`, `GET api/diagnose/{job_id}/events`, `.../status`, `.../report` | sections 1 to 5 |
+| any other `/api/...` | 404 `NOT_FOUND` |
+| `/legacy`, `/legacy/...`, `/workspace`, `/workspace/...` (the removed 8-tab UI and chat workspace) | 301 to the root UI with a **relative** `Location` (`./`, `../`, ...) |
+| `/static/...` (the removed UI's assets) | 404 |
+
+The previous 8-tab UI (`/legacy/`), the chat workspace (`/legacy/workspace`, `/workspace`, `dynamic-state-workspace`)
+and every route only they used (`/api/watch/*`, `/api/investigation/*`, `/api/investigations*`, `/api/workspace/chat`,
+`/api/mutation*`, `/api/transition(s)`, `/api/checkpoint`, `/api/restore`, `/api/snapshot(s)`, `/api/states`,
+`/api/state-graph`, `/api/state-lab/tree`, `/api/runtime*`, `/api/capabilities`, `/api/explore`, `/api/observe`,
+`/api/capture`, `/api/llm/status`, `/api/target/inspect-range`, `/api/target/deploy-collector`, ...) were removed, with
+the `/legacy/api/...` aliases. The Python functions behind them stay where MCP, the CLI or tests use them.
 
 Nothing in the server depends on a path prefix: with `proxy_pass http://127.0.0.1:8081/;` under `/dynamicstate/` all of the
-above work as `/dynamicstate/`, `/dynamicstate/legacy/`, `/dynamicstate/api/...`, because every URL the pages and the
-redirects use is relative.
+above work as `/dynamicstate/`, `/dynamicstate/api/...`, because every URL the page and the redirects use is relative.
 
 ## 9. The process profile (`process_profile`)
 
@@ -324,6 +337,66 @@ order and wording.
   first; `omitted` counts the rest. `detailed < listed` means only some threads were sampled over the window.
 - `window` is the whole diagnosis (`section_b.observation_duration_sec`, `collection_impact.samples_collected`).
 
-Items that would naturally link to a legacy interactive tool later: locks (`name`, `address`) to the variable watch list;
+Items that would naturally link to an exploration view later: locks (`name`, `address`) to the variable watch list;
 `growing_classes` and `heap.walk` to the pool/array scanner; `memory.address_space` categories and `modules` to the
 memory-range inspector; `memory.rss.series` / `threads.series` to the timeline compare.
+
+## 10. Exploration routes (job-bound)
+
+Reads of a diagnosed process from the result screen (docs/ui-redesign/EXPLORE_PROPOSAL_KO.md). Code:
+`extractor/web/explore.py` (reads, limits, observation session), `extractor/web/explore_routes.py` (HTTP glue),
+`extractor/web/ui/explore_fragments.py` (ko/en fragments), `extractor/web/observation_report.py` ("Add to report").
+Every route is in `API_ROUTES` and is probed by `tests/test_web_readonly_routes.py`.
+
+**Binding and security.** Same session token, Host and loopback-Origin checks and job-id validation as the diagnose
+routes. The pid, the transport (local / SSH) and the debug image come from the job; no request parameter names a pid,
+a host or a file. Before every read the job's process is checked: gone, a zombie, or a pid now owned by another
+process (its start time in `/proc/PID/stat` differs from the one recorded when the job started) gives `410
+TARGET_EXITED`. Reads of one job run one at a time on one adapter (one SSH connection) with a manager of their own, so
+the runtime's active target is never moved; an answer from another pid (auto-heal) is refused. A job that ended with an
+error is not explored (`409 NO_TARGET`).
+
+**Answer.** `{"success": true, "key", "html": {"ko", "en"}, "data", "cost": {"reads", "bytes", "ms", "stop_ms": 0,
+"writes": 0, "transport", "at"}}`; an error is `{"success": false, "error": {code, message}, "html": {ko, en}}`.
+`html` is inert (no script, no `on*=`, no URL; every target string escaped) and may contain `<!--slot:KEY-->` where a
+sub-row's detail goes and `data-act` buttons the UI's click handler understands.
+
+| Method | Path | Parameters (bounds) | Reads |
+|---|---|---|---|
+| GET | `{job}/chips` | — (finished job) | none: DWARF types and the result's own observations |
+| GET | `{job}/thread/{tid}` | tid: digits, must be a task of the job's pid | call stack (CFI), frame locals, locks held / waited for |
+| GET | `{job}/threads` | `name` 1..64 printable, `limit` 1..4096 (20), `filter` digits | `/proc/PID/task/*` only |
+| GET | `{job}/memory/maps` | — | `/proc/PID/maps` |
+| GET | `{job}/memory/range` | exactly one of `addr` (hex/decimal, < 2^64) and `expr`; `len` 1..4096 (256) | one read (+ one for `expr`) |
+| GET | `{job}/files` | — (local targets) | `/proc/PID/fd` links |
+| GET | `{job}/modules` | — | `/proc/PID/maps` + the ELF files on this host |
+| GET | `{job}/vars` | `q` up to 64 of `[A-Za-z0-9_:.]` | none: DWARF |
+| GET | `{job}/value` | `expr`: `*{0,4}name(.f|->f|[n])*`, ≤ 200 chars | one evaluation |
+| GET | `{job}/lock` | `name` 1..64 printable | stacks of all threads (8 frames) + the mutex words |
+| GET | `{job}/watch/events` | `after` | SSE `event: watch`, data `{version, watch}` |
+| GET | `{job}/watch/status` | `after` | `{version, watch}` (`watch: null` when nothing is observed) |
+| POST | `{job}/watch` | `{items: [{expr} or {addr, type: u64/u32/i32/u8}], pool: {expr, count, field, sel} or null, interval_s, running, pin: "now"/"clear"}` | starts / changes the server-side sampler |
+| POST | `{job}/watch/stop` | `{}` | stops the sampler (never the target) |
+| POST | `{job}/observation` | `{}` or `{remove: true}` | puts the current observation into the job's report |
+
+Repeated query parameters and values over 256 characters are `400`. Unknown actions are `404`.
+
+**Limits.** One-shot reads: a token bucket per job, burst 30, 5 per second (`429 RATE_LIMITED`). Observation: at most 16
+items; at most 262,144 bytes per sample (a 4,096 x 48-byte pool, 196,608 B, fits) and 524,288 bytes per second;
+interval 0.5, 1, 2 or 5 s (SSH targets: 2 s minimum, one daemon exchange per read); at most 4 observations sampling at
+once on the server; sampling stops by itself when no client asked for 30 s (`reason: idle`), after 30 minutes
+(`max_lifetime`), when the target exits (`target_exited`, last values kept, a resume does not restart it) or a read
+fails (`read_failed`). A pool of more than 4,096 elements is drawn in buckets of `ceil(N/4096)` elements per cell
+(majority status).
+
+**`watch` object.** `{seq, samples, state: running|paused|stopped|idle, reason, reason_detail, interval_s, intervals,
+transport, first_t, last_t, items: [{id, label, type, value | fields: [{name, value, spark, changes, last_change}],
+spark (last 30), changes, last_change, error}], pool: {expr, count, elem_size, elem_type, field, field_type, per_cell,
+bytes, cells (one digit 0-5 per cell), changed, legend: [{cls, value, name, count, delta}], sel, sel_view}, compare:
+{from_seq, from_t, to_seq, to_t, changed: [{name, before, now, diff}], same, pool}, pinned, cost, plan: {reads_per_sample,
+bytes_per_sample, reads_per_s, bytes_per_s, limits}}`.
+
+**"Add to report".** The job's next report (`{job}/report`, every format and language) carries an "Additional
+observation" section after "What to do next": HTML section `#obs-report` (sparklines, the pool grid, the comparison),
+a Markdown section between `<!-- ds:additional-observation -->` markers, JSON key `additional_observation`. The rest of
+the report is the cached report byte for byte; verdict, findings and checks never change.

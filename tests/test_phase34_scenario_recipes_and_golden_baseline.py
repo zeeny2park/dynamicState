@@ -213,28 +213,6 @@ class TestPhase34ScenarioRecipesAndGoldenBaseline(unittest.TestCase):
         self.assertIn("g_session.worker.state.counter", stuck_names)
         self.assertIn("g_heap_state->counter", stuck_names)
 
-    def test_04_phase3_web_ui_elements_and_routes(self):
-        """Verify Phase 3 UI elements exist in index.html."""
-        html_path = os.path.join(PROJECT_ROOT, "extractor", "web", "static", "index.html")
-        with open(html_path, "r", encoding="utf-8") as f:
-            html = f.read()
-        for el_id in (
-            "te-smart-watch-chips-card",
-            "te-smart-watch-chips",
-            "scenario-recipes-launchpad",
-            "btn-recipe-instant-xray",
-            "btn-recipe-before-after",
-            "btn-recipe-auto-watch",
-            "scenario-recipe-output",
-            "card-golden-baseline",
-            "input-golden-baseline-label",
-            "btn-save-golden-baseline",
-            "select-golden-baseline",
-            "btn-compare-golden-baseline",
-            "golden-baseline-diff-output",
-        ):
-            self.assertIn(f'id="{el_id}"', html, f"Missing Phase 3 UI element #{el_id}")
-
 
 if __name__ == "__main__":
     unittest.main()

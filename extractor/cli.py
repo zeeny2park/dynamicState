@@ -82,7 +82,6 @@ def main():
     srv_parser.add_argument("--port", type=int, default=8000, help="HTTP port to bind (default: 8000)")
     srv_parser.add_argument("--corpus", type=str, default="corpus", help="Path to State Corpus directory (default: corpus)")
     srv_parser.add_argument("--mode", type=str, default="LOW_IMPACT", choices=["CONSISTENT", "LOW_IMPACT"], help="Observation mode (default: LOW_IMPACT)")
-    srv_parser.add_argument("--allow-mutation", action="store_true", default=False, help="Explicitly enable live state-changing operations (checkpoint/restore/transition/explore/replay); without it the runtime is read-only regardless of --mode")
     srv_parser.add_argument("--snapshot", type=str, default=None, help="Optional snapshot file to load into corpus")
     srv_parser.add_argument("--binary", type=str, default=None, help="Optional target binary path")
     srv_parser.add_argument("--debug-image", type=str, default=None, help="Optional external debug image path")
@@ -205,12 +204,6 @@ def main():
     own_p.add_argument("--ssh-key", type=str, default=None)
     own_p.add_argument("--ssh-proxy-jump", type=str, default=None)
     own_p.add_argument("--corpus", type=str, default="corpus")
-
-    # 13d. workspace (Phase 9 Minimalist Chat + Trace Workspace Web UI)
-    ws_p = subparsers.add_parser("workspace", help="Launch the minimalist Gemini-style Chat + Process Trace Workspace Web UI")
-    ws_p.add_argument("--host", type=str, default="127.0.0.1", help="HTTP host to bind (default: 127.0.0.1)")
-    ws_p.add_argument("--port", type=int, default=8080, help="HTTP port to bind (default: 8080)")
-    ws_p.add_argument("--corpus", type=str, default="corpus", help="Corpus directory")
 
     # 14. recipe (Phase 4 guided diagnostic recipes & Golden Baselines)
     rec_p = subparsers.add_parser("recipe", help="Run a guided diagnostic recipe (instant_xray, before_after_diff, timeseries_watch) or Golden Baseline check")
@@ -709,8 +702,8 @@ def main():
         from .web.server import run_server, run_server_loop
         corpus_dir = os.path.abspath(args.corpus)
         os.makedirs(corpus_dir, exist_ok=True)
-        eff_mode = "CONSISTENT" if getattr(args, "allow_mutation", False) else args.mode
-        runtime = AgentRuntime(corpus_dir=corpus_dir, observation_mode=eff_mode, allow_mutation=getattr(args, "allow_mutation", False))
+        # the web server is read-only towards the target: no --allow-mutation (no route writes, stops or restores)
+        runtime = AgentRuntime(corpus_dir=corpus_dir, observation_mode=args.mode)
 
         if args.snapshot:
             if os.path.exists(args.snapshot):
@@ -737,7 +730,7 @@ def main():
         print("========================================")
         print(" dynamicState Web UI")
         print(f" {url}")
-        print(f" Mode: {runtime.observation_mode}" + (" (mutation enabled)" if runtime.allow_mutation else " (read-only)"))
+        print(f" Mode: {runtime.observation_mode} (read-only)")
         print(f" Corpus: {corpus_dir}")
         print(" Press Ctrl+C to terminate.")
         print("========================================")
@@ -1304,20 +1297,6 @@ def main():
             ssh_proxy_jump=args.ssh_proxy_jump,
         )
         print(json.dumps({"success": True, **res}, indent=2, ensure_ascii=False))
-        sys.exit(0)
-
-    elif args.command == "workspace":
-        from .agent_runtime import AgentRuntime
-        from .web.server import run_server, run_server_loop
-        from .web.workspace import get_workspace_static_dir
-        corpus_dir = os.path.abspath(args.corpus)
-        os.makedirs(corpus_dir, exist_ok=True)
-        rt = AgentRuntime(corpus_dir=corpus_dir)
-        rt.observation_mode = "LOW_IMPACT"
-        srv = run_server(runtime=rt, host=args.host, port=args.port, static_dir=get_workspace_static_dir())
-        print(f"dynamicState Trace Workspace running at http://{args.host}:{args.port}")
-        sys.stdout.flush()
-        run_server_loop(srv)
         sys.exit(0)
 
     elif args.command == "recipe":

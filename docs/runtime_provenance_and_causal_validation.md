@@ -330,7 +330,7 @@ Next Best Action (Bounded iteration, safety-checked, fail-closed)
 5. **Auditable Chronological Timeline**:
    - Every significant lifecycle event is appended to `session.timeline`:
      - `INVESTIGATION_STARTED`, `HYPOTHESIS_PROPOSED`, `OBSERVATION_PLANNED`, `OBSERVATION_EXECUTED`, `HYPOTHESIS_STATUS_UPDATED`, `OBSERVATION_BLOCKED`.
-   - Sequential, tamper-evident log queryable via ARP (`GET_INVESTIGATION_TIMELINE`) and REST API (`/api/investigation/timeline`).
+   - Sequential, tamper-evident log queryable via ARP (`GET_INVESTIGATION_TIMELINE`).
 6. **Finding Semantic Drill-Down Inspector**:
    - Exposes full hierarchical path (`c_type_path`), DWARF declaration location, target Build ID, before/after values, candidate functions with explicit limitations, and matching attribution evidence records.
 7. **Tamper-Resistant Session Persistence**:

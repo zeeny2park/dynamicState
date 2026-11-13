@@ -158,6 +158,7 @@ def _html_strings(view):
     out += view["symptom_html"]
     out += [f["body_html"] for f in view["findings"]] + [f["heading_html"] for f in view["findings"]]
     out += [c["detail_html"] for c in view["checks"]]
+    out += [r["detail_html"] for r in (view.get("profile") or {}).get("rows") or []]
     return out
 
 
@@ -292,6 +293,32 @@ class TestProfileView(unittest.TestCase):
         # a result without a report has no profile: the UI shows its "nothing to profile" line, never an empty card
         none = build_views({"verdict": "INCONCLUSIVE"}, None)["ko"]["profile"]
         self.assertEqual((none["available"], none["html"]), (False, ""))
+
+    def test_profile_card_of_every_fixture(self):
+        """E1 (EXPLORE_PROPOSAL_KO.md 4/10): every fixture gives the card its figures, the six rows in order with where
+        each was observed from, and the closing not-observed line; the rows' details are server markup with slots only
+        for live reads."""
+        from extractor.web.ui.view import build_view
+        rows_seen = 0
+        for name, res in _fixtures().items():
+            for lang, unseen in (("ko", "관측하지 않음"), ("en", "Not observed")):
+                with self.subTest(name=name, lang=lang):
+                    p = build_view(res, lang)["profile"]
+                    if not p["available"]:
+                        self.assertNotIn("rows", p)
+                        continue
+                    rows_seen += 1
+                    self.assertLessEqual(len(p["figures"]), 4)       # only figures the diagnosis observed
+                    self.assertEqual([r["key"] for r in p["rows"]], ["threads", "memory", "locks", "files", "modules", "vars"])
+                    for r in p["rows"]:
+                        self.assertTrue(r["label"] and r["line"] and r["src"], r)
+                        self.assertNotIn("<", r["label"] + r["line"] + r["src"])
+                        for k in re.findall(r"<!--slot:([^>]*)-->", r["detail_html"]):
+                            self.assertRegex(k, r"^[A-Za-z0-9_.:\-]+$")
+                            if k != "vars":      # the search results' place: filled by the UI when there is a query
+                                self.assertIn(f'data-key="{k}" aria-expanded="false"', r["detail_html"])
+                    self.assertTrue(p["unseen"].startswith(unseen))
+        self.assertGreater(rows_seen, 10)
 
 
 class TestLiveEventExtras(unittest.TestCase):

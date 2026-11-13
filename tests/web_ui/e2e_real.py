@@ -1,4 +1,4 @@
-"""Real end-to-end run of the web UI in headless Chromium: the real server (``python3 -m extractor.web.workspace``),
+"""Real end-to-end run of the web UI in headless Chromium: the real server (``python3 -m extractor.web``),
 real diagnoses of compiled benchmark targets, the UI driven like a user.  Prints one JSON summary on stdout.
 
     python3 tests/web_ui/e2e_real.py [--shots DIR]
@@ -178,6 +178,269 @@ class Run:
                 "report_has_script": "<script" in html.lower()}
 
 
+# ---------------------------------------------------------------------------------------------- exploration (E1-E4)
+EXPLORE_SHOTS = os.path.join(ROOT, "docs", "ui-redesign", "screens", "impl")
+WATCH_JS = "(() => { const x = (window.DSUI.shell.ui.x || {}); return x.watch || null; })()"
+
+
+def xshot(run, name, sel=None, full=False):
+    """A screenshot of the real UI for docs/ui-redesign/screens/impl/explore-*.png (only with --shots)."""
+    if not run.shots:
+        return
+    p = run.page
+    if sel:
+        p.evaluate("(s) => { const n = document.querySelector(s); if (n) { const y = n.getBoundingClientRect().top + scrollY - 70; scrollTo(0, Math.max(0, y)); } }", sel)
+        p.wait_for_timeout(150)
+    os.makedirs(EXPLORE_SHOTS, exist_ok=True)
+    p.screenshot(path=os.path.join(EXPLORE_SHOTS, "explore-" + name + ".png"), full_page=full)
+
+
+def timed(page, click_sel, wait_sel, timeout=10000):
+    t0 = time.monotonic()
+    page.click(click_sel)
+    page.wait_for_selector(wait_sel, timeout=timeout)
+    return round(time.monotonic() - t0, 3)
+
+
+def watch(page):
+    return page.evaluate(WATCH_JS)
+
+
+def wait_samples(page, n, timeout=15.0):
+    end = time.monotonic() + timeout
+    w = None
+    while time.monotonic() < end:
+        w = watch(page)
+        if w and (w.get("samples", 0) >= n or w.get("state") == "stopped"):
+            return w
+        page.wait_for_timeout(150)
+    return w
+
+
+def pause_watch(page):
+    if page.query_selector('#observe [data-act="obs-pause"]') and (watch(page) or {}).get("state") == "running":
+        page.click('#observe [data-act="obs-pause"]')
+        page.wait_for_timeout(300)
+
+
+def explore_deadlock(run):
+    p, rec = run.page, {}
+    p.wait_for_selector("#findings .related button", timeout=10000)
+    rec["chips"] = p.eval_on_selector_all("#findings .related button:not([hidden])", "els => els.map(e => e.textContent.trim())")
+    xshot(run, "deadlock-chips", "#findings .related")
+    rec["chip_to_stack_s"] = timed(p, "#findings .related button:nth-of-type(1)", ".stack button[aria-current=true]")
+    rec["frame"] = p.inner_text(".stack button[aria-current=true] .fn")
+    rec["back_link"] = bool(p.query_selector('[data-act="back"]'))
+    xshot(run, "deadlock-chip-thread", '[data-key^="th:"][aria-expanded="true"]')
+    rec["chip_to_lock_s"] = timed(p, '#findings .related button[data-keys^="pf:locks"]', '[data-k^="dt-lk:"] table')
+    rec["lock_rows"] = len(p.query_selector_all('[data-k^="dt-lk:"] tbody tr'))
+    xshot(run, "deadlock-lock", '[data-key^="lk:"][aria-expanded="true"]')
+    p.click('[data-k^="dt-lk:"] [data-act="track"]')
+    p.wait_for_selector("#observe", timeout=10000)
+    w = wait_samples(p, 4)
+    rec["watch_samples"], rec["watch_changes"] = w["samples"], w["items"][0]["changes"]
+    rec["watch_flat"] = len(set(map(str, w["items"][0]["spark"]))) == 1
+    xshot(run, "deadlock-watch-flat", "#observe")
+    pause_watch(p)
+    rec["paused"] = (watch(p) or {}).get("state")
+    return rec
+
+
+def explore_overflow(run, ctx):
+    p, rec = run.page, {}
+    p.wait_for_selector("#findings .related button", timeout=10000)
+    rec["chips"] = p.eval_on_selector_all("#findings .related button:not([hidden])", "els => els.map(e => e.textContent.trim())")
+    xshot(run, "overflow-chips", "#findings .related")
+    rec["chip_to_range_s"] = timed(p, '#findings .related button[data-act="goto-range"]', ".hex .b-over")
+    rec["over_bytes"] = len(p.query_selector_all(".hex .bs span.b-over"))
+    rec["buf_bytes"] = len(p.query_selector_all(".hex .bs span.b-buf"))
+    xshot(run, "overflow-range-view", '[data-key="range"]')
+    p.click('#findings .related button[data-keys^="pf:vars"]')
+    p.wait_for_selector(".valbox", timeout=10000)
+    xshot(run, "overflow-value-follow", ".valbox")
+    p.click('.valbox button[data-act="follow"]')
+    p.wait_for_timeout(600)
+    rec["follow_range"] = p.input_value("#rg-addr")
+    job = new_job(p)
+    base = ctx.request.get(f"{run.base}api/diagnose/{job}/report?format=html&lang=ko").text()
+    base_md = ctx.request.get(f"{run.base}api/diagnose/{job}/report?format=md&lang=ko").text()
+    p.click('#findings .related button[data-act="track"]')
+    p.wait_for_selector("#observe", timeout=10000)
+    wait_samples(p, 3)
+    p.click('[data-act="freeze"]')
+    p.wait_for_timeout(1500)
+    p.click('[data-act="obs-report"]')
+    p.wait_for_timeout(500)
+    rec["added"] = (p.evaluate("(window.DSUI.shell.ui.x || {}).report") or {}).get("samples")
+    pause_watch(p)
+    html = ctx.request.get(f"{run.base}api/diagnose/{job}/report?format=html&lang=ko").text()
+    md = ctx.request.get(f"{run.base}api/diagnose/{job}/report?format=md&lang=ko").text()
+    sys.path.insert(0, ROOT)
+    from extractor.web.observation_report import strip_from_report
+    st = strip_from_report({"html": html, "md": md, "json": "{}"})
+    rec["report_section"] = html.count('id="obs-report"')
+    rec["report_rest_equal"] = st["html"] == base and st["md"] == base_md
+    rec["report_has_script"] = "<script" in html.lower()
+    if run.shots:
+        rp = ctx.new_page()
+        rp.set_viewport_size({"width": 1100, "height": 900})
+        rp.goto(f"{run.base}api/diagnose/{job}/report?format=html&lang=ko#obs-report")
+        rp.wait_for_timeout(300)
+        rp.screenshot(path=os.path.join(EXPLORE_SHOTS, "explore-overflow-report-observation.png"))
+        rp.close()
+    return rec
+
+
+def new_job(page):
+    return page.evaluate("new URLSearchParams(location.search).get('job')")
+
+
+def diagnose(run, target, symptom=""):
+    run.start(target, symptom)
+    return run.follow()
+
+
+def explore_more(run, ctx, bins, targets, out):
+    p = run.page
+    # ---- healthy: thread stack, maps, variable search, watch of a counter, compare, interval, target exit
+    busy = start_target(bins["ok_busy_server"])
+    targets.append(busy)
+    rec = {"diagnosis": diagnose(run, str(busy.pid), "general health check")["done"]}
+    p.wait_for_timeout(300)
+    p.click('[data-key="pf:threads"]')
+    rows = p.query_selector_all('#dt-pf-threads > .rows > li > .row-btn')
+    rec["thread_rows"] = len(rows)
+    rec["thread_stack_s"] = timed(p, '#dt-pf-threads > .rows > li:nth-child(2) > .row-btn', '.stack button[aria-current=true]')
+    xshot(run, "healthy-thread-stack", "#profile")
+    p.click('[data-key="pf:threads"]')
+    p.click('[data-key="pf:memory"]')
+    rec["maps_s"] = timed(p, '[data-key="maps"]', '[data-k="dt-maps"] table')
+    xshot(run, "healthy-memory-maps", '[data-key="pf:memory"]')
+    p.click('[data-key="pf:memory"]')
+    p.click('[data-key="pf:vars"]')
+    p.fill("#var-q", "handled")
+    p.wait_for_selector('[data-key="var:handled"]', timeout=10000)
+    rec["value_s"] = timed(p, '[data-key="var:handled"]', '[data-k="dt-var:handled"] .valbox')
+    xshot(run, "healthy-variable-search", '[data-key="pf:vars"]')
+    p.click('[data-k="dt-var:handled"] [data-act="track"]')
+    p.wait_for_selector("#observe", timeout=10000)
+    p.click('#observe [data-act="trk-open"]')
+    w0 = wait_samples(p, 1)
+    t0 = time.monotonic()
+    w = wait_samples(p, w0["samples"] + 5)
+    span = time.monotonic() - t0
+    f0 = w["items"][0]["fields"][0]
+    rec["samples_in_span"] = [w["samples"] - w0["samples"], round(span, 1)]
+    rec["counter_spark"] = f0["spark"][-6:]
+    rec["counter_increases_every_sample"] = all(b > a for a, b in zip(f0["spark"][-6:], f0["spark"][-5:]))
+    xshot(run, "healthy-watch-sparklines", "#observe")
+    p.click('[data-act="freeze"]')
+    p.wait_for_timeout(2300)
+    w = watch(p)
+    rec["compare_changed"] = [c["name"] for c in (w.get("compare") or {}).get("changed", [])]
+    xshot(run, "healthy-compare", "#cmp-sec")
+    p.click('#observe [data-act="obs-int"][data-v="0.5"]')
+    w1 = wait_samples(p, 1)
+    t0 = time.monotonic()
+    w2 = wait_samples(p, w1["samples"] + 4)
+    rec["half_second"] = [w2["interval_s"], w2["samples"] - w1["samples"], round(time.monotonic() - t0, 1)]
+    p.click("#btn-theme")
+    p.wait_for_timeout(200)
+    xshot(run, "dark-healthy", "#observe")
+    p.click("#btn-theme")
+    p.set_viewport_size({"width": 760, "height": 900})
+    p.wait_for_timeout(200)
+    xshot(run, "w760-healthy-watch", "#observe")
+    p.set_viewport_size({"width": 1100, "height": 900})
+    last = w2["items"][0]["fields"][0]["value"]
+    stop(busy)
+    t0 = time.monotonic()
+    w = None
+    while time.monotonic() - t0 < 8:
+        w = watch(p)
+        if w and w.get("state") == "stopped":
+            break
+        p.wait_for_timeout(150)
+    rec["exit"] = {"state": w.get("state"), "reason": w.get("reason"), "seconds": round(time.monotonic() - t0, 1),
+                   "last_kept": w["items"][0]["fields"][0]["value"] >= last, "chip": p.inner_text("#tchip"),
+                   "alert": bool(p.query_selector("#observe .alert"))}
+    xshot(run, "exited", "#observe")
+    out["explore"]["healthy"] = rec
+    # ---- many threads: groups and members
+    rt = start_target(bins["request_threads"])
+    targets.append(rt)
+    rec = {"diagnosis": diagnose(run, str(rt.pid))["done"]}
+    p.wait_for_timeout(300)
+    p.click('[data-key="pf:threads"]')
+    rec["groups"] = len(p.query_selector_all('#dt-pf-threads [data-key^="grp:"]'))
+    rec["group_s"] = timed(p, '#dt-pf-threads [data-key="grp:0"]', ".mem-grid .row-btn")
+    rec["members_first"] = len(p.query_selector_all(".mem-grid .row-btn"))
+    if p.query_selector('[data-act="more"]'):
+        p.click('[data-act="more"]')
+        p.wait_for_timeout(800)
+    rec["members_more"] = len(p.query_selector_all(".mem-grid .row-btn"))
+    xshot(run, "threads300-members", '[data-key="grp:0"]')
+    stop(rt)
+    out["explore"]["threads"] = rec
+    # ---- pool
+    ss = start_target(bins["slot_server"])
+    targets.append(ss)
+    rec = {"diagnosis": diagnose(run, str(ss.pid))["done"]}
+    p.wait_for_timeout(300)
+    p.click('[data-key="pf:vars"]')
+    p.fill("#var-q", "g_slots")
+    p.wait_for_selector('[data-act="pool-go"]', timeout=10000)
+    xshot(run, "pool-search", '[data-key="pf:vars"]')
+    p.click('[data-act="pool-go"]')
+    p.wait_for_selector("#pool-grid .pc", timeout=10000)
+    w0 = wait_samples(p, 2)
+    t0 = time.monotonic()
+    w = wait_samples(p, w0["samples"] + 5)
+    span = time.monotonic() - t0
+    pool = w["pool"]
+    rec["pool"] = {"cells": len(pool["cells"]), "per_cell": pool["per_cell"], "legend_sum": sum(x["count"] for x in pool["legend"]),
+                   "legend": [x["name"] for x in pool["legend"]], "samples_in_span": [w["samples"] - w0["samples"], round(span, 1)],
+                   "bytes_per_sample": w["plan"]["bytes_per_sample"], "dom_cells": len(p.query_selector_all("#pool-grid .pc"))}
+    xshot(run, "pool-grid", "#pool-sec")
+    p.click('#pool-grid .pc[data-i="1337"]')
+    p.wait_for_timeout(2200)
+    rec["selected"] = ((watch(p) or {}).get("pool") or {}).get("sel_view", {}) and watch(p)["pool"]["sel_view"]["index"]
+    p.focus("#pool-grid")
+    p.keyboard.press("ArrowRight")
+    p.keyboard.press("ArrowDown")
+    p.keyboard.press("Enter")
+    p.wait_for_timeout(2200)
+    rec["keyboard_selected"] = watch(p)["pool"]["sel_view"]["index"]
+    rec["grid_tab_stops"] = p.evaluate("document.querySelectorAll('#pool-grid [tabindex], #pool-grid button').length")
+    xshot(run, "pool-grid-selected", "#pool-sec")
+    p.click('.pool-legend button[data-cls="4"]')
+    rec["filter"] = p.get_attribute("#pool-grid", "data-only")
+    xshot(run, "pool-filter", "#pool-sec")
+    p.click('.pool-legend button[data-cls="4"]')
+    p.click('[data-act="freeze"]')
+    p.wait_for_timeout(2300)
+    xshot(run, "pool-compare", "#cmp-sec")
+    job = new_job(p)
+    base = ctx.request.get(f"{run.base}api/diagnose/{job}/report?format=json").text()
+    p.click('[data-act="obs-report"]')
+    p.wait_for_timeout(500)
+    rep = json.loads(ctx.request.get(f"{run.base}api/diagnose/{job}/report?format=json").text())
+    b = json.loads(base)
+    ao = rep.pop("additional_observation", None)
+    rec["report"] = {"pool_cells": len((ao or {}).get("pool", {}).get("cells") or ""), "rest_equal": rep == b}
+    p.click("#btn-theme")
+    p.wait_for_timeout(200)
+    xshot(run, "dark-pool-grid", "#pool-sec")
+    p.click("#btn-theme")
+    p.click("#btn-lang")
+    p.wait_for_timeout(200)
+    xshot(run, "en-pool-grid", "#pool-sec")
+    p.click("#btn-lang")
+    pause_watch(p)
+    stop(ss)
+    out["explore"]["pool"] = rec
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--shots", default="")
@@ -185,18 +448,19 @@ def main() -> int:
     if args.shots:
         os.makedirs(args.shots, exist_ok=True)
     from playwright.sync_api import sync_playwright
-    out = {"runs": {}, "errors": []}
+    out = {"runs": {}, "errors": [], "explore": {}}
     tmp = tempfile.mkdtemp(prefix="ds_e2e_")
     server = targets = None
     targets = []
     try:
-        bins = {n: build(tmp, n) for n in ("deadlock_pipeline", "ok_idle_server", "overflow_ring")}
+        bins = {n: build(tmp, n) for n in ("deadlock_pipeline", "ok_idle_server", "overflow_ring", "ok_busy_server", "request_threads")}
+        bins["slot_server"] = build(tmp, "slot_server", os.path.join(ROOT, "tests", "fixtures", "real_runtime", "slot_server.c"))
         src = os.path.join(tmp, "exits_soon.c")
         with open(src, "w") as fh:
             fh.write(EXITING_C)
         bins["exits_soon"] = build(tmp, "exits_soon", src)
         port = free_port()
-        server = fixture_popen([sys.executable, "-m", "extractor.web.workspace", "--host", "127.0.0.1", "--port", str(port),
+        server = fixture_popen([sys.executable, "-m", "extractor.web", "--host", "127.0.0.1", "--port", str(port),
                                 "--corpus", os.path.join(tmp, "corpus")], cwd=ROOT, stdout=subprocess.DEVNULL,
                                stderr=subprocess.DEVNULL, name="dynamicstate-server", max_rss_mib=1400)
         base = f"http://127.0.0.1:{port}/"
@@ -250,6 +514,7 @@ def main() -> int:
             page.click("#btn-theme")
             page.click("#btn-lang")
             out["runs"]["deadlock"] = rec
+            out["explore"]["deadlock"] = explore_deadlock(run)
 
             # 2. healthy, by pid
             run.start(str(procs["ok_idle_server"].pid), "general health check")
@@ -266,6 +531,8 @@ def main() -> int:
             run.shot("real-overflow-ko")
             rec["screen"], rec["vs_report"] = scr, run.compare_with_report(scr, "ko")
             out["runs"]["overflow"] = rec
+            out["explore"]["overflow"] = explore_overflow(run, ctx)
+            explore_more(run, ctx, bins, targets, out)
 
             # 4. a target that exits during the diagnosis
             exits = start_target(bins["exits_soon"])

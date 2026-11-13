@@ -64,13 +64,10 @@
    ```bash
    ./bin/dynamic-state-ui --host 0.0.0.0 --port 8080
    ```
-   - 접속 주소: `http://<호스트>:8080/` 가 새 진단 화면이고, 이전 8탭 화면은 `/legacy/`, 이전 채팅 워크스페이스는 `/legacy/workspace` 입니다 (아래 안내의 탭 이름은 `/legacy/` 기준).
-2. **Step 1 (Target 연결 및 레시피 실행)**:
-   - `Matching Companion Nostrip / Debug ELF`에 호스트의 디버그 바이너리 경로를 입력합니다.
-   - 원격 임베디드 장비라면 `🌐 Remote Embedded Target (SSH)` 드로어를 열어 장비 IP, 계정, `Process Name`을 입력하고 `Find` → `🔍 Validate Target`을 클릭합니다.
-   - 검증 완료 후 나타나는 **💡 Smart Recommended Symbols** 칩을 클릭하거나, **🩺 Quick Diagnostic Recipes**의 3가지 버튼(`Instant X-Ray`, `500ms State Diff`, `Auto-Watch`) 중 하나를 눌러 즉시 결과를 확인합니다.
-3. **Tab 4 (Golden Baseline & 시계열 비교)**:
-   - 정상 동작 중일 때 `📌 Save Golden Baseline`을 눌러 기준점을 저장하고, 문제 발생 시 `⚖️ Compare vs Golden`으로 변질된 구조체 필드를 즉시 찾아냅니다.
+   - 접속 주소: `http://<호스트>:8080/` 가 진단 화면입니다. PID 또는 프로세스 이름(원격이면 SSH 정보도)을 넣고
+     **진단**을 누르면 검사가 끝나는 대로 화면이 채워지고, 끝나면 그 화면이 보고서입니다(HTML · Markdown · JSON 내려받기).
+   - 이전 8탭 화면(`/legacy/`)과 채팅 워크스페이스(`/legacy/workspace`)는 제거되었고, 옛 주소는 `/` 로 옮겨 갑니다.
+     레시피 · Golden Baseline · 시계열 비교는 CLI(위 2장의 `dynamic-state recipe`)와 MCP 도구로 씁니다.
 
 ---
 

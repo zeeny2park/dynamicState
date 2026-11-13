@@ -15,8 +15,7 @@
     ko: {
       title: "dynamicState · 진단", brand_sub: "진단", skip: "본문으로 건너뛰기",
       new: "새 진단", new_title: "다른 프로세스 진단", theme: "밝게 / 어둡게 전환", lang_btn: "KO",
-      lang_aria: "언어 전환: 지금 한국어, 누르면 English", tools: "도구",
-      legacy_ui: "기존 UI (레거시)", legacy_ws: "기존 워크스페이스 (레거시)",
+      lang_aria: "언어 전환: 지금 한국어, 누르면 English",
       hero_h: "실행 중인 프로세스를 멈추지 않고 진단합니다",
       hero_p: "PID 하나면 됩니다. 결과는 이 화면에 진행되는 대로 쌓이고, 끝나면 그대로 보고서가 됩니다.",
       mode_label: "대상 위치", local: "로컬", ssh: "SSH", target_label: "대상 프로세스",
@@ -83,13 +82,13 @@
       ago_now: "방금", ago_min: "{n}분 전", ago_hour: "{n}시간 전", ago_day: "어제", ago_days: "{n}일 전",
       live_phase: "{phase} 단계", live_finding: "발견 {n}: {label} 의심", live_verdict: "판정: {word}",
       refuted: "반박된 경쟁 가설:", err_TOO_MANY_JOBS: "동시에 실행할 수 있는 진단 수(4)를 넘었습니다. 하나가 끝난 뒤 다시 시도하세요.",
-      err_TARGET_UNREADABLE: "대상 프로세스를 읽을 수 없습니다: {message}"
+      err_TARGET_UNREADABLE: "대상 프로세스를 읽을 수 없습니다: {message}",
+      back_finding: "← 발견 {n}로 돌아가기", back_checks: "← 검사로 돌아가기"
     },
     en: {
       title: "dynamicState · Diagnose", brand_sub: "diagnose", skip: "Skip to content",
       new: "New diagnosis", new_title: "Diagnose another process", theme: "Toggle light / dark", lang_btn: "EN",
-      lang_aria: "Switch language: now English, press for 한국어", tools: "Tools",
-      legacy_ui: "Previous UI (legacy)", legacy_ws: "Previous workspace (legacy)",
+      lang_aria: "Switch language: now English, press for 한국어",
       hero_h: "Diagnose a running process without stopping it",
       hero_p: "A PID is all it takes. Results build up on this page as they arrive; when it ends, the page is the report.",
       mode_label: "Target location", local: "Local", ssh: "SSH", target_label: "Target process",
@@ -158,7 +157,8 @@
       ago_now: "just now", ago_min: "{n} min ago", ago_hour: "{n} h ago", ago_day: "yesterday", ago_days: "{n} days ago",
       live_phase: "{phase}", live_finding: "Finding {n}: {label} suspected", live_verdict: "Verdict: {word}",
       refuted: "Competing hypotheses refuted:", err_TOO_MANY_JOBS: "Too many diagnoses at once (limit 4). Try again when one ends.",
-      err_TARGET_UNREADABLE: "Cannot read the target process: {message}"
+      err_TARGET_UNREADABLE: "Cannot read the target process: {message}",
+      back_finding: "← Back to finding {n}", back_checks: "← Back to the checks"
     }
   };
   var ICON = { FAIL: "✖", INCONCLUSIVE: "?", PASS: "✔", SKIPPED: "–", RUNNING: "", PENDING: "" };
@@ -574,11 +574,37 @@
       kv(tr(lang, "k_transport"), tp) + "</dl></div></section>";
   }
 
+  /* a detail the server drew (profile rows, read fragments): its sub-rows open in place where it marks <!--slot:KEY--> */
+  var SLOT_RE = /<!--slot:([A-Za-z0-9_.:\-]+)-->/g, EXP_RE = /data-key="([A-Za-z0-9_.:\-]+)" aria-expanded="false"/g;
+  function fillSlots(html, s, ui, depth) {
+    var open = ui.open || {};
+    return String(html || "").replace(EXP_RE, function (m, k) { return open[k] ? 'data-key="' + k + '" aria-expanded="true"' : m; })
+      .replace(SLOT_RE, function (m, k) {
+        return open[k] && (depth || 0) < 6 ? '<div class="dt-in" data-k="dt-' + k + '">' + slotBody(k, s, ui, (depth || 0) + 1) + "</div>" : "";
+      });
+  }
+  function slotBody(k, s, ui, depth) { return hook("slot", k, s, ui, depth); }
+  /* the exploration module (explore.js) draws what the server's fragments and the observation need; without it, nothing */
+  function hook(name) {
+    var X = root.DSX;
+    return X && typeof X[name] === "function" ? X[name].apply(null, Array.prototype.slice.call(arguments, 1)) || "" : "";
+  }
   /* the process profile: the place is reserved from the plan stage; the content is the server's (view.profile) */
   function renderProfile(s, ui) {
     if (!s.plan && !s.verdict) return "";
     var lang = ui.lang, V = viewOf(s, lang), P = V && V.profile, body, desc = "";
-    if (P && P.available) {
+    if (P && P.available && P.rows) {
+      desc = (P.window ? '<span class="card-description">' + esc(P.window) + "</span>" : "") +
+        (P.hint ? '<span class="right">' + esc(P.hint) + "</span>" : "");
+      body = ((P.figures || []).length ? '<div class="pf-sum">' + P.figures.map(function (f) { return "<div><b>" + esc(f.v) + "</b>" + esc(f.k) + "</div>"; }).join("") + "</div>" : "") +
+        '<ul class="rows">' + P.rows.map(function (r) {
+          var k = "pf:" + r.key, open = !!(ui.open && ui.open[k]);
+          return '<li><button type="button" class="row-btn" data-act="tog" data-key="' + esc(k) + '" aria-expanded="' + open + '"><span class="k">' +
+            esc(r.label) + '</span><span class="v">' + esc(r.line) + '</span><span class="src">' + esc(r.src) +
+            '</span><span class="chev" aria-hidden="true"></span></button>' +
+            (open ? '<div class="dt-in" id="dt-pf-' + esc(r.key) + '">' + fillSlots(r.detail_html, s, ui, 0) + backLink(k, ui) + "</div>" : "") + "</li>";
+        }).join("") + '</ul><p class="impact unseen">' + esc(P.unseen) + "</p>";
+    } else if (P && P.available) {
       body = '<div class="pbody dsv" lang="' + lang + '">' + P.html + "</div>";
     } else if (P || s.verdict) {
       /* the verdict is in but carries no profile (an older server, or nothing was observed): never keep saying "pending" */
@@ -589,6 +615,13 @@
     }
     return '<section class="card" id="profile" aria-labelledby="h-profile"><div class="card-header"><h2 class="card-title" id="h-profile">' +
       esc((P && P.title) || tr(lang, "profile_h")) + "</h2>" + desc + '</div><div class="card-content">' + body + "</div></section>";
+  }
+  /* "← back to finding 1" on the detail a chip opened */
+  function backLink(k, ui) {
+    if (!ui.from || ui.fromKey !== k) return "";
+    var m = /^finding-(\d+)$/.exec(ui.from);
+    return '<div class="dt-actions"><button type="button" class="btn btn-ghost btn-sm" data-act="back">' +
+      esc(m ? tr(ui.lang, "back_finding", { n: m[1] }) : tr(ui.lang, "back_checks")) + "</button></div>";
   }
 
   function checkName(s, rid, lang) {
@@ -615,7 +648,7 @@
       var inner;
       if (vf) {
         inner = '<div class="fbody dsv" lang="' + lang + '" data-static="f' + f.n + "-" + lang + '">' + vf.body_html + "</div>" +
-          link(reportHref(s, ui, vf.anchor), tr(lang, "f_detail"));
+          hook("findingChips", f.n, s, ui) + link(reportHref(s, ui, vf.anchor), tr(lang, "f_detail"));
       } else if (s.verdict) {          // no view from the server: the result's own words (engine English)
         inner = '<div class="prose" lang="en">' + (f.description ? "<p>" + esc(f.description) + "</p>" : "") +
           (f.observed.length ? '<ul>' + f.observed.slice(0, 4).map(function (o) { return "<li>" + esc(o) + "</li>"; }).join("") + "</ul>" : "") + "</div>" +
@@ -655,7 +688,8 @@
       var dt = "";
       if (open) {
         if (vc && vc.detail_html) {
-          dt = '<div class="ckdetail dsv" lang="' + lang + '">' + vc.detail_html + "</div>" + link(reportHref(s, ui, vc.anchor), tr(lang, "ck_detail"));
+          dt = '<div class="ckdetail dsv" lang="' + lang + '">' + vc.detail_html + "</div>" + (s.verdict && vc.related_html ? vc.related_html : "") +
+            link(reportHref(s, ui, vc.anchor), tr(lang, "ck_detail"));
         } else {
           dt = (DONE[st] && line ? "<p>" + esc(line) + "</p>" : "") + '<p class="text-muted">' + esc(tr(lang, "ck_wait_detail")) + "</p>" +
             '<p class="rid">' + esc(tr(lang, "ck_id")) + " <code>" + esc(rid) + "</code></p>";
@@ -719,6 +753,7 @@
       '</span></div><div class="card-content">' + (ns || '<p class="empty">' + esc(tr(lang, "notseen_none")) + "</p>") + "</div></section>";
     out += '<section class="card" id="next" aria-labelledby="h-next"><div class="card-header"><h2 class="card-title" id="h-next">' + esc(tr(lang, "next_h")) +
       '</h2></div><div class="card-content">' + (V && V.next_html ? '<div class="prose">' + V.next_html + "</div>" : '<p class="empty">' + esc(tr(lang, "next_none")) + "</p>") + "</div></section>";
+    out += hook("observe", s, ui);
     var T = tilesOf(s, lang), href = reportHref(s, ui, "");
     var urls = v.report_urls || {};
     var mdHref = urls.md ? urls.md + "&lang=" + lang : "", jsHref = urls.json || "";
@@ -756,7 +791,7 @@
     var live = !s.verdict && !s.error;
     return "<b>" + esc(g.process_name || "?") + '</b><span class="sep">·</span><span>pid ' + esc(g.pid) + "</span>" +
       (g.architecture ? '<span class="sep opt-hide">·</span><span class="opt-hide">' + esc(g.architecture) + "</span>" : "") +
-      (live ? '<span class="sep">·</span><span class="live"><i aria-hidden="true"></i>' + esc(tr(ui.lang, "running")) + "</span>" : "");
+      (live ? '<span class="sep">·</span><span class="live"><i aria-hidden="true"></i>' + esc(tr(ui.lang, "running")) + "</span>" : hook("chipStatus", s, ui));
   }
 
   function ago(iso, lang, now) {
@@ -851,7 +886,7 @@
 
   var api = { STR: STR, reduce: reduce, render: render, renderIdle: renderIdle, renderChip: renderChip, announce: announce,
     sortEvents: sortEvents, groupOf: groupOf, counts: counts, fmtMs: fmtMs, fmtBytes: fmtBytes, stageIndex: stageIndex,
-    PHASES: PHASES, viewOf: viewOf };
+    PHASES: PHASES, viewOf: viewOf, fillSlots: fillSlots, backLink: backLink, tr: tr, esc: esc, L: L };
   if (typeof module !== "undefined" && module.exports) module.exports = api;
   root.DSUI = api;
   if (typeof document === "undefined") return;
@@ -862,7 +897,7 @@
     get: function (k) { try { return localStorage.getItem(k); } catch (e) { return null; } },
     set: function (k, v) { try { localStorage.setItem(k, v); } catch (e) { /* storage blocked */ } }
   };
-  var ui = { lang: (Q.get("lang") || LS.get("ds-lang") || "ko") === "en" ? "en" : "ko", expanded: {}, form: { mode: "local" },
+  var ui = { lang: (Q.get("lang") || LS.get("ds-lang") || "ko") === "en" ? "en" : "ko", expanded: {}, open: {}, form: { mode: "local" },
     elapsed: 0, conn: "ok", jobs: null, jobsState: "", examples: [], now: Date.now() };
   var events = [], request = null, job = null, replayTimers = [], es = null, pollTimer = null, watchdog = null,
     retries = 0, t0 = 0, tick = null, frozenElapsed = null, lastSpoken = "", gen = 0;
@@ -970,6 +1005,7 @@
     if (!t0) t0 = Date.now() - (typeof e.t === "number" ? e.t : 0);
     draw();
     if (e.type === "verdict" || e.type === "error") closeStream();
+    if (e.type === "verdict" && job && !ui.replay && root.DSX && root.DSX.onVerdict) root.DSX.onVerdict(job);
   }
 
   /* ---- server: start, SSE, polling fallback, reconnect from the last seq ---- */
@@ -1038,8 +1074,10 @@
     closeStream();
     replayTimers.forEach(clearTimeout); replayTimers = [];
     events = []; request = null; job = null; t0 = 0; frozenElapsed = null; retries = 0;
-    ui.expanded = {}; ui.conn = "ok"; ui.started = false; ui.replay = null; ui.replayClock = null; ui.copied = false;
+    ui.expanded = {}; ui.open = {}; ui.from = null; ui.fromKey = null;
+    ui.conn = "ok"; ui.started = false; ui.replay = null; ui.replayClock = null; ui.copied = false;
     stopTick();
+    if (root.DSX && root.DSX.reset) root.DSX.reset();
   }
   function openJob(id, req) {
     reset();
@@ -1177,19 +1215,11 @@
     r.classList.toggle("dark", dark); r.classList.toggle("light", !dark);
     LS.set("ds-theme", dark ? "dark" : "light");
   }
-  function toggleMenu(open) {
-    var b = document.getElementById("btn-tools"), m = document.getElementById("tools-menu");
-    open = open == null ? m.hidden : open;
-    m.hidden = !open; b.setAttribute("aria-expanded", String(open));
-    if (open) m.querySelector("a").focus();
-  }
+
 
   document.addEventListener("click", function (ev) {
     var el = ev.target.closest("[data-act]");
-    if (!el) {
-      if (!ev.target.closest(".menu")) toggleMenu(false);
-      return;
-    }
+    if (!el) return;
     var act = el.getAttribute("data-act"), s;
     switch (act) {
       case "ck": {
@@ -1198,9 +1228,16 @@
         drawNow();
         break;
       }
+      case "tog": {
+        var key = el.getAttribute("data-key");
+        if (ui.open[key]) delete ui.open[key]; else ui.open[key] = true;
+        if (ui.open[key] && root.DSX && root.DSX.opened) root.DSX.opened(key, el);
+        drawNow();
+        break;
+      }
       case "mode": readForm(); ui.form.mode = el.getAttribute("data-mode"); ui.formError = ""; drawNow(); break;
       case "new": case "home":
-        ev.preventDefault(); toggleMenu(false); history.pushState(null, "", location.pathname); reset(); loadIdle(); drawNow();
+        ev.preventDefault(); history.pushState(null, "", location.pathname); reset(); loadIdle(); drawNow();
         var tgt = document.querySelector('#form input[name="target"]'); if (tgt) tgt.focus();
         break;
       case "theme": {
@@ -1209,7 +1246,6 @@
         break;
       }
       case "lang": readForm(); ui.lang = ui.lang === "ko" ? "en" : "ko"; LS.set("ds-lang", ui.lang); drawNow(); break;
-      case "tools": toggleMenu(); break;
       case "open-job": ev.preventDefault(); history.pushState(null, "", "?job=" + encodeURIComponent(el.getAttribute("data-job"))); route(); break;
       case "open-replay": ev.preventDefault(); history.pushState(null, "", "?replay=" + encodeURIComponent(el.getAttribute("data-replay"))); route(); break;
       case "replay-again": history.replaceState(null, "", "?replay=" + encodeURIComponent(ui.replay)); route(); break;
@@ -1226,7 +1262,9 @@
         copyText(V ? tr(ui.lang, "verdict_prefix") + ": " + V.verdict_word + "\n" + stripTags(V.conclusion_html) : (s.verdict.result || {}).summary || "");
         break;
       }
-      default: break;
+      default:
+        if (root.DSX && root.DSX.click) root.DSX.click(act, el, ev);
+        break;
     }
   });
   document.addEventListener("submit", function (ev) {
@@ -1238,13 +1276,8 @@
     start(Object.assign({}, f));
   });
   document.addEventListener("input", function (ev) { if (ev.target.name && ev.target.closest("#form")) ui.form[ev.target.name] = ev.target.value; });
-  document.addEventListener("keydown", function (ev) {
-    if (ev.key === "Escape") { var m = document.getElementById("tools-menu"); if (!m.hidden) { toggleMenu(false); document.getElementById("btn-tools").focus(); } }
-    if ((ev.key === "ArrowDown" || ev.key === "ArrowUp") && ev.target.closest("#tools-menu")) {
-      var items = Array.prototype.slice.call(document.querySelectorAll("#tools-menu a")), i = items.indexOf(ev.target);
-      items[(i + (ev.key === "ArrowDown" ? 1 : items.length - 1)) % items.length].focus(); ev.preventDefault();
-    }
-  });
+
   window.addEventListener("popstate", route);
+  api.shell = { ui: ui, draw: draw, drawNow: drawNow, state: state, getJSON: getJSON, job: function () { return job; } };
   route();
 })(typeof window !== "undefined" ? window : globalThis);

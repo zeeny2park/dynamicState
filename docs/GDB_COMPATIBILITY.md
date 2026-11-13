@@ -162,5 +162,5 @@ Each thread's `thread_local` variables (`t_thread_id`, `t_worker_state`, `t_work
 
 ### 6.6. Web UI & Agent API Visualization
 - **Web UI Exploration Panel**: Displays real-time Checkpoint Backend (`GDB_CHECKPOINT` / `RESTART` / `NONE`), Checkpoint Semantics (`MEMORY_CHECKPOINT` / `RESTART_TO_OBSERVATION_POINT`), Thread Scope (`SINGLE_THREAD` / `MULTITHREAD`), Determinism Status (`VERIFIED` / `UNKNOWN` / `FAILED` / `NON_DETERMINISTIC`), and Branch Isolation (`SUPPORTED` / `CONDITIONAL` / `UNAVAILABLE`).
-- **Interactive Verification**: Includes an interactive **"Verify Restart Determinism"** button (`/api/runtime/verify_determinism`) allowing human engineers and agents to test state reproducibility on demand before launching long-running state explorations.
+- **Interactive Verification** (removed from the web UI on 2026-11-13; the runtime's `verify_restart_determinism` remains): the former 8-tab UI had a **"Verify Restart Determinism"** button (`/api/runtime/verify_determinism`) allowing human engineers and agents to test state reproducibility on demand before launching long-running state explorations.
 

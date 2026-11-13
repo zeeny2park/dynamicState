@@ -257,24 +257,6 @@ class TestPhase32RemoteAndMcpImprovements(unittest.TestCase):
         finally:
             mcp_srv.runtime = old_runtime
 
-    def test_04_web_ui_html_and_api_routes(self):
-        """Verify index.html exposes remote SSH / process discovery inputs and symbol path evaluator."""
-        html_path = os.path.join(PROJECT_ROOT, "extractor", "web", "static", "index.html")
-        with open(html_path, "r", encoding="utf-8") as f:
-            html = f.read()
-        for required_id in (
-            "te-remote-host",
-            "te-remote-user",
-            "te-remote-port",
-            "te-remote-jump",
-            "te-process-name",
-            "btn-find-target-pid",
-            "te-eval-expr-input",
-            "btn-te-eval-expr",
-            "btn-te-diff-expr",
-        ):
-            self.assertIn(f'id="{required_id}"', html, f"Missing UI element #{required_id} in index.html")
-
 
 if __name__ == "__main__":
     unittest.main()

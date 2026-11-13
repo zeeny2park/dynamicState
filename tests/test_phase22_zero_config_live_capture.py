@@ -1,7 +1,7 @@
 """Phase 22 Automated Test Suite: Zero-Configuration Live Capture, Language-Aligned LLM, and Radical UX Simplification.
 
 Validates:
-1. Two-Input Pre-Validation API (POST /api/investigation/validate-target):
+1. Two-Input Pre-Validation (WebApiAdapter.validate_target):
    - Strict PID validation (missing, malformed, negative, ESRCH nonexistent).
    - Debug image validation (file not found, non-ELF, stripped/missing DWARF, Build ID mismatch).
    - Valid C++ live fixture with matching unstripped debug binary -> valid=True, GNU Build ID match.
@@ -14,10 +14,7 @@ Validates:
    - Mandatory language instructions in prompt formatting.
    - Technical token preservation: C++ symbols, source paths, addresses, and JSON schema keys are not corrupted.
    - Deterministic fallback provider localization for Korean and English.
-4. UI Structure and Expert Mode Preservation:
-   - Basic mode: 3 primary areas (TARGET, INVESTIGATION RESULT, ASK A QUESTION).
-   - Expert mode: preservation of all 8 tabs, technical details, and deep link selectors.
-   - API route parity: validate-target, start, chat with locale.
+4. Web adapter parity: validate_target, start_investigation, analyze_investigation_chat with locale.
 """
 
 from io import BytesIO
@@ -27,11 +24,7 @@ import shutil
 import signal
 import subprocess
 import tempfile
-import threading
-import time
 import unittest
-import urllib.error
-import urllib.request
 
 from extractor.agent_models import AgentAction
 from extractor.agent_runtime import AgentRuntime
@@ -42,7 +35,7 @@ from extractor.debug_image import inspect_elf
 from extractor.investigation import InvestigationManager, InvestigationSession
 from extractor.llm_provider import DeterministicFallbackProvider, LLMProviderManager
 from extractor.snapshot_consistency import NON_ATOMIC, STOPPED
-from extractor.web.server import WebApiAdapter, run_server
+from extractor.web.server import WebApiAdapter
 from tests.support.fixture_process import fixture_popen
 
 
@@ -89,15 +82,9 @@ class TestPhase22ZeroConfigLiveCapture(unittest.TestCase):
         ready_line = cls.inferior_proc.stdout.readline().strip()
         assert ready_line == "READY", f"Inferior failed to start, got: {ready_line}"
 
-        # 5. Initialize runtime and ephemeral web server
+        # 5. Initialize runtime and the web adapter (its validate/start/chat functions, called directly)
         cls.runtime = AgentRuntime(corpus_dir=cls.corpus_dir)
-        cls.server = run_server(runtime=cls.runtime, host="127.0.0.1", port=0)
-        cls.port = cls.server.server_address[1]
-        cls.base_url = f"http://127.0.0.1:{cls.port}"
-
-        cls.server_thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
-        cls.server_thread.start()
-        time.sleep(0.1)
+        cls.adapter = WebApiAdapter(cls.runtime)
 
     @classmethod
     def tearDownClass(cls):
@@ -111,45 +98,26 @@ class TestPhase22ZeroConfigLiveCapture(unittest.TestCase):
                 cls.inferior_proc.kill()
                 cls.inferior_proc.wait()
 
-        cls.server.shutdown()
         shutil.rmtree(cls.work_dir, ignore_errors=True)
 
-    def _post_json(self, path: str, data: dict) -> dict:
-        req = urllib.request.Request(
-            f"{self.base_url}{path}",
-            data=json.dumps(data).encode("utf-8"),
-            headers={"Content-Type": "application/json", "X-Session-Token": self.server.session_token},
-            method="POST",
-        )
-        try:
-            with urllib.request.urlopen(req, timeout=25.0) as resp:
-                return json.loads(resp.read().decode("utf-8"))
-        except urllib.error.HTTPError as e:
-            return json.loads(e.read().decode("utf-8"))
-
-    def _get_raw(self, path: str) -> str:
-        req = urllib.request.Request(f"{self.base_url}{path}", headers={"X-Session-Token": self.server.session_token})
-        with urllib.request.urlopen(req, timeout=5.0) as resp:
-            return resp.read().decode("utf-8")
-
     # =========================================================================
-    # 1. Target Pre-Validation Tests (POST /api/investigation/validate-target)
+    # 1. Target Pre-Validation Tests (WebApiAdapter.validate_target)
     # =========================================================================
 
     def test_validate_target_invalid_or_missing_pid(self):
         """Pre-validation rejects invalid, zero, or negative PIDs with clear next action."""
         # Malformed PID
-        res = self._post_json("/api/investigation/validate-target", {"pid": "not-a-number", "debug_image": self.debug_bin})
+        res = self.adapter.validate_target({"pid": "not-a-number", "debug_image": self.debug_bin})
         self.assertFalse(res.get("success", False))
         self.assertIn("INVALID_PARAM", res.get("error", {}).get("code", ""))
 
         # Negative PID
-        res = self._post_json("/api/investigation/validate-target", {"pid": -10, "debug_image": self.debug_bin})
+        res = self.adapter.validate_target({"pid": -10, "debug_image": self.debug_bin})
         self.assertFalse(res.get("success", False))
 
     def test_validate_target_nonexistent_pid(self):
         """Pre-validation returns TARGET_NOT_FOUND for nonexistent PID without sending signals."""
-        res = self._post_json("/api/investigation/validate-target", {
+        res = self.adapter.validate_target({
             "pid": 99999999,
             "debug_image": self.debug_bin,
             "locale": "ko"
@@ -164,7 +132,7 @@ class TestPhase22ZeroConfigLiveCapture(unittest.TestCase):
     def test_validate_target_debug_image_not_found(self):
         """Pre-validation checks that the debug image path exists on disk."""
         nonexistent_path = os.path.join(self.work_dir, "nonexistent_debug.elf")
-        res = self._post_json("/api/investigation/validate-target", {
+        res = self.adapter.validate_target({
             "pid": self.inferior_proc.pid,
             "debug_image": nonexistent_path,
             "locale": "en"
@@ -182,7 +150,7 @@ class TestPhase22ZeroConfigLiveCapture(unittest.TestCase):
         with open(text_file, "w") as f:
             f.write("This is not an ELF binary.\n")
 
-        res = self._post_json("/api/investigation/validate-target", {
+        res = self.adapter.validate_target({
             "pid": self.inferior_proc.pid,
             "debug_image": text_file,
             "locale": "ko"
@@ -195,7 +163,7 @@ class TestPhase22ZeroConfigLiveCapture(unittest.TestCase):
 
     def test_validate_target_missing_dwarf_in_stripped_binary(self):
         """Pre-validation detects stripped binaries that lack .debug_info."""
-        res = self._post_json("/api/investigation/validate-target", {
+        res = self.adapter.validate_target({
             "pid": self.inferior_proc.pid,
             "debug_image": self.stripped_bin,
             "locale": "en"
@@ -209,7 +177,7 @@ class TestPhase22ZeroConfigLiveCapture(unittest.TestCase):
 
     def test_validate_target_build_id_mismatch(self):
         """Pre-validation compares GNU Build ID between running target and supplied debug image."""
-        res = self._post_json("/api/investigation/validate-target", {
+        res = self.adapter.validate_target({
             "pid": self.inferior_proc.pid,
             "debug_image": self.mismatch_bin,
             "locale": "ko"
@@ -225,7 +193,7 @@ class TestPhase22ZeroConfigLiveCapture(unittest.TestCase):
 
     def test_validate_target_success_matching_live_process(self):
         """Pre-validation passes with valid=True for live running process and matching debug ELF."""
-        res = self._post_json("/api/investigation/validate-target", {
+        res = self.adapter.validate_target({
             "pid": self.inferior_proc.pid,
             "debug_image": self.debug_bin,
             "locale": "ko"
@@ -252,7 +220,7 @@ class TestPhase22ZeroConfigLiveCapture(unittest.TestCase):
             "goal": "Live zero-config capture verification",
             "authorize_target": True,
         }
-        res = self._post_json("/api/investigation/start", start_payload)
+        res = self.adapter.start_investigation(start_payload)
         self.assertTrue(res.get("success"), f"Failed to start live investigation: {res}")
         inv_data = res.get("data", {})
         self.assertIn(inv_data.get("status"), ["COMPLETED", "PARTIAL"])
@@ -328,16 +296,16 @@ class TestPhase22ZeroConfigLiveCapture(unittest.TestCase):
         self.assertIn("deterministic", parsed_en["summary"].lower())
 
     def test_conversational_chat_endpoint_accepts_and_propagates_locale(self):
-        """POST /api/investigation/chat accepts locale and returns localized structured analysis."""
+        """analyze_investigation_chat accepts locale and returns localized structured analysis."""
         # Create an investigation session
-        start_res = self._post_json("/api/investigation/start", {
+        start_res = self.adapter.start_investigation({
             "goal": "Chat test session",
             "authorize_target": True,
         })
         inv_id = start_res.get("data", {}).get("investigation_id")
         self.assertIsNotNone(inv_id)
 
-        chat_res = self._post_json("/api/investigation/chat", {
+        chat_res = self.adapter.analyze_investigation_chat({
             "investigation_id": inv_id,
             "message": "현재 상태 요약",
             "locale": "ko",
@@ -348,55 +316,6 @@ class TestPhase22ZeroConfigLiveCapture(unittest.TestCase):
         data = chat_res.get("data", {})
         self.assertIn("summary", data)
         self.assertEqual(data.get("provider_metadata", {}).get("locale"), "ko")
-
-    # =========================================================================
-    # 4. Basic Mode vs Expert Mode UI Structure
-    # =========================================================================
-
-    def test_html_contains_basic_three_areas_and_expert_preservation(self):
-        """Index HTML defines the 3 basic areas and preserves advanced elements under .advanced-only."""
-        html = self._get_raw("/legacy/")
-
-        # Area 1: TARGET
-        self.assertIn('id="basic-target-area"', html)
-        self.assertIn('id="basic-target-pid"', html)
-        self.assertIn('id="basic-debug-image"', html)
-        self.assertIn('id="btn-basic-connect-analyze"', html)
-        self.assertIn('id="basic-progress-sequence"', html)
-        self.assertIn('id="basic-target-connected-summary"', html)
-
-        # Area 2: INVESTIGATION RESULT
-        self.assertIn('id="basic-results-area"', html)
-        self.assertIn('id="basic-result-summary"', html)
-        self.assertIn('id="basic-quality-warning"', html)
-        self.assertIn('id="basic-facts-list"', html)
-        self.assertIn('id="btn-more-facts"', html)
-        self.assertIn('id="basic-causes-list"', html)
-        self.assertIn('id="btn-more-causes"', html)
-        self.assertIn('id="basic-next-list"', html)
-        self.assertIn('id="btn-more-next"', html)
-
-        # Area 3: ASK A QUESTION
-        self.assertIn('id="basic-question-area"', html)
-        self.assertIn('id="basic-question-input"', html)
-        self.assertIn('id="btn-basic-ask"', html)
-        self.assertIn('id="basic-chat-history"', html)
-
-        # Expert Mode Preserved: 8 Tabs and advanced panels marked .advanced-only
-        self.assertIn('id="app-nav-tabs"', html)
-        self.assertIn('id="advanced-investigation-view"', html)
-        self.assertIn('class="nav-tab advanced-only"', html)
-
-    def test_css_and_js_assets_serve_successfully(self):
-        """App CSS and JS assets load without 404 and contain Phase 22 rules."""
-        css = self._get_raw("/legacy/app.css")
-        self.assertIn("basic-progress-sequence", css)
-        self.assertIn(".basic-card", css)
-
-        js = self._get_raw("/legacy/app.js")
-        self.assertIn("handleBasicConnectAndAnalyze", js)
-        self.assertIn("renderBasicInvestigationView", js)
-        self.assertIn("btn_basic_connect_analyze", js)
 
 
 if __name__ == "__main__":

@@ -51,6 +51,7 @@ def build_view(result: Dict[str, Any], lang: str, report: Optional[Dict[str, Any
     from extractor import human_report as hr
     from extractor import report_visuals as rv
     from extractor.diagnostic_recipes import CAPABILITY_DESCRIPTIONS
+    from extractor.web.ui import explore_fragments as xf
 
     if lang not in LANGS:
         raise ValueError(f"lang must be one of {LANGS}")
@@ -88,6 +89,9 @@ def build_view(result: Dict[str, Any], lang: str, report: Optional[Dict[str, Any
             item["capability"] = cap
             item["capability_label"] = CAPABILITY_DESCRIPTIONS.get(cap, (cap, cap))[i]
         item["findings"] = [n for n, f in enumerate(findings, 1) if rid in [str(x) for x in f.get("recipe_ids") or []]]
+        if kind == "run":
+            meta = rv._recipe_meta(rid)
+            item["related_html"] = xf.check_chips_html(lang, meta[0] if meta else "")
         checks.append(item)
 
     # ---- findings: the report's card body (picture, facts, why, evidence) under the UI's own heading
@@ -122,9 +126,16 @@ def build_view(result: Dict[str, Any], lang: str, report: Optional[Dict[str, Any
     next_lines = next((s["lines"] for s in comp["sections"] if s["key"] == "next"), [])
     from extractor import profile_render as pr
     prof = comp.get("profile") or {}
+    from extractor.web.ui import explore_view as xv
+    hot: Dict[int, int] = {}
+    for n, f in enumerate(findings, 1):
+        for d in f.get("subject_details") or []:
+            if isinstance(d, dict) and d.get("kind") == "thread" and str(d.get("name") or "").isdigit():
+                hot.setdefault(int(d["name"]), n)
+    card = xv.profile_card(prof, lang, dwarf=_dwarf_known(report), hot_tids=hot) if prof.get("available") else {}
     profile = {"title": pr.Lx(lang).t("title"), "available": bool(prof.get("available")),
                "glance": pr.glance_text(pr.Lx(lang), prof) if prof.get("available") else "",
-               "html": pr.profile_html(prof, lang) if prof.get("available") else ""}
+               "html": pr.profile_html(prof, lang) if prof.get("available") else "", **{k: v for k, v in card.items() if k != "available"}}
     return {
         "version": VIEW_VERSION, "lang": lang, "verdict": verdict, "tone": VERDICT_TONE.get(verdict, "skip"),
         "verdict_word": hr.T[f"v_{vkey}"][i], "verdict_meaning": hr.T[f"vm_{vkey}"][i],
@@ -135,6 +146,15 @@ def build_view(result: Dict[str, Any], lang: str, report: Optional[Dict[str, Any
         "not_examined_html": rv._md_html(comp.get("not_examined") or []) if comp.get("not_examined") else "",
         "next_html": rv._md_html(next_lines) if next_lines else "",
     }
+
+
+def _dwarf_known(report: Optional[Dict[str, Any]]) -> Optional[bool]:
+    """Whether the diagnosis had DWARF for the executable (the report's target capabilities), None when it does not say."""
+    ctx = (report or {}).get("section_b_target_context") if isinstance(report, dict) else None
+    caps = (ctx or {}).get("target_capabilities") if isinstance(ctx, dict) else None
+    if isinstance(caps, list) and caps:
+        return "DWARF_DEBUG_INFO" in caps
+    return None
 
 
 def build_views(result: Dict[str, Any], report: Optional[Dict[str, Any]] = None) -> Dict[str, Dict[str, Any]]:
