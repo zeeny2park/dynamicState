@@ -3070,6 +3070,9 @@ def runtime_export_incident_report(
         if sess is not None and output_path and err:
             raise ValueError(err)
         report_dict = (json.loads(res["report_json"]).get("report") or {}) if res.get("report_json") else {}
+        extras = res.pop("session_report_extras", None)
+        if extras and report_dict:
+            report_dict = {**report_dict, **{k: v for k, v in extras.items() if k not in report_dict}}
         sec_a = report_dict.get("section_a_executive_summary") or {}
         sec_d = report_dict.get("section_d_detailed_inspection_results") or {}
         extra = {

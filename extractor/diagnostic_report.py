@@ -117,6 +117,7 @@ class TargetContextSection:
     investigation_start_time: str = ""
     investigation_end_time: str = ""
     build_id_check: Optional[Dict[str, Any]] = None  # {status, process_build_id, debug_build_id}; None = not recorded
+    target_abi: Optional[Dict[str, Any]] = None      # TargetABI.to_dict() incl. kernel_release, recorded at diagnosis time
     collection_failures: List[str] = field(default_factory=list)
     environmental_limitations: List[str] = field(default_factory=list)
 

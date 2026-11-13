@@ -158,6 +158,7 @@ class TargetABI:
     libc_path: Optional[str] = None          # mapped libc file used as evidence
     evidence: List[str] = field(default_factory=list)
     error: Optional[str] = None
+    kernel_release: Optional[str] = None     # /proc/sys/kernel/osrelease of the TARGET host (read via the adapter)
 
     @property
     def detected(self) -> bool:
@@ -176,6 +177,7 @@ class TargetABI:
             "libc_path": self.libc_path,
             "evidence": list(self.evidence),
             "error": self.error,
+            "kernel_release": self.kernel_release,
         }
 
     @classmethod
@@ -192,6 +194,7 @@ class TargetABI:
             libc_path=d.get("libc_path"),
             evidence=list(d.get("evidence") or []),
             error=d.get("error"),
+            kernel_release=d.get("kernel_release"),
         )
 
 
@@ -305,6 +308,13 @@ def detect_target_abi(
     """
     abi = TargetABI()
     reader = getattr(adapter, "read_target_file", None)
+    if callable(reader):  # kernel release of the target host (local or remote); anything not a release string is dropped
+        try:
+            raw = reader(int(pid), "/proc/sys/kernel/osrelease", 256)
+            txt = raw.decode("ascii").strip() if raw else ""
+            abi.kernel_release = txt if re.fullmatch(r"\d+\.\d+[\w.+~-]*", txt) else None
+        except Exception:  # noqa: BLE001
+            abi.kernel_release = None
     hdr: Optional[bytes] = None
     if callable(reader):
         try:

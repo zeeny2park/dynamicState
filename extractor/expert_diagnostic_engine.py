@@ -511,6 +511,7 @@ class TargetAssessmentResult:
     process_identity: Optional[str] = None
     executable_identity: Optional[str] = None
     build_id_check: Optional[Dict[str, Any]] = None  # {status MATCHED|MISMATCHED|UNKNOWN, process_build_id, debug_build_id}
+    target_abi: Optional[Dict[str, Any]] = None  # TargetABI.to_dict() read through the adapter at diagnosis time
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -535,6 +536,7 @@ class TargetAssessmentResult:
             "process_identity": self.process_identity,
             "executable_identity": self.executable_identity,
             "build_id_check": self.build_id_check,
+            "target_abi": self.target_abi,
         }
 
 
@@ -743,6 +745,7 @@ class TargetAssessor:
             process_identity=proc_identity,
             executable_identity=executable_identity,
             build_id_check=build_id_check,
+            target_abi=allocator_abi.to_dict() if allocator_abi is not None else None,
         )
 
 
@@ -3190,6 +3193,7 @@ class AdaptiveInvestigationSession:
             build_id=getattr(self.target_assessment, "build_id", None) if self.target_assessment else None,
             companion_elf=self.companion_elf,
             build_id_check=getattr(self.target_assessment, "build_id_check", None) if self.target_assessment else None,
+            target_abi=getattr(self.target_assessment, "target_abi", None) if self.target_assessment else None,
             target_capabilities=self.target_assessment.capabilities if self.target_assessment else [],
             collection_mode=actual_collection_mode,
             target_stop_duration_ms=round(measured_stop_ms, 3),

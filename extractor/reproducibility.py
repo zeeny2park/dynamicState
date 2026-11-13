@@ -21,7 +21,6 @@ from __future__ import annotations
 
 import html
 import os
-import platform
 import re
 import subprocess
 from dataclasses import asdict, dataclass, field
@@ -41,6 +40,8 @@ class ReproducibilitySection:
     target_kernel: Optional[str] = None
     target_arch: Optional[str] = None
     target_libc: Optional[str] = None
+    # "diagnosis": recorded when the diagnosis ran; "export_time_detection": nothing was recorded, re-read at export
+    target_source: Optional[str] = None
     # rows: {module, debug_image, process_build_id, debug_build_id, status, note}
     build_id_checks: List[Dict[str, Any]] = field(default_factory=list)
     # rows in execution order: {order, recipe_id, recipe_version, check_id, status, started_at, ended_at,
@@ -125,7 +126,9 @@ def build_reproducibility(report: Dict[str, Any], result: Optional[Dict[str, Any
     abi = target.get("abi") if isinstance(target.get("abi"), dict) else {}
     impact = result.get("collection_impact") if isinstance(result.get("collection_impact"), dict) else {}
     ident = tool_identity()
-    remote = bool(target.get("transport") or target.get("host") or target.get("remote_host"))
+    recorded = sec_b.get("target_abi") if isinstance(sec_b.get("target_abi"), dict) else None
+    abi = recorded or abi
+    source = "diagnosis" if recorded else (target.get("abi_source") or ("diagnosis" if abi else None))
     detected = abi.get("status") == "DETECTED"
     libc = abi.get("libc") if detected and abi.get("libc") not in (None, "", "unknown", "UNKNOWN") else None
     if libc and abi.get("libc_version"):
@@ -133,9 +136,10 @@ def build_reproducibility(report: Dict[str, Any], result: Optional[Dict[str, Any
     samples = impact.get("samples_collected")
     return ReproducibilitySection(
         tool_version=ident["version"], tool_commit=ident["commit"],
-        target_kernel=None if remote else (platform.release() or None),
+        target_kernel=abi.get("kernel_release") or None,   # the target host's, never the rendering host's
         target_arch=abi.get("architecture") if detected else None,
         target_libc=libc,
+        target_source=source,
         build_id_checks=_build_id_rows(sec_b, target.get("debug_image")),
         recipes=_recipe_rows(sec_d.get("checks") or []),
         observation={
@@ -156,6 +160,8 @@ _T: Dict[str, Any] = {
     "intro": ("What a reader needs to re-explain this diagnosis. A value the engine did not record is shown as unknown.",
               "이 진단을 다시 설명하는 데 필요한 정보입니다. 엔진이 기록하지 못한 값은 알 수 없음으로 표시합니다."),
     "unknown": ("unknown", "알 수 없음"),
+    "redetected": (" (re-read at export time, not recorded during the diagnosis)",
+                   " (진단 때 기록되지 않아 보고서를 만들 때 다시 읽음)"),
     "h_env": ("Tool and target", "도구와 대상"),
     "tool": ("dynamicState version / commit", "dynamicState 버전 / 커밋"),
     "kernel": ("Target kernel", "대상 커널"),
@@ -193,8 +199,10 @@ def _v(x: Any, li: int, fmt: Optional[str] = None) -> str:
 def _env_pairs(s: ReproducibilitySection, li: int) -> List[tuple]:
     tool = _t("unknown", li) if not (s.tool_version or s.tool_commit) else \
         f"{s.tool_version or _t('unknown', li)} / {s.tool_commit or _t('unknown', li)}"
-    return [(_t("tool", li), tool), (_t("kernel", li), _v(s.target_kernel, li)),
-            (_t("arch", li), _v(s.target_arch, li)), (_t("libc", li), _v(s.target_libc, li))]
+    sfx = _t("redetected", li) if s.target_source == "export_time_detection" else ""
+    return [(_t("tool", li), tool), (_t("kernel", li), _v(s.target_kernel, li) + (sfx if s.target_kernel else "")),
+            (_t("arch", li), _v(s.target_arch, li) + (sfx if s.target_arch else "")),
+            (_t("libc", li), _v(s.target_libc, li) + (sfx if s.target_libc else ""))]
 
 
 def _obs_pairs(s: ReproducibilitySection, li: int) -> List[tuple]:

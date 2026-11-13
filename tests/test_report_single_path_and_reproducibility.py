@@ -15,8 +15,10 @@ import json
 import os
 import re
 import sys
+import stat
 import tempfile
 import unittest
+from dataclasses import dataclass, field
 from types import SimpleNamespace
 from unittest import mock
 
@@ -48,13 +50,24 @@ class _Saved:
         return json.loads(json.dumps(self.d))
 
 
+@dataclass
+class _Concl:
+    confidence: float = 0.0
+    confidence_basis: str = ""
+    stop_reason: object = None
+    diagnostic_limitations: list = field(default_factory=list)
+    missing_evidence_and_unknowns: list = field(default_factory=list)
+    recommended_remediations: list = field(default_factory=list)
+
+
 def _fake_session(saved):
     """An investigation session as far as the report adapter reads it, rebuilt from a saved diagnose() result."""
     report = saved["report"]
     checks = [DiagnosticCheck.from_dict(c) for c in report["section_d_detailed_inspection_results"]["checks"]]
-    concl = SimpleNamespace(confidence=saved["confidence"], confidence_basis="", stop_reason=saved.get("stop_reason"),
-                            diagnostic_limitations=[], missing_evidence_and_unknowns=[])
+    concl = _Concl(confidence=saved["confidence"], stop_reason=saved.get("stop_reason"))
     return SimpleNamespace(
+        raw_problem_statement="general health check", plan=None, active_hypotheses=[], rejected_hypotheses=[],
+        collected_evidence=[], timeline=[], target_assessment=None,
         pid=saved["target"]["pid"], companion_elf=saved["target"]["debug_image"], adapter=None, state=saved["state"],
         investigation_id=saved["investigation_id"], checks=checks, collected_evidence_records=[], conclusion=concl,
         budget_tracker=None, build_diagnostic_report=lambda: DiagnosticReport.from_dict(json.loads(json.dumps(report))))
@@ -167,6 +180,75 @@ class TestSingleGenerationPath(unittest.TestCase):
         self.assertEqual(out["verdict"], saved["verdict"])
 
 
+OLD_JSON_KEYS = ("report_13_points", "plan", "timeline", "active_hypotheses", "rejected_hypotheses", "conclusion",
+                 "status", "target_pid", "problem_statement", "diagnostic_limitations")
+
+
+class TestJsonContractAndFileHardening(unittest.TestCase):
+    def _by_id(self, **kw):
+        saved = _load("overflow_ring")
+        sess = _fake_session(saved)
+        eng = mcp_srv.runtime.expert_diagnostic_engine
+        with mock.patch.object(eng, "get_session", lambda i: sess):
+            return saved, json.loads(mcp_srv.runtime_export_incident_report(
+                investigation_id=saved["investigation_id"], **kw))
+
+    def test_json_report_keeps_the_session_keys(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "r.json")
+            saved, out = self._by_id(format="json", output_path=path)
+            self.assertTrue(out["success"], out)
+            with open(path, encoding="utf-8") as fh:
+                on_disk = json.load(fh)
+            for doc in (out["report"], on_disk):
+                for k in OLD_JSON_KEYS:
+                    self.assertIn(k, doc, k)
+                self.assertIn("section_a_executive_summary", doc)       # the DiagnosticReport is still the body
+                self.assertIn("section_j_reproducibility", doc)
+                self.assertEqual(doc["target_pid"], saved["target"]["pid"])
+                self.assertEqual(doc["status"], saved["state"])
+                self.assertEqual(len(doc["report_13_points"]), 14)
+            self.assertNotIn("session_report_extras", out)
+
+    def test_symlink_at_output_path_is_refused(self):
+        saved = _load("overflow_ring")
+        with tempfile.TemporaryDirectory() as tmp:
+            victim = os.path.join(tmp, "victim.txt")
+            with open(victim, "w") as fh:
+                fh.write("keep")
+            link = os.path.join(tmp, "link.md")
+            os.symlink(victim, link)
+            out = _export_fresh(saved, "en", output_path=link, report_html_path=link + ".html")
+            self.assertIsNone(out["saved_path"])
+            self.assertTrue(out["save_error"])
+            with open(victim) as fh:
+                self.assertEqual(fh.read(), "keep")
+            for kw in ("report_html_path", "report_json_path"):
+                os.symlink(victim, os.path.join(tmp, kw))
+                out = _export_fresh(saved, "en", **{kw: os.path.join(tmp, kw)})
+                self.assertTrue(out["save_html_error"] or out["save_json_error"], kw)
+            with open(victim) as fh:
+                self.assertEqual(fh.read(), "keep")
+            # the investigation_id call shape refuses it too
+            sess = _fake_session(saved)
+            with mock.patch.object(mcp_srv.runtime.expert_diagnostic_engine, "get_session", lambda i: sess):
+                res = json.loads(mcp_srv.runtime_export_incident_report(
+                    investigation_id=saved["investigation_id"], output_path=link))
+            self.assertFalse(res["success"])
+            with open(victim) as fh:
+                self.assertEqual(fh.read(), "keep")
+
+    def test_new_report_files_are_owner_only(self):
+        saved = _load("overflow_ring")
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = {k: os.path.join(tmp, "sub", k) for k in ("output_path", "report_html_path", "report_json_path")}
+            out = _export_fresh(saved, "en", **paths)
+            self.assertTrue(out["saved_path"] and out["saved_html_path"] and out["saved_json_path"])
+            for p in paths.values():
+                self.assertEqual(stat.S_IMODE(os.stat(p).st_mode), 0o600, p)
+            self.assertEqual(stat.S_IMODE(os.stat(os.path.dirname(paths["output_path"])).st_mode), 0o700)
+
+
 class TestReproducibilityModel(unittest.TestCase):
     def setUp(self):
         self.saved = _load("overflow_ring")
@@ -232,6 +314,63 @@ class TestReproducibilityModel(unittest.TestCase):
         rpt["section_b_target_context"] = sec
         self.assertEqual(DiagnosticReport.from_dict(rpt).to_dict()["section_b_target_context"]["build_id_check"]["status"],
                          "MATCHED")
+
+
+class TestTargetKernelIsNeverTheRenderingHost(unittest.TestCase):
+    def setUp(self):
+        self.saved = _load("overflow_ring")
+
+    def test_report_without_the_field_renders_unknown(self):
+        with mock.patch("platform.release", lambda: "HOST-KERNEL-9.9"):
+            rep = build_reproducibility(self.saved["report"], self.saved)
+            out = _export_fresh(self.saved, "en")
+        self.assertIsNone(rep.target_kernel)
+        self.assertNotIn("HOST-KERNEL", out["report_markdown"] + out["report_html"])
+        self.assertIn("Target kernel: `unknown`", out["report_markdown"])
+        self.assertIn("대상 커널: `알 수 없음`", _export_fresh(self.saved, "ko")["report_markdown"])
+
+    def test_recorded_kernel_is_rendered_whatever_the_host(self):
+        saved = json.loads(json.dumps(self.saved))
+        saved["report"]["section_b_target_context"]["target_abi"] = {
+            "status": "DETECTED", "architecture": "x86_64", "libc": "glibc", "libc_version": "2.35",
+            "kernel_release": "5.15.0-91-generic"}
+        with mock.patch("platform.release", lambda: "HOST-KERNEL-9.9"):
+            out = _export_fresh(saved, "ko")
+        self.assertIn("대상 커널: `5.15.0-91-generic`", out["report_markdown"])
+        self.assertIn("`x86_64`", out["report_markdown"])
+        self.assertIn("glibc 2.35", out["report_markdown"])
+        self.assertNotIn("HOST-KERNEL", out["report_markdown"] + out["report_html"])
+        self.assertEqual(out["reproducibility"]["target_source"], "diagnosis")
+
+    def test_export_time_redetection_is_labelled(self):
+        res = {"target": {"abi": {"status": "DETECTED", "architecture": "aarch64", "libc": "glibc",
+                                  "kernel_release": "6.1.0"}, "abi_source": "export_time_detection"}}
+        rep = build_reproducibility({}, res)
+        self.assertEqual(rep.target_source, "export_time_detection")
+        self.assertIn("보고서를 만들 때 다시 읽음", "\n".join(render_markdown(rep, "ko")))
+        self.assertIn("re-read at export time", "\n".join(render_markdown(rep, "en")))
+
+    def test_gone_process_session_has_unknown_target(self):
+        saved = _load("overflow_ring")
+        saved["report"]["section_b_target_context"].pop("target_abi", None)
+        out = ir.export_incident_report(pid=saved["target"]["pid"], session=_fake_session(saved))  # adapter=None
+        r = out["reproducibility"]
+        self.assertEqual((r["target_kernel"], r["target_arch"], r["target_libc"]), (None, None, None))
+
+    def test_target_abi_reads_the_kernel_through_the_adapter(self):
+        from extractor.target_abi import TargetABI, detect_target_abi
+
+        class Ad:
+            def __init__(self, osr):
+                self.osr = osr
+
+            def read_target_file(self, pid, path, n):
+                return self.osr if path == "/proc/sys/kernel/osrelease" else None
+
+        self.assertEqual(detect_target_abi(Ad(b"5.4.0-1\n"), 1, probe_version=False).kernel_release, "5.4.0-1")
+        self.assertIsNone(detect_target_abi(Ad(b"\x7fELF\x02\x01"), 1, probe_version=False).kernel_release)
+        self.assertIsNone(detect_target_abi(Ad(None), 1, probe_version=False).kernel_release)
+        self.assertEqual(TargetABI.from_dict(TargetABI(kernel_release="5.4.0").to_dict()).kernel_release, "5.4.0")
 
 
 class TestReproducibilityRendering(unittest.TestCase):

@@ -15,6 +15,7 @@ fault needs a finding, and an unattributed finding is not confirmed.
 from __future__ import annotations
 
 import html
+from dataclasses import asdict
 import json
 import os
 import sys
@@ -180,11 +181,17 @@ def result_from_session(session: Any) -> Dict[str, Any]:
     stop_ms = float(sec_b.get("target_stop_duration_ms") or 0.0)
     target: Dict[str, Any] = {"pid": session.pid, "process_name": sec_b.get("target_process_name"),
                               "debug_image": session.companion_elf, "abi": None}
-    try:
-        from .target_abi import detect_target_abi
-        target["abi"] = detect_target_abi(session.adapter, session.pid, probe_version=False).to_dict()
-    except Exception:  # noqa: BLE001 - the process may be gone; the ABI is then recorded as unknown
-        pass
+    if not sec_b.get("target_abi"):
+        # Nothing was recorded at diagnosis time (older session): re-read now, labelled as such in the report; if the
+        # process is gone the ABI stays unknown.
+        try:
+            from .target_abi import detect_target_abi
+            redetected = detect_target_abi(session.adapter, session.pid, probe_version=False)
+            if redetected.status == "DETECTED":   # target process gone / unreadable: everything stays unknown
+                target["abi"] = redetected.to_dict()
+                target["abi_source"] = "export_time_detection"
+        except Exception:  # noqa: BLE001
+            pass
     return {
         "verdict": str(sec_a.get("overall_result") or VERDICT_INCONCLUSIVE),
         "confidence": float(getattr(concl, "confidence", 0.0) or 0.0),
@@ -202,6 +209,52 @@ def result_from_session(session: Any) -> Dict[str, Any]:
         "investigation_id": session.investigation_id, "target": target, "state": session.state,
         "stop_reason": getattr(concl, "stop_reason", None), "healthy_scope": {},
     }
+
+
+def session_report_extras(session: Any, report: Dict[str, Any]) -> Dict[str, Any]:
+    """Session-only keys that ``AdaptiveInvestigationSession.export_report("json")`` adds next to the DiagnosticReport
+    dict; kept in the JSON of an ``investigation_id`` export (no second report generation: ``report`` is the one built)."""
+    sec_d = report.get("section_d_detailed_inspection_results") or {}
+    concl = getattr(session, "conclusion", None)
+    ta = getattr(session, "target_assessment", None)
+    return {
+        "report_13_points": {
+            "1_problem_description": session.raw_problem_statement,
+            "2_target_information": report.get("section_b_target_context", {}),
+            "3_initial_classification": report.get("section_c_diagnostic_strategy", {}),
+            "4_investigation_scope": {"targeted_recipes": [st.recipe_id for st in session.plan.steps] if session.plan else []},
+            "5_executed_diagnostic_procedures": [c for c in sec_d.get("checks", [])
+                                                 if c.get("status") not in ("NOT_EXECUTED", "SKIPPED")],
+            "6_actual_observations": [r.to_dict() for r in session.collected_evidence_records],
+            "7_confirmed_findings": [h.to_dict() for h in session.active_hypotheses if h.status == "CONFIRMED"],
+            "7_findings_detail": report.get("section_e_findings_and_root_cause", {}),
+            "8_probable_causes": [h.problem_statement for h in session.active_hypotheses
+                                  if h.status in ("CONFIRMED", "LIKELY")],
+            "9_rejected_hypotheses": [h.to_dict() for h in session.rejected_hypotheses],
+            "10_unresolved_hypotheses": [h.to_dict() for h in session.active_hypotheses
+                                         if h.status in ("PROPOSED", "LIKELY", "INCONCLUSIVE")],
+            "11_evidence_to_source_mapping": [c for c in [ev.get("correlation") for ev in session.collected_evidence] if c],
+            "12_missing_evidence": ta.limitations if ta else [],
+            "13_recommended_next_actions": concl.recommended_remediations if concl else [],
+        },
+        "investigation_id": session.investigation_id,
+        "target_pid": session.pid,
+        "problem_statement": session.raw_problem_statement,
+        "status": session.state,
+        "conclusion": asdict(concl) if concl else None,
+        "plan": session.plan.to_dict() if session.plan else None,
+        "active_hypotheses": [h.to_dict() for h in session.active_hypotheses],
+        "rejected_hypotheses": [h.to_dict() for h in session.rejected_hypotheses],
+        "timeline": session.timeline,
+        "diagnostic_limitations": ta.limitations if ta else [],
+    }
+
+
+def _safe_extras(session: Any, report: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    try:
+        return json.loads(json.dumps(session_report_extras(session, report), default=str))
+    except Exception:  # noqa: BLE001 - an addition to the JSON; the report itself is already built
+        return None
 
 
 def _finding_row(f: Dict[str, Any], remediation: List[str]) -> Dict[str, Any]:
@@ -248,8 +301,14 @@ def _write(path_in: Optional[str], content: str, file_type: str, forbid_same_as:
         print(f"WARNING: {err}", file=sys.stderr)
         return None, err
     try:
-        os.makedirs(os.path.dirname(san), exist_ok=True)
-        with open(san, "w", encoding="utf-8") as fh:
+        parent = os.path.dirname(san)
+        if parent:
+            os.makedirs(parent, mode=0o700, exist_ok=True)
+        flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW          # a symlink at the output path is refused, never followed
+        fd = os.open(san, flags, 0o600)      # a newly created report file is owner-only
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
             fh.write(content)
         return san, None
     except OSError as exc:
@@ -490,9 +549,11 @@ def export_incident_report(
 
     saved_path, save_error = _write(output_path, report_markdown, "incident report")
     saved_html_path, save_html_error = _write(report_html_path, report_html, "HTML report", forbid_same_as=saved_path)
+    extras = _safe_extras(session, report) if session is not None and report is not None else None
+    json_doc = {**report, **{k: v for k, v in extras.items() if k not in report}} if (report is not None and extras) \
+        else (report if report is not None else res)
     saved_json_path, save_json_error = _write(
-        report_json_path, json.dumps(report if report is not None else res, indent=2, default=str), "JSON report",
-        forbid_same_as=saved_path)
+        report_json_path, json.dumps(json_doc, indent=2, default=str), "JSON report", forbid_same_as=saved_path)
     latency_us = round((time.monotonic_ns() - t0) / 1000.0, 2)
     if verdict == VERDICT_INCONCLUSIVE:
         hint = (f"Incident report for PID {eff_pid} is INCONCLUSIVE ({len(limitations)} limitation(s): "
@@ -533,6 +594,7 @@ def export_incident_report(
         "report_html": report_html,
         "report_json": report_json,
         "reproducibility": repro.to_dict(),
+        "session_report_extras": extras,
         "report_path": res.get("report_path"),
         "saved_path": saved_path,
         "save_error": save_error,
