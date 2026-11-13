@@ -952,10 +952,12 @@ def _lock_digest(info: Dict[str, Any]) -> List[Dict[str, Any]]:
     """Per mutex of one lock inspection: owner, state word and the threads blocked in a futex wait on it (the
     per-sample evidence of the lock-contention check; ``judge`` adds the owner's progress counters)."""
     waiters: Dict[str, List[int]] = {}
+    inferred: Dict[str, List[int]] = {}
     for t in info.get("threads") or []:
         w = t.get("waiting_on_lock") if isinstance(t, dict) else None
         if isinstance(w, dict) and t.get("tid") is not None:
-            waiters.setdefault(str(w.get("lock_address")), []).append(int(t["tid"]))
+            # a waiter inferred from the stack (the futex record was unreadable) is not counted as a waiter
+            (inferred if w.get("inferred") else waiters).setdefault(str(w.get("lock_address")), []).append(int(t["tid"]))
     out = []
     for l in info.get("locks") or []:
         if not isinstance(l, dict):
@@ -963,7 +965,8 @@ def _lock_digest(info: Dict[str, Any]) -> List[Dict[str, Any]]:
         addr = str(l.get("runtime_address"))
         out.append({"lock": l.get("name"), "address": addr, "type": l.get("type_name"),
                     "state_word": l.get("lock_state_word"), "owner_tid": l.get("owner_tid"),
-                    "owner_name": l.get("owner_thread_name"), "waiter_tids": sorted(waiters.get(addr, []))})
+                    "owner_name": l.get("owner_thread_name"), "waiter_tids": sorted(waiters.get(addr, [])),
+                    "inferred_waiter_tids": sorted(inferred.get(addr, []))})
     return out
 
 

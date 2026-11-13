@@ -375,6 +375,7 @@ def inspect_thread_callstacks_and_locks(
                 "owner_status": owner_support.status,
                 "owner_status_reason": owner_support.message,
                 "waiting_tids": [],
+                "inferred_waiting_tids": [],
             }
             locks_report.append(l_info)
             locks_by_addr[l_addr] = l_info
@@ -419,6 +420,7 @@ def inspect_thread_callstacks_and_locks(
             "owner_thread_name": owner_thread_name,
             "owner_status": owner_support.status,
             "waiting_tids": [],
+            "inferred_waiting_tids": [],
         }
         locks_report.append(l_info)
         locks_by_addr[l_addr] = l_info
@@ -448,6 +450,9 @@ def inspect_thread_callstacks_and_locks(
             sc_info = dict(t.get("syscall") or {"state": "unavailable"})   # adapter-provided (IMP-011 part 3)
         else:
             sc_info = mgr._imp011_read_syscall(pid, t_tid)
+        # Is the precise source unusable?  Only then may the stack-scan fallback below run.
+        syscall_record_unusable = (sc_info.get("state") not in ("blocked", "running", "not_in_syscall")
+                                   or (sc_info.get("state") == "blocked" and not sc_info.get("args")))
         if sc_info.get("state") == "blocked":
             syscall_nr = int(sc_info["nr"])
             # IMP-015: number -> name via the table of the TARGET architecture; None when unsupported/undetected
@@ -541,7 +546,8 @@ def inspect_thread_callstacks_and_locks(
             if cfi_res is not None:
                 frames = _cfi_callstack_frames(cfi_res)
             # The raw stack read is still needed by the scan fallback and by the mutex-pointer fallback below.
-            need_raw = cfi_res is None or (waiting_on_lock is None and bool(locks_by_addr) and t_state in ("S", "D"))
+            need_raw = cfi_res is None or (waiting_on_lock is None and syscall_record_unusable and bool(locks_by_addr)
+                                           and t_state in ("S", "D"))
             if scan_len >= ptr_size and need_raw:
                 try:
                     raw_stack, sst, s_err = target_adapter.read_memory(pid, scan_from, scan_len)
@@ -595,9 +601,15 @@ def inspect_thread_callstacks_and_locks(
                                     "estimated": True,
                                 })
 
-                    # Fallback when /proc/<pid>/task/<tid>/syscall is unavailable:
+                    # Fallback ONLY when the syscall record of this thread could not be read (unavailable, remote adapter
+                    # without it, or a blocked record without arguments).  A readable record is authoritative: "blocked"
+                    # names the futex address the thread waits on, "running" / "not in syscall" say it is not waiting in
+                    # the kernel at all (the stack of such a thread still holds stale &mutex values from earlier calls;
+                    # measured on lock_hotspot / lock_convoy: every stack-only "waiter" was a thread whose record said
+                    # "running").  Waiters found here are inferred and marked so (``inferred`` / ``confidence``) and are
+                    # kept out of ``waiting_tids`` (which the lock-contention and lock-fault judgements count).
                     # Scan active stack frames (from innermost SP upward) for pointers into locked pthread_mutex_t objects
-                    if waiting_on_lock is None and locks_by_addr and t_state in ("S", "D"):
+                    if waiting_on_lock is None and syscall_record_unusable and locks_by_addr and t_state in ("S", "D"):
                         matched_lock_info = None
                         for w_i in range(num_words):
                             cand_val = struct.unpack_from(ptr_fmt, raw_stack, w_i * ptr_size)[0]
@@ -625,9 +637,11 @@ def inspect_thread_callstacks_and_locks(
                                 "held_by_tid": matched_lock_info["owner_tid"],
                                 "held_by_thread_name": matched_lock_info["owner_thread_name"],
                                 "resolved_via": "STACK_MUTEX_POINTER_SCAN",
+                                "inferred": True,
+                                "confidence": "LOW",
                             }
-                            if t_tid not in matched_lock_info["waiting_tids"]:
-                                matched_lock_info["waiting_tids"].append(t_tid)
+                            if t_tid not in matched_lock_info["inferred_waiting_tids"]:
+                                matched_lock_info["inferred_waiting_tids"].append(t_tid)
                             if matched_lock_info["owner_tid"] and matched_lock_info["owner_tid"] != t_tid:
                                 wait_for_edges.append({
                                     "waiter_tid": t_tid,
@@ -636,6 +650,7 @@ def inspect_thread_callstacks_and_locks(
                                     "lock_address": matched_lock_info["runtime_address"],
                                     "owner_tid": matched_lock_info["owner_tid"],
                                     "owner_name": matched_lock_info["owner_thread_name"],
+                                    "inferred": True,
                                 })
 
         thread_reports.append({
