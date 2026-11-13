@@ -86,7 +86,11 @@ def _export_fresh(saved, lang="en", **kw):
 
 
 def _headings(md):
-    return [ln for ln in md.splitlines() if ln.startswith("## ")]
+    """Section titles of the common outline.  "Not examined" exists only when the diagnosis reported items beyond
+    the checks (data, not structure: a stored session carries fewer such rows), and the opt-in appendix is unnumbered."""
+    import re as _re
+    return [_re.sub(r"^## \d+\. ", "", ln) for ln in md.splitlines() if _re.match(r"^## \d+\. ", ln)
+            and not ln.endswith(("Not examined", "확인하지 못한 것"))]
 
 
 class TestSingleGenerationPath(unittest.TestCase):
@@ -132,7 +136,7 @@ class TestSingleGenerationPath(unittest.TestCase):
                 for html in (fresh["report_html"], stored["report_html"]):
                     # the common outline: conclusion, findings, reproducibility, and detailed records per part
                     for marker in ('class="dsv"', 'id="dsv-findings"', 'id="sec-conclusion"', 'id="reproducibility"',
-                                   'class="dsv-detail"'):
+                                   'class="collapsible dsv-detail"'):
                         self.assertIn(marker, html, f"{name}/{lang}: {marker}")
                 self.assertEqual(sorted(fresh["reproducibility"]), sorted(stored["reproducibility"]))
                 self.assertEqual([r["recipe_id"] for r in fresh["reproducibility"]["recipes"]],
@@ -402,9 +406,15 @@ class TestReproducibilityRendering(unittest.TestCase):
             html_part = html_part[:html_part.find("</section>")]
             for label, text in (("md", md_part), ("html", html_part)):
                 self.assertEqual(english_sentences(text), [], f"{name} {label}")
-            for word in ("도구와 대상", "빌드 ID", "관측 구간", "실행한 검사와 레시피 버전"):   # the outline's vocabulary: 검사
+            # the section keeps its short facts; the target's kernel / architecture / libc and the build-ID match are
+            # stated once, in the target card, and the per-check table is in the section's detail block
+            for word in ("dynamicState 버전", "관측 구간", "실행한 검사와 레시피 버전"):
                 self.assertIn(word, md_part)
                 self.assertIn(word, html_part)
+            target = re.split(r"(?m)^## \d+\. 대상$", out["report_markdown"])[1].split("\n## ")[0]
+            for word in ("대상 커널", "아키텍처", "빌드 ID"):
+                self.assertIn(word, target)
+            self.assertIn('id="reproducibility-detail"', out["report_html"])
 
     def test_english_sections_present_and_html_escaped(self):
         rep = ReproducibilitySection(

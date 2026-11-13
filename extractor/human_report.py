@@ -342,10 +342,12 @@ T: Dict[str, Tuple[str, str]] = {
     # Every report (summary, incident Markdown, incident HTML; every verdict) has these sections in this order; a
     # section with nothing to say is left out and the rest are numbered consecutively (see ``compose``).
     "s_conclusion": ("Conclusion", "결론"),
-    "s_findings": ("What was found", "발견한 문제"),
+    "s_findings": ("What was found", "발견된 문제"),
+    "s_target": ("Target", "대상"),
+    "s_not_examined": ("Not examined", "확인하지 못한 것"),
     "s_hypothesis": ("The hypothesis you asked to check", "요청한 가설 검증"),
     "s_next": ("What to do next", "다음에 할 일"),
-    "s_scope": ("What was checked", "검사 범위"),
+    "s_scope": ("Checks", "검사"),
     "s_method": ("How the diagnosis was done and what it cost the target", "진단 방법과 대상에 준 영향"),
     "s_repro": ("Reproducibility", "재현 정보"),
     "s_reference": ("Reference", "참고 자료"),
@@ -401,26 +403,27 @@ T: Dict[str, Tuple[str, str]] = {
     "n_healthy2": ("Nothing needs fixing based on these checks. If a symptom persists, describe it more specifically "
                    "and run again, and keep in mind what '{sec}' lists as not examined.",
                    "이 검사 결과로는 고칠 것이 없습니다. 증상이 계속되면 더 구체적으로 알려 다시 실행하고, '{sec}'에 "
-                   "확인하지 못한 것으로 적힌 항목도 함께 고려하세요."),
+                   "적힌 항목도 함께 고려하세요."),
     "n_incon_nc2": ("Several items under '{sec}' were not examined; resolving those is the shortest way to a "
                     "conclusion.",
                     "'{sec}'에 확인하지 못한 항목이 있습니다. 그것들을 해결하는 것이 결론에 이르는 가장 빠른 "
                     "길입니다."),
     # scope (the one definition of "checks": run = found + clean + could not judge; not run is separate)
-    "s_counts": ("{run} checks ran: {found} found a problem, {clean} came back clean and {undecided} could not judge.",
-                 "검사 {run}개를 실행했습니다. 이상 발견 {found}개, 이상 없음 {clean}개, 판단하지 못함 {undecided}개입니다."),
+    "s_counts": ("{run} checks ran: {found} found a problem, {undecided} could not judge and {clean} passed.",
+                 "검사 {run}개를 실행했습니다. 이상 발견 {found}개, 판단 불가 {undecided}개, 통과 {clean}개입니다."),
     "s_counts_none": ("No check ran.", "실행된 검사가 없습니다."),
     "s_notrun": (" Another {n} were not run.", " 실행하지 않은 검사가 {n}개 더 있습니다."),
     "s_caveat": ("A check that could not judge, or was not run, is not evidence that the process is fine.",
-                 "판단하지 못했거나 실행하지 않은 검사는 문제가 없다는 근거가 아닙니다."),
+                 "판단 불가이거나 실행 안 한 검사는 문제가 없다는 근거가 아닙니다."),
     "s_healthy": ("What the healthy verdict covers: the {n} baseline checks ran to completion and found nothing. "
-                  "What is listed below as could not judge, not run or not examined is outside the verdict.",
+                  "What is listed as could not judge, not run or not examined is outside the verdict.",
                   "정상 판정이 다루는 범위: 기본 검사 {n}개가 끝까지 실행되어 아무것도 발견하지 못했다는 것입니다. "
-                  "아래에서 판단하지 못함, 실행하지 않음, 확인하지 못한 것으로 적힌 항목은 이 판정에 포함되지 않습니다."),
+                  "판단 불가, 실행 안 함, 확인하지 못한 것으로 적힌 항목은 이 판정에 포함되지 않습니다."),
+    # the four status words of the design system (docs/ui-redesign/DESIGN_SYSTEM_KO.md), identical in the live UI
     "g_FAIL": ("Found a problem", "이상 발견"),
-    "g_INCONCLUSIVE": ("Could not judge", "판단하지 못함"),
-    "g_PASS": ("Clean", "이상 없음"),
-    "g_SKIPPED": ("Not run", "실행하지 않음"),
+    "g_INCONCLUSIVE": ("Could not judge", "판단 불가"),
+    "g_PASS": ("Passed", "통과"),
+    "g_SKIPPED": ("Not run", "실행 안 함"),
     "g_other": ("Also not examined", "그 밖에 확인하지 못한 것"),
     "g_fail_row": ("{name}: looks for {what}; it is the basis of finding {fi}.",
                    "{name}: 이 검사가 찾는 것은 '{what}'이며, 발견 {fi}의 근거입니다."),
@@ -438,6 +441,28 @@ T: Dict[str, Tuple[str, str]] = {
     "st_ERROR": ("the check itself ended with an error", "검사 자체가 오류로 끝남"),
     "st_UNSUPPORTED": ("not supported on this target", "이 대상에서 지원되지 않음"),
     "st_TIMEOUT": ("the check ran out of time", "검사 시간이 초과됨"),
+    # target card
+    "t_proc": ("Process", "프로세스"), "t_arch": ("Architecture", "아키텍처"), "t_kernel": ("Target kernel", "대상 커널"),
+    "t_exe": ("Executable", "실행 파일"), "t_build": ("Build ID", "빌드 ID"), "t_debug": ("Debug info", "디버그 정보"),
+    "t_transport": ("Transport", "전송"), "t_unknown": ("unknown", "알 수 없음"), "t_none": ("none", "없음"),
+    "t_bid_MATCHED": ("matches the debug info", "디버그 정보와 일치"),
+    "t_bid_MISMATCHED": ("does not match the debug info", "디버그 정보와 불일치"),
+    "t_bid_UNKNOWN": ("comparison with the debug info not recorded", "디버그 정보와의 비교가 기록되지 않음"),
+    "t_local": ("local (this host)", "로컬 (이 호스트)"), "t_ssh": ("SSH to {host}", "SSH ({host})"),
+    "t_redetected": (" (re-read at export time, not recorded during the diagnosis)",
+                     " (진단 때 기록되지 않아 보고서를 만들 때 다시 읽음)"),
+    # the four figures of the tiles (Markdown has no tiles: one line, same place)
+    "gl_line": ("**At a glance**: {x}.", "**한눈에 보기**: {x}."),
+    "gl_checks": ("{run} checks run", "검사 {run}개 실행"), "gl_notrun": (" (+{n} not run)", " (실행 안 함 {n}개 별도)"),
+    "gl_stop": ("target stop time {ms}", "대상 정지 시간 {ms}"), "gl_never": (", never paused", ", 한 번도 멈추지 않음"),
+    "gl_bytes": ("data read {b}", "읽은 데이터 {b}"), "gl_dur": ("took {t}", "소요 시간 {t}"),
+    # not examined
+    "ne_pointer": ("The {u} check(s) that could not judge and the {n} that were not run are listed under '{sec}'.",
+                   "판단 불가 검사 {u}개와 실행 안 한 검사 {n}개는 '{sec}'에 있습니다."),
+    "m_mode": ("The process was read while it kept running (capture mode {mode}); the stop time is measured, not assumed.",
+               "프로세스가 실행되는 동안 읽었습니다 (수집 방식 {mode}). 정지 시간은 가정이 아니라 측정값입니다."),
+    "m_mode_stop": ("The process was paused while it was read (capture mode {mode}); the stop time is measured.",
+                    "읽는 동안 프로세스가 일시 정지되었습니다 (수집 방식 {mode}). 정지 시간은 측정값입니다."),
     # method and cost
     "m_target": ("Target: {who}{abi}, debug image {img}.", "대상: {who}{abi}, 디버그 이미지 {img}."),
     "m_target_noimg": ("Target: {who}{abi}, no debug image was used.", "대상: {who}{abi}, 디버그 이미지 없음."),
@@ -523,8 +548,8 @@ GLOSSARY: Dict[str, Tuple[str, str, str, str]] = {
                  "실행 가능 비율", "샘플 중 스레드가 대기하지 않고 실행할 준비가 되어 있던 비율."),
     "zerostop": ("zero-stop", "the process was read while it kept running; it was never paused.",
                  "무중단(zero-stop)", "프로세스가 계속 실행되는 상태에서 읽었고, 한 번도 멈추지 않았다는 뜻."),
-    "debug": ("debug image", "the build of the program that still carries variable and line information (DWARF).",
-              "디버그 이미지", "변수와 줄 정보(DWARF)가 남아 있는 프로그램 빌드."),
+    "debug": ("debug info (debug image)", "the build of the program that still carries variable and line information "
+              "(DWARF).", "디버그 정보(디버그 이미지)", "변수와 줄 정보(DWARF)가 남아 있는 프로그램 빌드."),
     "verdict": ("confirmed / probable / could not decide", "confirmed = proven by the evidence, probable = likely but "
                 "not fully proven, could not decide = the checks gave no answer (this does not mean the process is fine).",
                 "확정 / 추정 / 판단 불가", "확정(확인된 결함, 확정된 근본 원인) = 증거로 입증됨, 추정(결함 추정, 추정 원인) "
@@ -554,6 +579,7 @@ class _Ctx:
         self.i = 1 if lang == "ko" else 0
         self.lang = lang
         self.terms: List[str] = []
+        self.extra: Dict[str, Any] = {}
 
     def t(self, key: str, **kw: Any) -> str:
         return T[key][self.i].format(**kw)
@@ -966,7 +992,7 @@ def _healthy_sentence(ctx: _Ctx, who: str, res: Dict[str, Any]) -> str:
     The full wording of every not-checked item is in the scope section."""
     scope = res.get("healthy_scope") if isinstance(res.get("healthy_scope"), dict) else {}
     if not scope.get("healthy"):
-        return ctx.t("c_healthy_noscope2", who=who, sec=ctx.t("s_scope"))
+        return ctx.t("c_healthy_noscope2", who=who, sec=ctx.t("s_not_examined"))
     from .healthy_verdict import display_label
     shown: List[str] = []
     for x in scope.get("not_checked") or []:
@@ -1400,10 +1426,85 @@ def _section4(ctx: _Ctx, res: Dict[str, Any], rows: List[Dict[str, Any]]) -> Lis
                     out += ["", f"{ctx.t('g_extra', n=len(extra))}:"] + _by_domain(ctx, extra)
             else:
                 out += _by_domain(ctx, grp)
-    other = _not_examined_lines(ctx, res)
-    if other:
-        out += ["", f"### {ctx.t('g_other')}", ""] + other
     return out
+
+
+def _section_not_examined(ctx: _Ctx, res: Dict[str, Any], rows: List[Dict[str, Any]]) -> List[str]:
+    """What could not be examined beyond the checks themselves; the undecided / not-run checks stay in the check
+    section and are only pointed to here (said once)."""
+    other = _not_examined_lines(ctx, res)
+    if not other:
+        return []
+    cnt = check_counts(rows)
+    out: List[str] = []
+    if cnt["undecided"] or cnt["not_run"]:
+        out += [ctx.t("ne_pointer", u=cnt["undecided"], n=cnt["not_run"], sec=ctx.t("s_scope")), ""]
+    return out + other
+
+
+def _section_target(ctx: _Ctx, res: Dict[str, Any], report: Optional[Dict[str, Any]],
+                    repro: Optional[Dict[str, Any]]) -> List[str]:
+    """The target card: what was diagnosed (identity stated once; the method section does not repeat it)."""
+    t = res.get("target") or {}
+    sec_b = (report or {}).get("section_b_target_context") or {}
+    repro = repro or {}
+    unk = ctx.t("t_unknown")
+    sfx = ctx.t("t_redetected") if repro.get("target_source") == "export_time_detection" else ""
+    out: List[str] = []
+    name = t.get("process_name") or sec_b.get("target_process_name")
+    out.append(f"- {ctx.t('t_proc')}: " + (f"{_c(name)} " if name else "") + f"(pid {t.get('pid') or sec_b.get('pid')})")
+    abi = t.get("abi") if isinstance(t.get("abi"), dict) else {}
+    arch = repro.get("target_arch") or (abi.get("architecture") if abi.get("status") == "DETECTED" else None)
+    libc = repro.get("target_libc") or (abi.get("libc") if abi.get("status") == "DETECTED" else None)
+    out.append(f"- {ctx.t('t_arch')}: {_c(arch or unk)}" + (f" · {_c(libc)}" if libc else "") + (sfx if arch else ""))
+    out.append(f"- {ctx.t('t_kernel')}: {_c(repro.get('target_kernel') or unk)}" + (sfx if repro.get("target_kernel") else ""))
+    exe = sec_b.get("binary_path")
+    if exe:
+        out.append(f"- {ctx.t('t_exe')}: {_c(exe)}")
+    bid_rows = repro.get("build_id_checks") or []
+    bid = (bid_rows[0] if len(bid_rows) == 1 else {}) or {}
+    build = (sec_b.get("build_id") or bid.get("process_build_id") or (ctx.extra or {}).get("build_id"))
+    status = str(bid.get("status") or "UNKNOWN")
+    out.append(f"- {ctx.t('t_build')}: {_c(build or unk)} ({ctx.t('t_bid_' + (status if 't_bid_' + status in T else 'UNKNOWN'))})")
+    img = t.get("debug_image") or sec_b.get("companion_elf")
+    out.append(f"- {ctx.t('t_debug')}: " + (_c(img) if img else ctx.t("t_none")))
+    if t.get("transport") == "ssh" or t.get("host") or t.get("remote_host"):
+        out.append(f"- {ctx.t('t_transport')}: " + ctx.t("t_ssh", host=_c(t.get("host") or t.get("remote_host") or "?")))
+    else:
+        out.append(f"- {ctx.t('t_transport')}: " + ctx.t("t_local"))
+    return out
+
+
+def glance_parts(ctx: _Ctx, res: Dict[str, Any], rows: List[Dict[str, Any]]) -> List[Tuple[str, str, str]]:
+    """The four figures of the tiles: (key, value, note) for checks, target stop time, data read, duration."""
+    cnt = check_counts(rows)
+    ci = res.get("collection_impact") if isinstance(res.get("collection_impact"), dict) else {}
+    out: List[Tuple[str, str, str]] = []
+    if rows:
+        out.append(("checks", str(cnt["run"]), ""))
+    if isinstance(ci.get("measured_stop_ms"), (int, float)):
+        out.append(("stop", fmt_ms(ci["measured_stop_ms"], ctx.i),
+                    "never" if float(ci["measured_stop_ms"]) == 0 and ci.get("zero_stop") else ""))
+    if isinstance(ci.get("bytes_read"), (int, float)):
+        out.append(("bytes", fmt_bytes(ci["bytes_read"]), ""))
+    if isinstance(res.get("duration_s"), (int, float)):
+        out.append(("duration", fmt_ms(float(res["duration_s"]) * 1000.0, ctx.i), ""))
+    return out
+
+
+def _glance_line(ctx: _Ctx, res: Dict[str, Any], rows: List[Dict[str, Any]]) -> List[str]:
+    cnt = check_counts(rows)
+    parts = []
+    for key, val, note in glance_parts(ctx, res, rows):
+        if key == "checks":
+            parts.append(ctx.t("gl_checks", run=val) + (ctx.t("gl_notrun", n=cnt["not_run"]) if cnt["not_run"] else ""))
+        elif key == "stop":
+            parts.append(ctx.t("gl_stop", ms=val) + (ctx.t("gl_never") if note else ""))
+        elif key == "bytes":
+            parts.append(ctx.t("gl_bytes", b=val))
+        else:
+            parts.append(ctx.t("gl_dur", t=val))
+    return [ctx.t("gl_line", x=" · ".join(parts))] if parts else []
 
 
 def _abi_text(res: Dict[str, Any]) -> str:
@@ -1428,10 +1529,10 @@ def _section5(ctx: _Ctx, res: Dict[str, Any], renders: List[Dict[str, Any]]) -> 
         if "target_unreadable" not in kinds:
             out.append("- " + ctx.t("n_incon_stop"))
             if len(res.get("not_covered") or []) > 1:
-                out.append("- " + ctx.t("n_incon_nc2", sec=ctx.t("s_scope")))
+                out.append("- " + ctx.t("n_incon_nc2", sec=ctx.t("s_not_examined")))
         return out
     if v == "HEALTHY" and not findings:
-        return [ctx.t("n_healthy2", sec=ctx.t("s_scope"))]
+        return [ctx.t("n_healthy2", sec=ctx.t("s_not_examined"))]
     for i, (f, r) in enumerate(zip(findings, renders), 1):
         steps = list(r.get("next") or []) if r.get("registered") else []   # a registered text may give its own steps
         steps += [s for s in _finding_next(ctx, f, r) if s not in steps]
@@ -1475,30 +1576,18 @@ def fmt_bytes(n: Any) -> str:
 
 
 def _section6(ctx: _Ctx, res: Dict[str, Any], extra: Optional[Dict[str, Any]] = None) -> List[str]:
-    """How the diagnosis was done and what it cost: target identity, zero-stop statement, duration, data read."""
+    """How the diagnosis was done and what it cost, beyond what the target card and the four figures say: the
+    zero-stop statement, the observation, the CPU it used, ids and time of the report."""
     extra = extra or {}
-    t = res.get("target") or {}
-    who = _who(ctx, t)
-    abi = _abi_text(res).strip()
-    abi = ", " + abi[1:-1] if abi else ""
-    out = [ctx.t("m_target", who=who, abi=abi, img=_c(t["debug_image"])) if t.get("debug_image")
-           else ctx.t("m_target_noimg", who=who, abi=abi)]
-    if extra.get("build_id"):
-        out[-1] += ctx.t("m_build", b=_c(extra["build_id"]))
+    out: List[str] = []
     ci = res.get("collection_impact") or {}
     if not ci or ci.get("capture_mode") is None and ci.get("bytes_read") is None:
         out.append(ctx.t("m_none"))
     else:
         ctx.term("zerostop")
-        ms = fmt_ms(ci.get("measured_stop_ms") or 0.0, ctx.i)
-        out.append(ctx.t("m_zero" if ci.get("zero_stop") else "m_stop", ms=ms, mode=_c(ci.get("capture_mode") or "-")))
+        out.append(ctx.t("m_mode" if ci.get("zero_stop") else "m_mode_stop", mode=_c(ci.get("capture_mode") or "-")))
         if ci.get("wall_clock_ms") is not None:
-            line = ctx.t("m_time", obs=fmt_ms(ci.get("wall_clock_ms"), ctx.i), s=_num(ci.get("samples_collected")))
-            if isinstance(res.get("duration_s"), (int, float)):
-                line += ctx.t("m_total", tot=fmt_ms(float(res["duration_s"]) * 1000.0, ctx.i))
-            out.append(line)
-        if ci.get("bytes_read") is not None:
-            out.append(ctx.t("m_bytes", b=fmt_bytes(ci.get("bytes_read"))))
+            out.append(ctx.t("m_time", obs=fmt_ms(ci.get("wall_clock_ms"), ctx.i), s=_num(ci.get("samples_collected"))))
         if ci.get("impact_measured"):
             if ci.get("attributable_cpu_ms") is not None:
                 basis = ci.get("attributable_basis")
@@ -1592,15 +1681,23 @@ def _render_findings(ctx: _Ctx, findings: List[Dict[str, Any]], report: Optional
     return renders
 
 
-SECTION_ORDER = ("conclusion", "findings", "hypothesis", "next", "scope", "method", "reproducibility", "reference")
-_SECTION_TITLE = {"conclusion": "s_conclusion", "findings": "s_findings", "hypothesis": "s_hypothesis",
-                  "next": "s_next", "scope": "s_scope", "method": "s_method", "reproducibility": "s_repro",
+# The card order of the design system (docs/ui-redesign/DESIGN_SYSTEM_KO.md), shared by the live UI and the report:
+# verdict -> tiles -> target -> findings -> checks -> not examined -> next steps, then the report-only reference
+# material.  "tiles" has no heading (the Markdown shows its four figures as one line at the end of the conclusion);
+# every other key is a section.  The live UI's tests compare their card order against this constant.
+REPORT_SECTION_ORDER = ("conclusion", "tiles", "target", "findings", "checks", "not_examined", "next",
+                        "hypothesis", "method", "reproducibility", "reference")
+SECTION_ORDER = tuple(k for k in REPORT_SECTION_ORDER if k != "tiles")
+_SECTION_TITLE = {"conclusion": "s_conclusion", "target": "s_target", "findings": "s_findings",
+                  "checks": "s_scope", "not_examined": "s_not_examined", "next": "s_next",
+                  "hypothesis": "s_hypothesis", "method": "s_method", "reproducibility": "s_repro",
                   "reference": "s_reference"}
 
 
 def compose(result: Dict[str, Any], report: Optional[Dict[str, Any]] = None, lang: str = "en", *,
             pointers: bool = False, method_extra: Optional[Dict[str, Any]] = None,
-            extra_sections: Optional[Dict[str, List[str]]] = None) -> Dict[str, Any]:
+            extra_sections: Optional[Dict[str, List[str]]] = None,
+            repro: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """The common outline of every report, as data: ``sections`` is a list of ``{key, title, lines}`` in the order
     of ``SECTION_ORDER`` (sections with nothing to say are left out); ``blocks`` are the per-finding parts, ``rows``
     and ``counts`` the one check table.  Markdown and HTML are both rendered from this.
@@ -1612,6 +1709,13 @@ def compose(result: Dict[str, Any], report: Optional[Dict[str, Any]] = None, lan
     res = dict(result or {})
     report = report if isinstance(report, dict) else (res.get("report") if isinstance(res.get("report"), dict) else None)
     ctx = _Ctx(lang)
+    ctx.extra = dict(method_extra or {})
+    if repro is None:
+        try:
+            from .reproducibility import build_reproducibility
+            repro = build_reproducibility(report or {}, res).to_dict()
+        except Exception:  # noqa: BLE001 - the target card then shows what the result itself carries
+            repro = {}
     findings = [f for f in (res.get("findings") or []) if isinstance(f, dict)]
     res["findings"] = findings
     renders = _render_findings(ctx, findings, report)
@@ -1622,14 +1726,17 @@ def compose(result: Dict[str, Any], report: Optional[Dict[str, Any]] = None, lan
     sym = _symptom_note(ctx, res)
     if sym:
         concl += [""] + sym
+    glance = _glance_line(ctx, res, rows)
     blocks = _finding_blocks(ctx, res, renders, report, rows)
     extra_sections = extra_sections or {}
     body: Dict[str, List[str]] = {
-        "conclusion": concl,
+        "conclusion": concl + ([""] + glance if glance else []),
+        "target": _section_target(ctx, res, report, repro),
         "findings": _section2(ctx, blocks) if blocks else [],
-        "hypothesis": list(extra_sections.get("hypothesis") or []),
+        "checks": _section4(ctx, res, rows),
+        "not_examined": _section_not_examined(ctx, res, rows),
         "next": _section5(ctx, res, renders),
-        "scope": _section4(ctx, res, rows),
+        "hypothesis": list(extra_sections.get("hypothesis") or []),
         "method": _section6(ctx, res, method_extra),
         "reproducibility": list(extra_sections.get("reproducibility") or []),
     }
@@ -1647,7 +1754,8 @@ def compose(result: Dict[str, Any], report: Optional[Dict[str, Any]] = None, lan
         s["heading"] = f"{n}. {s['title']}"
     return {"lang": lang, "ctx": ctx, "res": res, "report": report, "renders": renders, "blocks": blocks, "rows": rows,
             "counts": check_counts(rows), "verdict": verdict, "verdict_line": concl[0], "conclusion": concl[2],
-            "symptom_note": sym, "glossary": g, "sections": sections,
+            "symptom_note": sym, "glossary": g, "sections": sections, "glance": glance_parts(ctx, res, rows),
+            "repro": repro,
             "scope_head": _scope_head(ctx, res, rows), "not_examined": _not_examined_lines(ctx, res)}
 
 

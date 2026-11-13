@@ -287,7 +287,14 @@ def render_html(s: ReproducibilitySection, language: str = "en") -> str:
 # results in words, local times with the timezone stated once, recipe start times as offsets from the start of the
 # observation).  The exact timestamps of every check are in ``detail_html`` (a collapsed block) and in the JSON.
 _O: Dict[str, Any] = {
-    "h_rec": ("Checks run, in order, with their recipe versions", "실행한 검사와 레시피 버전 (실행 순서)"),
+    "h_rec": ("Checks run, with their recipe versions", "실행한 검사와 레시피 버전"),
+    "window": ("{a} to {b}", "{a} ~ {b}"),
+    "n_checks": (" checks", "개"),
+    "v_common": ("{v} for {n} of them", "{n}개는 {v}"),
+    "where": ("The order, version, start time and duration of every check are in the detail block of the HTML report "
+              "and in the JSON (`reproducibility.recipes`).",
+              "검사별 실행 순서, 레시피 버전, 시작 시각, 걸린 시간은 HTML 보고서의 상세 블록과 JSON "
+              "(`reproducibility.recipes`)에 있습니다."),
     "rec_cols": (("#", "Check", "Version", "Result", "Started (after the window opened)", "Took", "Samples"),
                  ("순번", "검사", "버전", "결과", "시작 (관측 시작 후)", "걸린 시간", "표본")),
     "detail": ("Exact start and end times of every check, as recorded", "검사별 정확한 시작·종료 시각 (기록 그대로)"),
@@ -335,46 +342,53 @@ def _rec_outline_cells(r: Dict[str, Any], start: Any, li: int) -> List[str]:
 
 
 def outline_markdown(s: ReproducibilitySection, language: str = "en") -> List[str]:
-    """The section's Markdown lines for the incident report outline (without its heading)."""
+    """The section's Markdown lines for the incident report outline (without its heading): only the short facts.
+    The target kernel / architecture / libc and the build-ID match are in the report's target card; the per-check
+    table (order, version, start offset, duration) is in ``detail_html`` and in the opt-in Markdown appendix."""
     li = 1 if language == "ko" else 0
     o = s.observation or {}
-    # samples and wall-clock time are stated once, in "How the diagnosis was done"
-    obs = [(_t("start", li), _local(o.get("started_at"), li)), (_t("end", li), _local(o.get("ended_at"), li))]
-    obs += _obs_pairs(s, li)[2:4]
-    out = [_t("intro", li), "", f"**{_t('h_env', li)}**"]
-    out += [f"- {k}: `{v}`" for k, v in _env_pairs(s, li)]
-    out += ["", f"**{_t('h_bid', li)}**", "", "| " + " | ".join(_t("bid_cols", li)) + " |",
-            "| " + " | ".join([":---"] * 5) + " |"]
-    for r in s.build_id_checks or []:
-        out.append("| " + " | ".join(f"`{c}`" for c in _bid_cells(r, li)) + " |")
-    out += ["", _t("bid_scope", li) + ("" if any(r.get("note") != "not_recorded" for r in s.build_id_checks or [])
-                                       else " " + _t("bid_nr", li))]
-    out += ["", f"**{_t('h_obs', li)}**"] + [f"- {k}: `{v}`" for k, v in obs]
-    out += ["", f"**{_o('h_rec', li)}**", ""]
+    tool = _env_pairs(s, li)[0]
+    window = _o("window", li).format(a=_local(o.get("started_at"), li), b=_local(o.get("ended_at"), li))
+    extra = [p for p in _obs_pairs(s, li)[2:4] if p[1] != _t("unknown", li)]
+    window += "".join(f", {k} {v}" for k, v in extra)
+    out = [_t("intro", li), "", f"- {tool[0]}: `{tool[1]}`", f"- {_t('h_obs', li)}: {window}"]
     if s.recipes:
-        rows = [_rec_outline_cells(r, o.get("started_at"), li) for r in s.recipes]
-        cols = list(_o("rec_cols", li))
-        if all(r.get("samples") is None for r in s.recipes):      # a column of "unknown" says nothing
-            cols, rows = cols[:-1], [r[:-1] for r in rows]
-        out += ["| " + " | ".join(cols) + " |", "| " + " | ".join([":---"] * len(cols)) + " |"]
-        out += ["| " + " | ".join(r) + " |" for r in rows]
+        versions: Dict[str, List[str]] = {}
+        for r in s.recipes:
+            versions.setdefault(str(r.get("recipe_version") or _t("unknown", li)), []).append(str(r.get("recipe_id")))
+        common = max(versions, key=lambda v: len(versions[v]))
+        from .human_report import check_label
+        parts = [_o("v_common", li).format(v=f"`{common}`", n=len(versions[common]))]
+        parts += [f"`{v}`: " + ", ".join(check_label(x, li) for x in ids) for v, ids in versions.items() if v != common]
+        out.append(f"- {_o('h_rec', li)}: {len(s.recipes)}" + _o("n_checks", li) + " (" + "; ".join(parts) + ")")
+        out.append("- " + _o("where", li))
     else:
-        out.append(_t("rec_none", li))
+        out.append(f"- {_o('h_rec', li)}: {_t('rec_none', li)}")
     return out
 
 
 def detail_html(s: ReproducibilitySection, language: str = "en") -> str:
-    """The recorded start / end timestamps and check ids of every executed check (the detail behind the section)."""
+    """The detail behind the section: every executed check in order with its recipe version, start offset and
+    duration, the build-ID comparison, and the recorded timestamps exactly as stored."""
     e = html.escape
-    if not s.recipes:
-        return ""
-    head = "".join(f"<th>{e(c)}</th>" for c in ("#", "Recipe", "Check ID", "Version", "Status", "Started", "Ended",
-                                                 "Duration", "Samples", "Sampling window"))
-    rows = "".join("<tr>" + "".join(f"<td>{e(str(x) if x is not None else 'unknown')}</td>" for x in (
-        r.get("order"), r.get("recipe_id"), r.get("check_id"), r.get("recipe_version"), r.get("status"),
-        r.get("started_at"), r.get("ended_at"), r.get("duration_s"), r.get("samples"), r.get("sampling_window_s")))
-        + "</tr>" for r in s.recipes)
+    li = 1 if language == "ko" else 0
     o = s.observation or {}
-    obs = "".join(f"<li><strong>{e(k)}</strong>: <code>{e(str(v))}</code></li>" for k, v in o.items())
-    return (f"<p><strong>Observation window (as recorded)</strong></p><ul>{obs}</ul>"
-            f'<div class="dsd-scroll"><table><tr>{head}</tr>{rows}</table></div>')
+    out = []
+    if s.recipes:
+        from .human_report import _inline_html
+        rows = [_rec_outline_cells(r, o.get("started_at"), li) for r in s.recipes]
+        cols = list(_o("rec_cols", li))
+        if all(r.get("samples") is None for r in s.recipes):
+            cols, rows = cols[:-1], [r[:-1] for r in rows]
+        cols += ["Started (recorded)", "Ended (recorded)"]
+        rows = [r + [str(x.get("started_at") or ""), str(x.get("ended_at") or "")] for r, x in zip(rows, s.recipes)]
+        out.append('<div class="dsd-scroll"><table class="table"><tr>' + "".join(f"<th>{e(c)}</th>" for c in cols) + "</tr>"
+                   + "".join("<tr>" + "".join(f"<td>{_inline_html(c)}</td>" for c in r) + "</tr>" for r in rows)
+                   + "</table></div>")
+    if s.build_id_checks:
+        out.append('<div class="dsd-scroll"><table class="table"><tr>' + "".join(f"<th>{e(c)}</th>" for c in _t("bid_cols", li))
+                   + "</tr>" + "".join("<tr>" + "".join(f"<td><code>{e(c)}</code></td>" for c in _bid_cells(r, li)) + "</tr>"
+                                       for r in s.build_id_checks) + "</table></div>")
+    out.append("<p><strong>Observation window (as recorded)</strong></p><ul>"
+               + "".join(f"<li><strong>{e(k)}</strong>: <code>{e(str(v))}</code></li>" for k, v in o.items()) + "</ul>")
+    return "".join(out)

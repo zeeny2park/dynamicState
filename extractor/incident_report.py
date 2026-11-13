@@ -151,17 +151,14 @@ def _detail_appendix_markdown(parts: Dict[str, Any], comp: Dict[str, Any], li: i
     return out
 
 
-_PAGE_CSS = """
-html { -webkit-text-size-adjust: 100%; }
-body { margin: 0; padding: 16px; background: #f1f5f9; color: #0f172a; }
-@media (prefers-color-scheme: dark) { body { background: #020617; color: #e2e8f0; } }
-"""
+# The page itself adds nothing: background, type and colours come from the shared theme the body inlines
+# (report_visuals.theme_style), light or dark by the OS setting or a .dark class on <html>.
 
 
 def _page(title: str, lang: str, body: str) -> str:
     return ("<!DOCTYPE html>\n<html lang=\"" + lang + "\"><head>\n<meta charset=\"utf-8\">\n"
             "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n"
-            f"<title>{html.escape(title)}</title>\n<style>{_PAGE_CSS}</style>\n</head>\n<body>\n{body}\n</body>\n</html>\n")
+            f"<title>{html.escape(title)}</title>\n</head>\n<body>\n{body}\n</body>\n</html>\n")
 
 
 def _limitation_text(nc: Dict[str, Any]) -> str:
@@ -329,8 +326,9 @@ def _demote_headings(md: str) -> List[str]:
 def _html_fallback(title: str, verdict: str, summary_md: str, lang: str = "en", human_md: str = "") -> str:
     """Plain page used only when the structured page could not be built: the Markdown report, escaped."""
     from .human_report import markdown_to_html
-    return _page(title, lang, f'<main class="ds-fallback" lang="{lang}" data-verdict="{html.escape(verdict)}">'
-                 + markdown_to_html(summary_md) + "</main>")
+    from .report_visuals import theme_style
+    return _page(title, lang, theme_style(lang) + f'<main class="ds-fallback card" lang="{lang}" data-verdict="{html.escape(verdict)}">'
+                 + '<div class="card-content">' + markdown_to_html(summary_md) + "</div></main>")
 
 
 def _compose_markdown(title: str, comp: Dict[str, Any], appendix: List[str]) -> str:
@@ -538,7 +536,8 @@ def export_incident_report(
     comp = compose(view, report, language, pointers=True,
                    method_extra={"build_id": build_id or sec_b_build_id, "generated": _generated_at()},
                    extra_sections={"hypothesis": _hypothesis_lines(hyp_res, li),
-                                   "reproducibility": _reproducibility_section(repro, language)})
+                                   "reproducibility": _reproducibility_section(repro, language)},
+                   repro=res["reproducibility"])
     from .report_detail import partition
     parts = partition(view, report, comp["rows"])
     parts["reproducibility"] = repro_detail_html(repro, language)

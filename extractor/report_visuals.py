@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import html
 import math
+import os
 import re
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -44,12 +45,12 @@ _L: Dict[str, Tuple[str, str]] = {
     "nav_detail": ("Detailed report", "상세 보고서"),
     "verdict": ("Verdict", "판정"),
     "checks": ("Checks", "검사"),
-    "checks_run": ("Checks run", "실행한 검사"),
+    "checks_run": ("Checks", "검사"),
     "checks_not_run": ("+ {n} not run", "실행하지 않은 검사 {n}개 별도"),
     "stop_time": ("Target stop time", "대상 정지 시간"),
     "zero_stop": ("never paused", "한 번도 멈추지 않음"),
     "bytes_read": ("Data read", "읽은 데이터"),
-    "duration": ("Diagnosis time", "진단 소요 시간"),
+    "duration": ("Time taken", "소요 시간"),
     "no_findings": ("No problem was found within the checked scope. The check list below shows what was and was not "
                     "examined.",
                     "점검한 범위 안에서는 문제가 발견되지 않았습니다. 무엇을 검사했고 무엇을 검사하지 못했는지는 아래 "
@@ -180,14 +181,15 @@ _L: Dict[str, Tuple[str, str]] = {
     "ck_intro": ("Every check the diagnosis considered, by outcome. Select a row for what it looks for and what it found.",
                  "진단이 고려한 모든 검사를 결과별로 정리했습니다. 행을 선택하면 무엇을 확인하는 검사이고 무엇이 나왔는지 볼 수 있습니다."),
     "ck_all": ("All", "전체"),
-    "ck_FAIL": ("Found a problem", "이상 발견"), "ck_PASS": ("Clean", "이상 없음"),
-    "ck_INCONCLUSIVE": ("Could not judge", "판단하지 못함"), "ck_SKIPPED": ("Not run", "실행하지 않음"),
+    # the four status words of the design system (same as human_report.T g_*, same as the live UI)
+    "ck_FAIL": ("Found a problem", "이상 발견"), "ck_PASS": ("Passed", "통과"),
+    "ck_INCONCLUSIVE": ("Could not judge", "판단 불가"), "ck_SKIPPED": ("Not run", "실행 안 함"),
     "ck_ERROR": ("Error", "오류"),
     "ck_FAIL_hint": ("the check found what it looks for", "검사가 찾던 이상을 발견함"),
     "ck_PASS_hint": ("ran to completion and found nothing", "끝까지 실행했고 아무것도 발견하지 못함"),
     "ck_INCONCLUSIVE_hint": ("ran but could not reach an answer; not evidence that the process is fine",
                              "실행했지만 답을 내지 못함. 문제가 없다는 근거가 아님"),
-    "ck_SKIPPED_hint": ("not executed; not evidence that the process is fine", "실행하지 않음. 문제가 없다는 근거가 아님"),
+    "ck_SKIPPED_hint": ("not executed; not evidence that the process is fine", "실행되지 않음. 문제가 없다는 근거가 아님"),
     "ck_ERROR_hint": ("the check itself failed", "검사 자체가 실패함"),
     "ck_what": ("Looks for", "확인하는 것"), "ck_result": ("Result", "결과"),
     "ck_why": ("Why no answer", "답을 내지 못한 이유"), "ck_time": ("Time", "소요 시간"),
@@ -208,6 +210,9 @@ _L: Dict[str, Tuple[str, str]] = {
     "d_scope": ("Check totals and limitations (detailed records, English)", "검사 집계와 제한 사항 (상세 기록, 영문)"),
     "d_method": ("Target, collection and plan (detailed records, English)", "대상·수집·계획 상세 (상세 기록, 영문)"),
     "d_other": ("Other detailed records (English)", "그 밖의 상세 기록 (영문)"),
+    "ck_desc": ("{run} run · {n} not run", "실행 {run} · 실행 안 함 {n}"),
+    "ck_open_hint": ("Select a row to see that check's result", "행을 누르면 그 검사의 결과가 펼쳐집니다"),
+    "ne_right": ("not evidence that the process is fine", "문제가 없다는 근거가 아님"),
     "d_repro": ("Exact start and end time of every check (detailed records, English)",
                 "검사별 정확한 시작·종료 시각 (상세 기록, 영문)"),
 }
@@ -266,77 +271,105 @@ _RECIPES: Dict[str, Tuple[str, str, str, str, str]] = {
 _DOMAIN_ORDER = ("CONCURRENCY", "MEMORY_INTEGRITY", "MEMORY_GROWTH", "ABNORMAL_STATE", "OTHER")
 _STATUS_ORDER = ("FAIL", "INCONCLUSIVE", "PASS", "SKIPPED")   # = human_report.CHECK_GROUPS
 _STATUS_ICON = {"FAIL": "✖", "PASS": "✔", "INCONCLUSIVE": "?", "SKIPPED": "–", "ERROR": "!"}
-_THREAD_COLORS = ("#2563eb", "#9333ea", "#0d9488", "#c2410c", "#be185d", "#4d7c0f")
+_THREAD_COLORS = ("var(--chart-1)", "var(--chart-2)", "var(--chart-3)", "var(--chart-4)", "var(--chart-5)",
+                  "var(--info)")   # theme tokens, never raw colours
 _VERDICT_TONE = {"CONFIRMED_FAULT": "bad", "FAULT": "bad", "PROBABLE_FAULT": "warn", "DEGRADED": "warn",
                  "HEALTHY": "good", "INCONCLUSIVE": "unk", "ABORTED": "unk"}
 
 _CSS = """
-.dsv { --bg:#ffffff; --panel:#f8fafc; --ink:#0f172a; --mute:#64748b; --line:#cbd5e1; --soft:#e2e8f0;
-  --bad:#b91c1c; --bad-bg:#fee2e2; --warn:#b45309; --warn-bg:#fef3c7; --good:#15803d; --good-bg:#dcfce7;
-  --unk:#475569; --unk-bg:#e2e8f0; --buf:#dbeafe; --buf-line:#3b82f6; --hdr:#e2e8f0; --accent:#2563eb;
-  max-width: 1100px; margin: 0 auto 24px; color: var(--ink);
-  font: 15px/1.6 -apple-system, "Segoe UI", "Noto Sans KR", "Apple SD Gothic Neo", sans-serif; }
-@media (prefers-color-scheme: dark) {
-  .dsv { --bg:#0f172a; --panel:#1e293b; --ink:#e2e8f0; --mute:#94a3b8; --line:#475569; --soft:#334155;
-    --bad:#f87171; --bad-bg:#450a0a; --warn:#fbbf24; --warn-bg:#451a03; --good:#4ade80; --good-bg:#052e16;
-    --unk:#cbd5e1; --unk-bg:#334155; --buf:#1e3a8a; --buf-line:#60a5fa; --hdr:#334155; --accent:#60a5fa; }
-}
-.dsv *, .dsv *::before, .dsv *::after { box-sizing: border-box; }
-.dsv code, .dsv .dsv-mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 13px; }
-.dsv code { background: var(--soft); padding: 1px 5px; border-radius: 4px; overflow-wrap: anywhere; }
-.dsv h2 { font-size: 20px; margin: 28px 0 10px; padding: 0; border: 0; color: var(--ink); }
-.dsv h3 { font-size: 16px; margin: 0 0 8px; color: var(--ink); }
-.dsv h4 { font-size: 14px; margin: 18px 0 6px; color: var(--ink); }
+/* Report layout only.  Colours, type, radius and the components (card, badge, collapsible, table, status icon,
+   progress) come from the shared theme (load_theme); the .dsv-* picture classes take the theme through its bridge
+   block.  No colour value is written here: only var(--token). */
+.dsv { max-width: 920px; margin: 0 auto; padding: 22px 16px 60px; display: flex; flex-direction: column; gap: 12px; }
+.dsv code, .dsv .dsv-mono { font-family: var(--font-mono); font-size: 12.5px; }
 .dsv p { margin: 6px 0; }
-.dsv-card { background: var(--bg); border: 1px solid var(--line); border-radius: 10px; padding: 18px 22px; margin: 14px 0; }
-.dsv-hero { border-left: 8px solid var(--tone); }
-.dsv-tone-bad { --tone: var(--bad); --tone-bg: var(--bad-bg); } .dsv-tone-warn { --tone: var(--warn); --tone-bg: var(--warn-bg); }
-.dsv-tone-good { --tone: var(--good); --tone-bg: var(--good-bg); } .dsv-tone-unk { --tone: var(--unk); --tone-bg: var(--unk-bg); }
-.dsv-title { font-size: 22px; font-weight: 700; margin: 0 0 4px; border: 0; padding: 0; line-height: 1.3; overflow-wrap: anywhere; }
-.dsv-badge { display: inline-block; padding: 2px 10px; border-radius: 999px; font-weight: 700; font-size: 13px;
-  background: var(--tone-bg); color: var(--tone); border: 1px solid var(--tone); white-space: nowrap; }
+.dsv ul, .dsv ol { margin: 6px 0; padding-left: 20px; } .dsv li { margin: 3px 0; }
+.dsv .card-content > :first-child { margin-top: 0; } .dsv .card-content > :last-child { margin-bottom: 0; }
+.dsv .card-content h3 { margin: 16px 0 6px; } .dsv .card-content h3:first-child { margin-top: 0; }
+.dsv .card-content pre { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); padding: 8px 10px;
+  overflow-x: auto; font-size: 12px; }
+.dsv .card-content .collapsible { margin-top: 12px; }
+/* masthead and verdict banner */
+.dsv .masthead { padding: 18px 22px; }
+.dsv .masthead h1 { font-size: 20px; overflow-wrap: anywhere; }
+.dsv .masthead .meta { color: var(--muted-foreground); font-size: 12.5px; margin-top: 4px; display: flex; gap: 6px 8px; flex-wrap: wrap; }
+.dsv .masthead nav { display: flex; flex-wrap: wrap; gap: 6px 14px; margin-top: 10px; font-size: 12.5px; }
+.dsv .banner .line1 { display: flex; align-items: center; gap: 8px 10px; flex-wrap: wrap; }
+.dsv .banner .line1 .text-muted { font-size: 12.5px; }
+.dsv .banner .sum { margin: 10px 0 0; font-size: 16px; line-height: 1.5; }
+.dsv .banner .note { margin: 8px 0 0; font-size: 13px; color: var(--muted-foreground); }
+/* tiles */
+.dsv .tiles { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px; }
+.dsv .tile { padding: 10px 12px; }
+.dsv .tile .k { font-size: 12px; color: var(--muted-foreground); }
+.dsv .tile .v { font-size: 20px; font-weight: 600; letter-spacing: -.01em; margin-top: 2px; font-variant-numeric: tabular-nums; }
+.dsv .tile .s { font-size: 11.5px; color: var(--muted-foreground); margin-top: 2px; }
+.dsv .tile .progress-stack { margin-top: 6px; }
+/* target */
+.dsv .kv { display: grid; grid-template-columns: 1.4fr 1fr; gap: 7px 28px; font-size: 13px; margin: 0; }
+.dsv .kv div { display: flex; gap: 8px; align-items: baseline; min-width: 0; }
+.dsv .kv dt { color: var(--muted-foreground); flex: none; width: 84px; margin: 0; }
+.dsv .kv dd { margin: 0; min-width: 0; overflow-wrap: anywhere; }
+/* findings */
+.dsv .finding + .finding { border-top: 1px solid var(--border); margin-top: 18px; padding-top: 18px; }
+.dsv .fhead { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-bottom: 6px; }
+.dsv .fhead h3 { margin: 0; }
+.dsv-keyfacts { list-style: none; padding-left: 0 !important; font-size: 13px; }
+/* checks: rows as in the live UI (status icon · name · domain · one-line result), each row opens in place */
+.dsv .ckhead { display: flex; align-items: center; gap: 8px; margin: 16px 0 4px; font-size: 13px; font-weight: 600; }
+.dsv .ckhead small { font-weight: 400; color: var(--muted-foreground); font-size: 12px; }
+.dsv .dsv-ckgroup > summary small { font-weight: 400; color: var(--muted-foreground); font-size: 12px; }
+details.dsv-ck { border-top: 1px solid var(--border); font-size: 13px; }
+details.dsv-ck > summary { list-style: none; cursor: pointer; display: flex; align-items: center; gap: 10px; padding: 7px 4px; border-radius: 4px; }
+details.dsv-ck > summary::-webkit-details-marker { display: none; }
+details.dsv-ck > summary:hover { background: var(--accent); }
+.dsv-ck-main { display: flex; flex-direction: column; min-width: 0; flex: 1; }
+.dsv-ck-name { font-weight: 500; } .dsv-ck-cat { color: var(--muted-foreground); font-size: 12px; margin-left: 6px; }
+.dsv-ck-line { color: var(--muted-foreground); font-size: 12.5px; overflow-wrap: anywhere; }
+.dsv-ck-ms { color: var(--muted-foreground); font-family: var(--font-mono); font-size: 11.5px; flex: none; }
+.dsv-ck dl { display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: 4px 14px; margin: 0; padding: 4px 4px 10px 32px; }
+.dsv-ck dt { color: var(--muted-foreground); } .dsv-ck dd { margin: 0; overflow-wrap: anywhere; }
+.dsv-ck .collapsible { margin: 0 4px 10px 32px; }
+/* detailed records (English) in place: the theme's Collapsible */
+.dsv-detail-body { font-size: 12px; overflow-wrap: anywhere; }
+.dsv-detail-body h4 { margin: 10px 0 4px; }
+.dsv-detail-body .dsd-scroll { overflow-x: auto; }
+.dsv-detail-body table { border-collapse: collapse; width: 100%; min-width: 520px; margin: 4px 0; font-size: 12px; }
+.dsv-detail-body th, .dsv-detail-body td { border-bottom: 1px solid var(--border); padding: 4px 6px; text-align: left; vertical-align: top; }
+.dsv-detail-body th { color: var(--muted-foreground); font-weight: 500; }
+.dsv-detail-body td code { white-space: pre-wrap; word-break: break-all; }
+.dsv-detail-body .dsd-pre { white-space: pre-wrap; word-break: break-all; }
+.dsv-detail-body .meta-bar { color: var(--muted-foreground); }
+/* pictures of the findings (report-specific; colours through the bridge variables) */
 .dsv-chip { display: inline-block; padding: 1px 8px; border-radius: 999px; font-size: 12px; border: 1px solid var(--line);
   color: var(--mute); background: var(--panel); white-space: nowrap; }
 .dsv-chip-obs { color: var(--good); border-color: var(--good); } .dsv-chip-rec { color: var(--warn); border-color: var(--warn); }
 .dsv-chip-no { color: var(--unk); border-style: dashed; }
-.dsv-concl { font-size: 17px; margin: 10px 0 14px; }
-.dsv-tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; }
-.dsv-tile { background: var(--panel); border: 1px solid var(--soft); border-radius: 8px; padding: 10px 12px; }
-.dsv-tile b { display: block; font-size: 20px; line-height: 1.3; }
-.dsv-tile span { font-size: 12px; color: var(--mute); }
-.dsv-bar { display: flex; height: 10px; border-radius: 5px; overflow: hidden; background: var(--soft); margin: 6px 0 2px; }
-.dsv-bar i { display: block; height: 100%; }
+.dsv-bar { display: flex; height: 6px; border-radius: 3px; overflow: hidden; background: var(--soft); margin: 8px 0 4px; }
+.dsv-bar i { display: block; height: 100%; background: var(--sc); }
 .dsv-s-FAIL { --sc: var(--bad); --sb: var(--bad-bg); } .dsv-s-PASS { --sc: var(--good); --sb: var(--good-bg); }
 .dsv-s-INCONCLUSIVE { --sc: var(--warn); --sb: var(--warn-bg); } .dsv-s-SKIPPED { --sc: var(--unk); --sb: var(--unk-bg); }
-.dsv-s-ERROR { --sc: var(--bad); --sb: var(--bad-bg); }
-.dsv-bar i { background: var(--sc); }
-.dsv-nav { display: flex; flex-wrap: wrap; gap: 6px 14px; font-size: 13px; margin-top: 14px; }
-.dsv-nav a { color: var(--accent); text-decoration: none; } .dsv-nav a:hover { text-decoration: underline; }
-.dsv-fhead { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-bottom: 6px; }
-.dsv-fhead h3 { margin: 0; }
 .dsv-note { font-size: 13px; color: var(--mute); }
 .dsv-legend { display: flex; flex-wrap: wrap; gap: 4px 14px; font-size: 12px; color: var(--mute); margin: 8px 0 0; }
-.dsv-facts { margin: 8px 0 0; padding-left: 20px; font-size: 14px; } .dsv-facts li { margin: 3px 0; }
-/* stepper and filter: hidden radio inputs, labels drawn as buttons */
+.dsv-facts { margin: 8px 0 0; padding-left: 20px; font-size: 13px; } .dsv-facts li { margin: 3px 0; }
 .dsv-r { position: absolute; opacity: 0; width: 1px; height: 1px; margin: 0; pointer-events: none; }
-.dsv-r + label { display: inline-block; font-size: 13px; padding: 3px 12px; margin: 0 4px 8px 0; border-radius: 6px; cursor: pointer;
-  border: 1px solid var(--line); background: var(--panel); color: var(--ink); user-select: none; }
-.dsv-r + label:hover { border-color: var(--accent); }
-.dsv-r:checked + label { background: var(--ink); color: var(--bg); border-color: var(--ink); }
-.dsv-r:focus-visible + label { outline: 2px solid var(--accent); outline-offset: 2px; }
+.dsv-r + label { display: inline-block; font-size: 12.5px; padding: 2px 10px; margin: 0 4px 8px 0; border-radius: calc(var(--radius) - 2px);
+  cursor: pointer; border: 1px solid var(--line); background: var(--bg); color: var(--ink); user-select: none; }
+.dsv-r + label:hover { background: var(--panel); }
+.dsv-r:checked + label { background: var(--primary); color: var(--primary-foreground); border-color: var(--primary); }
+.dsv-r:focus-visible + label { outline: 2px solid var(--ring); outline-offset: 2px; }
 .dsv-r + label .dsv-n { font-weight: 700; margin-left: 5px; }
-.dsv-steplbl { font-size: 13px; color: var(--mute); margin-right: 6px; }
+.dsv-steplbl { font-size: 12.5px; color: var(--mute); margin-right: 6px; }
 @keyframes dsv-appear { from { opacity: 0; } to { opacity: 1; } }
 @media (prefers-reduced-motion: no-preference) {
   .dsv-rplay:checked ~ [data-step], .dsv-rplay:checked ~ * [data-step] { animation: dsv-appear .45s both; animation-delay: calc(var(--d) * 1.1s); }
 }
-.dsv-seq { display: grid; grid-template-columns: minmax(0, 1.25fr) minmax(0, 1fr); gap: 18px; align-items: start; }
-@media (max-width: 820px) { .dsv-seq { grid-template-columns: minmax(0, 1fr); } }
-.dsv-svgbox { overflow-x: auto; border: 1px solid var(--soft); border-radius: 8px; background: var(--panel); padding: 6px; }
+.dsv-seq { display: grid; grid-template-columns: minmax(0, 1.25fr) minmax(0, 1fr); gap: 18px; align-items: start; margin-top: 10px; }
+.dsv-svgbox { overflow-x: auto; border: 1px solid var(--line); border-radius: var(--radius); background: var(--panel); padding: 8px; }
 .dsv svg { display: block; max-width: 100%; height: auto; }
-.dsv svg text { fill: var(--ink); font-family: -apple-system, "Segoe UI", "Noto Sans KR", sans-serif; }
+.dsv svg text { fill: var(--ink); font-family: var(--font-sans); }
 .dsv svg .dsv-t-mute { fill: var(--mute); } .dsv svg .dsv-t-bad { fill: var(--bad); font-weight: 700; }
-.dsv svg .dsv-t-on { fill: #ffffff; font-weight: 700; }
+.dsv svg .dsv-t-on { fill: var(--info-foreground); font-weight: 700; }
 .dsv svg .dsv-life { stroke: var(--line); stroke-width: 1.5; stroke-dasharray: 4 4; }
 .dsv svg .dsv-lockbox { fill: var(--bg); stroke: var(--ink); stroke-width: 1.5; }
 .dsv svg .dsv-arrow { stroke: var(--ink); stroke-width: 2; fill: none; }
@@ -346,26 +379,25 @@ _CSS = """
 .dsv svg .dsv-grid { stroke: var(--soft); stroke-width: 1; } .dsv svg .dsv-axis { stroke: var(--line); stroke-width: 1.5; }
 .dsv svg .dsv-area { fill: var(--bad-bg); } .dsv svg .dsv-linep { stroke: var(--bad); stroke-width: 2.5; fill: none; }
 .dsv svg .dsv-pt { fill: var(--bg); stroke: var(--bad); stroke-width: 2.5; } .dsv svg .dsv-pt:hover { fill: var(--bad); }
-.dsv-steps { list-style: none; counter-reset: dsvs; margin: 0; padding: 0; }
-.dsv-steps li { counter-increment: dsvs; position: relative; padding: 8px 10px 8px 42px; border: 1px solid transparent; border-radius: 8px; }
-.dsv-steps li::before { content: counter(dsvs); position: absolute; left: 8px; top: 8px; width: 24px; height: 24px; border-radius: 50%;
-  background: var(--soft); color: var(--ink); font-size: 13px; font-weight: 700; text-align: center; line-height: 24px; }
-.dsv-steps .dsv-sub { display: block; font-size: 13px; color: var(--mute); }
-/* thread strip */
+.dsv-steps { list-style: none; counter-reset: dsvs; margin: 0; padding: 0 !important; font-size: 13px; }
+.dsv-steps li { counter-increment: dsvs; position: relative; padding: 6px 8px 6px 34px; border-top: 1px dashed var(--line); }
+.dsv-steps li:first-child { border-top: 0; }
+.dsv-steps li::before { content: counter(dsvs); position: absolute; left: 4px; top: 7px; width: 20px; height: 20px; border-radius: 50%;
+  background: var(--primary); color: var(--primary-foreground); font-size: 11px; font-weight: 700; text-align: center; line-height: 20px; }
+.dsv-steps .dsv-sub { display: block; font-size: 12px; color: var(--mute); }
 .dsv-tbl { width: 100%; border-collapse: collapse; font-size: 13px; margin: 6px 0; }
-.dsv-tbl th, .dsv-tbl td { border: 0; border-bottom: 1px solid var(--soft); padding: 6px 8px; text-align: left; vertical-align: middle; background: none; }
-.dsv-tbl th { color: var(--mute); font-weight: 600; font-size: 12px; }
+.dsv-tbl th, .dsv-tbl td { border: 0; border-bottom: 1px solid var(--line); padding: 6px 8px; text-align: left; vertical-align: middle; background: none; }
+.dsv-tbl th { color: var(--mute); font-weight: 500; font-size: 12px; }
 .dsv-tbl tr.dsv-hot td:first-child { box-shadow: inset 4px 0 0 var(--bad); }
 .dsv-scroll { overflow-x: auto; }
 .dsv-scroll > .dsv-tbl { min-width: 560px; }   /* narrow screens scroll the table instead of squeezing it */
 .dsv-smp { display: inline-flex; gap: 2px; vertical-align: middle; }
 .dsv-smp i { display: inline-block; width: 16px; height: 16px; border-radius: 3px; font-style: normal; font-size: 10px; line-height: 16px;
-  text-align: center; color: #ffffff; background: var(--unk); }
-.dsv-smp .dsv-st-R { background: var(--good); color: #052e16; } .dsv-smp .dsv-st-S { background: #94a3b8; }
-.dsv-smp .dsv-st-D { background: var(--warn); color: #451a03; } .dsv-smp .dsv-st-Z, .dsv-smp .dsv-st-T { background: var(--bad); }
+  text-align: center; color: var(--background); background: var(--unk); }
+.dsv-smp .dsv-st-R { background: var(--good); } .dsv-smp .dsv-st-S { background: var(--mute); }
+.dsv-smp .dsv-st-D { background: var(--warn); } .dsv-smp .dsv-st-Z, .dsv-smp .dsv-st-T { background: var(--bad); }
 .dsv-meter { display: inline-block; width: 70px; height: 8px; border-radius: 4px; background: var(--soft); vertical-align: middle; overflow: hidden; }
 .dsv-meter i { display: block; height: 100%; background: var(--accent); }
-/* memory map */
 .dsv-mem { display: flex; align-items: flex-end; gap: 0; overflow-x: auto; padding: 8px 2px 4px; }
 .dsv-seg { flex: 0 0 auto; }
 .dsv-seg > span { display: block; font-size: 12px; font-weight: 600; padding: 0 4px 3px; white-space: nowrap; }
@@ -373,7 +405,7 @@ _CSS = """
 .dsv-cells { display: flex; }
 .dsv-cell { width: 62px; height: 66px; border: 1px solid var(--line); margin-right: -1px; padding: 3px 4px; font-size: 11px; line-height: 1.25;
   display: flex; flex-direction: column; justify-content: space-between; background: var(--bg); overflow: hidden; }
-.dsv-cell b { font-size: 12px; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; overflow-wrap: anywhere; }
+.dsv-cell b { font-size: 12px; font-family: var(--font-mono); overflow-wrap: anywhere; }
 .dsv-cell small { color: var(--mute); font-size: 10px; white-space: nowrap; }
 .dsv-c-hdr { background: var(--hdr); } .dsv-c-buf { background: var(--buf); border-color: var(--buf-line); }
 .dsv-c-over { background: repeating-linear-gradient(135deg, var(--bad-bg), var(--bad-bg) 6px, var(--bg) 6px, var(--bg) 12px);
@@ -383,9 +415,8 @@ _CSS = """
 .dsv-c-rest { border-style: dashed; color: var(--mute); justify-content: center; text-align: center; }
 .dsv-wall { flex: 0 0 auto; align-self: stretch; width: 0; border-left: 3px solid var(--bad); margin: 0 5px 0 6px; position: relative; }
 .dsv-memaxis { display: flex; justify-content: space-between; font-size: 12px; color: var(--mute); margin: 2px 2px 0; }
-/* pointer diagram */
 .dsv-ptr { display: flex; flex-wrap: wrap; align-items: stretch; gap: 8px; margin: 8px 0; }
-.dsv-box { border: 2px solid var(--line); border-radius: 8px; padding: 8px 12px; background: var(--panel); min-width: 150px; }
+.dsv-box { border: 1.5px solid var(--line); border-radius: var(--radius); padding: 8px 12px; background: var(--panel); min-width: 150px; }
 .dsv-box small { display: block; color: var(--mute); font-size: 12px; }
 .dsv-box-bad { border-color: var(--bad); background: var(--bad-bg); }
 .dsv-arrowtxt { align-self: center; font-size: 12px; color: var(--mute); text-align: center; white-space: nowrap; }
@@ -394,57 +425,20 @@ _CSS = """
 .dsv-life div { padding: 5px 14px 5px 18px; background: var(--panel); border: 1px solid var(--line); margin-right: -1px; }
 .dsv-life div.dsv-on { background: var(--bad-bg); border-color: var(--bad); color: var(--bad); font-weight: 600; z-index: 1; }
 .dsv-life div.dsv-maybe { border-style: dashed; color: var(--mute); }
-/* checklist */
-.dsv-ckgroup > h4 { display: flex; align-items: baseline; gap: 8px; margin: 18px 0 4px; }
-.dsv-ckgroup > h4 small { font-weight: 400; color: var(--mute); font-size: 12px; }
-.dsv-dot { display: inline-flex; width: 22px; height: 22px; border-radius: 50%; align-items: center; justify-content: center; flex: 0 0 22px;
-  font-size: 13px; font-weight: 700; background: var(--sb); color: var(--sc); border: 1.5px solid var(--sc); }
-details.dsv-ck { border: 1px solid var(--soft); border-left: 4px solid var(--sc); border-radius: 6px; margin: 4px 0; padding: 0; background: var(--bg); font-size: 14px; }
-details.dsv-ck > summary { list-style: none; cursor: pointer; display: flex; align-items: center; gap: 10px; padding: 7px 12px; font-weight: 400; }
-details.dsv-ck > summary::-webkit-details-marker { display: none; }
-details.dsv-ck > summary::after { content: "▸"; margin-left: auto; color: var(--mute); }
-details.dsv-ck[open] > summary::after { content: "▾"; }
-details.dsv-ck > summary:hover { background: var(--panel); }
-.dsv-ck-name { font-weight: 600; } .dsv-ck-line { color: var(--mute); font-size: 13px; overflow-wrap: anywhere; }
-.dsv-ck-main { display: flex; flex-direction: column; min-width: 0; }
-.dsv-ck dl { display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: 4px 14px; margin: 0; padding: 4px 14px 12px 44px; font-size: 13px; }
-.dsv-ck dt { color: var(--mute); } .dsv-ck dd { margin: 0; overflow-wrap: anywhere; }
-.dsv-nc { font-size: 13px; padding-left: 20px; } .dsv-nc li { margin: 3px 0; overflow-wrap: anywhere; }
-/* outline: one section per part of the report, numbered like the Markdown report */
-.dsv-head { margin: 8px 0 4px; }
-.dsv-sec > h2 { font-size: 20px; margin: 30px 0 10px; padding: 0 0 4px; border-bottom: 1px solid var(--soft); }
-.dsv-sec h3 { font-size: 16px; margin: 14px 0 6px; }
-.dsv-text p, .dsv-card > p { margin: 6px 0; }
-.dsv-text ol, .dsv-text ul, .dsv-card > ul, .dsv-card > ol { padding-left: 22px; margin: 6px 0; }
-.dsv-text pre, .dsv-card pre { background: var(--panel); border: 1px solid var(--soft); border-radius: 6px; padding: 8px 10px; overflow-x: auto; font-size: 12px; }
-.dsv-keyfacts { list-style: none; padding-left: 0 !important; }
-.dsv-tile-sub { display: block; }
-details.dsv-ckgroup { margin: 10px 0; }
-details.dsv-ckgroup > summary { cursor: pointer; display: flex; align-items: baseline; flex-wrap: wrap; gap: 8px; font-weight: 600; padding: 6px 0; }
-details.dsv-ckgroup > summary small { font-weight: 400; color: var(--mute); font-size: 12px; }
-/* detailed records (English) attached to the part they belong to */
-details.dsv-detail { margin: 10px 0 2px; border: 1px dashed var(--line); border-radius: 8px; background: var(--panel); }
-details.dsv-detail > summary { cursor: pointer; padding: 6px 12px; font-size: 13px; color: var(--accent); }
-.dsv-detail-body { padding: 4px 12px 10px; font-size: 12px; overflow-wrap: anywhere; }
-.dsv-detail-body h4 { font-size: 13px; margin: 10px 0 4px; }
-.dsv-detail-body p { margin: 4px 0; }
-.dsv-detail-body .dsd-scroll { overflow-x: auto; }
-.dsv-detail-body table { border-collapse: collapse; width: 100%; min-width: 520px; margin: 4px 0; }
-.dsv-detail-body th, .dsv-detail-body td { border: 1px solid var(--soft); padding: 4px 6px; text-align: left; vertical-align: top; }
-.dsv-detail-body td code { white-space: pre-wrap; word-break: break-all; }
-.dsv-detail-body .dsd-pre { white-space: pre-wrap; word-break: break-all; }
-.dsv-ck .dsv-detail { margin: 0 14px 10px 44px; }
-@media (max-width: 600px) {
-  .dsv-card { padding: 14px 14px; }
-  .dsv-ck dl { padding-left: 14px; grid-template-columns: minmax(0, 1fr); }
-  .dsv-ck .dsv-detail { margin: 0 8px 10px 8px; }
-  .dsv-title { font-size: 19px; }
+@media (max-width: 760px) {
+  .dsv .tiles { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .dsv .kv { grid-template-columns: minmax(0, 1fr); }
+  .dsv-seq { grid-template-columns: minmax(0, 1fr); }
+  .dsv-ck dl { padding-left: 8px; grid-template-columns: minmax(0, 1fr); }
+  .dsv-ck .collapsible { margin-left: 8px; }
 }
 @media print {
-  .dsv-r, .dsv-r + label, .dsv-steplbl, .dsv-nav { display: none !important; }
-  .dsv-card { break-inside: avoid; }
+  .dsv { padding: 0; max-width: none; }
+  .dsv-r, .dsv-r + label, .dsv-steplbl, .dsv .masthead nav { display: none !important; }
   .dsv [data-step], .dsv [data-step] > * { visibility: visible !important; opacity: 1 !important; animation: none !important; }
-  .dsv-ckgroup { display: block !important; }
+  .dsv .dsv-scroll, .dsv .dsd-scroll, .dsv-svgbox, .dsv-mem { overflow: visible !important; }
+  .dsv .dsv-scroll > .dsv-tbl, .dsv-detail-body table { min-width: 0 !important; table-layout: auto; }
+  .dsv td, .dsv th, .dsv code { overflow-wrap: anywhere; word-break: break-word; }
 }
 """
 
@@ -1048,24 +1042,39 @@ def _md_html(lines: List[str]) -> str:
 
 
 def _detail(lx: _Lx, key: str, body: str, anchor: str) -> str:
-    """A collapsed block of detailed records (English) next to the part it belongs to.  The label is in the report
-    language; the body is marked so that the language test exempts exactly the detail and nothing around it."""
+    """The detailed records (English) behind one part, in the theme's Collapsible, right where that part is.  The
+    label is in the report language; the body is marked so that the language test exempts exactly the detail."""
     if not body:
         return ""
-    return (f'<details class="dsv-detail" id="{E(anchor)}"><summary>{E(lx.t(key))}</summary>'
-            f'<div class="dsv-detail-body" lang="en">{body}</div><!--/dsv-detail-body--></details>')
+    return (f'<details class="collapsible dsv-detail" id="{E(anchor)}"><summary>{E(lx.t(key))}</summary>'
+            f'<div class="dsv-detail-body in" lang="en">{body}</div><!--/dsv-detail-body--></details>')
+
+
+# verdict -> the theme's status tone (only the four status colours, plus neutral)
+_VERDICT_TONE_CLASS = {"CONFIRMED_FAULT": "tone-fail", "FAULT": "tone-fail", "PROBABLE_FAULT": "tone-warn",
+                       "DEGRADED": "tone-warn", "HEALTHY": "tone-pass", "INCONCLUSIVE": "tone-skip", "ABORTED": "tone-skip"}
+
+
+def _card(sec_id: str, title: str, body: str, desc: str = "", right: str = "", extra_cls: str = "") -> str:
+    """One section of the report as the theme's Card (header with the section title, content)."""
+    head = (f'<div class="card-header"><h2 class="card-title">{E(title)}</h2>'
+            + (f'<span class="card-description">{desc}</span>' if desc else "")
+            + (f'<span class="right">{right}</span>' if right else "") + "</div>")
+    return f'<section class="card{" " + extra_cls if extra_cls else ""}" id="{E(sec_id)}">{head}<div class="card-content">{body}</div></section>'
 
 
 def _finding_card(lx: _Lx, i: int, f: Dict[str, Any], report: Optional[Dict[str, Any]],
                   block: Optional[Dict[str, Any]] = None, detail: str = "") -> str:
+    """One finding inside the findings card (a block, not a nested card): title and status badge, the key facts,
+    the picture, the text (one click away when the picture says it), the reasoning, the evidence, the detail."""
     cat = str(f.get("category"))
     reg = category_label(cat)
     label = reg[lx.i] if reg else (CATEGORY_LABEL[cat][lx.i] if cat in CATEGORY_LABEL else cat)
     status = str(f.get("status") or "")
     st_word = {"CONFIRMED_ROOT_CAUSE": T["k_fstatus_c"][lx.i], "PROBABLE_CAUSE": T["k_fstatus_p"][lx.i]}.get(status, status)
-    tone = "bad" if status == "CONFIRMED_ROOT_CAUSE" else "warn"
+    tone = "tone-fail" if status == "CONFIRMED_ROOT_CAUSE" else "tone-warn"
     if str(f.get("severity") or "").upper() == "INFO" and status in ("CONFIRMED_ROOT_CAUSE", "PROBABLE_CAUSE"):
-        st_word, tone = T["k_fstatus_i"][lx.i], "unk"  # not a fault: neutral badge and tone
+        st_word, tone = T["k_fstatus_i"][lx.i], "tone-skip"  # not a fault: neutral badge
     try:
         fn = finding_viz(cat) or _VIZ.get(cat)
         viz = (fn(lx, f, report, f"f{i}") or "") if fn else ""
@@ -1082,8 +1091,8 @@ def _finding_card(lx: _Lx, i: int, f: Dict[str, Any], report: Optional[Dict[str,
         facts = f"<li>{E(ko_text(desc, lx.i))}</li>" + facts
     head = (f'<h3>{E(lx.t("finding", i=i))}: {E(label)} {_code(cat)}</h3>' if block is None
             else f'<h3>{_inline_html(block["heading"])}</h3>')
-    parts = [f'<section class="dsv-card dsv-tone-{tone}" id="finding-{i}"><span id="dsv-finding-{i}"></span>'
-             f'<div class="dsv-fhead">{head}<span class="dsv-badge">{E(st_word)}</span></div>']
+    parts = [f'<div class="finding" id="finding-{i}"><span id="dsv-finding-{i}"></span>'
+             f'<div class="fhead">{head}<span class="badge badge-tone {tone}">{E(st_word)}</span></div>']
     if block is not None:
         parts.append('<ul class="dsv-facts dsv-keyfacts">' + "".join(f"<li>{_inline_html(x)}</li>" for x in block["facts"]) + "</ul>")
         if block["body"] and not viz:
@@ -1095,18 +1104,17 @@ def _finding_card(lx: _Lx, i: int, f: Dict[str, Any], report: Optional[Dict[str,
     parts.append(viz)
     if block is not None and (block["body"] or block["diagram"]) and viz:
         # the picture states the same facts; the text (and the text diagram) stays one click away
-        parts.append(f'<details class="dsv-ck dsv-s-SKIPPED dsv-astext"><summary><span class="dsv-ck-name">'
-                     f'{E(lx.t("as_text"))}</span></summary><div class="dsv-text" style="padding:0 14px 8px">'
+        parts.append(f'<details class="collapsible dsv-astext"><summary>{E(lx.t("as_text"))}</summary><div class="in dsv-text">'
                      f'{_md_html(block["body"] + [""] + block["diagram"])}</div></details>')
     if block is not None and block["diagram"] and not viz:
         parts.append(_md_html(block["diagram"]))
     if block is not None and block["why"]:
         parts.append(f'<div class="dsv-text">{_md_html([T["f_why"][lx.i], ""] + [f"{n}. {x}" for n, x in enumerate(block["why"], 1)])}</div>')
     if facts:
-        parts.append(f'<details class="dsv-ck dsv-s-SKIPPED"><summary><span class="dsv-ck-name">{E(lx.t("evidence"))}</span></summary>'
-                     f'<ul class="dsv-facts" style="padding:4px 14px 12px 34px">{facts}</ul></details>')
+        parts.append(f'<details class="collapsible"><summary>{E(lx.t("evidence"))}</summary>'
+                     f'<ul class="dsv-facts in">{facts}</ul></details>')
     parts.append(_detail(lx, "d_finding", detail, f"finding-{i}-detail"))
-    parts.append("</section>")
+    parts.append("</div>")
     return "".join(parts)
 
 
@@ -1127,11 +1135,21 @@ def _check_rows(res: Dict[str, Any], report: Optional[Dict[str, Any]]) -> List[D
     return check_rows(res, report)
 
 
+def _status_bar(rows: List[Dict[str, Any]]) -> str:
+    """The theme's stacked progress bar of the check outcomes (FAIL, INCONCLUSIVE, PASS, SKIPPED)."""
+    if not rows:
+        return ""
+    col = {"FAIL": "var(--destructive)", "INCONCLUSIVE": "var(--warning)", "PASS": "var(--success)", "SKIPPED": "var(--muted-foreground)"}
+    return ('<div class="progress-stack">' + "".join(
+        f'<i style="background:{col[s]};width:{sum(1 for r in rows if r["status"] == s) * 100 / len(rows):.2f}%"></i>'
+        for s in _STATUS_ORDER if any(r["status"] == s for r in rows)) + "</div>")
+
+
 def _checklist(lx: _Lx, res: Dict[str, Any], report: Optional[Dict[str, Any]], findings: List[Dict[str, Any]],
                comp: Optional[Dict[str, Any]] = None, details: Optional[Dict[str, Any]] = None) -> str:
-    """The scope part: counts once, then the checks grouped by outcome (clean and not-run collapsed), each row with
-    what it looks for, what it found or why it could not judge, and its own detailed result."""
-    from .human_report import _undecided_reason, check_counts, check_label
+    """The content of the checks card: the counts once, then the rows grouped by the four statuses (found a problem
+    and could not judge open, passed and not run collapsed), each row opening in place with its own detail."""
+    from .human_report import _undecided_reason, check_counts
     from .human_report import _Ctx as _HCtx
     hctx = (comp or {}).get("ctx") or _HCtx(lx.lang)
     details = details or {}
@@ -1147,10 +1165,7 @@ def _checklist(lx: _Lx, res: Dict[str, Any], report: Optional[Dict[str, Any]], f
             linked.setdefault(str(rid), []).append(i)
     cnt = check_counts(rows)
     if not rows:
-        return f'<div class="dsv-card"><p>{E(lx.t("ck_none"))}</p></div>'
-    total = len(rows)
-    bar = "".join(f'<i class="dsv-s-{s}" style="width:{sum(1 for r in rows if r["status"] == s) * 100 / total:.2f}%" '
-                  f'title="{E(lx.t("ck_" + s))}"></i>' for s in _STATUS_ORDER if any(r["status"] == s for r in rows))
+        return f'<p>{E(lx.t("ck_none"))}</p>'
     groups: List[str] = []
     for s in _STATUS_ORDER:
         grp = [r for r in rows if r["status"] == s]
@@ -1179,79 +1194,115 @@ def _checklist(lx: _Lx, res: Dict[str, Any], report: Optional[Dict[str, Any]], f
                 dl.append((lx.t("ck_linked"), " ".join(f'<a href="#finding-{i}">{E(lx.t("finding", i=i))}</a>' for i in linked[r["rid"]])))
             if r.get("n_ev"):
                 dl.append((lx.t("ck_evidence"), str(r["n_ev"])))
+            ms = ""
             if isinstance(r.get("dur"), (int, float)) and r.get("planned", True) and s != "SKIPPED":
-                dl.append((lx.t("ck_time"), f"{float(r['dur']) * 1000:.0f} ms"))
-            dl.append((lx.t("ck_id"), _code(r["rid"]) + (f' <span class="dsv-chip">{E(lx.t("ck_required"))}</span>' if r.get("required") else "")))
-            items.append(f'<details class="dsv-ck dsv-s-{s}" data-status="{s}" id="check-{E(r["rid"])}"><summary><span class="dsv-dot" aria-hidden="true">{_STATUS_ICON[s]}</span>'
-                         f'<span class="dsv-ck-main"><span><span class="dsv-ck-name">{E(name)}</span> '
-                         f'<span class="dsv-chip">{E(lx.t("dom_" + dom))}</span></span>'
-                         + (f'<span class="dsv-ck-line">{E(line[:160])}</span>' if line else "") + "</span></summary><dl>"
+                ms = f"{float(r['dur']) * 1000:.0f} ms"
+                dl.append((lx.t("ck_time"), ms))
+            dl.append((lx.t("ck_id"), _code(r["rid"]) + (f' <span class="badge badge-outline">{E(lx.t("ck_required"))}</span>' if r.get("required") else "")))
+            items.append(f'<details class="dsv-ck dsv-s-{s}" data-status="{s}" id="check-{E(r["rid"])}"><summary>'
+                         f'<span class="status-icon {s} tone-{s}" aria-hidden="true">{_STATUS_ICON[s]}</span>'
+                         f'<span class="dsv-ck-main"><span><span class="dsv-ck-name">{E(name)}</span>'
+                         f'<span class="dsv-ck-cat">{E(lx.t("dom_" + dom))}</span></span>'
+                         + (f'<span class="dsv-ck-line">{E(line[:160])}</span>' if line else "") + "</span>"
+                         + (f'<span class="dsv-ck-ms">{E(ms)}</span>' if ms else "") + "</summary><dl>"
                          + "".join(f"<dt>{E(k)}</dt><dd>{v}</dd>" for k, v in dl) + "</dl>"
                          + _detail(lx, "d_check", (details.get("checks") or {}).get(r["rid"], ""), f"check-{r['rid']}-detail")
                          + "</details>")
-        opened = " open" if s in ("FAIL", "INCONCLUSIVE") else ""
-        groups.append(f'<details class="dsv-ckgroup dsv-s-{s}"{opened}><summary><span class="dsv-dot" aria-hidden="true">{_STATUS_ICON[s]}</span>'
-                      f'{E(lx.t("ck_" + s))} ({len(grp)}) <small>{E(lx.t("ck_" + s + "_hint"))}</small></summary>{"".join(items)}</details>')
-    head_lines = (comp or {}).get("scope_head") or []
-    nc_lines = (comp or {}).get("not_examined") or []
-    nc_html = ""
-    if nc_lines:
-        nc_html = f'<h3>{E(T["g_other"][lx.i])}</h3>' + _md_html(nc_lines)
-    head = "".join(f"<p>{_inline_html(x)}</p>" for x in head_lines if x) or \
-        f'<p>{E(T["s_counts"][lx.i].format(**cnt))}</p>'
-    return (f'<div class="dsv-card dsv-checklist">{head}<div class="dsv-bar">{bar}</div>'
-            f'<div class="dsv-ckgroups">{"".join(groups)}</div>{nc_html}'
-            + _detail(lx, "d_scope", details.get("scope", ""), "scope-detail") + "</div>")
+        title = (f'<span class="status-icon {s} tone-{s}" aria-hidden="true">{_STATUS_ICON[s]}</span>'
+                 f'{E(lx.t("ck_" + s))} ({len(grp)}) <small>{E(lx.t("ck_" + s + "_hint"))}</small>')
+        if s in ("FAIL", "INCONCLUSIVE"):
+            groups.append(f'<div class="dsv-ckgroup dsv-s-{s}"><h3 class="ckhead">{title}</h3>{"".join(items)}</div>')
+        else:
+            groups.append(f'<details class="collapsible collapsible-plain dsv-ckgroup dsv-s-{s}"><summary>{title}</summary>'
+                          f'{"".join(items)}</details>')
+    head_lines = (comp or {}).get("scope_head") or [T["s_counts"][lx.i].format(**cnt)]
+    head = "".join(f"<p>{_inline_html(x)}</p>" for x in head_lines if x)
+    return (head + _status_bar(rows) + "".join(groups)
+            + _detail(lx, "d_scope", details.get("scope", ""), "scope-detail"))
 
 
 # ------------------------------------------------------------------------------------------------ header
+def _masthead(lx: _Lx, title: str, res: Dict[str, Any], comp: Dict[str, Any]) -> str:
+    """The report starts with a masthead card (title, meta, section links) instead of the app header."""
+    t = res.get("target") if isinstance(res.get("target"), dict) else {}
+    repro = comp.get("repro") or {}
+    meta = []
+    if t.get("process_name"):
+        meta.append(_code(t["process_name"]))
+    if t.get("pid") is not None:
+        meta.append(f"<span>pid {E(str(t['pid']))}</span>")
+    if repro.get("target_arch"):
+        meta.append(f"<span>{E(str(repro['target_arch']))}</span>")
+    gen = (comp["ctx"].extra or {}).get("generated")
+    if gen:
+        meta.append(f"<span>{E(T['m_generated'][lx.i].format(ts=gen).rstrip('.'))}</span>")
+    nav = "".join(f'<a href="#{_SEC_ID[s["key"]]}">{E(s["title"])}</a>' for s in comp["sections"] if s["key"] != "conclusion")
+    return (f'<header class="card masthead" id="sec-masthead"><h1>{E(title)}</h1>'
+            + (f'<div class="meta">{"<span>·</span>".join(meta)}</div>' if meta else "")
+            + f'<nav>{nav}</nav></header>')
+
+
 def _hero(lx: _Lx, title: str, res: Dict[str, Any], rows: List[Dict[str, Any]], summary_md: str = "",
           comp: Optional[Dict[str, Any]] = None, details: Optional[Dict[str, Any]] = None) -> str:
-    """The conclusion part: the verdict in words, the conclusion sentence, a few key figures."""
-    from .human_report import check_counts, conclusion_sentence as _cs, fmt_bytes, fmt_ms
+    """The verdict banner card: the verdict in words, the conclusion sentence, the symptom note, its detail."""
+    from .human_report import conclusion_sentence as _cs
     verdict = str(res.get("verdict") or "INCONCLUSIVE")
-    tone = _VERDICT_TONE.get(verdict, "unk")
     vkey = verdict if f"v_{verdict}" in T else "INCONCLUSIVE"
     concl = (comp or {}).get("conclusion") or _cs(summary_md)
-    impact = res.get("collection_impact") if isinstance(res.get("collection_impact"), dict) else {}
+    sym = "".join(f'<p class="note">{_inline_html(x)}</p>' for x in (comp or {}).get("symptom_note") or [])
+    label = T["v_line"][lx.i].split("{word}")[0].strip("* ")
+    return (f'<section class="card card-tone banner {_VERDICT_TONE_CLASS.get(verdict, "tone-skip")}" id="sec-conclusion">'
+            f'<div class="card-content"><h2 class="sr-only">{E(T["s_conclusion"][lx.i])}</h2>'
+            f'<div class="line1"><span class="badge badge-tone badge-lg">{E(label)} {E(T["v_" + vkey][lx.i])}</span>'
+            f'{_code(verdict)}<span class="text-muted">{E(T["vm_" + vkey][lx.i])}</span></div>'
+            + (f'<p class="sum">{_inline_html(concl)}</p>' if concl else "") + sym
+            + _detail(lx, "d_verdict", (details or {}).get("verdict", ""), "verdict-detail") + "</div></section>")
+
+
+def _tiles(lx: _Lx, res: Dict[str, Any], rows: List[Dict[str, Any]], comp: Dict[str, Any]) -> str:
+    """The four tiles: checks, target stop time, data read, duration (no confidence)."""
+    from .human_report import check_counts
+    c = check_counts(rows)
     tiles = []
-    if rows:
-        c = check_counts(rows)
-        bar = "".join(f'<i class="dsv-s-{s}" style="width:{sum(1 for r in rows if r["status"] == s) * 100 / len(rows):.2f}%"></i>'
-                      for s in _STATUS_ORDER if any(r["status"] == s for r in rows))
-        txt = " · ".join(f"{_STATUS_ICON[s]} {lx.t('ck_' + s)} {n}" for s, n in
-                         (("FAIL", c["found"]), ("INCONCLUSIVE", c["undecided"]), ("PASS", c["clean"])) if n)
-        tiles.append(f'<div class="dsv-tile"><span>{E(lx.t("checks_run"))}</span><b>{c["run"]}</b><div class="dsv-bar">{bar}</div>'
-                     f'<span>{E(txt)}</span>' + (f'<span class="dsv-tile-sub">{E(lx.t("checks_not_run", n=c["not_run"]))}</span>'
-                                                 if c["not_run"] else "") + '</div>')
-    if isinstance(impact.get("measured_stop_ms"), (int, float)):
-        stop = float(impact["measured_stop_ms"])
-        tiles.append(f'<div class="dsv-tile"><span>{E(lx.t("stop_time"))}</span><b>{E(fmt_ms(stop, lx.i))}</b>'
-                     + (f'<span>{E(lx.t("zero_stop"))}</span>' if stop == 0 and impact.get("zero_stop") else "") + "</div>")
-    if isinstance(impact.get("bytes_read"), (int, float)):
-        tiles.append(f'<div class="dsv-tile"><span>{E(lx.t("bytes_read"))}</span><b>{E(fmt_bytes(impact["bytes_read"]))}</b></div>')
-    if isinstance(res.get("duration_s"), (int, float)):
-        tiles.append(f'<div class="dsv-tile"><span>{E(lx.t("duration"))}</span><b>{E(fmt_ms(float(res["duration_s"]) * 1000, lx.i))}</b></div>')
-    sym = "".join(f'<p class="dsv-note">{_inline_html(x)}</p>' for x in (comp or {}).get("symptom_note") or [])
-    return (f'<div class="dsv-card dsv-hero dsv-tone-{tone}" id="dsv-glance">'
-            f'<p><span class="dsv-badge">{E(T["v_line"][lx.i].split("{word}")[0].strip("* "))} {E(T["v_" + vkey][lx.i])}</span> '
-            f'{_code(verdict)} <span class="dsv-note">{E(T["vm_" + vkey][lx.i])}</span></p>'
-            + (f'<p class="dsv-concl">{_inline_html(concl)}</p>' if concl else "") + sym
-            + (f'<div class="dsv-tiles">{"".join(tiles)}</div>' if tiles else "")
-            + "</div>" + _detail(lx, "d_verdict", (details or {}).get("verdict", ""), "verdict-detail"))
+    for key, val, note in comp.get("glance") or []:
+        if key == "checks":
+            sub = f"{_STATUS_ICON['FAIL']} {c['found']} · {_STATUS_ICON['INCONCLUSIVE']} {c['undecided']} · " \
+                  f"{_STATUS_ICON['PASS']} {c['clean']} · {_STATUS_ICON['SKIPPED']} {c['not_run']}"
+            tiles.append(f'<div class="card tile"><div class="k">{E(lx.t("checks_run"))}</div><div class="v">{E(val)}</div>'
+                         f'{_status_bar(rows)}<div class="s">{E(sub)}</div></div>')
+        elif key == "stop":
+            tiles.append(f'<div class="card tile"><div class="k">{E(lx.t("stop_time"))}</div><div class="v">{E(val)}</div>'
+                         + (f'<div class="s">{E(lx.t("zero_stop"))}</div>' if note else "") + "</div>")
+        elif key == "bytes":
+            tiles.append(f'<div class="card tile"><div class="k">{E(lx.t("bytes_read"))}</div><div class="v">{E(val)}</div></div>')
+        else:
+            tiles.append(f'<div class="card tile"><div class="k">{E(lx.t("duration"))}</div><div class="v">{E(val)}</div></div>')
+    return f'<div class="tiles" id="sec-tiles">{"".join(tiles)}</div>' if tiles else ""
 
 
-_SEC_ID = {"conclusion": "sec-conclusion", "findings": "dsv-findings", "hypothesis": "sec-hypothesis",
-           "next": "sec-next", "scope": "dsv-checks", "method": "sec-method", "reproducibility": "reproducibility",
-           "reference": "sec-reference"}
+def _kv(lines: List[str]) -> str:
+    """'- key: value' lines (the target section) as the theme's key/value grid."""
+    out = []
+    for ln in lines:
+        m = re.match(r"^- ([^:]+): (.*)$", ln)
+        if m:
+            out.append(f"<div><dt>{E(m.group(1))}</dt><dd>{_inline_html(m.group(2))}</dd></div>")
+    return f'<dl class="kv">{"".join(out)}</dl>'
+
+
+# the HTML id of each block of human_report.REPORT_SECTION_ORDER
+_SEC_ID = {"conclusion": "sec-conclusion", "tiles": "sec-tiles", "target": "sec-target", "findings": "dsv-findings",
+           "checks": "dsv-checks", "not_examined": "sec-not-examined", "next": "sec-next", "hypothesis": "sec-hypothesis",
+           "method": "sec-method", "reproducibility": "reproducibility", "reference": "sec-reference"}
 
 
 def build_visual_summary(result: Dict[str, Any], report: Optional[Dict[str, Any]] = None, lang: str = "en",
                          title: str = "", summary_md: str = "", *, comp: Optional[Dict[str, Any]] = None,
                          details: Optional[Dict[str, Any]] = None, subtitle: str = "") -> str:
-    """The HTML body of the report: the common outline (``human_report.compose``), each part with its picture or
-    check list, and the detailed records of each part in a collapsed block next to it (``details``, from
-    ``report_detail.partition``).  No script."""
+    """The HTML body of the report in the design system's card order (``human_report.REPORT_SECTION_ORDER``):
+    masthead, verdict banner, tiles, target, findings, checks, not examined, next steps, then the report-only
+    material; each part carries its detailed records in a Collapsible next to it (``details``, from
+    ``report_detail.partition``).  The theme is inlined (``theme_style``); no script, no external resource."""
     from .human_report import compose
     lx = _Lx(lang if lang in ("en", "ko") else "en")
     res = dict(result or {})
@@ -1261,38 +1312,81 @@ def build_visual_summary(result: Dict[str, Any], report: Optional[Dict[str, Any]
     findings = [f for f in (res.get("findings") or []) if isinstance(f, dict)]
     rows = comp["rows"]
     details = details or {}
-    nav = "".join(f'<a href="#{_SEC_ID[s["key"]]}">{E(s["heading"])}</a>' for s in comp["sections"])
-    parts = [f"<style>{_CSS}{_interaction_css()}</style>", f'<div class="dsv" lang="{lx.lang}">',
-             f'<header class="dsv-head"><h1 class="dsv-title">{E(title)}</h1>'
-             + (f'<p class="dsv-note">{_inline_html(subtitle)}</p>' if subtitle else "")
-             + f'<nav class="dsv-nav">{nav}</nav></header>']
+    parts = [theme_style(lx.lang), f'<style id="ds-report">{_CSS}{_interaction_css()}</style>',
+             f'<div class="dsv" lang="{lx.lang}">', _masthead(lx, title, res, comp)]
     for s in comp["sections"]:
         key = s["key"]
-        parts.append(f'<section class="dsv-sec" id="{_SEC_ID[key]}"><h2>{E(s["heading"])}</h2>')
         if key == "conclusion":
             parts.append(_hero(lx, title, res, rows, summary_md, comp, details))
+            parts.append(_tiles(lx, res, rows, comp))
+        elif key == "target":
+            parts.append(_card(_SEC_ID[key], s["title"], _kv(s["lines"])))
         elif key == "findings":
-            parts += [_finding_card(lx, i, f, report, b, (details.get("findings") or {}).get(i, ""))
-                      for i, (f, b) in enumerate(zip(findings, comp["blocks"]), 1)]
-        elif key == "scope":
-            parts.append(_checklist(lx, res, report, findings, comp, details))
+            body = "".join(_finding_card(lx, i, f, report, b, (details.get("findings") or {}).get(i, ""))
+                           for i, (f, b) in enumerate(zip(findings, comp["blocks"]), 1))
+            parts.append(_card(_SEC_ID[key], s["title"], body, desc=str(len(findings))))
+        elif key == "checks":
+            c = comp["counts"]
+            parts.append(_card(_SEC_ID[key], s["title"], _checklist(lx, res, report, findings, comp, details),
+                               desc=E(lx.t("ck_desc", run=c["run"], n=c["not_run"])), right=E(lx.t("ck_open_hint"))))
+        elif key == "not_examined":
+            parts.append(_card(_SEC_ID[key], s["title"], _md_html(s["lines"]), right=E(lx.t("ne_right"))))
         elif key == "method":
-            parts.append(f'<div class="dsv-card">{_md_html([x for x in s["lines"] if not x.startswith("_")])}'
-                         + _detail(lx, "d_method", details.get("method", ""), "method-detail") + "</div>")
+            gen = T["m_generated"][lx.i].split("{ts}")[0]          # the masthead states the time of the report
+            parts.append(_card(_SEC_ID[key], s["title"], _md_html([x for x in s["lines"] if not x.startswith("- " + gen)])
+                               + _detail(lx, "d_method", details.get("method", ""), "method-detail")))
         elif key == "reproducibility":
-            parts.append(f'<div class="dsv-card dsv-repro">{_md_html(s["lines"])}'
-                         + _detail(lx, "d_repro", details.get("reproducibility", ""), "reproducibility-detail") + "</div>")
+            parts.append(_card(_SEC_ID[key], s["title"], _md_html(s["lines"])
+                               + _detail(lx, "d_repro", details.get("reproducibility", ""), "reproducibility-detail")))
         elif key == "reference":
             # the "where is the detail" list is for the Markdown reader; here each part carries its own detail
             where = f"### {T['r_where'][lx.i]}"
             body = s["lines"][:s["lines"].index(where)] if where in s["lines"] else s["lines"]
-            parts.append(f'<div class="dsv-card">{_md_html(body)}'
-                         + _detail(lx, "d_other", details.get("other", ""), "other-detail") + "</div>")
+            parts.append(_card(_SEC_ID[key], s["title"], _md_html(body)
+                               + _detail(lx, "d_other", details.get("other", ""), "other-detail")))
         else:
-            parts.append(f'<div class="dsv-card">{_md_html(s["lines"])}</div>')
-        parts.append("</section>")
+            parts.append(_card(_SEC_ID[key], s["title"], _md_html(s["lines"])))
     parts.append("</div>")
-    return "\n".join(parts)
+    return "\n".join(p for p in parts if p)
+
+
+# ------------------------------------------------------------------------------------------------ theme
+# The one token file of the design system.  The live UI's copy is canonical once it exists; until then the mock's.
+_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+THEME_PATH = os.path.join(_ROOT, "extractor", "web", "ui", "theme.css")
+_THEME_FALLBACK_PATH = os.path.join(_ROOT, "docs", "ui-redesign", "mock", "theme.css")
+
+
+def theme_path() -> str:
+    """The theme file the report inlines: the live UI's ``theme.css`` when present, else the design mock's."""
+    return THEME_PATH if os.path.exists(THEME_PATH) else _THEME_FALLBACK_PATH
+
+
+def load_theme() -> str:
+    """The shared theme (tokens + components + the .dsv bridge), plus a print rule that re-applies its light token
+    block so a printed report is light whatever the OS setting.  "" when no theme file is available."""
+    try:
+        with open(theme_path(), encoding="utf-8") as fh:
+            css = fh.read()
+    except OSError:
+        return ""
+    m = re.search(r"(?s):root\s*\{(.*?)\n\}", css)
+    if m:
+        css += "\n@media print { :root:root:root:root, :root.dark:root:root { " + m.group(1).strip() + " } }\n"
+    return css
+
+
+# the theme's Collapsible labels are Korean; an English report gets English ones in its inlined copy
+_COLLAPSIBLE_EN = (('content: "펼치기"', 'content: "Show"'), ('content: "접기"', 'content: "Hide"'))
+
+
+def theme_style(lang: str = "ko") -> str:
+    """The theme as an inline ``<style>`` block (the report must open as one standalone file)."""
+    css = load_theme()
+    if lang == "en":
+        for a, b in _COLLAPSIBLE_EN:
+            css = css.replace(a, b)
+    return f'<style id="ds-theme">{css}</style>' if css else ""
 
 
 def wrap_detail(report_html: str, label: str) -> str:
@@ -1302,5 +1396,5 @@ def wrap_detail(report_html: str, label: str) -> str:
     end = report_html.rfind("</body>")
     if start < 0 or end < start:
         return report_html
-    return (report_html[:start] + f'<details class="dsv-detail" id="dsv-detail"><summary>{E(label)}</summary>\n'
+    return (report_html[:start] + f'<details class="collapsible dsv-detail" id="dsv-detail"><summary>{E(label)}</summary>\n'
             + report_html[start:end] + "</details>\n" + report_html[end:])

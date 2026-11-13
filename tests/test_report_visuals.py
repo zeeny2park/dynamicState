@@ -123,7 +123,7 @@ class TestVisualSummary(unittest.TestCase):
             h = self._html(res, lang)
             i = h.index('id="dsv-finding-1"')
             self.assertIn(word, h[i:i + 700])
-            self.assertIn("dsv-tone-unk", h[i - 40:i])
+            self.assertIn("badge-tone tone-skip", h[i:i + 700])                   # the neutral tone of the theme
             self.assertNotIn("probable cause", h[i:i + 700])
             self.assertNotIn("추정 원인", h[i:i + 700])
         fault = deadlock_result()
@@ -175,7 +175,7 @@ class TestVisualSummary(unittest.TestCase):
         d = res["report"]["section_d_detailed_inspection_results"]["checks"][0]["actual_observations"]
         del d["memory_integrity"]["heap"]["defects"][0]["damage"]["bytes_past_usable_end"]
         h = self._html(res)
-        self.assertNotIn("dsv-mem", h.split("</style>", 1)[1])
+        self.assertNotIn("dsv-mem", h.rsplit("</style>", 1)[1])                    # after the two style blocks
         self.assertIn("heap chunk header damaged", h)                                # falls back to the description
 
     def test_leak_chart_and_owner(self):
@@ -197,7 +197,7 @@ class TestVisualSummary(unittest.TestCase):
         self.assertIn("not selected for this symptom", h)
         self.assertIn('href="#finding-1"', h)                                        # failing check -> its finding
         self.assertIn("not evidence that the process is fine", h)
-        self.assertIn("Also not examined", h)
+        self.assertIn('id="sec-not-examined"', h)                                  # its own card now
 
     def test_result_status_wins_over_report_status(self):
         res = deadlock_result()
@@ -250,7 +250,7 @@ class TestVisualSummary(unittest.TestCase):
     def test_wrap_detail(self):
         page = '<html><body><div class="report-card">A. Executive Summary</div></body></html>'
         out = wrap_detail(page, "Detail " + EVIL)
-        self.assertIn('<details class="dsv-detail" id="dsv-detail">', out)
+        self.assertIn('<details class="collapsible dsv-detail" id="dsv-detail">', out)
         self.assertNotIn(EVIL, out)
         self.assertLess(out.index("<details"), out.index("A. Executive Summary"))
         self.assertEqual(wrap_detail("<p>x</p>", "d"), "<p>x</p>")

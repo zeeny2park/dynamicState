@@ -91,7 +91,7 @@ def _render(name, lang):
     return out, without_detail(out["report_html"])
 
 
-DETAIL_BODY = re.compile(r'(?s)<div class="dsv-detail-body"[^>]*>.*?</div><!--/dsv-detail-body-->')
+DETAIL_BODY = re.compile(r'(?s)<div class="dsv-detail-body[^"]*"[^>]*>.*?</div><!--/dsv-detail-body-->')
 
 
 def without_detail(html):
@@ -133,9 +133,9 @@ class TestKoreanReportHasNoEnglishSentences(unittest.TestCase):
         out, _ = _render("overflow_ring", "en")
         self.assertIn("is a heap buffer with 72 usable bytes", out["human_summary"])
         md = out["report_markdown"]
-        for h in ("## 1. Conclusion", "## 2. What was found", "## 3. What to do next", "## 4. What was checked",
-                  "## 5. How the diagnosis was done and what it cost the target", "## 6. Reproducibility",
-                  "## 7. Reference"):
+        for h in ("## 1. Conclusion", "## 2. Target", "## 3. What was found", "## 4. Checks", "## 5. Not examined",
+                  "## 6. What to do next", "## 7. How the diagnosis was done and what it cost the target",
+                  "## 8. Reproducibility", "## 9. Reference"):
             self.assertIn(h, md)
 
     def test_verdicts_are_the_saved_ones(self):
@@ -150,10 +150,10 @@ class TestDetailExemptionIsExact(unittest.TestCase):
     def test_only_detail_bodies_are_removed_and_their_labels_are_checked(self):
         out, visual = _render("overflow_ring", "ko")
         html = out["report_html"]
-        n_blocks = html.count('<details class="dsv-detail"')
+        n_blocks = html.count('<details class="collapsible dsv-detail"')
         self.assertGreater(n_blocks, 5)                                   # verdict, finding, checks, scope, method
         self.assertEqual(n_blocks, html.count("<!--/dsv-detail-body-->"))  # every block marks the end of its body
-        self.assertEqual(visual.count('<details class="dsv-detail"'), n_blocks)  # the blocks and labels stay
+        self.assertEqual(visual.count('<details class="collapsible dsv-detail"'), n_blocks)  # blocks and labels stay
         self.assertIn("이 발견의 상세 근거", visual)
         self.assertIn("이 검사의 상세 결과", visual)
         self.assertNotIn("Executive Summary", visual)                     # the English records are gone

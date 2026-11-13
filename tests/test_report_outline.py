@@ -34,7 +34,7 @@ from test_korean_report_language import NAMES, _load, _Saved, without_detail  # 
 DETAIL_FIXTURES = os.path.join(ROOT, "tests", "fixtures", "report_detail")
 KINDS = {"CONFIRMED_FAULT": "overflow_ring", "PROBABLE_FAULT": "uaf_jobq", "DEGRADED": "lock_convoy",
          "HEALTHY": "ok_idle_server", "INCONCLUSIVE": "request_threads"}
-DETAIL_BODY = re.compile(r'(?s)<div class="dsv-detail-body"[^>]*>(.*?)</div><!--/dsv-detail-body-->')
+DETAIL_BODY = re.compile(r'(?s)<div class="dsv-detail-body[^"]*"[^>]*>(.*?)</div><!--/dsv-detail-body-->')
 
 
 def _render_dict(d, lang, **kw):
@@ -59,7 +59,12 @@ def _md_h2(md):
 
 
 def _html_h2(html):
-    return [re.sub(r"<[^>]+>", "", h) for h in re.findall(r'<section class="dsv-sec" id="[^"]+"><h2>(.*?)</h2>', html)]
+    """Section titles of the HTML report: the banner's (visually hidden) title and each card's title."""
+    return [re.sub(r"<[^>]+>", "", h) for h in re.findall(r'<h2 class="(?:sr-only|card-title)">(.*?)</h2>', without_detail(html))]
+
+
+def _titles(md_h2):
+    return [h.split(". ", 1)[1] for h in md_h2]
 
 
 def _text(html):
@@ -82,7 +87,7 @@ class TestOutline(unittest.TestCase):
             for lang in ("en", "ko"):
                 out = _render_dict(_load(name), lang)
                 md, html = _md_h2(out["report_markdown"]), _html_h2(out["report_html"])
-                self.assertEqual(md, html, (name, lang))
+                self.assertEqual(_titles(md), html, (name, lang))     # the HTML cards carry no numbers
                 # the summary is the same outline without the incident-only parts (hypothesis, reproducibility)
                 titles = lambda hs: [h.split(". ", 1)[1] for h in hs]  # noqa: E731
                 incident_only = ("Reproducibility", "재현 정보", "The hypothesis you asked to check", "요청한 가설 검증")
@@ -105,7 +110,7 @@ class TestOutline(unittest.TestCase):
                 self.assertIn(words[v][i], first[2], (v, lang))
                 self.assertIn(f"`{v}`", first[2])
                 # the findings section exists exactly when there is a finding (no section only to say "nothing")
-                self.assertEqual(any("발견한 문제" in h or "What was found" in h for h in _md_h2(md)),
+                self.assertEqual(any("발견된 문제" in h or "What was found" in h for h in _md_h2(md)),
                                  bool(_load(name)["findings"]), (v, lang))
 
     def test_headings_are_numbered_once_and_correctly_nested(self):
@@ -155,14 +160,14 @@ class TestOutline(unittest.TestCase):
             for lang in ("en", "ko"):
                 out = _render_dict(d, lang)
                 html, md = out["report_html"], out["report_markdown"]
-                tile = re.search(r'<div class="dsv-tile"><span>[^<]+</span><b>(\d+)</b>', html)
+                tile = re.search(r'<div class="card tile"><div class="k">[^<]+</div><div class="v">(\d+)</div>', html)
                 self.assertEqual(int(tile.group(1)), c["run"], (name, lang))
                 for text in (md, _text(html)):
-                    sent = re.search(r"(\d+) checks ran: (\d+) found a problem, (\d+) came back clean and (\d+) could"
+                    sent = re.search(r"(\d+) checks ran: (\d+) found a problem, (\d+) could not judge and (\d+) passed"
                                      if lang == "en" else
-                                     r"검사 (\d+)개를 실행했습니다. 이상 발견 (\d+)개, 이상 없음 (\d+)개, 판단하지 못함 (\d+)개", text)
+                                     r"검사 (\d+)개를 실행했습니다. 이상 발견 (\d+)개, 판단 불가 (\d+)개, 통과 (\d+)개", text)
                     self.assertEqual(tuple(int(x) for x in sent.groups()),
-                                     (c["run"], c["found"], c["clean"], c["undecided"]), (name, lang))
+                                     (c["run"], c["found"], c["undecided"], c["clean"]), (name, lang))
                 for g, n in (("FAIL", c["found"]), ("INCONCLUSIVE", c["undecided"]), ("PASS", c["clean"]),
                              ("SKIPPED", c["not_run"])):
                     self.assertEqual(html.count(f'<details class="dsv-ck dsv-s-{g}" data-status="{g}"'), n, (name, g))
@@ -171,19 +176,14 @@ class TestOutline(unittest.TestCase):
 
     def test_healthy_report_is_short(self):
         # Bound: the healthy Markdown was 120 lines / about 1000 words before (each check listed three times).  Now
-        # each thing is said once; what remains is the conclusion, one advice line, the 30 checks named once in
-        # grouped lines, what the verdict does not cover, the method block and the glossary: <= 80 lines and
-        # <= 700 words in either language (Korean words are longer units, English runs about 20 % more words).
-        # The reproducibility section is reference material for re-explaining the run (one table row per executed
-        # check, about 25 lines) and is not counted; it is bounded on its own: one line per executed check + 30.
+        # each thing is said once: the conclusion with the four figures, the target card (7 lines), the 30 checks
+        # named once in grouped lines, what was not examined, one advice line, the method block, the short
+        # reproducibility facts (the per-check table is in the HTML detail and the opt-in appendix) and the glossary:
+        # the whole body <= 100 lines and <= 800 words in Korean / 950 in English (English runs ~20 % more words).
         for name in ("ok_idle_server", "ok_scenario_a"):
-            for lang, words in (("ko", 700), ("en", 850)):
-                full = _render_dict(_load(name), lang)["report_markdown"]
-                title = "재현 정보" if lang == "ko" else "Reproducibility"
-                md, repro = re.split(r"(?m)^## \d+\. " + title + "$", full)
-                repro = repro.split("\n## ")[0]
-                self.assertLessEqual(len(repro.splitlines()), len(_load(name)["checks_run"]) + 30, (name, lang))
-                self.assertLessEqual(len(md.splitlines()), 80, (name, lang))
+            for lang, words in (("ko", 800), ("en", 950)):
+                md = _render_dict(_load(name), lang)["report_markdown"]
+                self.assertLessEqual(len(md.splitlines()), 100, (name, lang))
                 self.assertLessEqual(len(md.split()), words, (name, lang))
 
     def test_healthy_report_says_what_the_verdict_covers_and_what_was_not_checked(self):
@@ -193,9 +193,10 @@ class TestOutline(unittest.TestCase):
             md = _render_dict(d, lang)["report_markdown"]
             concl = md.split("## 1.")[1].split("\n## ")[0]
             self.assertIn(outside, concl)                      # named in the conclusion (docs/HEALTHY_VERDICT.md)
-            scope = md.split("## 3.")[1].split("\n## ")[0]
-            self.assertIn(covers, scope)
-            self.assertIn(outside, scope)
+            checks = re.split(r"(?m)^## \d+\. (?:Checks|검사)$", md)[1].split("\n## ")[0]
+            self.assertIn(covers, checks)                      # stated with the checks it rests on
+            not_examined = re.split(r"(?m)^## \d+\. (?:Not examined|확인하지 못한 것)$", md)[1].split("\n## ")[0]
+            self.assertIn(outside, not_examined)
 
     def test_symptom_not_understood_note_is_in_the_conclusion(self):
         d = copy.deepcopy(_load("overflow_ring"))
@@ -219,7 +220,7 @@ class TestDetailPerPart(unittest.TestCase):
     @staticmethod
     def _blocks(html):
         return {m.group(1): m.group(2) for m in re.finditer(
-            r'(?s)<details class="dsv-detail" id="([^"]+)"><summary>.*?</summary><div class="dsv-detail-body"[^>]*>(.*?)'
+            r'(?s)<details class="collapsible dsv-detail" id="([^"]+)"><summary>.*?</summary><div class="dsv-detail-body[^"]*"[^>]*>(.*?)'
             r'</div><!--/dsv-detail-body-->', html)}
 
     def test_nothing_of_the_detailed_report_is_lost(self):
@@ -298,8 +299,89 @@ class TestHumanSummary(unittest.TestCase):
     def test_summary_is_the_same_outline_without_incident_only_parts(self):
         d = _load("overflow_ring")
         s = render_human_report(d, d["report"], "en")
-        self.assertEqual(_md_h2(s), ["1. Conclusion", "2. What was found", "3. What to do next", "4. What was checked",
-                                     "5. How the diagnosis was done and what it cost the target", "6. Reference"])
+        self.assertEqual(_md_h2(s), ["1. Conclusion", "2. Target", "3. What was found", "4. Checks", "5. Not examined",
+                                     "6. What to do next", "7. How the diagnosis was done and what it cost the target",
+                                     "8. Reference"])
+
+
+class TestDesignSystem(unittest.TestCase):
+    """The report HTML against the checklist of docs/ui-redesign/DESIGN_SYSTEM_KO.md section 5 and its card order."""
+
+    CASES = ("overflow_ring", "uaf_jobq", "lock_convoy", "ok_idle_server", "request_threads", "deadlock_circular")
+    # the former group labels of the outline (an engine sentence such as "힙 메타데이터에 이상 없음" is not a status label)
+    OLD_WORDS = ("판단하지 못함", "이상 없음 (", "실행하지 않음", "came back clean", "Clean (", "Could not decide")
+
+    def _pages(self):
+        for name in self.CASES:
+            for lang in ("en", "ko"):
+                yield name, lang, _render_dict(_load(name), lang)
+
+    def test_card_order_is_the_exported_order(self):
+        from extractor.human_report import REPORT_SECTION_ORDER, SECTION_ORDER
+        from extractor.report_visuals import _SEC_ID
+        self.assertEqual(REPORT_SECTION_ORDER[:7], ("conclusion", "tiles", "target", "findings", "checks",
+                                                    "not_examined", "next"))   # the design system's order
+        self.assertEqual(SECTION_ORDER, tuple(k for k in REPORT_SECTION_ORDER if k != "tiles"))
+        for name, lang, out in self._pages():
+            html = out["report_html"]
+            ids = {v: k for k, v in _SEC_ID.items()}
+            found = [ids[i] for i in re.findall(r'<(?:section|div) class="(?:card|tiles)[^"]*" id="([^"]+)"', html) if i in ids]
+            self.assertEqual(found, [k for k in REPORT_SECTION_ORDER if k in found], (name, lang, found))
+            self.assertEqual(found[:3], ["conclusion", "tiles", "target"], (name, lang))
+            self.assertIn('class="card masthead"', html.split('id="sec-conclusion"')[0])   # the masthead comes first
+            keys = [s["key"] for s in compose(_load(name), _load(name)["report"], lang)["sections"]]
+            self.assertEqual(keys, [k for k in SECTION_ORDER if k in keys])
+
+    def test_no_external_url_and_no_colour_outside_the_token_block(self):
+        for name, lang, out in self._pages():
+            html = out["report_html"]
+            self.assertNotRegex(html, r"https?://", (name, lang))
+            theme = re.search(r'(?s)<style id="ds-theme">.*?</style>', html)
+            self.assertTrue(theme, "the shared theme is inlined")
+            rest = html.replace(theme.group(0), "")
+            self.assertEqual(re.findall(r"#[0-9a-fA-F]{3,8}\b(?![\w-])", re.sub(r'(?s)href="#[^"]*"', "", rest)), [], (name, lang))
+            self.assertNotRegex(rest, r"\b(?:rgba?|hsla?|oklch)\(", (name, lang))
+
+    def test_only_the_four_status_words(self):
+        for name, lang, out in self._pages():
+            text = _text(out["report_html"]) + out["report_markdown"]
+            for w in self.OLD_WORDS:
+                self.assertNotIn(w, text, (name, lang, w))
+            words = re.findall(r'<details class="dsv-ck dsv-s-(\w+)"', out["report_html"])
+            self.assertTrue(set(words) <= {"FAIL", "INCONCLUSIVE", "PASS", "SKIPPED"})
+            for g, (en, ko) in (("FAIL", ("Found a problem", "이상 발견")), ("INCONCLUSIVE", ("Could not judge", "판단 불가")),
+                                ("PASS", ("Passed", "통과")), ("SKIPPED", ("Not run", "실행 안 함"))):
+                if g in words:
+                    self.assertIn(en if lang == "en" else ko, text, (name, lang, g))
+
+    def test_no_card_inside_a_card(self):
+        for name, lang, out in self._pages():
+            body = without_detail(out["report_html"])
+            # between a card's opening tag and its end there is no other card opening tag
+            cards = [m.start() for m in re.finditer(r'<(?:section|div|header) class="card[ "]', body)]
+            ends = []
+            for start in cards:
+                tag = re.match(r"<(\w+)", body[start:]).group(1)
+                d, i = 0, start
+                for m in re.finditer(r"<(/?)" + tag + r"\b", body[start:]):
+                    d += -1 if m.group(1) else 1
+                    if d == 0:
+                        ends.append(start + m.start())
+                        break
+            for start, end in zip(cards, ends):
+                inner = body[start + 1:end]
+                self.assertNotRegex(inner, r'<(?:section|div|header) class="card[ "]', (name, lang, body[start:start + 80]))
+
+    def test_dark_mode_follows_the_os_and_a_dark_class(self):
+        html = _render_dict(_load("overflow_ring"), "ko")["report_html"]
+        self.assertIn("prefers-color-scheme: dark", html)
+        self.assertIn(".dark {", html)
+        self.assertIn("@media print", html)
+
+    def test_english_collapsible_labels_are_english(self):
+        html = _render_dict(_load("overflow_ring"), "en")["report_html"]
+        self.assertIn('content: "Show"', html)
+        self.assertNotRegex(html, "[가-힣]")              # nothing Korean in an English report, styles included
 
 
 if __name__ == "__main__":

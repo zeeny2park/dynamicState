@@ -60,7 +60,7 @@ class TestIncidentHtml(unittest.TestCase):
     def _check_html(self, h, lang):
         self.assertNotRegex(h, r"""(?:src|href)\s*=\s*["']?https?://""")
         self.assertIn("A. Executive Summary", h)                       # the detailed records are attached ...
-        pre = re.sub(r'(?s)<div class="dsv-detail-body"[^>]*>.*?</div><!--/dsv-detail-body-->', "", h)
+        pre = re.sub(r'(?s)<div class="dsv-detail-body[^"]*"[^>]*>.*?</div><!--/dsv-detail-body-->', "", h)
         self.assertNotIn("A. Executive Summary", pre)                  # ... in collapsed blocks, not in the reading part
         self.assertIn('id="sec-conclusion"', pre)
         self.assertIn('lang="%s"' % lang, pre)

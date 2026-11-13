@@ -1212,15 +1212,13 @@ class DiagnosticReport:
 # record shown in one place can be linked from another (``detail-chk-<check_id>``, ``detail-ev-<evidence_id>``,
 # ``detail-hyp-<hypothesis_id>``, ``detail-fnd-<finding_id>``).
 
-_DETAIL_BADGE = {
-    "CONFIRMED": "#b91c1c; color: #fff", "CONFIRMED_FAULT": "#b91c1c; color: #fff", "FAULT": "#b91c1c; color: #fff",
-    "FAIL": "#b91c1c; color: #fff", "DEGRADED": "#ea580c; color: #fff", "LIKELY": "#d97706; color: #fff",
-    "PROBABLE": "#d97706; color: #fff", "PROBABLE_FAULT": "#d97706; color: #fff", "SUPPORTED": "#2563eb; color: #fff",
-    "PASS": "#15803d; color: #fff", "HEALTHY": "#15803d; color: #fff", "INCONCLUSIVE": "#6b7280; color: #fff",
-    "NOT_APPLICABLE": "#4b5563; color: #fff", "NOT_EXECUTED": "#9ca3af; color: #111", "SKIPPED": "#64748b; color: #fff",
-    "UNSUPPORTED": "#64748b; color: #fff", "ERROR": "#dc2626; color: #fff", "REFUTED": "#475569; color: #fff",
-    "CRITICAL": "#991b1b; color: #fff", "HIGH": "#c2410c; color: #fff", "MEDIUM": "#d97706; color: #fff",
-    "LOW": "#0284c7; color: #fff",
+# status / severity -> the design system's tones (the detail records take the shared theme, no own colours)
+_DETAIL_TONE = {
+    "CONFIRMED": "fail", "CONFIRMED_FAULT": "fail", "FAULT": "fail", "FAIL": "fail", "ERROR": "fail",
+    "CRITICAL": "fail", "HIGH": "fail", "CONFIRMED_ROOT_CAUSE": "fail",
+    "DEGRADED": "warn", "LIKELY": "warn", "PROBABLE": "warn", "PROBABLE_FAULT": "warn", "INCONCLUSIVE": "warn",
+    "MEDIUM": "warn", "PROBABLE_CAUSE": "warn",
+    "PASS": "pass", "HEALTHY": "pass", "SUPPORTED": "info",
 }
 
 
@@ -1234,11 +1232,8 @@ def detail_anchor(kind: str, ident: Any) -> str:
 
 
 def detail_badge(text: Any) -> str:
-    style = _DETAIL_BADGE.get(str(text).upper(), "background: #475569; color: #fff")
-    if not style.startswith("background"):
-        style = "background:" + style
-    return (f'<span style="display:inline-block; padding: 2px 8px; border-radius: 4px; font-weight:600; font-size:11px; '
-            f'font-family:monospace; {style}">{_e(text)}</span>')
+    tone = _DETAIL_TONE.get(str(text).upper(), "skip")
+    return f'<span class="badge badge-tone tone-{tone} mono">{_e(text)}</span>'
 
 
 def _lines(items: Any, empty: str = "<em>None</em>") -> str:
