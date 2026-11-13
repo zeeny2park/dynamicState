@@ -4,7 +4,7 @@ The browser renders a ``DiagnoseResult`` without re-implementing any of the repo
 everything that is words or a picture comes from here, and every piece is produced by the same functions that
 write the incident report (``human_report.compose``, ``report_visuals``), so the final screen and the report say
 the same thing.  The ``verdict`` event of ``/api/diagnose/{job_id}/events`` carries ``view = {"ko": ..., "en": ...}``
-(see ``docs/ui-redesign/UI_EVENTS.md``); the replay files under ``replay/`` are made with the same function.
+(see ``docs/ui-redesign/API_CONTRACT.md``); the replay files under ``replay/`` are made with the same function.
 
 Read-only use of the report modules; nothing here decides anything about the diagnosis.
 """
@@ -37,11 +37,13 @@ def _strip_tags(s: str) -> str:
 
 
 def _finding_body(card: str) -> str:
-    """The report's finding card without its own frame and heading: the UI draws the frame and the heading
+    """The report's finding block without its own frame and heading: the UI draws the frame and the heading
     (whose badge changes while the diagnosis runs); everything inside is the report's."""
-    body = re.sub(r'^<section class="dsv-card[^"]*" id="finding-\d+"><span id="dsv-finding-\d+"></span>', "", card)
-    body = re.sub(r'^<div class="dsv-fhead">.*?</div>', "", body, flags=re.S)
-    return re.sub(r"</section>$", "", body)
+    m = re.match(r'<div class="finding" id="finding-\d+"><span id="dsv-finding-\d+"></span>'
+                 r'<div class="fhead">.*?</div>(.*)</div>$', card, re.S)
+    if not m:
+        raise ValueError("report_visuals._finding_card changed shape")
+    return m.group(1)
 
 
 def build_view(result: Dict[str, Any], lang: str, report: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
@@ -68,7 +70,7 @@ def build_view(result: Dict[str, Any], lang: str, report: Optional[Dict[str, Any
     from_report = {}
     for st, rid, summary, dl in _CK_RE.findall(checklist):
         from_report[html.unescape(rid)] = {"name": _strip_tags(_span("dsv-ck-name", summary)),
-                                           "domain": _strip_tags(_span("dsv-chip", summary)),
+                                           "domain": _strip_tags(_span("dsv-ck-cat", summary)),
                                            "line": _strip_tags(_span("dsv-ck-line", summary)), "detail_html": dl}
     checks = []
     for r in rows:
@@ -127,7 +129,6 @@ def build_view(result: Dict[str, Any], lang: str, report: Optional[Dict[str, Any
         "tiles": tiles, "checks": checks, "findings": fviews,
         "not_examined_html": rv._md_html(comp.get("not_examined") or []) if comp.get("not_examined") else "",
         "next_html": rv._md_html(next_lines) if next_lines else "",
-        "picture_css": rv._CSS + rv._interaction_css(),
     }
 
 
@@ -154,3 +155,63 @@ def category_labels(category: str) -> Dict[str, str]:
     from extractor.report_registry import category_label
     reg = category_label(category) or CATEGORY_LABEL.get(category)
     return {"en": reg[0], "ko": reg[1]} if reg else {"en": category, "ko": category}
+
+
+# ---------------------------------------------------------------------------------------------- live event extras
+# Each function below gives one field of a live event (API_CONTRACT.md 6); all read the session or the report code,
+# none changes anything.
+
+def check_line(check: Dict[str, Any]) -> Dict[str, str]:
+    """The report's one-line result of one check (the line its check list shows), from the engine's check record:
+    the interpretation for PASS / FAIL, the reason it could not judge otherwise.  ``check`` has the fields of a
+    report check (``recipe_id``, ``status``, ``technical_interpretation``, ``limitations``, ``missing_evidence``,
+    ``actual_observations``, ``error_details``)."""
+    from extractor import human_report as hr
+    rows = hr.check_rows({"checks_run": []}, {"section_d_detailed_inspection_results": {"checks": [check]}})
+    if not rows:
+        return {"en": "", "ko": ""}
+    r = rows[0]
+    out = {}
+    for lang, i in (("en", 0), ("ko", 1)):
+        s = r["status"]
+        interp = str(r.get("interp") or "")
+        if interp and interp != "Check executed" and s in ("FAIL", "PASS"):
+            out[lang] = hr.ko_text(interp, i)[:160]
+        elif s in ("INCONCLUSIVE", "SKIPPED"):
+            out[lang] = re.sub(r"`", "", hr._undecided_reason(hr._Ctx(lang), r, {}))[:160]
+        else:
+            out[lang] = ""
+    return out
+
+
+def plan_exclusions(registry: Any, planned: List[str]) -> Dict[str, List[Dict[str, Any]]]:
+    """The checks the plan leaves out, split as the report splits them (``section_c.recipes_excluded``): not
+    selected for this symptom, and not examined in this mode (a capability a zero-stop diagnosis does not have)."""
+    from extractor.diagnostic_recipes import CAPABILITY_DESCRIPTIONS
+    planned_set = set(planned)
+    ids = [rid for rid in registry.list_recipe_ids() if rid not in planned_set]
+    labels = plan_labels(ids)
+    not_planned, not_in_mode = [], []
+    for rid in ids:
+        missing = registry.missing_capabilities(rid)
+        row = dict(recipe_id=rid, **labels[rid])
+        if missing:
+            cap = missing[0]
+            desc = CAPABILITY_DESCRIPTIONS.get(cap, (cap, cap))
+            not_in_mode.append(dict(row, capability=cap, capability_label={"en": desc[0], "ko": desc[1]}))
+        else:
+            not_planned.append(row)
+    return {"not_planned": not_planned, "not_in_mode": not_in_mode}
+
+
+def verdict_words(verdict: Any) -> Dict[str, str]:
+    """The report's word for a verdict, both languages (the recent-diagnoses list)."""
+    from extractor.human_report import T
+    key = f"v_{verdict}" if f"v_{verdict}" in T else "v_INCONCLUSIVE"
+    return {"en": T[key][0], "ko": T[key][1]}
+
+
+def headline(result: Dict[str, Any]) -> Dict[str, str]:
+    """One phrase for a finished diagnosis in a list: the first finding's category in words, else empty."""
+    findings = [f for f in (result.get("findings") or []) if isinstance(f, dict)]
+    return category_labels(str(findings[0].get("category"))) if findings else {"en": "", "ko": ""}

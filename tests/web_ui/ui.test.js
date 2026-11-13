@@ -113,7 +113,7 @@ test("a verdict without the view (contract as written) still renders a complete 
     const html = UI.render(s, UIS("ko"));
     assert.ok(!/undefined|\[object Object\]|NaN/.test(html), n);
     assert.ok(html.includes('id="report"') && html.includes("format=md&amp;lang=ko"), n);
-    const word = UI.STR.ko["v_" + d.events.find((e) => e.type === "verdict").data.result.verdict];
+    const word = d.events.find((e) => e.type === "verdict").data.result.verdict;     // no view: the verdict code itself
     assert.ok(html.includes(word), `${n}: ${word}`);
   }
 });
@@ -182,7 +182,7 @@ test("the idle screen: one button, the form fields, examples when the server is 
     const ssh = UI.renderIdle({ lang, form: { mode: "ssh" } });
     for (const name of ["remote_host", "ssh_user", "ssh_port", "ssh_key"]) assert.ok(ssh.includes(`name="${name}"`));
     const jobs = UI.renderIdle({ lang, form: {}, jobs: [{ job_id: "abc", pid: 42, target_name: "svc", state: "done",
-      verdict: "HEALTHY", started_at: new Date().toISOString() }] });
-    assert.ok(jobs.includes("?job=abc") && jobs.includes(UI.STR[lang].v_HEALTHY));
+      verdict: "HEALTHY", verdict_word: { ko: "점검한 범위 안에서 정상", en: "healthy within the checked scope" }, started_at: new Date().toISOString() }] });
+    assert.ok(jobs.includes("?job=abc") && jobs.includes((lang === "ko" ? "점검한 범위 안에서 정상" : "healthy within the checked scope")));
   }
 });

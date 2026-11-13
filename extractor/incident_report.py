@@ -403,6 +403,7 @@ def export_incident_report(
     session: Any = None,
     report_json_path: Optional[str] = None,
     markdown_detail: bool = False,
+    result: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Render the incident report (Markdown, HTML, JSON) of one diagnosis.
 
@@ -413,7 +414,11 @@ def export_incident_report(
     The Markdown and the HTML follow the same outline (``human_report.compose``), with the reproducibility section
     (``extractor.reproducibility``) in its place.  The detailed (A-I) records are attached to the part of the HTML
     report they explain (``report_detail.partition``); the Markdown points to them, and ``markdown_detail=True``
-    appends them to the Markdown as well, organised by report part."""
+    appends them to the Markdown as well, organised by report part.
+
+    ``result`` is a ``DiagnoseResult`` dict of a diagnosis that already ran, with its inline ``report``
+    (``diagnose(..., include_report=True)``): it is rendered as is, so a caller that showed that result (the web UI's
+    diagnosis job) gets the report of exactly the same verdict, findings and checks."""
     t0 = time.monotonic_ns()
     if language not in ("en", "ko"):
         raise ValueError(f"language must be 'en' or 'ko', got {language!r}")
@@ -421,6 +426,8 @@ def export_incident_report(
         title = DEFAULT_TITLE_KO
     if session is not None and not pid:
         pid = session.pid
+    if result is not None and not pid:
+        pid = (result.get("target") or {}).get("pid")
     if pid is not None and (isinstance(pid, bool) or int(pid) <= 0):
         return {
             "success": False, "pid": pid, "overall_status": VERDICT_INCONCLUSIVE, "verdict": VERDICT_INCONCLUSIVE,
@@ -431,7 +438,12 @@ def export_incident_report(
     li = 1 if language == "ko" else 0
 
     # 1. the diagnosis (the only verdict)
-    if session is not None:
+    if result is not None:
+        from .human_report import render_human_report
+        res = json.loads(json.dumps(result, default=str))
+        summary_md = render_human_report(res, res.get("report"), lang=language)
+        companion_elf_path = companion_elf_path or (res.get("target") or {}).get("debug_image")
+    elif session is not None:
         try:
             from .human_report import render_human_report
             res = result_from_session(session)

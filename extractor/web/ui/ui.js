@@ -5,7 +5,7 @@
  *   html  = render(state, ui)       pure: a string; the shell morphs it into the page, so nodes already on screen stay
  * Words, labels and pictures of the diagnosis come from the server (event payloads and the verdict's `view`); the
  * only words here are the UI's own (STR).  No framework, no build step, no external URL.  Event shapes:
- * docs/ui-redesign/UI_EVENTS.md.
+ * docs/ui-redesign/API_CONTRACT.md.
  */
 (function (root) {
   "use strict";
@@ -81,10 +81,7 @@
       ago_now: "방금", ago_min: "{n}분 전", ago_hour: "{n}시간 전", ago_day: "어제", ago_days: "{n}일 전",
       live_phase: "{phase} 단계", live_finding: "발견 {n}: {label} 의심", live_verdict: "판정: {word}",
       refuted: "반박된 경쟁 가설:", err_TOO_MANY_JOBS: "동시에 실행할 수 있는 진단 수(4)를 넘었습니다. 하나가 끝난 뒤 다시 시도하세요.",
-      /* verdict words for places that have no view (recent list, a verdict without a view): the report's words
-         (human_report.T v_*), kept equal by tests/test_web_ui_static.py */
-      v_CONFIRMED_FAULT: "확인된 결함", v_PROBABLE_FAULT: "결함 추정", v_FAULT: "결함 추정", v_DEGRADED: "성능 저하 (결함 아님)",
-      v_HEALTHY: "점검한 범위 안에서 정상", v_INCONCLUSIVE: "판단 불가", v_ABORTED: "중단됨"
+      err_TARGET_UNREADABLE: "대상 프로세스를 읽을 수 없습니다: {message}"
     },
     en: {
       title: "dynamicState · Diagnose", brand_sub: "diagnose", skip: "Skip to content",
@@ -125,7 +122,7 @@
       f_pending: "The picture and the evidence appear here once verification ends.", f_by: "Checks that pointed to it",
       f_detail: "Detailed records of this finding (report)",
       checks_h: "Checks", checks_desc: "{done}/{total} done", checks_hint: "Press a row to see that check's result",
-      st_FAIL: "Problem found", st_INCONCLUSIVE: "Inconclusive", st_PASS: "Pass", st_SKIPPED: "Not run",
+      st_FAIL: "Found a problem", st_INCONCLUSIVE: "Could not judge", st_PASS: "Passed", st_SKIPPED: "Not run",
       st_RUNNING: "running…", st_PENDING: "waiting",
       not_run_n: "Not run {n}", not_run_hint: "not evidence that the process is fine",
       not_planned_h: "Not selected for this symptom",
@@ -157,9 +154,7 @@
       ago_now: "just now", ago_min: "{n} min ago", ago_hour: "{n} h ago", ago_day: "yesterday", ago_days: "{n} days ago",
       live_phase: "{phase}", live_finding: "Finding {n}: {label} suspected", live_verdict: "Verdict: {word}",
       refuted: "Competing hypotheses refuted:", err_TOO_MANY_JOBS: "Too many diagnoses at once (limit 4). Try again when one ends.",
-      v_CONFIRMED_FAULT: "confirmed fault", v_PROBABLE_FAULT: "probable fault", v_FAULT: "probable fault",
-      v_DEGRADED: "degraded, not a fault", v_HEALTHY: "healthy within the checked scope", v_INCONCLUSIVE: "could not decide",
-      v_ABORTED: "aborted"
+      err_TARGET_UNREADABLE: "Cannot read the target process: {message}"
     }
   };
   var ICON = { FAIL: "✖", INCONCLUSIVE: "?", PASS: "✔", SKIPPED: "–", RUNNING: "", PENDING: "" };
@@ -236,9 +231,10 @@
     if (x.recipe_id && !x.rid) x.rid = x.recipe_id;
     switch (x.type) {
       case "target":
-        x.architecture = x.architecture || (x.abi && x.abi.architecture) || x.arch || null;
-        x.libc = x.libc || (x.abi && x.abi.libc) || null;
-        x.libc_version = x.libc_version || (x.abi && x.abi.libc_version) || null;
+        var abi = x.abi || x.target_abi || {};
+        x.architecture = x.architecture || abi.architecture || x.arch || null;
+        x.libc = x.libc || abi.libc || null;
+        x.libc_version = x.libc_version || abi.libc_version || null;
         if (x.threads == null) x.threads = x.thread_count;
         x.debug_image = x.debug_image || x.companion_elf_path || null;
         if (x.debug_info == null && x.dwarf_available != null) x.debug_info = x.dwarf_available;
@@ -399,7 +395,8 @@
       var st = s.checks[rid].status;
       if (DONE[st]) { n.done++; n[st]++; }
     });
-    n.notrun = n.SKIPPED + s.skipped.not_planned.length + s.skipped.not_in_mode.length;
+    var gone = function (c) { return !s.checks[c.rid]; };
+    n.notrun = n.SKIPPED + s.skipped.not_planned.filter(gone).length + s.skipped.not_in_mode.filter(gone).length;
     return n;
   }
 
@@ -430,9 +427,9 @@
   }
 
   var VTONE = { CONFIRMED_FAULT: "fail", FAULT: "fail", PROBABLE_FAULT: "warn", DEGRADED: "warn", HEALTHY: "pass" };
-  function verdictWord(code, lang) {
-    var w = tr(lang, "v_" + code);
-    return w === "v_" + code ? code : w;
+  /* the verdict in words comes from the server (view.verdict_word, jobs[].verdict_word); without it, the code */
+  function verdictWord(code, lang, words) {
+    return L(words, lang) || String(code || "");
   }
   function mdInline(t) {
     return esc(t).replace(/`([^`]+)`/g, "<code>$1</code>").replace(/\*\*([^*]+)\*\*/g, "<b>$1</b>");
@@ -505,6 +502,9 @@
         }).join("") + "</ol>";
     }
     if (s.error) html += '<div class="alert alert-tone tone-fail" role="alert">' + esc(errorText(s.error, lang, s.request)) + "</div>";
+    else if (v && v.notice && v.notice.code) {       // the verdict stands; the target itself prevented more (it exited ...)
+      html += '<div class="alert alert-tone tone-warn" role="status">' + esc(errorText(v.notice, lang, s.request)) + "</div>";
+    }
     if (ui.conn === "lost" && !v) {
       html += '<div class="alert alert-tone tone-fail" role="alert"><span>' + esc(tr(lang, "conn_lost")) +
         '</span><button type="button" class="btn btn-outline btn-sm" data-act="reconnect" style="margin-left:auto">' + esc(tr(lang, "reconnect")) + "</button></div>";
@@ -646,7 +646,8 @@
         '<span class="ln">' + esc(line) + '</span><span class="ms">' + ms + '</span><span class="chev" aria-hidden="true">' + (open ? "▾" : "▸") + "</span></button>" +
         '<div class="dt" id="ckd-' + esc(rid) + '"' + (open ? "" : " hidden") + ">" + dt + "</div></li>";
     }).join("");
-    var np = s.skipped.not_planned, nm = s.skipped.not_in_mode;
+    var notRow = function (c) { return !s.checks[c.rid]; };     // a left-out check the engine ran after all is a row
+    var np = s.skipped.not_planned.filter(notRow), nm = s.skipped.not_in_mode.filter(notRow);
     function staticRow(c, why) {
       var vc = vmap[c.rid];
       return '<li><div class="ck-static">' + statusIcon("SKIPPED", lang) + '<span class="nm">' + esc(vc && vc.name || L(c.name, lang) || c.rid) +
@@ -843,7 +844,7 @@
   var ui = { lang: (Q.get("lang") || LS.get("ds-lang") || "ko") === "en" ? "en" : "ko", expanded: {}, form: { mode: "local" },
     elapsed: 0, conn: "ok", jobs: null, jobsState: "", examples: [], now: Date.now() };
   var events = [], request = null, job = null, replayTimers = [], es = null, pollTimer = null, watchdog = null,
-    retries = 0, t0 = 0, tick = null, frozenElapsed = null, lastSpoken = "", gen = 0, picCss = false;
+    retries = 0, t0 = 0, tick = null, frozenElapsed = null, lastSpoken = "", gen = 0;
   var main = document.getElementById("main"), chip = document.getElementById("tchip"), live = document.getElementById("live");
 
   /* morph: bring the live node `a` to the new node `b` in place, so what is on screen keeps its node (focus, the
@@ -898,12 +899,6 @@
       patch(main, renderIdle(ui));
       chip.hidden = true;
       return;
-    }
-    if (s.verdict && s.verdict.picture_css && !picCss) {        // the report's picture styles, under theme.css's bridge
-      var st = document.createElement("style");
-      st.id = "dsv-css"; st.textContent = s.verdict.picture_css;
-      document.head.insertBefore(st, document.head.firstChild);
-      picCss = true;
     }
     ui.elapsed = frozenElapsed != null ? frozenElapsed : ui.replayClock != null ? ui.replayClock : (t0 ? Date.now() - t0 : s.t);
     if (s.verdict || s.error) {

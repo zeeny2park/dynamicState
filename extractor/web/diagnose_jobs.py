@@ -39,6 +39,41 @@ def _process_name(pid: int) -> Optional[str]:
         return None
 
 
+def _reason_code(reason: str) -> str:
+    """The engine's own words for an unusable local target (``_preflight_target``) as an error code."""
+    r = reason or ""
+    if "not readable by this user" in r or "Permission denied" in r or "Operation not permitted" in r:
+        return "PERMISSION_DENIED"
+    if "does not exist" in r or "No such process" in r or "has exited" in r or "No such file" in r:
+        return "TARGET_NOT_FOUND"
+    return "TARGET_UNREADABLE"
+
+
+def preflight_error(pid: int) -> Optional[Dict[str, str]]:
+    """The engine's pre-flight check of a local target (``expert_diagnostic_engine._preflight_target``), before a
+    job exists: ``{"code", "message"}`` when the diagnosis could only end INCONCLUSIVE for that reason, else None."""
+    try:
+        from extractor.expert_diagnostic_engine import _preflight_target
+        from extractor.target_adapter import LocalTargetAdapter
+        _name, reason = _preflight_target(pid, LocalTargetAdapter())
+    except Exception:  # noqa: BLE001 - the diagnosis itself will say what is wrong
+        return None
+    return {"code": _reason_code(reason), "message": reason} if reason else None
+
+
+def outcome_notice(result: Dict[str, Any], job: "DiagnoseJob") -> Optional[Dict[str, str]]:
+    """What the UI should say next to a verdict that the target itself prevented: it exited during the diagnosis,
+    or it could not be read.  From the result's ``target_unreadable`` entry, or a local process that is gone now."""
+    for n in result.get("not_covered") or []:
+        if isinstance(n, dict) and n.get("kind") == "target_unreadable":
+            code = _reason_code(str(n.get("reason") or ""))
+            return {"code": "TARGET_EXITED" if code == "TARGET_NOT_FOUND" and job.target_name else code,
+                    "message": str(n.get("reason") or "")}
+    if not job.remote_host and job.target_name and not os.path.isdir(f"/proc/{int(job.pid)}"):
+        return {"code": "TARGET_EXITED", "message": f"process {job.pid} exited during the diagnosis"}
+    return None
+
+
 class DiagnoseJob:
     def __init__(self, params: Dict[str, Any]):
         self.job_id = secrets.token_urlsafe(16)[:JOB_ID_LEN]
@@ -58,6 +93,9 @@ class DiagnoseJob:
         self.session: Any = None
         self.reports: Dict[str, Dict[str, Any]] = {}
         self.report_lock = threading.Lock()
+        self.result: Optional[Dict[str, Any]] = None      # the finished DiagnoseResult with its inline report
+        self.verdict_word: Optional[Dict[str, str]] = None
+        self.headline: Optional[Dict[str, str]] = None
 
     # -- events
     def emit(self, etype: str, data: Dict[str, Any]) -> None:
@@ -88,8 +126,8 @@ class DiagnoseJob:
             return {
                 "job_id": self.job_id, "investigation_id": self.investigation_id, "pid": self.pid,
                 "target_name": self.target_name, "remote_host": self.remote_host, "state": self.state,
-                "verdict": self.verdict, "started_at": self.started_at, "finished_at": self.finished_at,
-                "last_seq": len(self.events),
+                "verdict": self.verdict, "verdict_word": self.verdict_word, "headline": self.headline,
+                "started_at": self.started_at, "finished_at": self.finished_at, "last_seq": len(self.events),
             }
 
 
@@ -169,6 +207,10 @@ class _TimelineTranslator:
         data["process_name"] = self.job.target_name
         data["transport"] = "ssh" if self.job.remote_host else "local"
         data["investigation_id"] = session.investigation_id
+        abi = data.get("target_abi") if isinstance(data.get("target_abi"), dict) else {}
+        for key in ("architecture", "libc", "libc_version"):
+            if abi.get(key):
+                data[key] = abi[key]
         self.job.emit("target", data)
 
     def _on_PLAN_GENERATED(self, session: Any, d: Dict[str, Any]) -> None:
@@ -176,9 +218,21 @@ class _TimelineTranslator:
         steps = [{"step_id": s["step_id"], "recipe_id": s["recipe_id"], "name": s.get("recipe_name"),
                   "category": s.get("category"), "domain": s.get("domain"), "priority": s.get("priority"),
                   "status": s.get("status", "PENDING")} for s in plan.get("steps", [])]
-        self.job.emit("plan", {"total_steps": plan.get("total_steps", len(steps)),
-                               "rationale": plan.get("plan_rationale", d.get("rationale", "")),
-                               "estimated_overhead_ms": plan.get("estimated_overhead_ms"), "steps": steps})
+        data: Dict[str, Any] = {"total_steps": plan.get("total_steps", len(steps)),
+                                "rationale": plan.get("plan_rationale", d.get("rationale", "")),
+                                "estimated_overhead_ms": plan.get("estimated_overhead_ms"), "steps": steps}
+        try:
+            from extractor.web.ui import view
+            labels = view.plan_labels([st["recipe_id"] for st in steps])
+            for st in steps:
+                st["label"] = labels[st["recipe_id"]]["name"]
+                st["domain_label"] = labels[st["recipe_id"]]["domain_label"]
+            registry = getattr(session, "recipe_registry", None)
+            if registry is not None:
+                data.update(view.plan_exclusions(registry, [st["recipe_id"] for st in steps]))
+        except Exception:  # noqa: BLE001 - labels are a convenience; the plan event goes out without them
+            pass
+        self.job.emit("plan", data)
 
     def _on_STEP_EXECUTED(self, session: Any, d: Dict[str, Any]) -> None:
         steps = self._steps(session)
@@ -204,16 +258,42 @@ class _TimelineTranslator:
             "contradicting_evidence_ids": list(getattr(check, "contradicting_evidence_ids", []) or []),
             "limitations": list(getattr(check, "limitations", []) or []),
             "missing_evidence": list(getattr(check, "missing_evidence", []) or []),
-            "index": index, "total": len(steps)}))
+            "index": index, "total": len(steps), **self._extras(session, check)}))
         if status == "FAIL" and index is not None:
             st = steps[index]
             key = f"{st.category}/{st.domain}"
             if key not in self.provisional_keys:
                 self.provisional_keys.add(key)
-                self.job.emit("finding_provisional", self.serialize({
-                    "key": key, "recipe_id": recipe_id, "check_id": getattr(check, "check_id", None), "name": name,
-                    "category": st.category, "domain": st.domain,
-                    "summary": getattr(check, "technical_interpretation", ""), "status": "provisional"}))
+                data = {"key": key, "recipe_id": recipe_id, "check_id": getattr(check, "check_id", None), "name": name,
+                        "category": st.category, "domain": st.domain,
+                        "summary": getattr(check, "technical_interpretation", ""), "status": "provisional"}
+                try:
+                    from extractor.web.ui import view
+                    data["category_label"] = view.category_labels(str(st.category))
+                except Exception:  # noqa: BLE001
+                    pass
+                self.job.emit("finding_provisional", self.serialize(data))
+
+    @staticmethod
+    def _extras(session: Any, check: Any) -> Dict[str, Any]:
+        """``line`` (the report's one-line result, ko / en) and ``bytes_read`` (cumulative), when they exist."""
+        out: Dict[str, Any] = {}
+        try:
+            from extractor.web.ui import view
+            if check is not None:
+                out["line"] = view.check_line({
+                    "recipe_id": check.recipe_id, "status": str(check.status), "name": check.name,
+                    "technical_interpretation": getattr(check, "technical_interpretation", ""),
+                    "limitations": list(getattr(check, "limitations", []) or []),
+                    "missing_evidence": list(getattr(check, "missing_evidence", []) or []),
+                    "actual_observations": getattr(check, "actual_observations", None) or {},
+                    "error_details": getattr(check, "error_details", None)})
+        except Exception:  # noqa: BLE001
+            pass
+        metrics = getattr(getattr(session, "budget_tracker", None), "metrics", None)
+        if isinstance(getattr(metrics, "bytes_read", None), (int, float)):
+            out["bytes_read"] = int(metrics.bytes_read)
+        return out
 
     def _on_HYPOTHESES_VERIFIED(self, session: Any, d: Dict[str, Any]) -> None:
         act = list(getattr(session, "active_hypotheses", []) or [])
@@ -258,6 +338,10 @@ class DiagnoseJobManager:
 
     # -- API
     def start(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        if self._diagnose_fn is None and not params.get("remote_target"):
+            refused = preflight_error(int(params["pid"]))
+            if refused is not None:
+                return {"success": False, "error": refused}
         key = (str((params.get("remote_target") or {}).get("remote_host") or ""), int(params["pid"]))
         with self._lock:
             running_id = self._running_by_target.get(key)
@@ -287,22 +371,39 @@ class DiagnoseJobManager:
         state, verdict = "error", None
         try:
             fn = self._diagnose_fn
+            extra: Dict[str, Any] = {}
             if fn is None:
                 from extractor.human_report import diagnose_with_summary as fn  # same function as POST /api/diagnose
+                extra["keep_report"] = True     # the view and the report are made from this very result
             p = job.params
             result, summary = fn(
                 p["pid"], debug_image=p.get("debug_image"), symptom=p.get("symptom"), time_limit_s=p.get("time_limit_s"),
                 engine=engine, lang=job.language, target=p.get("remote_target"), symptom_fields=p.get("symptom_fields"),
+                **extra,
             )
-            full = self._serialize({**result, "human_summary": summary})
+            report = result.get("report") if isinstance(result.get("report"), dict) else None
+            if report is not None:
+                job.result = self._serialize(result)
+            result = {k: v for k, v in result.items() if k != "report"}
+            full = self._serialize({**result, "report": None, "human_summary": summary})
             verdict = full.get("verdict")
             if not job.investigation_id:
                 job.investigation_id = full.get("investigation_id")
             base = f"api/diagnose/{job.job_id}/report"
-            job.emit("verdict", {
+            data: Dict[str, Any] = {
                 "result": full, "human_summary": summary, "report_path": full.get("report_path"),
                 "report_urls": {f: f"{base}?format={f}" for f in ("html", "md", "json")}, "language": job.language,
-            })
+            }
+            try:
+                from extractor.web.ui import view
+                job.verdict_word, job.headline = view.verdict_words(verdict), view.headline(full)
+                data["view"] = view.build_views(job.result or full, report)
+            except Exception:  # noqa: BLE001 - the UI renders the result without the view
+                pass
+            notice = outcome_notice(full, job)
+            if notice:
+                data["notice"] = notice
+            job.emit("verdict", data)
             state = "done"
         except Exception as exc:  # noqa: BLE001
             job.emit("error", {"code": "DIAGNOSE_ERROR", "message": f"{type(exc).__name__}: {exc}", "stage": "diagnose"})
@@ -350,12 +451,16 @@ class DiagnoseJobManager:
             if lang in job.reports:
                 return job.reports[lang]
             engine = self._engine_getter()
-            session = job.session or (getattr(engine, "sessions", {}) or {}).get(job.investigation_id or "")
-            if session is None:
-                return {"success": False, "error": {"code": "SESSION_GONE", "message": "the investigation is no longer in memory"}}
             from extractor import incident_report
-            res = incident_report.export_incident_report(
-                session=session, language=lang, pid=job.pid, process_name=job.target_name, engine=engine)
+            if job.result is not None:      # the result the UI showed, so the report says exactly the same
+                res = incident_report.export_incident_report(result=job.result, language=lang, pid=job.pid,
+                                                             process_name=job.target_name)
+            else:
+                session = job.session or (getattr(engine, "sessions", {}) or {}).get(job.investigation_id or "")
+                if session is None:
+                    return {"success": False, "error": {"code": "SESSION_GONE", "message": "the investigation is no longer in memory"}}
+                res = incident_report.export_incident_report(
+                    session=session, language=lang, pid=job.pid, process_name=job.target_name, engine=engine)
             if not res.get("success"):
                 return {"success": False, "error": {"code": "REPORT_ERROR", "message": str(res.get("error") or "report failed")}}
             out = {"success": True, "html": res.get("report_html") or "", "md": res.get("report_markdown") or "",

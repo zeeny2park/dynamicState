@@ -251,7 +251,7 @@ class TestJobEvents(ServerCase):
         end = time.time() + 10
         while time.time() < end:
             _, body, _ = self.jreq("GET", f"/api/diagnose/{jid}/status")
-            if body["job"]["last_seq"] >= 4:
+            if body["job"]["last_seq"] >= 3:       # classified, target, plan
                 break
             time.sleep(0.05)
         self.assertEqual(body["job"]["state"], "running")

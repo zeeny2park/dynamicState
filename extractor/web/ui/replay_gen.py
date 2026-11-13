@@ -1,6 +1,6 @@
 """Make the UI's replay files from saved ``DiagnoseResult`` fixtures.
 
-A replay is the event sequence the server would stream for that diagnosis (``docs/ui-redesign/UI_EVENTS.md``):
+A replay is the event sequence the server would stream for that diagnosis (``docs/ui-redesign/API_CONTRACT.md``):
 target -> classified -> plan -> check_start/check_done per check in executed order (a finding_provisional right
 after the first failing check that supports it) -> verified -> verdict.  The page plays it with ``?replay=<name>``.
 
@@ -83,7 +83,7 @@ def events_from_result(res: Dict[str, Any], request: Optional[Dict[str, Any]] = 
 
     def push(e: Dict[str, Any], dt: int) -> None:
         """Append one event in the server's wire shape (API_CONTRACT.md: envelope, contract field names) with the
-        fields the UI asks the contract to add (UI_EVENTS.md); ``t`` (ms) is the replay clock."""
+        fields the contract adds for the UI; ``t`` (ms) is the replay clock."""
         nonlocal t
         t += dt
         data = {k: v for k, v in e.items() if k != "type"}
@@ -161,26 +161,20 @@ def events_from_result(res: Dict[str, Any], request: Optional[Dict[str, Any]] = 
          500)
     result = {k: v for k, v in res.items() if k != "report"}
     from extractor.human_report import render_human_report
-    push({"type": "verdict", "result": result, "view": views, "picture_css": _picture_css(),
+    push({"type": "verdict", "result": result, "view": views,
           "human_summary": {lang: render_human_report(res, res.get("report"), lang=lang) for lang in ("ko", "en")},
           "report_url": report_url}, 500)
     return ev
 
 
-def _picture_css() -> str:
-    from extractor import report_visuals as rv
-    return rv._CSS + rv._interaction_css()
-
-
 def report_html(res: Dict[str, Any], lang: str) -> str:
-    """The incident report page of the result (the same renderer as export_incident_report, no diagnosis run)."""
-    from extractor.human_report import compose
-    from extractor.incident_report import DEFAULT_TITLE, DEFAULT_TITLE_KO, _compose_html
-    from extractor.report_detail import partition
-    report = res.get("report") if isinstance(res.get("report"), dict) else None
-    comp = compose(res, report, lang, pointers=True)
-    parts = partition(res, report, comp["rows"])
-    return _compose_html(DEFAULT_TITLE_KO if lang == "ko" else DEFAULT_TITLE, comp, res, report, lang, parts)
+    """The incident report page of the result, by the one report path (``export_incident_report(result=...)``, as
+    the server's report endpoint renders a finished job): theme, outline, reproducibility section, detail per part."""
+    from extractor.incident_report import export_incident_report
+    out = export_incident_report(result=res, language=lang)
+    if not out.get("success") or not out.get("report_html"):
+        raise RuntimeError(f"report failed: {out.get('error')}")
+    return out["report_html"]
 
 
 def main() -> None:

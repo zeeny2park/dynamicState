@@ -1786,7 +1786,8 @@ def render_human_report(result: Dict[str, Any], report: Optional[Dict[str, Any]]
 def diagnose_with_summary(pid: int, debug_image: Optional[str] = None, symptom: Optional[str] = None,
                           time_limit_s: Optional[float] = None, engine: Any = None, lang: str = "en",
                           corpus_dir: Optional[str] = None, target: Any = None,
-                          adapter: Any = None, symptom_fields: Any = None) -> Tuple[Dict[str, Any], str]:
+                          adapter: Any = None, symptom_fields: Any = None,
+                          keep_report: bool = False) -> Tuple[Dict[str, Any], str]:
     """Run ``diagnose`` once and return ``(result_dict_without_inline_report, human_summary_markdown)``.
 
     The inline full report is requested only to give the summary its names and numbers; it is dropped from the
@@ -1804,7 +1805,8 @@ def diagnose_with_summary(pid: int, debug_image: Optional[str] = None, symptom: 
                    include_report=True, **kw)
     d = res.to_dict()
     summary = render_human_report(d, d.get("report"), lang=lang)
-    d["report"] = None
+    if not keep_report:     # keep_report=True: the caller renders the report / the UI view from the same result
+        d["report"] = None
     return d, summary
 
 
