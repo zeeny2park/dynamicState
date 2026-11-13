@@ -1230,7 +1230,8 @@ class AdaptiveInvestigationSession:
         self.symptom_fields = parse_symptom_fields(symptom_fields)   # structured symptom input (stage 2), or None
         self.pid = pid
         self.companion_elf = companion_elf
-        self.corpus_dir = corpus_dir or "/tmp/dynamicstate_corpus"
+        from .corpus_retention import resolve_corpus_dir
+        self.corpus_dir = resolve_corpus_dir(corpus_dir)
         self._investigations_dir = os.path.join(self.corpus_dir, "investigations")
         os.makedirs(self._investigations_dir, exist_ok=True)
         self.adapter = adapter or LocalTargetAdapter()
@@ -3679,7 +3680,8 @@ class ExpertDiagnosticEngine:
     session_listener_factory: Optional[Callable[[AdaptiveInvestigationSession], Any]] = None
 
     def __init__(self, corpus_dir: Optional[str] = None):
-        self.corpus_dir = corpus_dir or "/tmp/dynamicstate_corpus"
+        from .corpus_retention import resolve_corpus_dir
+        self.corpus_dir = resolve_corpus_dir(corpus_dir)
         self._investigations_dir = os.path.join(self.corpus_dir, "investigations")
         os.makedirs(self._investigations_dir, exist_ok=True)
         self.sessions: Dict[str, AdaptiveInvestigationSession] = {}

@@ -12,6 +12,7 @@ Guarantees:
 
 from dataclasses import dataclass, field
 from .dataclass_dict import asdict
+from .corpus_retention import resolve_corpus_dir
 from datetime import datetime, timezone
 import hashlib
 import json
@@ -151,7 +152,7 @@ class RuntimeEvidenceProvider:
         budget_tracker: Optional[Any] = None,
     ):
         self.adapter = adapter or LocalTargetAdapter()
-        self.watch_manager = watch_manager or WatchSessionManager(corpus_dir=corpus_dir or "/tmp/dynamicstate_corpus")
+        self.watch_manager = watch_manager or WatchSessionManager(corpus_dir=resolve_corpus_dir(corpus_dir))
         self.budget_tracker = budget_tracker
         self._historical_samples: Dict[str, Dict[str, Any]] = {}
         # IMP-010: overrides for ThreadSamplingConfig (thread_sample_count, thread_sample_interval_sec, ...)

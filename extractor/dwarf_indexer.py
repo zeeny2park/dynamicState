@@ -967,6 +967,10 @@ class DwarfIndexer:
                             and cached_data.get("build_id") == elf_info.build_id):
                         index = DwarfIndex.from_cache_dict(cached_data)
                         index.artifact_path = abs_path  # the image actually opened, not the path recorded at write time
+                        try:
+                            os.utime(disk_cache_file, None)  # LRU recency; the file may have been pruned meanwhile
+                        except OSError:
+                            pass
                         with cls._lock:
                             cls._cache[cache_key] = index
                         return index
@@ -981,6 +985,8 @@ class DwarfIndexer:
                     with os.fdopen(tmp_fd, "w", encoding="utf-8") as tf:
                         json.dump(index.to_cache_dict(), tf, ensure_ascii=False)
                     os.replace(tmp_path, disk_cache_file)
+                    from .corpus_retention import prune_cache_dir
+                    prune_cache_dir(os.path.dirname(disk_cache_file), protect=[disk_cache_file])
                 except Exception:
                     pass
 
