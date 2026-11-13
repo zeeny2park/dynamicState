@@ -312,10 +312,13 @@ class TestReportRendering(unittest.TestCase):
         ko = build_visual_summary(self._result(), self._result()["report"], "ko")
         html_en = en if isinstance(en, str) else str(en)
         html_ko = ko if isinstance(ko, str) else str(ko)
-        self.assertIn("RECIPE_USE_AFTER_FREE,RECIPE_OBJECT_LIFETIME_ANOMALIES", html_en)
-        self.assertIn("not examined", html_en)
+        # the common report outline names each check in words next to its id, one sentence for the whole group
+        for rid in ("RECIPE_USE_AFTER_FREE", "RECIPE_OBJECT_LIFETIME_ANOMALIES"):
+            self.assertIn(rid, html_en)
+            self.assertIn(rid, html_ko)
+        self.assertIn("not examined", html_en.lower())
         self.assertIn("allocation tracing", html_en)
-        self.assertIn("점검하지 않음", html_ko)
+        self.assertIn("점검하지 않은", html_ko)
         self.assertIn("할당 추적", html_ko)
         self.assertNotIn("not supported in this mode", html_ko)
 
