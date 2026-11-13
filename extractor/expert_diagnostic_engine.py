@@ -3862,7 +3862,10 @@ class ExpertDiagnosticEngine:
 #                          concrete names the evidence exposed (lock names, thread ids, function names,
 #                          variable names, "file:line"); [] when the evidence exposed none.
 #                          subject_details = same names as {kind, name}.
-#   checks_run       list  {check_id, recipe_id, name, status, duration_s, limitations}; executed only
+#                          location_candidates = statically derived source-line candidates (never observed, never
+#                          in subjects): {basis "static", observed false, status, candidates [{rank, location,
+#                          function, statement, action, reason, reason_ko}], ...}; extractor.static_location_candidates.
+#   checks_run      list  {check_id, recipe_id, name, status, duration_s, limitations}; executed only
 #   not_covered      list  {kind, item, reason}; everything that could not be examined (check statuses
 #                          INCONCLUSIVE/ERROR/NOT_APPLICABLE/UNSUPPORTED/NOT_EXECUTED, engine limitations,
 #                          features unsupported on the target ABI, budget exhaustion, missing debug image,
@@ -4531,6 +4534,10 @@ def _diagnose_run(
             report["process_profile"] = res.process_profile
         except Exception:  # noqa: BLE001 - the profile is a presentation of data already collected; never a failure
             res.process_profile = {}
+        # Roadmap stage 3: statically derived location candidates per finding (findings[].location_candidates).
+        # Never subjects, never a status or verdict input; debug image + source text only (no target access).
+        from .static_location_candidates import attach_location_candidates
+        attach_location_candidates(res.findings, debug_image, report=report, profile=res.process_profile)
 
         try:
             rep_dir = os.path.join(engine.corpus_dir, "reports")
