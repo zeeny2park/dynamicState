@@ -1192,6 +1192,10 @@ class DiagnosticConclusion:
 _REPORTABLE_WITHOUT_CHECKS = {STATE_BLOCKED, STATE_FAILED, STATE_BUDGET_EXHAUSTED, STATE_INCONCLUSIVE}
 
 
+# Steps run_to_completion always allows beyond the plan's own steps (see its limit()).
+STEP_MARGIN_BEYOND_PLAN = 10
+
+
 class AdaptiveInvestigationSession:
     """Represents a single active or completed expert investigation session."""
 
@@ -1475,13 +1479,21 @@ class AdaptiveInvestigationSession:
     def run_to_completion(self, max_steps: int = 30) -> DiagnosticConclusion:
         """Runs the investigation state machine iteratively until a terminal state is reached."""
         steps_executed = 0
-        while self.state not in TERMINAL_STATES and steps_executed < max_steps:
+
+        def limit() -> int:
+            # max_steps guards against a state machine that never terminates; it must not cut a plan short.
+            # The plan grows with every registered baseline recipe (recipe_plugins), so the cap is never below
+            # what the current plan needs plus a margin for classify / assess / plan / replan / conclude steps.
+            planned = int(getattr(self.plan, "total_steps", 0) or 0) if self.plan is not None else 0
+            return max(max_steps, planned + STEP_MARGIN_BEYOND_PLAN)
+
+        while self.state not in TERMINAL_STATES and steps_executed < limit():
             if self.is_paused:
                 break
             self.step()
             steps_executed += 1
 
-        if self.state not in TERMINAL_STATES and steps_executed >= max_steps:
+        if self.state not in TERMINAL_STATES and steps_executed >= limit():
             self.state = STATE_INCONCLUSIVE
             self._finalize_conclusion(
                 stop_reason="STEP_BUDGET_REACHED",

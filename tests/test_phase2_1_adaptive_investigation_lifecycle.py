@@ -75,6 +75,22 @@ class TestPhase21AdaptiveInvestigationLifecycle(unittest.TestCase):
         self.assertTrue(conclusion.confidence > 0.0)
         self.assertEqual(conclusion.investigation_id, session.investigation_id)
 
+    def test_step_cap_never_cuts_the_plan_short(self):
+        """A plan longer than max_steps (every registered baseline recipe adds a step) still runs to completion;
+        the cap only bounds what goes beyond the plan."""
+        from extractor.expert_diagnostic_engine import STEP_MARGIN_BEYOND_PLAN
+        session = self.engine.start_investigation(
+            problem_statement="0x7fff0038 주소에서 세그폴트 및 메모리 오염 의심", pid=self._spawn_healthy_target(),
+            companion_elf="/tmp/expert_diagnostic_debug.elf")
+        for _ in range(3):
+            session.step()
+        planned = session.plan.total_steps
+        self.assertGreater(planned, 3)
+        conclusion = session.run_to_completion(max_steps=3)
+        self.assertEqual(session.state, STATE_COMPLETED)
+        self.assertNotEqual(conclusion.stop_reason, "STEP_BUDGET_REACHED")
+        self.assertGreaterEqual(STEP_MARGIN_BEYOND_PLAN, 4)
+
     def test_pause_and_resume_control(self):
         """Verifies pause and resume semantics."""
         session = self.engine.start_investigation("General health check")
