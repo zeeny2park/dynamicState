@@ -119,6 +119,11 @@ class TestPhase242RealProcessTemporalGrowthAndAccuracy(unittest.TestCase):
                             g_alloc_count += 100;
                         }
                         usleep(150000);
+                        /* FIXTURE_CAP: 2 MiB per 150 ms (~13 MiB/s); stop at 512 MiB (~38 s), stay alive. The test
+                           observes the process for about a second. */
+                        if (g_alloc_count >= 1000 + 100 * 256) {
+                            while (1) pause();
+                        }
                     }
                     return 0;
                 }

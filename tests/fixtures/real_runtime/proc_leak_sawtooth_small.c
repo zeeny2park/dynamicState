@@ -48,6 +48,10 @@ static void *batcher(void *arg)
         run_batch();
         g_batches++;
         usleep(100000);
+        /* FIXTURE_CAP: leaks 80 KB per batch (~0.16 MiB/s measured); stop after 1500 batches (~120 MB, ~12 min),
+         * stay alive. */
+        if (g_batches >= 1500u)
+            for (;;) pause();
     }
     return NULL;
 }

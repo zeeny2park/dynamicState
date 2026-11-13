@@ -24,6 +24,9 @@ static void *uploader(void *arg)
             buf[i] = (char)i;
         g_uploads++;          /* buf dropped */
         usleep(20000);
+        /* FIXTURE_CAP: ~15.5 MiB/s measured; stop leaking at ~1 GiB (~65 s), stay alive. */
+        if (g_uploads >= 3200u)
+            for (;;) pause();
     }
     return NULL;
 }
