@@ -1,0 +1,41 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>dynamicState · 진단</title>
+<link rel="stylesheet" href="theme.css">
+<link rel="stylesheet" href="ui.css">
+<script>
+/* theme before first paint: ?theme=, then the stored choice, else the OS preference (no class) */
+(function () {
+  var q = new URLSearchParams(location.search).get("theme"), t = null;
+  try { t = localStorage.getItem("ds-theme"); } catch (e) { /* storage blocked */ }
+  t = q === "dark" || q === "light" ? q : t;
+  if (t === "dark" || t === "light") document.documentElement.classList.add(t);
+})();
+</script>
+</head>
+<body>
+<a class="skip" href="#main" data-s="skip">본문으로 건너뛰기</a>
+<header class="top" role="banner">
+  <a class="brand" href="./" data-act="home"><span class="dot" aria-hidden="true"></span>dynamicState <small data-s="brand_sub">진단</small></a>
+  <div id="tchip" class="tchip" hidden></div>
+  <div class="grow"></div>
+  <button type="button" class="btn btn-ghost btn-sm" data-act="new" data-s="new">새 진단</button>
+  <button type="button" class="btn btn-ghost btn-sm" data-act="theme" id="btn-theme" data-s-aria="theme"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M12 3a6 6 0 0 0 9 9 9 9 0 1 1-9-9Z"/></svg></button>
+  <button type="button" class="btn btn-ghost btn-sm" data-act="lang" id="btn-lang">KO</button>
+  <div class="menu">
+    <button type="button" class="btn btn-ghost btn-sm" data-act="tools" id="btn-tools" aria-haspopup="true" aria-expanded="false" aria-controls="tools-menu"><span data-s="tools">도구</span> ▾</button>
+    <div class="menu-list card" id="tools-menu" role="menu" hidden>
+      <a role="menuitem" href="legacy/" data-s="legacy_ui">기존 UI (레거시)</a>
+      <a role="menuitem" href="legacy/workspace" data-s="legacy_ws">기존 워크스페이스 (레거시)</a>
+    </div>
+  </div>
+</header>
+<main id="main" tabindex="-1"></main>
+<div id="live" class="sr-only" aria-live="polite" aria-atomic="true"></div>
+<noscript><p class="noscript">이 화면은 JavaScript가 필요합니다. / This page needs JavaScript.</p></noscript>
+<script src="ui.js"></script>
+</body>
+</html>
