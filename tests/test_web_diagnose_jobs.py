@@ -592,6 +592,34 @@ int main(void) {
 """
 
 
+class TestStartPreflight(ServerCase):
+    """A local target the engine's own preflight rejects is refused before a job exists, with a code."""
+
+    def test_missing_process_is_target_not_found(self):
+        free = next(p for p in range(4194000, 4194300) if not os.path.isdir(f"/proc/{p}"))
+        st, body, _ = self.jreq("POST", "/api/diagnose/start", {"pid": free})
+        self.assertEqual(st, 200)
+        self.assertFalse(body["success"])
+        self.assertEqual(body["error"]["code"], "TARGET_NOT_FOUND")
+        self.assertIn(str(free), body["error"]["message"])
+
+    def test_reason_codes(self):
+        self.assertEqual(diagnose_jobs._reason_code("process 5 memory is not readable by this user: [Errno 13]"),
+                         "PERMISSION_DENIED")
+        self.assertEqual(diagnose_jobs._reason_code("process 5 does not exist"), "TARGET_NOT_FOUND")
+        self.assertEqual(diagnose_jobs._reason_code("something else"), "TARGET_UNREADABLE")
+
+    def test_exited_target_is_a_notice_on_the_verdict(self):
+        job = diagnose_jobs.DiagnoseJob({"pid": 4194301})
+        job.target_name = "gone"
+        notice = diagnose_jobs.outcome_notice({"not_covered": []}, job)
+        if not os.path.isdir("/proc/4194301"):
+            self.assertEqual(notice["code"], "TARGET_EXITED")
+        unread = {"not_covered": [{"kind": "target_unreadable", "item": "pid 9",
+                                   "reason": "process 9 memory is not readable by this user: denied"}]}
+        self.assertEqual(diagnose_jobs.outcome_notice(unread, job)["code"], "PERMISSION_DENIED")
+
+
 @unittest.skipUnless(shutil.which("gcc"), "gcc is required for the live fixture")
 class TestLiveParity(ServerCase):
     def test_start_events_verdict_equals_synchronous_endpoint(self):
@@ -620,7 +648,34 @@ class TestLiveParity(ServerCase):
             self.assertEqual(len(result["checks_run"]), len(sync["result"]["checks_run"]))
             self.assertEqual(sorted(f.get("category", "") for f in result["findings"]),
                              sorted(f.get("category", "") for f in sync["result"]["findings"]))
-            # a real report through the one renderer
+            # what the UI shows comes with the events (API_CONTRACT.md 6): labels, left-out checks, lines, the view
+            plan = next(e["data"] for e in events if e["type"] == "plan")
+            self.assertTrue(all(st["label"]["ko"] and st["domain_label"]["en"] for st in plan["steps"]))
+            self.assertIn("not_planned", plan)
+            self.assertIn("not_in_mode", plan)
+            for row in plan["not_in_mode"]:
+                self.assertTrue(row["capability"] and row["capability_label"]["ko"])
+            planned = {st["recipe_id"] for st in plan["steps"]}
+            self.assertFalse(planned & {r["recipe_id"] for r in plan["not_planned"] + plan["not_in_mode"]})
+            done = [e["data"] for e in events if e["type"] == "check_done"]
+            self.assertTrue(all(set(d["line"]) == {"ko", "en"} for d in done))
+            self.assertTrue(all(isinstance(d["bytes_read"], int) for d in done))
+            target = next(e["data"] for e in events if e["type"] == "target")
+            self.assertTrue(target.get("architecture"))
+            verdict = events[-1]["data"]
+            self.assertNotIn("report", {k for k, v in verdict["result"].items() if v})    # no inline report on the wire
+            for lang in ("ko", "en"):
+                view = verdict["view"][lang]
+                self.assertEqual(view["verdict"], result["verdict"])
+                self.assertEqual(len(view["findings"]), len(result["findings"]))
+                self.assertGreater(len(view["checks"]), 0)
+            self.assertNotIn("picture_css", verdict)
+            _, jobs, _ = self.jreq("GET", "/api/diagnose/jobs")
+            mine = next(j for j in jobs["jobs"] if j["job_id"] == started["job_id"])
+            self.assertEqual(mine["verdict_word"], verdict["view"]["en"] and {
+                "en": verdict["view"]["en"]["verdict_word"], "ko": verdict["view"]["ko"]["verdict_word"]})
+            self.assertEqual(set(mine["headline"]), {"en", "ko"})
+            # a real report through the one renderer, from the same result the events carried
             st, hd, html = self.request("GET", f"/api/diagnose/{started['job_id']}/report?format=html&lang=en")
             self.assertEqual(st, 200)
             self.assertIn(b"<html", html.lower())
