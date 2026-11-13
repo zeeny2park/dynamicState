@@ -12,7 +12,8 @@ Orchestrates:
 8. Structured Diagnostic Conclusion & Incident Reporting
 """
 
-from dataclasses import asdict, dataclass, field, fields
+from dataclasses import dataclass, field, fields
+from .dataclass_dict import asdict  # same result as dataclasses.asdict, much faster on large observations
 from datetime import datetime, timezone
 from enum import Enum
 import hashlib
@@ -1333,7 +1334,9 @@ class AdaptiveInvestigationSession:
                     return str(o)
 
                 with os.fdopen(fd, "w", encoding="utf-8") as f:
-                    json.dump(self.to_dict(), f, indent=2, default=_serialize_fallback)
+                    # json.dump() always runs the pure-Python encoder and indent= disables the C encoder:
+                    # on a many-thread target (tens of MB per save, one save per step) that was ~80% of a diagnosis.
+                    f.write(json.dumps(self.to_dict(), default=_serialize_fallback))
                     f.flush()
                     # Apply and verify chmod 0600 - DO NOT SWALLOW
                     os.chmod(tmp_path, 0o600)
