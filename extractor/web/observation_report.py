@@ -31,6 +31,8 @@ W: Dict[str, Tuple[str, str]] = {
     "unchanged": ("unchanged", "변화 없음"),
     "pool": ("Pool", "풀"), "pool_line": ("{e} · {n} × {t} ({s} B) · status field {f} · {per} element(s) per cell",
                                           "{e} · {n} × {t} ({s} B) · 상태 필드 {f} · 칸 하나 = 원소 {per}개"),
+    "pool_trunc": ("the array has {total} elements; only the first {n} are read (per-sample read budget)",
+                   "배열은 원소 {total}개이고 앞의 {n}개만 읽음 (표본 읽기 한도)"),
     "other": ("other", "그 밖"),
     "cmp": ("Compare", "비교"), "cmp_line": ("frozen at sample #{a} ({ta}) → #{b} ({tb}) · changed {c} · same {s}",
                                            "고정: 표본 #{a} ({ta}) → #{b} ({tb}) · 바뀜 {c} · 그대로 {s}"),
@@ -42,6 +44,14 @@ W: Dict[str, Tuple[str, str]] = {
 def _t(lang: str, k: str, **kw: Any) -> str:
     s = W[k][1 if lang == "ko" else 0]
     return s.format(**kw) if kw else s
+
+
+def _pool_line(lang: str, p: Dict[str, Any]) -> str:
+    line = _t(lang, "pool_line", e=p["expr"], n=p["count"], t=_v(p.get("elem_type")), s=p.get("elem_size"), f=_v(p.get("field")),
+              per=p.get("per_cell", 1))
+    if int(p.get("total") or 0) > int(p["count"]):
+        line += " · " + _t(lang, "pool_trunc", total=p["total"], n=p["count"])
+    return line
 
 
 def _v(x: Any) -> str:
@@ -110,7 +120,7 @@ def section_html(obs: Dict[str, Any], lang: str) -> str:
         grid = "".join(f'<i class="pc s{int(c)}"></i>' for c in cells if c.isdigit())
         legend = "".join(f'<li><i class="pc s{int(x["cls"])}"></i>{E(_v(x["name"]) if x.get("name") is not None else _t(lang, "other"))} <b>{int(x["count"])}</b></li>'
                          for x in p.get("legend") or [])
-        body.append(f'<h3>{E(_t(lang, "pool"))}</h3><p class="impact">{E(_t(lang, "pool_line", e=p["expr"], n=p["count"], t=_v(p.get("elem_type")), s=p.get("elem_size"), f=_v(p.get("field")), per=p.get("per_cell", 1)))}</p>'
+        body.append(f'<h3>{E(_t(lang, "pool"))}</h3><p class="impact">{E(_pool_line(lang, p))}</p>'
                     f'<div class="pool{size}" style="--cols:64"><div class="rl"></div><div class="cells">{grid}</div></div><ul class="pool-legend">{legend}</ul>')
     c = obs.get("compare")
     if c:
@@ -147,8 +157,7 @@ def section_md(obs: Dict[str, Any], lang: str) -> str:
         out.append("")
     p = obs.get("pool")
     if p:
-        out += [f"### {_t(lang, 'pool')}", "", _t(lang, "pool_line", e=p["expr"], n=p["count"], t=_v(p.get("elem_type")), s=p.get("elem_size"),
-                                                   f=_v(p.get("field")), per=p.get("per_cell", 1)), ""]
+        out += [f"### {_t(lang, 'pool')}", "", _pool_line(lang, p), ""]
         out += [f"- {_md_cell(x['name']) if x.get('name') is not None else _t(lang, 'other')}: {x['count']}" for x in p.get("legend") or []]
         out.append("")
     c = obs.get("compare")

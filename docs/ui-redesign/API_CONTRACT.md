@@ -387,7 +387,12 @@ interval 0.5, 1, 2 or 5 s (SSH targets: 2 s minimum, one daemon exchange per rea
 once on the server; sampling stops by itself when no client asked for 30 s (`reason: idle`), after 30 minutes
 (`max_lifetime`), when the target exits (`target_exited`, last values kept, a resume does not restart it) or a read
 fails (`read_failed`). A pool of more than 4,096 elements is drawn in buckets of `ceil(N/4096)` elements per cell
-(majority status).
+(majority status). The per-sample budget charges the pool read plus two reserve elements; an array the budget cannot
+cover (48-byte elements: more than 5,459) is observed as its first `count` elements: the variable search offers that
+count (`pool.total` is the array length), a larger or default count is `400 BUDGET` naming the largest that fits, and
+the `watch.pool` object carries `total` and `truncated` (the card and the report print "first n of N elements").
+Variable search, value, lock and watch of an expression on a target without DWARF are `409 NO_DEBUG_INFO`; maps,
+threads, address reads, modules and address watches still work.
 
 **`watch` object.** `{seq, samples, state: running|paused|stopped|idle, reason, reason_detail, interval_s, intervals,
 transport, first_t, last_t, items: [{id, label, type, value | fields: [{name, value, spark, changes, last_change}],

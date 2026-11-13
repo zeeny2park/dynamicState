@@ -61,6 +61,8 @@ F: Dict[str, Tuple[str, str]] = {
     "dbg_unknown": ("unknown", "모름"),
     "v_name": ("name", "이름"), "v_type": ("type", "형식"), "v_size": ("size", "크기"), "v_where": ("where", "위치"),
     "v_show": ("Show value", "값 보기"), "v_track": ("Add to watch", "추적에 추가"), "v_pool": ("View as pool", "풀로 보기"),
+    "v_pool_cap": ("first {n} of {total} elements (the per-sample read budget does not cover more)",
+                   "원소 {total}개 중 앞의 {n}개 (표본 읽기 한도 때문에 더는 못 봅니다)"),
     "v_static": ("static", "정적"), "v_global": ("global", "전역"),
     "v_none": ("This executable has no globals or statics with that name.", "이 실행 파일에는 그런 이름의 전역·정적 변수가 없습니다."),
     "val_h": ("Value", "값"), "val_read": ("read {t} · {s} B once · {c}", "읽음 {t} · {s} B 1회 · {c}"),
@@ -335,6 +337,8 @@ def vars_fragment(lang: str, d: Dict[str, Any]) -> str:
             p = v["pool"]
             acts += (f'<button type="button" class="btn btn-outline btn-sm" data-act="pool-go" data-expr="{E(str(p["expr"]))}" '
                      f'data-count="{int(p["count"])}" data-field="{E(str(p["field"]))}">{E(t(lang, "v_pool"))}</button>')
+            if int(p.get("total") or p["count"]) > int(p["count"]):
+                acts += ' <span class="dt-note">' + E(t(lang, "v_pool_cap", n=f"{int(p['count']):,}", total=f"{int(p['total']):,}")) + "</span>"
         else:
             acts += f'<button type="button" class="btn btn-ghost btn-sm" data-act="track" data-expr="{E(name)}">{E(t(lang, "v_track"))}</button>'
         where = (t(lang, "v_static") if v.get("kind") == "static_variable" else t(lang, "v_global")) + " · " + str(v.get("decl") or "")

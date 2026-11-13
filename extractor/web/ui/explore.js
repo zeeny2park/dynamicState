@@ -30,6 +30,7 @@
       view: "보기", apply: "다시 보기", pool_remove: "풀 보기 닫기",
       pool_prefill: "형식에서 미리 채움", pool_grid: "풀 격자: 화살표로 이동, Enter로 선택",
       pool_note: "칸 하나 = 원소 {per}개 · 64개씩 한 줄 · 이번 표본에서 상태가 바뀐 칸 {chg}개 · 범례를 누르면 그 상태만 · 숫자 옆은 관찰 시작 대비 증감 · 표본 #{n} ({t}) · 표본마다 {b} B 한 번 읽기",
+      pool_trunc: "배열은 원소 {total}개이고 앞의 {n}개만 읽습니다 (표본 읽기 한도 때문에 더는 읽지 않습니다)",
       pool_cell: "칸을 누르면 그 원소의 필드가 여기에 나옵니다.", element: "원소", watch_el: "이 원소 추적", other: "그 밖",
       sel_changed: "상태가 마지막으로 바뀐 시각: {t}", bucket: "칸 #{c}: 원소 {a}–{b}",
       cmp_h: "비교", cmp_sub: "고정한 시점 이후 바뀐 것만", freeze: "지금 값 고정", refreeze: "다시 고정", unfreeze: "고정 해제",
@@ -55,6 +56,7 @@
       field: "status field", view: "View", apply: "Apply", pool_remove: "Close the pool view",
       pool_prefill: "prefilled from the type", pool_grid: "pool grid: arrows move, Enter selects",
       pool_note: "{per} element(s) per cell · 64 per row · {chg} cells changed state this sample · click a legend item to show only that status · deltas since the view started · sample #{n} ({t}) · one {b}-byte read per sample",
+      pool_trunc: "the array has {total} elements; only the first {n} are read (the per-sample read budget does not allow more)",
       pool_cell: "Click a cell to see that element's fields here.", element: "Element", watch_el: "Watch this element", other: "other",
       sel_changed: "state last changed at {t}", bucket: "cell #{c}: elements {a}–{b}",
       cmp_h: "Compare", cmp_sub: "only what changed since the freeze", freeze: "Freeze now", refreeze: "Freeze again", unfreeze: "Clear",
@@ -264,7 +266,8 @@
     return '<div class="obs-sec" id="pool-sec"><h3>' + esc(xt(lang, "pool_h")) + ' <span class="text-muted mono">' + esc(P.expr + " · " + fmtN(P.count) + " × " + P.elem_type +
       " (" + P.elem_size + " B) · " + P.field + (P.field_type ? " (" + P.field_type + ")" : "")) + "</span></h3>" + (still ? "" : poolForm(P, ui)) +
       '<div class="pool-wrap"><div>' + grid + (still ? '<ul class="pool-legend">' + legend + "</ul>" : '<div class="pool-legend">' + legend + "</div>") + "</div><div>" + side + "</div></div>" +
-      '<p class="dt-note" style="margin-top:6px">' + esc(xt(lang, "pool_note", { per: P.per_cell || 1, chg: fmtN(P.changed || 0), n: W.seq || 0, t: clock(W.last_t), b: fmtN(P.bytes) })) + "</p></div>";
+      '<p class="dt-note" style="margin-top:6px">' + esc(xt(lang, "pool_note", { per: P.per_cell || 1, chg: fmtN(P.changed || 0), n: W.seq || 0, t: clock(W.last_t), b: fmtN(P.bytes) })) +
+      (P.total > P.count ? " · " + esc(xt(lang, "pool_trunc", { total: fmtN(P.total), n: fmtN(P.count) })) : "") + "</p></div>";
   }
   function compareSection(W, ui, still) {
     var X = xs(ui), lang = ui.lang, C = W.compare;

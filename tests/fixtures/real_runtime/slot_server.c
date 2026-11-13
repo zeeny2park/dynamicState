@@ -13,7 +13,9 @@
 #include <time.h>
 #include <unistd.h>
 
-#define NSLOTS 4096
+#ifndef NSLOTS
+#define NSLOTS 4096                /* tests build larger pools with -DNSLOTS=10000 / 100000 (web UI pool grid > 4,096 slots) */
+#endif
 
 enum slot_state { SLOT_FREE = 0, SLOT_ACCEPTING, SLOT_READING, SLOT_WRITING, SLOT_CLOSING };
 
