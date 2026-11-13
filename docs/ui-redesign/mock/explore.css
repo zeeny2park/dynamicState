@@ -42,7 +42,7 @@
 .table tr.sub td:first-child { padding-left: 28px; }
 .table .num { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
 .table .nw { white-space: nowrap; }
-.table button.lnk { all: unset; cursor: pointer; font-family: var(--font-mono); font-size: 12px; text-decoration: underline;
+.table button.lnk { all: unset; cursor: pointer; white-space: nowrap; font-family: var(--font-mono); font-size: 12px; text-decoration: underline;
   text-underline-offset: 3px; text-decoration-color: var(--border); }
 .table button.lnk:focus-visible { outline: 2px solid var(--ring); }
 .table tr[aria-current="true"] td { background: var(--muted); }
