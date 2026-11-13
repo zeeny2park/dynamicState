@@ -7,8 +7,8 @@
    "ko": "확인된 결함",
    "en": "confirmed fault"
   },
-  "process_name": "deadlock_circul",
-  "pid": 3734210
+  "process_name": "deadlock_pipeli",
+  "pid": 17673
  },
  {
   "name": "healthy",
@@ -19,7 +19,7 @@
    "en": "healthy within the checked scope"
   },
   "process_name": "ok_idle_server",
-  "pid": 3733586
+  "pid": 17424
  },
  {
   "name": "inconclusive",

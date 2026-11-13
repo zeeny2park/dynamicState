@@ -269,6 +269,31 @@ class TestFinalScreen(unittest.TestCase):
                 self.assertIn('id="ds-theme"', page)
 
 
+class TestProfileView(unittest.TestCase):
+    """The verdict's view carries the process profile as the report's own fragment (no wording in the browser)."""
+
+    def test_view_profile_matches_the_report_section(self):
+        import gzip
+        import json
+        from extractor import human_report as hr
+        from extractor.web.ui.view import build_views
+        path = os.path.join(ROOT, "tests", "fixtures", "profile", "deadlock_pipeline.json.gz")
+        with gzip.open(path, "rt", encoding="utf-8") as fh:
+            res = json.load(fh)
+        views = build_views(res, res["report"])
+        for lang, title in (("ko", "프로세스 프로필"), ("en", "Process profile")):
+            p = views[lang]["profile"]
+            self.assertEqual((p["title"], p["available"]), (title, True))
+            self.assertTrue(p["html"].startswith('<p class="profile-glance">'))
+            self.assertIn(p["glance"], p["html"])
+            self.assertIn("m_out", p["html"])
+            comp = hr.compose(res, res["report"], lang)
+            self.assertEqual([s["key"] for s in comp["sections"]][:3], ["conclusion", "target", "profile"])
+        # a result without a report has no profile: the UI shows its "nothing to profile" line, never an empty card
+        none = build_views({"verdict": "INCONCLUSIVE"}, None)["ko"]["profile"]
+        self.assertEqual((none["available"], none["html"]), (False, ""))
+
+
 class TestLiveEventExtras(unittest.TestCase):
     """The fields the server adds to live events for the UI (API_CONTRACT.md 6), from the report code."""
 

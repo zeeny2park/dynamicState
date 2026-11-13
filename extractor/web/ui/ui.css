@@ -107,6 +107,9 @@ main > * { min-width: 0; }
 .fbody.dsv { max-width: none; margin: 10px 0 0; font-size: 13.5px; line-height: 1.55; color: var(--card-foreground); }
 .fbody.dsv h4 { margin: 12px 0 6px; font-size: 13px; }
 .fbody.dsv .dsv-facts { font-size: 13px; }
+.pbody.dsv { max-width: none; margin: 0; font-size: 13.5px; line-height: 1.55; color: var(--card-foreground); }
+.pbody.dsv p { margin: 6px 0; } .pbody.dsv h3 { margin: 16px 0 6px; font-size: 14px; } .pbody.dsv h4 { margin: 12px 0 6px; font-size: 13px; }
+.pbody.dsv .collapsible { margin-top: 10px; } .pbody.dsv .profile-glance { font-size: 14px; }
 .ckdetail.dsv { max-width: none; margin: 0; font-size: 13px; color: var(--card-foreground); }
 .ckdetail.dsv dl { display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: 4px 14px; margin: 0; }
 .ckdetail.dsv dt { color: var(--muted-foreground); } .ckdetail.dsv dd { margin: 0; overflow-wrap: anywhere; }
