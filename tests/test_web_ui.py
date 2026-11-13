@@ -309,8 +309,10 @@ class TestJavaScript(unittest.TestCase):
         out = subprocess.run([NODE, "--test", os.path.join(ROOT, "tests", "web_ui", "ui.test.js")],
                              capture_output=True, text=True, timeout=300)
         self.assertEqual(out.returncode, 0, out.stdout[-4000:] + out.stderr[-2000:])
-        self.assertRegex(out.stdout, r"ℹ pass \d+")
-        self.assertIn("ℹ fail 0", out.stdout)
+        # node's default reporter is "spec" on a TTY-less CI run in some versions ("# pass N") and the
+        # human one elsewhere ("ℹ pass N"); the summary lines differ only in that prefix
+        self.assertRegex(out.stdout, r"(?:ℹ|#) pass \d+")
+        self.assertRegex(out.stdout, r"(?:ℹ|#) fail 0\b")
 
 
 if __name__ == "__main__":

@@ -74,7 +74,7 @@ this rule is reported INCONCLUSIVE.
 What is observed. The cheap trend is 5-6 `/proc` samples (VmRSS, anonymous writable mappings) over the thread
 sampler's window, about 1 s. The heap walks (IMP-008) are >= 3 censuses of the in-use heap with per-owner and
 per-unreachable-size-class counts, spaced over the same window, each limited to 75 % of the session byte budget
-left (session budget 32 MiB, so about 24 MiB for the first walk).
+left (session budget 64 MiB, so about 48 MiB for the first walk).
 
 Why /proc is not enough. A periodic working set with a leak under it also rises and falls, and within one window
 of about one period its samples look like those of the healthy batch. RSS also does not move when a leak fills
@@ -89,7 +89,7 @@ Why the walks are not enough for a large sawtooth. A fall of the in-use total is
 leak" only when no unreachable size class and no global/static owner grew across every walk; before this rule
 any fall cleared, and `proc_leak_sawtooth_small` was HEALTHY in 4 of 4 runs (now a MEMORY_LEAK finding). That
 judgement needs the walks. On `ok_sawtooth` (50 x 2 MiB blocks per batch in a thread's arena, released after
-each batch) one walk needs about 62 MiB of reads (the arena heap), more than the 24 MiB a walk may use, so no
+each batch) one walk needs about 62 MiB of reads (the arena heap), more than the 48 MiB a walk may use, so no
 walk completes and the check is INCONCLUSIVE with: "memory growth not judged: one heap walk of this process needs
 about 62.0 MiB of reads, more than the 24.0 MiB budget left for it ... The /proc samples rose by .. MiB and fell
 back ..: one window of memory that rises and falls cannot tell a periodic working set from one with a leak under
