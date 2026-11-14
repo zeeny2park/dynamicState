@@ -38,6 +38,8 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # The six checks of the roadmap (stage 1, row 4) plus the shared-state check: what each needs and why.
 UNSUPPORTED = {
     "RECIPE_USE_AFTER_FREE": "allocation_tracing",
+    # a pointer value read from memory is not a free() argument: which pointer is freed needs a free() history
+    "RECIPE_INVALID_FREE": "allocation_tracing",
     "RECIPE_SUSPICIOUS_ALLOCATION_PATTERNS": "allocation_tracing",
     "RECIPE_OBJECT_LIFETIME_ANOMALIES": "allocation_tracing",
     "RECIPE_UNEXPECTED_VARIABLE_CHANGES": "caller_specification",
@@ -50,7 +52,6 @@ UNSUPPORTED = {
 DECISIVE_INPUTS = {
     # recipes that stay plannable: some group must be producible
     "RECIPE_INVALID_MEMORY_ACCESS": [{"is_healthy"}, {"faulting_address", "is_mapped"}],
-    "RECIPE_INVALID_FREE": [{"allocator_inspector", "target_address"}],
     "RECIPE_HEAP_METADATA_CORRUPTION": [{"magic_corrupted"}],
     "RECIPE_PROCESS_MEMORY_GROWTH": [{"rss_history_kb", "epoch_count"}],
     "RECIPE_HEAP_GROWTH": [{"heap_series_kb", "epoch_count"}],
@@ -69,6 +70,7 @@ DECISIVE_INPUTS = {
                               {"lifetime_evidence_available"}, {"quarantine_record_found"},
                               {"target_slot_status"}, {"is_active_chunk"}],
     "RECIPE_SUSPICIOUS_ALLOCATION_PATTERNS": [{"requested_bytes"}, {"allocation_size"}],
+    "RECIPE_INVALID_FREE": [{"alignment_valid"}, {"vma_name"}, {"mapped_region"}, {"pointer_address"}],
     "RECIPE_OBJECT_LIFETIME_ANOMALIES": [{"lifetime_expired"}, {"dangling_reference"}, {"lifetime_valid"}],
     "RECIPE_UNEXPECTED_VARIABLE_CHANGES": [{"valid_range"}, {"expected_bounds"}, {"out_of_bounds"}],
     "RECIPE_STATE_TRANSITION_VIOLATIONS": [{"allowed_states"}, {"allowed_transitions"}, {"state_specification"},
@@ -343,12 +345,12 @@ struct bag g_bag;
 enum phase g_phase = P_RUN;
 int *g_ptr;
 unsigned long g_alloc_count = 5, g_free_count = 5;
-unsigned long g_capacity = 64, g_length = 3;
+unsigned long g_buf_capacity = 64, g_buf_length = 3;  /* related by the stem "buf", not by the g_ prefix */
 unsigned int g_magic = 0x600dcafe;
 int g_mode = 7;
 pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
 static void *worker(void *a) {
-    for (;;) { pthread_mutex_lock(&g_lock); g_length = 3; pthread_mutex_unlock(&g_lock); usleep(20000); }
+    for (;;) { pthread_mutex_lock(&g_lock); g_buf_length = 3; pthread_mutex_unlock(&g_lock); usleep(20000); }
 }
 int main(void) {
     pthread_t t; pthread_create(&t, 0, worker, 0);
@@ -366,7 +368,7 @@ FIXTURE_ANOMALOUS = r"""
 #include <unistd.h>
 int g_mode = -1;
 unsigned long g_alloc_count = 0, g_free_count = 0;
-unsigned long g_capacity = 8, g_length = 20;
+unsigned long g_buf_capacity = 8, g_buf_length = 20;
 int main(void) {
     puts("READY"); fflush(stdout);
     for (;;) { g_alloc_count++; usleep(500); }

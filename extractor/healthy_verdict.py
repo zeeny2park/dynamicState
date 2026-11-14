@@ -140,6 +140,19 @@ def _double_free_cap_scope_limit(c: Any) -> Optional[Dict[str, Any]]:
             "reason": "double free not checked: heap larger than the baseline cap"}
 
 
+def _no_mutex_scope_limit(c: Any) -> Optional[Dict[str, Any]]:
+    """RECIPE_ORPHAN_LOCK / RECIPE_SELF_DEADLOCK INCONCLUSIVE only because the process has no pthread mutex to
+    inspect (none in the debug info, none behind a futex wait; the lock inspections themselves completed).  The
+    question had nothing to look at: a scope item, never a claim that "every mutex is owned by a live thread"."""
+    from .recipe_plugins.lock_faults import no_mutex_to_inspect
+    if not no_mutex_to_inspect(_obs(c)):
+        return None
+    return {"kind": "no_mutex_to_inspect", "item": "mutex_owners",
+            "label": ("orphan lock / self-deadlock (no pthread mutex found to inspect)",
+                      "주인 잃은 락 / 자기 교착 (검사할 pthread 뮤텍스를 찾지 못함)"),
+            "reason": "orphan lock / self-deadlock not checked: no pthread mutex found to inspect"}
+
+
 def _registered_scope_label(recipe_id: str) -> Optional[Tuple[str, str]]:
     """What a plugin baseline recipe clears, from its check-list label (report_registry)."""
     from .report_registry import recipe_label
@@ -307,11 +320,16 @@ def evaluate(*, verdict: str, findings: List[Dict[str, Any]], checks: List[Any],
                     lim = _uaf_cap_scope_limit(c)
                 elif rid == "RECIPE_DOUBLE_FREE":
                     lim = _double_free_cap_scope_limit(c)
+                elif rid in ("RECIPE_ORPHAN_LOCK", "RECIPE_SELF_DEADLOCK"):
+                    lim = _no_mutex_scope_limit(c)
             if lim is not None:
                 partial.append("global arrays and stack margins checked, heap not walked (above the baseline cap)"
-                               if rid == "RECIPE_HEAP_METADATA_CORRUPTION" else "heap not walked (above the baseline cap)")
-                not_checked.append({"kind": lim["kind"], "item": lim["item"], "label": lim["label"][0],
-                                    "label_ko": lim["label"][1], "reason": lim["reason"]})
+                               if rid == "RECIPE_HEAP_METADATA_CORRUPTION" else
+                               ("no pthread mutex to inspect" if lim["kind"] == "no_mutex_to_inspect"
+                                else "heap not walked (above the baseline cap)"))
+                if not any(x.get("kind") == lim["kind"] and x.get("item") == lim["item"] for x in not_checked):
+                    not_checked.append({"kind": lim["kind"], "item": lim["item"], "label": lim["label"][0],
+                                        "label_ko": lim["label"][1], "reason": lim["reason"]})
                 continue
             ok = False
             why = "; ".join(list(getattr(c, "limitations", None) or []) + list(getattr(c, "missing_evidence", None) or [])) \

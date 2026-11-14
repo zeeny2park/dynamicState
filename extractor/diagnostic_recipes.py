@@ -342,6 +342,10 @@ _register(DiagnosticRecipe(
     version="1.0.0",
     name="Invalid Free & Non-Heap Pointer Deallocation Audit",
     domain=DOMAIN_MEMORY_INTEGRITY,
+    # A pointer VALUE read from memory is not a free() argument: which pointer is passed to free() is only known
+    # from a free() history.  Without it the rule can only say "not observed" (free_call_observed False).
+    requires_capabilities=(CAP_ALLOCATION_TRACING,),
+    unsupported_question="Was free() called on a pointer that is not a heap block (stack / global / interior)?",
     observations=(OBS_MEMORY_INTEGRITY, OBS_PROCESS_INFO,),
     applicable_problem_categories=[CATEGORY_INVALID_DOUBLE_FREE, CATEGORY_MEMORY_CORRUPTION],
     required_prerequisites=["memory_read_available", "memory_maps_available"],
@@ -1669,6 +1673,19 @@ def _rule_invalid_free(recipe: DiagnosticRecipe, data: Dict[str, Any]) -> Option
     alloc_insp = data.get("allocator_inspector") or data.get("allocator")
     ptr_addr = data.get("pointer_address") if "pointer_address" in data else (data.get("target_address") if "target_address" in data else data.get("address"))
     maps = data.get("maps") or data.get("proc_maps") or []
+    if data.get("free_call_observed") is False:
+        # The live observation holds a pointer VALUE; nobody was seen passing it to free().  A pointer to a global
+        # or into an object is valid as a pointer, and "would be an invalid free target" is not an invalid free.
+        return RecipeEvaluationResult(
+            recipe_id=rid,
+            status=RECIPE_STATUS_INSUFFICIENT_EVIDENCE,
+            confidence=0.20,
+            confidence_basis="A pointer value was observed, but no free() of it was observed (zero-stop, no "
+                             "allocation tracing): whether it is ever freed cannot be decided.",
+            missing_evidence=["observed_free_call"],
+            limitations=recipe.limitations,
+            details={"is_invalid_free": False, "free_call_observed": False},
+        )
     if alloc_insp and ptr_addr is not None:
         val_res = alloc_insp.validate_free_target(ptr_addr, maps=maps)
         if not val_res.is_valid:
@@ -2155,18 +2172,42 @@ def _rule_heap_growth(recipe: DiagnosticRecipe, data: Dict[str, Any]) -> Optiona
     return None
 
 
+def memory_grew_in_window(data: Dict[str, Any]) -> Optional[bool]:
+    """Did memory (heap walk / heap VMA / RSS) grow over the same observation window?  True / False when measured,
+    None when nothing was measured.  Used to decide whether a growing count is backed by memory."""
+    li = data.get("leak_investigation") if isinstance(data.get("leak_investigation"), dict) else {}
+    trend = data.get("memory_trend") if isinstance(data.get("memory_trend"), dict) else {}
+    measured = False
+    if li.get("verdict") in _LEAK_VERDICTS or trend.get("indicates_growth"):
+        return True
+    if li.get("verdict") in _NO_LEAK_VERDICTS:
+        measured = True
+    hg = data.get("heap_growth_bytes")
+    if isinstance(hg, (int, float)) and not isinstance(hg, bool):
+        if hg > 64 * 1024:
+            return True
+        measured = True
+    rss = [x for x in (data.get("rss_history_kb") or []) if isinstance(x, (int, float))]
+    if len(rss) >= 2:
+        if rss[-1] - rss[0] > 100:
+            return True
+        measured = True
+    return False if measured else None
+
+
 def _rule_long_lived_object_accumulation(recipe: DiagnosticRecipe, data: Dict[str, Any]) -> Optional[RecipeEvaluationResult]:
     """Verdict rule of RECIPE_LONG_LIVED_OBJECT_ACCUMULATION (None: no rule matched; the generic rule decides)."""
     rid = recipe.recipe_id
-    obj_delta = data.get("object_count_delta")
-    if obj_delta is None:
-        obj_delta = data.get("container_size_delta")
-    if obj_delta is None:
-        obj_delta = data.get("container_size")
-    if obj_delta is None:
-        obj_delta = data.get("active_chunk_count")
-    if obj_delta is None:
-        obj_delta = data.get("retained_objects_count")
+    # Accumulation is a CHANGE over the window.  An object census delta counts as it is; an integer read from the
+    # target (a container's size / count member) counts only together with memory growth in the same window.  A
+    # size read once is not a delta: a pool's block size of 4096 is not 4096 retained objects.
+    census_delta = data.get("object_count_delta")
+    count_delta = data.get("container_size_delta")
+    if count_delta is None:
+        count_delta = data.get("container_delta")
+    obj_delta = census_delta if census_delta is not None else count_delta
+    absolute = next((data.get(k) for k in ("container_size", "active_chunk_count", "retained_objects_count")
+                     if data.get(k) is not None), None)
 
     # Case G: A large but stable container must not be called accumulating memory!
     if (
@@ -2180,13 +2221,49 @@ def _rule_long_lived_object_accumulation(recipe: DiagnosticRecipe, data: Dict[st
             recipe_id=rid,
             status=RECIPE_STATUS_NOT_APPLICABLE,
             confidence=0.91,
-            confidence_basis=f"Container holds populated elements ({obj_delta}) but population delta across observation epochs is zero. Bounded static cache refuted as accumulating leak.",
+            confidence_basis=f"Container holds populated elements ({absolute if obj_delta is None else obj_delta}) but population delta across observation epochs is zero. Bounded static cache refuted as accumulating leak.",
             contradicting_facts=["Container element delta is zero across observation window"],
             not_applicable_reason="Container delta is zero across observation epochs",
             recommended_action="Refute object accumulation leak; container operates as stable bounded cache.",
             details={"object_accumulation_confirmed": False, "stable_container": True},
         )
 
+    if census_delta is None and count_delta is not None and count_delta > 50:
+        grew = memory_grew_in_window(data)
+        if grew is False:
+            return RecipeEvaluationResult(
+                recipe_id=rid,
+                status=RECIPE_STATUS_CONTRADICTED,
+                confidence=0.80,
+                confidence_basis=f"{data.get('container_name') or 'a count'} rose by {count_delta} over the "
+                                 f"observation window while heap / RSS stayed flat: a count without memory behind it "
+                                 f"is not retained objects.",
+                contradicting_facts=[f"count +{count_delta} with no memory growth in the same window"],
+                recommended_action="Refute object accumulation; the growing integer is not backed by memory.",
+                details={"object_accumulation_confirmed": False, "count_without_memory_growth": True},
+            )
+        if grew is None:
+            return RecipeEvaluationResult(
+                recipe_id=rid,
+                status=RECIPE_STATUS_INSUFFICIENT_EVIDENCE,
+                confidence=0.30,
+                confidence_basis=f"{data.get('container_name') or 'a count'} rose by {count_delta}, but memory "
+                                 f"growth in the same window was not measured.",
+                missing_evidence=["heap_or_rss_growth_in_the_same_window"],
+                limitations=recipe.limitations,
+            )
+    if obj_delta is None and absolute is not None and absolute <= 5:
+        obj_delta = absolute            # a near-empty container: bounded at this moment (not a fault either way)
+    if obj_delta is None and absolute is not None:
+        return RecipeEvaluationResult(
+            recipe_id=rid,
+            status=RECIPE_STATUS_INSUFFICIENT_EVIDENCE,
+            confidence=0.25,
+            confidence_basis=f"One reading of {data.get('container_name') or 'the container'} ({absolute}); a size "
+                             f"at one moment is not accumulation.",
+            missing_evidence=["container_size_across_epochs"],
+            limitations=recipe.limitations,
+        )
     if obj_delta is not None and obj_delta > 50:
         return RecipeEvaluationResult(
             recipe_id=rid,
@@ -2482,14 +2559,17 @@ def _rule_allocation_free_imbalance(recipe: DiagnosticRecipe, data: Dict[str, An
     free_count = data.get("free_count") if data.get("free_count") is not None else data.get("cumulative_frees")
     if alloc_count is not None and free_count is not None:
         if alloc_count >= 5 * max(1, free_count):
+            # A static ratio is not a leak (a pool allocated once and never freed by design has the same ratio);
+            # an imbalance needs the gap to GROW over the window - the delta branch above.
             return RecipeEvaluationResult(
                 recipe_id=rid,
-                status=RECIPE_STATUS_SUPPORTED,
-                confidence=0.92,
-                confidence_basis=f"Severe allocation/free imbalance: {alloc_count} allocations vs {free_count} frees.",
-                supporting_facts=[f"Allocs: {alloc_count}, Frees: {free_count}"],
-                recommended_action="Audit object lifetime and ensure symmetrical free() in destructors.",
-                details={"imbalance_confirmed": True},
+                status=RECIPE_STATUS_INSUFFICIENT_EVIDENCE,
+                confidence=0.30,
+                confidence_basis=f"Allocation/free counters read {alloc_count} vs {free_count} at one moment; a "
+                                 f"static ratio is not an imbalance until the gap is seen to grow over the window.",
+                missing_evidence=["alloc_free_gap_growth_over_window"],
+                limitations=recipe.limitations,
+                details={"imbalance_confirmed": False, "static_ratio_only": True},
             )
         elif abs(alloc_count - free_count) <= max(10, int(0.05 * alloc_count)):
             return RecipeEvaluationResult(
@@ -2527,6 +2607,20 @@ def _rule_suspicious_boundary_values(recipe: DiagnosticRecipe, data: Dict[str, A
     rid = recipe.recipe_id
     val = data.get("value") or data.get("observed_value")
     if val in (0xFFFFFFFF, 0x7FFFFFFF, 0xFFFFFFFFFFFFFFFF, -1):
+        # -1 / all-ones / INT_MAX are very often VALID sentinels ("not configured", "no limit", an unopened fd).
+        # The value is an anomaly only against an expected range that excludes it.
+        rng = data.get("valid_range") or data.get("expected_bounds")
+        if not (isinstance(rng, (list, tuple)) and len(rng) == 2 and not (rng[0] <= val <= rng[1])):
+            return RecipeEvaluationResult(
+                recipe_id=rid,
+                status=RECIPE_STATUS_INSUFFICIENT_EVIDENCE,
+                confidence=0.20,
+                confidence_basis=f"{data.get('variable_name') or 'a variable'} holds the sentinel-like value {val}; "
+                                 f"without an expected range it is not judged (a sentinel is often valid).",
+                missing_evidence=["expected_value_range"],
+                limitations=recipe.limitations,
+                details={"boundary_violation": False, "sentinel_value_not_judged": val},
+            )
         return RecipeEvaluationResult(
             recipe_id=rid,
             status=RECIPE_STATUS_SUPPORTED,
@@ -2535,6 +2629,17 @@ def _rule_suspicious_boundary_values(recipe: DiagnosticRecipe, data: Dict[str, A
             supporting_facts=[f"Value {val} matches known sentinel/extreme"],
             recommended_action="Verify arithmetic underflow protection.",
             details={"boundary_violation": True},
+        )
+    if isinstance(val, int) and not isinstance(val, bool) and data.get("variable_type_kind", "integer") in ("integer", "enum"):
+        # the recipe's contradicting criterion: an integer state value that is no boundary / sentinel value
+        return RecipeEvaluationResult(
+            recipe_id=rid,
+            status=RECIPE_STATUS_CONTRADICTED,
+            confidence=0.70,
+            confidence_basis=f"{data.get('variable_name') or 'the state variable'} holds {val}, not a boundary or "
+                             f"sentinel value.",
+            contradicting_facts=[f"value {val} is no boundary / sentinel value"],
+            details={"boundary_violation": False},
         )
     return None
 
@@ -2561,7 +2666,7 @@ def _rule_inconsistent_related_variables(recipe: DiagnosticRecipe, data: Dict[st
             status=RECIPE_STATUS_SUPPORTED,
             confidence=0.95,
             confidence_basis=f"Coupled variable invariant violation detected: length ({length}) exceeds capacity ({cap}).",
-            supporting_facts=[f"Length {length} exceeds capacity {cap}"],
+            supporting_facts=list(data.get("field_inconsistency_facts") or [f"Length {length} exceeds capacity {cap}"]),
             recommended_action="Audit bounds checking on buffer write routines.",
             details={"invariant_violation_confirmed": True, "field_inconsistency": True, "capacity": cap, "length": length},
         )
@@ -2775,7 +2880,9 @@ def _rule_repeated_allocation_patterns(recipe: DiagnosticRecipe, data: Dict[str,
     rid = recipe.recipe_id
     if not (not ("positive_evidence_found" in data or "negative_evidence_found" in data)):
         return None
-    if data.get("unreclaimed_site_growth") is True or (data.get("alloc_delta", 0) > 100 and data.get("free_delta", 0) == 0):
+    # alloc_delta / free_delta are None when the counter source changed between epochs: not comparable
+    a_d, f_d = data.get("alloc_delta"), data.get("free_delta")
+    if data.get("unreclaimed_site_growth") is True or (a_d is not None and f_d is not None and a_d > 100 and f_d == 0):
         return RecipeEvaluationResult(
             recipe_id=rid,
             status=RECIPE_STATUS_SUPPORTED,

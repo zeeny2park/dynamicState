@@ -298,7 +298,14 @@ class TestPhase212DiagnosticAccuracy(unittest.TestCase):
         proc = self._spawn_target("leak")
         provider = RuntimeEvidenceProvider()
         rec_accum = DiagnosticRecipeRegistry().get_recipe(RECIPE_LONG_LIVED_OBJECT_ACCUMULATION)
-        obs, recs = provider.collect_for_recipe(rec_accum, proc.pid, self.debug_elf)
+        # Accumulation is growth over a window (a size read once is not), backed by memory growth: observe the
+        # container across epochs of one provider session until it has grown.
+        deadline = time.monotonic() + 6.0
+        while True:
+            obs, recs = provider.collect_for_recipe(rec_accum, proc.pid, self.debug_elf)
+            if (obs.get("container_size_delta") or 0) > 50 or time.monotonic() > deadline:
+                break
+            time.sleep(0.4)
 
         self.assertGreaterEqual(obs.get("active_chunk_count", 0), 50)
         self.assertEqual(obs.get("container_name"), "g_retained_telemetry_records")
@@ -311,6 +318,9 @@ class TestPhase212DiagnosticAccuracy(unittest.TestCase):
         proc = self._spawn_target("alloc_imbalance")
         provider = RuntimeEvidenceProvider()
         rec_imb = DiagnosticRecipeRegistry().get_recipe(RECIPE_ALLOCATION_FREE_IMBALANCE)
+        # an imbalance is a gap that GROWS over the window (a static ratio is not): two epochs of one session
+        provider.collect_for_recipe(rec_imb, proc.pid, self.debug_elf)
+        time.sleep(0.6)
         obs, recs = provider.collect_for_recipe(rec_imb, proc.pid, self.debug_elf)
 
         self.assertGreaterEqual(obs.get("alloc_count", 0), 2000)

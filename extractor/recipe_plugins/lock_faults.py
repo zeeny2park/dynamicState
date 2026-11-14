@@ -58,7 +58,12 @@ MUTEX_TYPE = "pthread_mutex_t"
 
 # ---------------------------------------------------------------------------------------------- collection
 def _is_mutex(lock: Dict[str, Any]) -> bool:
-    """Only a glibc pthread_mutex_t has the word layout these rules read (sem_t, rwlock, custom structs do not)."""
+    """Only a glibc pthread_mutex_t has the word layout these rules read (sem_t, rwlock, custom structs do not).
+    Decided by the layout the inspector derived from DWARF (``glibc_mutex_layout``: pthread_mutex_t, or std::mutex
+    & co. wrapping one at offset 0), not by the type name; the name is a fallback for records without the field."""
+    layout = lock.get("glibc_mutex_layout")
+    if layout is not None:
+        return layout is True
     return MUTEX_TYPE in str(lock.get("type_name") or lock.get("type") or "")
 
 
@@ -91,6 +96,7 @@ def _digest(info: Dict[str, Any], t_s: float, switches: Optional[Dict[str, int]]
         if not isinstance(l, dict):
             continue
         locks.append({"lock_label": l.get("name"), "address": l.get("runtime_address"), "type": l.get("type_name"),
+                      "glibc_mutex_layout": l.get("glibc_mutex_layout"),
                       "state_word": l.get("lock_state_word"), "recursion_count": l.get("recursion_count"),
                       "owner_id": l.get("owner_tid"), "waiter_ids": [w for w in l.get("waiting_tids") or []]})
     waits, frames = [], {}
@@ -242,6 +248,27 @@ def _n_locks(lw: Dict[str, Any]) -> int:
     return max((sum(1 for l in s.get("locks") or [] if _is_mutex(l)) for s in lw.get("samples") or []), default=0)
 
 
+def _nothing_inspected(recipe: DiagnosticRecipe, lw: Dict[str, Any]) -> RecipeEvaluationResult:
+    """No mutex with the glibc layout was found (debug info, struct members, futex waits): the question was not
+    checked.  That is "nothing inspected", not "every mutex is fine" (HEALTHY lists it as a scope limit)."""
+    txt = (f"no pthread mutex found to inspect in {len(lw.get('samples') or [])} samples (globals, struct members, "
+           "futex waits): nothing inspected")
+    return RecipeEvaluationResult(
+        recipe_id=recipe.recipe_id, status=RECIPE_STATUS_INSUFFICIENT_EVIDENCE, confidence=0.3, confidence_basis=txt,
+        missing_evidence=["a pthread mutex to inspect"], limitations=list(recipe.limitations) + [txt],
+        details={"mutexes_inspected": 0, "nothing_inspected": True})
+
+
+def no_mutex_to_inspect(observation: Dict[str, Any]) -> bool:
+    """The lock-wait observation is complete and holds no mutex with the glibc layout (used by the HEALTHY rule)."""
+    lw = observation.get(OBS_LOCK_WAIT_STATE) if isinstance(observation, dict) else None
+    if not isinstance(lw, dict) or lw.get("unavailable") or len(lw.get("samples") or []) < SAMPLES:
+        return False
+    if lw.get("lock_owner_status") != "SUPPORTED" or not any(s.get("thread_ids") for s in lw["samples"]):
+        return False
+    return _n_locks(lw) == 0 and not any(s.get("waits") for s in lw["samples"])
+
+
 def orphan_lock_rule(recipe: DiagnosticRecipe, data: Dict[str, Any]) -> Optional[RecipeEvaluationResult]:
     bad = _incomplete(recipe, data)
     if bad:
@@ -272,6 +299,8 @@ def orphan_lock_rule(recipe: DiagnosticRecipe, data: Dict[str, Any]) -> Optional
                              + ", ".join(map(str, lw["unverified_owner_tids"][:5])),
             missing_evidence=["owner_tid_liveness"], limitations=list(recipe.limitations), details={"lock_wait_state": lw})
     n = _n_locks(lw)
+    if n == 0:
+        return _nothing_inspected(recipe, lw)
     out_of = lw.get("owner_outside_process") or []
     txt = (f"{n} mutex(es) inspected in {len(lw['samples'])} samples: every locked one is owned by a live thread"
            + (f"; {len(out_of)} is owned by a thread outside this process (process-shared mutex, not an orphan)" if out_of else ""))
@@ -299,6 +328,8 @@ def self_deadlock_rule(recipe: DiagnosticRecipe, data: Dict[str, Any]) -> Option
                                "inner function does not lock again, or use a recursive mutex deliberately.",
             details={"self_waits": selfw, "finding_category": CATEGORY_SELF_DEADLOCK})
     n = _n_locks(lw)
+    if n == 0:
+        return _nothing_inspected(recipe, lw)
     txt = f"{n} mutex(es) inspected in {len(lw['samples'])} samples: no thread waits for a mutex it owns itself"
     return RecipeEvaluationResult(
         recipe_id=rid, status=RECIPE_STATUS_CONTRADICTED, confidence=0.8, confidence_basis=txt, contradicting_facts=[txt],

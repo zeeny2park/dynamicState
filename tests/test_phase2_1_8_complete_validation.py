@@ -823,13 +823,19 @@ class TestPhase218CompleteValidation(unittest.TestCase):
 
         # C1-03: Container Accumulation -> SUPPORTED
         p_cont = self._spawn("c1_03_container_accumulation")
+        # accumulation = the count GROWS over a window and memory grows with it (a size read once is not)
+        def _rss_kb(pid):
+            with open(f"/proc/{pid}/statm") as fh:
+                return int(fh.read().split()[1]) * os.sysconf("SC_PAGE_SIZE") // 1024
         c_sz1 = int(wsm.evaluate_symbol_paths(p_cont.pid, self.debug_bin, ["g_container_size"])["results"][0]["value"])
-        time.sleep(0.06)
+        rss1 = _rss_kb(p_cont.pid)
+        time.sleep(1.6)
         c_sz2 = int(wsm.evaluate_symbol_paths(p_cont.pid, self.debug_bin, ["g_container_size"])["results"][0]["value"])
+        rss2 = _rss_kb(p_cont.pid)
         self.assertGreaterEqual(c_sz2, c_sz1)
         res_c1_03 = self.registry.evaluate_recipe(
             "RECIPE_LONG_LIVED_OBJECT_ACCUMULATION",
-            {"active_chunk_count": c_sz2, "chunk_growth_rate": max(10, c_sz2 - c_sz1)},
+            {"active_chunk_count": c_sz2, "container_size_delta": c_sz2 - c_sz1, "rss_history_kb": [rss1, rss2]},
         )
         self.assertEqual(res_c1_03.status, RECIPE_STATUS_SUPPORTED)
 
@@ -846,12 +852,17 @@ class TestPhase218CompleteValidation(unittest.TestCase):
 
         # C1-05: Allocation/Free Counter Imbalance -> SUPPORTED
         p_imb = self._spawn("c1_05_alloc_free_imbalance")
+        # an imbalance is a gap that GROWS over the window (a static ratio is not): two reads
+        imb_0 = wsm.evaluate_symbol_paths(p_imb.pid, self.debug_bin, ["g_alloc_count", "g_free_count"])
+        time.sleep(0.5)
         imb_res = wsm.evaluate_symbol_paths(p_imb.pid, self.debug_bin, ["g_alloc_count", "g_free_count"])
         a_cnt = int(imb_res["results"][0]["value"])
         f_cnt = int(imb_res["results"][1]["value"])
         res_c1_05 = self.registry.evaluate_recipe(
             "RECIPE_ALLOCATION_FREE_IMBALANCE",
-            {"alloc_count": a_cnt, "free_count": f_cnt, "temporal_observations": 3},
+            {"alloc_count": a_cnt, "free_count": f_cnt, "temporal_observations": 3,
+             "alloc_delta": a_cnt - int(imb_0["results"][0]["value"]),
+             "free_delta": f_cnt - int(imb_0["results"][1]["value"])},
         )
         self.assertEqual(res_c1_05.status, RECIPE_STATUS_SUPPORTED)
 

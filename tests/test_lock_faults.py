@@ -95,7 +95,8 @@ class TestOrphanRule(unittest.TestCase):
 
     def test_non_mutex_type_is_not_decoded(self):
         d = _obs(_samples([(1, "main")], [_lock(typ="sem_t", waiters=())], []))
-        self.assertEqual(_run(lf.RECIPE_ORPHAN_LOCK, d).status, dr.RECIPE_STATUS_CONTRADICTED)
+        # not decoded, so no mutex was inspected: "nothing inspected", not a pass (and never an orphan)
+        self.assertEqual(_run(lf.RECIPE_ORPHAN_LOCK, d).status, dr.RECIPE_STATUS_INSUFFICIENT_EVIDENCE)
 
     def test_owner_alive_outside_the_process_is_not_an_orphan(self):
         d = _obs(_samples([(1, "main")], [_lock(waiters=())], []), exists=lambda tid: True)

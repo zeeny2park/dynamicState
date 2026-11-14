@@ -605,6 +605,75 @@ def run_all(targets: List[Dict[str, Any]], diagnose_fn: Callable = _default_diag
     return report
 
 
+def _adversarial_diagnose(pid, debug_image, kind, corpus_dir):
+    from extractor.expert_diagnostic_engine import diagnose
+    from tests.support import adversarial_healthy as adv
+    return diagnose(pid, debug_image, corpus_dir=corpus_dir, **adv.diagnose_kwargs(kind)).to_dict()
+
+
+def run_adversarial(diagnose_fn: Callable = _adversarial_diagnose,
+                    programs: Optional[List[str]] = None) -> Dict[str, Any]:
+    """The "adversarial healthy" suite: healthy programs whose names / values look like faults
+    (tests/fixtures/adversarial_healthy), each diagnosed under every symptom kind.  Reported on its own: it is not
+    part of the scored 21 defect + 8 healthy targets.  A fault verdict or any finding is a false positive."""
+    from tests.support import adversarial_healthy as adv
+    t0 = time.monotonic()
+    tmp = tempfile.mkdtemp(prefix="diagacc_adv_")
+    rows: List[Dict[str, Any]] = []
+    try:
+        corpus = os.path.join(tmp, "corpus")
+        for name in programs or adv.programs():
+            try:
+                binary = adv.build(name, tmp)
+            except subprocess.CalledProcessError as e:
+                rows.append({"program": name, "kind": None, "error": f"build failed: {e.stderr[-300:]}"})
+                continue
+            for kind in adv.SYMPTOM_KINDS:
+                row: Dict[str, Any] = {"program": name, "symptom_kind": kind}
+                proc = fixture_popen([binary], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                     stderr=subprocess.DEVNULL, max_lifetime_s=READY_TIMEOUT_S + DIAGNOSE_TIMEOUT_S + 60,
+                                     name="adv_" + name)
+                try:
+                    proc.stdout.readline()
+                    time.sleep(0.3)
+                    t1 = time.monotonic()
+                    res = diagnose_fn(proc.pid, binary, kind, corpus)
+                    row["diagnose_s"] = round(time.monotonic() - t1, 2)
+                    row["verdict"] = res.get("verdict")
+                    row["violations"] = adv.violations(res)
+                    row["false_positive"] = bool(row["violations"])
+                except Exception as e:  # noqa: BLE001 - one failing run is an error row, not a crashed suite
+                    row["error"] = f"{type(e).__name__}: {e}"[:300]
+                finally:
+                    _kill(proc)
+                rows.append(row)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    ok_rows = [r for r in rows if "error" not in r]
+    return {
+        "programs": sorted({r["program"] for r in rows}),
+        "runs": len(ok_rows),
+        "false_positives": sum(1 for r in ok_rows if r["false_positive"]),
+        "fault_verdicts": sum(1 for r in ok_rows if r.get("verdict") in adv.FAULT_VERDICTS),
+        "errors": len(rows) - len(ok_rows),
+        "verdicts": {v: sum(1 for r in ok_rows if r.get("verdict") == v) for v in sorted({str(r.get("verdict")) for r in ok_rows})},
+        "wall_s": round(time.monotonic() - t0, 1),
+        "rows": rows,
+    }
+
+
+def format_adversarial(adv_report: Dict[str, Any]) -> str:
+    lines = ["", f"adversarial healthy suite (separate; not in the totals above): {len(adv_report['programs'])} programs, "
+                 f"{adv_report['runs']} runs, false positives {adv_report['false_positives']} "
+                 f"(fault verdicts {adv_report['fault_verdicts']}), errors {adv_report['errors']}; verdicts "
+                 + ", ".join(f"{k} {n}" for k, n in adv_report["verdicts"].items())]
+    for r in adv_report["rows"]:
+        if r.get("false_positive") or r.get("error"):
+            lines.append(f"  {r['program']:24} {str(r.get('symptom_kind')):20} {str(r.get('verdict')):16} "
+                         f"{r.get('error') or '; '.join(r['violations'])}")
+    return "\n".join(lines)
+
+
 def format_table(report: Dict[str, Any]) -> str:
     lines = [f"{'target':20} {'kind':15} {'origin':15} {'verdict':16} {'det':>3} {'names':>7} {'loc':>3} {'cand':>5}"
              f"  categories"]
@@ -685,6 +754,9 @@ def main(argv: Optional[List[str]] = None) -> int:
                     help="target set: the main benchmark (default) or the held-out validation suite, reported "
                          "separately (results file suffix -heldout)")
     ap.add_argument("--list", action="store_true", help="list targets and exit")
+    ap.add_argument("--adversarial", choices=("on", "off", "only"), default="on",
+                    help="the separately reported adversarial-healthy suite (tests/fixtures/adversarial_healthy): "
+                         "on (default, after the targets), off, or only")
     args = ap.parse_args(argv)
     targets = load_ground_truth(SUITES[args.suite])
     if args.list:
@@ -698,7 +770,18 @@ def main(argv: Optional[List[str]] = None) -> int:
             print(f"unknown target(s): {bad}", file=sys.stderr)
             return 2
         targets = [g for g in targets if g["id"] in args.only]
+    if args.adversarial == "only":
+        adv_report = run_adversarial()
+        out = args.output or os.path.join(RESULTS_DIR, f"{datetime.date.today().isoformat()}-adversarial.json")
+        with open(out, "w", encoding="utf-8") as fh:
+            json.dump(adv_report, fh, indent=2)
+            fh.write("\n")
+        print(format_adversarial(adv_report))
+        print(f"results written to {out}")
+        return 0
     report = run_all(targets, symptom_mode=args.symptom, repeat=max(1, args.repeat), suite=args.suite)
+    if args.adversarial == "on" and not args.only:
+        report["adversarial_healthy"] = run_adversarial()
     env = report["environment"]
     out = args.output or os.path.join(
         RESULTS_DIR, f"{datetime.date.today().isoformat()}-{env['arch']}-{env['commit'][:7]}"
@@ -710,6 +793,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         json.dump(report, fh, indent=2)
         fh.write("\n")
     print(format_table(report))
+    if report.get("adversarial_healthy"):
+        print(format_adversarial(report["adversarial_healthy"]))
     print(f"results written to {out}")
     sys.stdout.flush()
     if any(r.get("error", "").endswith("(hang)") for r in report["rows"]):

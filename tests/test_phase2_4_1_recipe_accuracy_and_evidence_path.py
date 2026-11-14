@@ -56,10 +56,11 @@ class TestPhase241RecipeAccuracyAndEvidencePath(unittest.TestCase):
                 #include <stdint.h>
                 #include <pthread.h>
 
-                int g_capacity = 64;
-                int g_length = 8;
+                /* a capacity/length pair shares a stem; a name prefix (g_) alone does not relate two globals */
+                int g_buf_capacity = 64;
+                int g_buf_length = 8;
                 uint32_t g_magic_canary = 0x12345678;
-                char *g_active_ptr = (char*)&g_capacity;
+                char *g_active_ptr = (char*)&g_buf_capacity;
 
                 int main(void) {
                     printf("HEALTHY_READY %d\\n", getpid());
@@ -85,9 +86,13 @@ class TestPhase241RecipeAccuracyAndEvidencePath(unittest.TestCase):
                 #include <unistd.h>
                 #include <stdint.h>
 
-                int g_capacity = 10;
-                int g_length = 100;
+                int g_buf_capacity = 10;
+                int g_buf_length = 100;
+                /* 0xDEADBEEF is not corrupt by its value: the expected magic comes from the sibling objects,
+                   and the last object's magic alone disagrees with them */
                 uint32_t g_magic_canary = 0xDEADBEEF;
+                struct obj { uint32_t magic; int id; } g_objs[4] = {
+                    {0x12345678, 1}, {0x12345678, 2}, {0x12345678, 3}, {0xDEADBEEF, 4} };
                 void *g_bad_ptr = (void*)0xBAADF00D;
 
                 int main(void) {
@@ -330,7 +335,8 @@ class TestPhase241RecipeAccuracyAndEvidencePath(unittest.TestCase):
             },
             "RECIPE_ALLOCATION_FREE_IMBALANCE": {
                 "healthy": {"alloc_count": 100, "free_count": 100, "cumulative_allocations": 100, "cumulative_frees": 100},
-                "defect": {"alloc_count": 10000, "free_count": 10, "cumulative_allocations": 10000, "cumulative_frees": 10},
+                "defect": {"alloc_count": 10000, "free_count": 10, "cumulative_allocations": 10000, "cumulative_frees": 10,
+                           "alloc_delta": 9000, "free_delta": 5},  # static ratio is not a leak: the gap grew over the window
             },
             "RECIPE_OBJECT_LIFETIME_ANOMALIES": {
                 "healthy": {"lifetime_valid": True},
@@ -342,7 +348,8 @@ class TestPhase241RecipeAccuracyAndEvidencePath(unittest.TestCase):
             },
             "RECIPE_LONG_LIVED_OBJECT_ACCUMULATION": {
                 "healthy": {"container_size": 5, "container_delta": 0},
-                "defect": {"monotonic_growth": True, "container_size_delta": 2000},
+                "defect": {"monotonic_growth": True, "container_size_delta": 2000,
+                           "heap_growth_bytes": 4 * 1024 * 1024},  # a growing count backed by memory growth
             },
             # Memory Integrity Domain
             "RECIPE_DOUBLE_FREE": {
@@ -372,7 +379,7 @@ class TestPhase241RecipeAccuracyAndEvidencePath(unittest.TestCase):
             },
             "RECIPE_SUSPICIOUS_BOUNDARY_VALUES": {
                 "healthy": {"value": 50},
-                "defect": {"observed_value": -1},
+                "defect": {"observed_value": -1, "valid_range": (0, 100)},  # a sentinel is an anomaly only against an expected range
             },
             # Concurrency Domain
             "RECIPE_THREAD_STATE_ANOMALIES": {

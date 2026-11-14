@@ -244,11 +244,18 @@ def _walk_members(idx: Any, type_offset: Optional[int], prefix: str, base_off: i
         return
     if canon.tag not in ("DW_TAG_structure_type", "DW_TAG_class_type"):
         return
+    from .inspection.threads import glibc_mutex_layout
     for m in canon.members:
         if not m.name:
             continue
-        mname = idx.get_type_name(m.type_offset)
-        if _is_mutex_type_name(mname):
+        # the layout decides (pthread_mutex_t, or std::mutex & co. wrapping one at offset 0), not a type name
+        # ending in "mutex" (a custom spin "my_mutex" struct has no glibc word layout)
+        mc = idx.resolve_canonical_type(m.type_offset)
+        # the mutex itself (pthread_mutex_t, or a one-member wrapper such as std::mutex), not a user struct that
+        # merely starts with one: recurse into that to name the member
+        wrapper_only = (idx.get_type_name(m.type_offset) in ("pthread_mutex_t", "__gthread_mutex_t")
+                        or mc is None or len([x for x in (getattr(mc, "members", None) or []) if x.name]) <= 1)
+        if glibc_mutex_layout(idx, m.type_offset) and wrapper_only:
             out.append((f"{prefix}.{m.name}", base_off + int(m.offset or 0)))
         else:
             _walk_members(idx, m.type_offset, f"{prefix}.{m.name}", base_off + int(m.offset or 0), depth + 1, out)
@@ -405,6 +412,7 @@ def augment_lock_info(
                 "runtime_address": f"0x{addr:x}",
                 "runtime_address_int": addr,
                 "type_name": "pthread_mutex_t",
+                "glibc_mutex_layout": True,     # a validated member layout or a validated futex word
                 "discovered_via": source,
                 "waiting_tids": [],
             }

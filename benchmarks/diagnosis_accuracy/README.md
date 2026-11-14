@@ -136,6 +136,18 @@ generalisation again. Engine-level misses found by the suite are listed in the c
 - Also recorded: verdict, categories, subjects, `not_covered` kinds, wall time, capture mode, measured stop time;
   `non_zero_stop` flags any non-zero-stop collection. A `diagnose` exception or hang becomes a row with `error`.
 
+## Adversarial healthy suite (separate; not in the totals)
+
+`tests/fixtures/adversarial_healthy/*.c|*.cpp`: healthy programs whose names and values look like faults (0xDEADBEEF
+as the valid magic, unrelated `alloc_*` / `free_*` statistics, `max_*` next to `*_len`, growing statistics in
+pointer+count structs, sentinel -1 / all-ones states, `clock_t` / `struct block_stats`, integers named like
+pointers). Each is diagnosed under every symptom kind (`None` = default check, crash_corruption, memory_growth,
+hang_deadlock, state_inconsistency, variable_anomaly). Any fault verdict (CONFIRMED/PROBABLE_FAULT, FAULT, DEGRADED)
+or any finding is a false positive. Reported after the table and as `adversarial_healthy` in the results JSON
+(`programs`, `runs`, `false_positives`, `fault_verdicts`, `verdicts`, `rows`); it never changes the scored 21 + 8
+numbers. `--adversarial on` (default; skipped with `--only`), `off`, or `only`. Cost: about 4 s per run, ~6 min.
+The same matrix is a unit test: `tests/test_adversarial_healthy.py`.
+
 ## Baseline (2026-11-12, aarch64, commit in file name)
 
 Results files written before the `long_stall` scope change include `long_stall` (2 targets) in the totals, i.e. they say
