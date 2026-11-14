@@ -28,6 +28,7 @@ from extractor.typed_evidence import (
     TYPED_EVIDENCE_KEY,
     TypedEvidence,
 )
+from extractor.cause_predictions import OUTCOME_REFUTED, OUTCOME_SUPPORTED
 from extractor.diagnostic_rule_model import (
     VERDICT_CONFIRMED,
     VERDICT_LIKELY,
@@ -181,14 +182,21 @@ _BOUND_RANK = {VERDICT_CONFIRMED: 5, VERDICT_LIKELY: 4, VERDICT_SUPPORTED: 3, VE
                VERDICT_REFUTED: 1}
 
 
-def candidate_verdict_source(candidate: Any, verified: List[Any]) -> Dict[str, Any]:
-    """The verdict a competing candidate takes from the verified hypotheses (stage 1: one hypothesis model).
+def candidate_verdict_source(candidate: Any, verified: List[Any],
+                             outcome: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """The verdict a competing candidate takes in an investigation whose hypotheses are verified (stage 1).
 
-    ``verified``: the investigation's verified hypotheses (active + rejected ExpertHypothesis).  The candidate's
-    evidence is the evidence its discriminating rules (``applicable_diagnostic_rules``) produced:
-    * some of it supports a verified hypothesis -> that hypothesis's status and confidence (the strongest one);
-    * it only contradicts -> REFUTED (its own checks found their invariant holding);
-    * none of its rules produced evidence -> INCONCLUSIVE (not checked)."""
+    ``verified``: the investigation's verified hypotheses (active + rejected ExpertHypothesis).  ``outcome``: what the
+    evidence says about THIS cause (``cause_predictions.evaluate_causes``; candidates with declared predictions):
+    * supported (the evidence discriminates in its favour) -> the status of the verified hypothesis that consumed the
+      decisive evidence (at least SUPPORTED), bound to the checks that produced it;
+    * refuted (observed evidence contradicts what it predicts) -> REFUTED;
+    * undecided -> INCONCLUSIVE, with the reason (shared evidence that does not distinguish it from a rival, or
+      nothing observed that bears on it).
+    Without an outcome (a candidate with no declared predictions) the former rule applies: the candidate takes the
+    verdict of the verified hypothesis that consumed the evidence of its rules."""
+    if outcome:
+        return _verdict_source_from_outcome(candidate, verified, outcome)
     rules = set(getattr(candidate, "applicable_diagnostic_rules", None) or [])
     best: Optional[Tuple[int, float, Any, List[str]]] = None
     contra_ids: List[str] = []
@@ -223,6 +231,64 @@ def candidate_verdict_source(candidate: Any, verified: List[Any]) -> Dict[str, A
     return {"hypothesis_id": None, "category": None, "rules": sorted(rules), "status": VERDICT_INCONCLUSIVE,
             "confidence": 0.20, "supporting_evidence_ids": [], "contradicting_evidence_ids": [],
             "basis": "None of its discriminating checks produced evidence in this investigation."}
+
+
+def _signal_text(items: List[Dict[str, Any]]) -> str:
+    return ", ".join(f"{m.get('signal')}={m.get('observed')}" for m in items)
+
+
+def _verdict_source_from_outcome(candidate: Any, verified: List[Any], oc: Dict[str, Any]) -> Dict[str, Any]:
+    """verdict_source of a candidate from its evidence outcome (see candidate_verdict_source)."""
+    kind = oc.get("outcome")
+    decisive = list(oc.get("decisive") or [])
+    contradicted = list(oc.get("contradicted") or [])
+    matched = list(oc.get("matched") or [])
+    shown = decisive if kind == OUTCOME_SUPPORTED else contradicted if kind == OUTCOME_REFUTED else matched
+    ev_ids = [e for m in shown for e in m.get("evidence_ids") or []]
+    rules = list(dict.fromkeys(r for m in shown for r in m.get("rules") or []))
+    base = {"rules": rules, "applicable_rules": sorted(getattr(candidate, "applicable_diagnostic_rules", None) or []),
+            "outcome": kind, "reason": oc.get("reason"), "signals": shown,
+            "rivals_not_distinguished": list(oc.get("rivals_not_distinguished") or []),
+            "supporting_evidence_ids": [], "contradicting_evidence_ids": []}
+
+    def consumer(ids: List[str], lists: Tuple[str, ...]) -> Optional[Any]:
+        best = None
+        for h in verified:
+            hid = {e.get("evidence_id") for ln in lists for e in (getattr(h, ln, None) or []) if isinstance(e, dict)}
+            if not hid & set(ids):
+                continue
+            st = _BOUND_STATUS.get(str(getattr(h, "status", "")), VERDICT_INCONCLUSIVE)
+            key = (_BOUND_RANK.get(st, 0), float(getattr(h, "confidence", 0.0) or 0.0))
+            if best is None or key > best[0]:
+                best = (key, h)
+        return best[1] if best else None
+
+    if kind == OUTCOME_SUPPORTED:
+        h = consumer(ev_ids, ("supporting_evidence",))
+        st = _BOUND_STATUS.get(str(getattr(h, "status", "")), VERDICT_INCONCLUSIVE) if h is not None else None
+        if st is None or _BOUND_RANK.get(st, 0) < _BOUND_RANK[VERDICT_SUPPORTED]:
+            st, conf = VERDICT_SUPPORTED, 0.5
+        else:
+            conf = round(float(getattr(h, "confidence", 0.0) or 0.0), 4)
+        return dict(base, hypothesis_id=getattr(h, "hypothesis_id", None), category=getattr(h, "category", None),
+                    status=st, confidence=conf, supporting_evidence_ids=ev_ids,
+                    basis="The evidence discriminates in favour of this cause: " + _signal_text(decisive)
+                          + (f" (verified hypothesis {getattr(h, 'hypothesis_id', '')})." if h is not None else "."))
+    if kind == OUTCOME_REFUTED:
+        h = consumer(ev_ids, ("supporting_evidence", "contradicting_evidence"))
+        return dict(base, hypothesis_id=getattr(h, "hypothesis_id", None), category=getattr(h, "category", None),
+                    status=VERDICT_REFUTED, confidence=0.10, contradicting_evidence_ids=ev_ids,
+                    basis="Observed evidence contradicts what this cause predicts: "
+                          + "; ".join(f"{m.get('signal')}={m.get('observed')} (predicted {'/'.join(m.get('predicted') or [])})"
+                                      for m in contradicted) + ".")
+    rivals = list(oc.get("rivals_not_distinguished") or [])
+    if matched:
+        basis = ("The evidence does not distinguish this cause" + (" from " + ", ".join(rivals) if rivals else "")
+                 + ": the observations it shares (" + _signal_text(matched) + ") are predicted by the rival too, "
+                 "or its own defining observation is missing.")
+    else:
+        basis = "Nothing observed in this investigation bears on this cause."
+    return dict(base, hypothesis_id=None, category=None, status=VERDICT_INCONCLUSIVE, confidence=0.20, basis=basis)
 
 
 # Dependency-graph defects that make the graph itself invalid (not merely unverified): get_independent_root_sources
@@ -1917,9 +1983,10 @@ class CompetingHypothesis:
         if self.verdict_source:
             # One source of truth: the verified hypothesis decides; the ledger audit above stays as provenance data
             decision_rule_applied = "RULE_BOUND_TO_VERIFIED_HYPOTHESIS"
-            decision_explanation = (f"Verdict of verified hypothesis {self.verdict_source.get('hypothesis_id')} "
-                                    f"({self.verdict_source.get('category')}) for the evidence of rules "
-                                    f"{self.verdict_source.get('rules')}; ledger audit: {self.status}.")
+            decision_explanation = (f"Bound in the verified investigation (hypothesis "
+                                    f"{self.verdict_source.get('hypothesis_id')}, outcome "
+                                    f"{self.verdict_source.get('outcome') or 'rule-bound'}, evidence of rules "
+                                    f"{self.verdict_source.get('rules')}); ledger audit: {self.status}.")
             self.status = str(self.verdict_source.get("status") or VERDICT_INCONCLUSIVE)
             self.confidence = float(self.verdict_source.get("confidence") or 0.0)
             self.confidence_basis = str(self.verdict_source.get("basis") or "")

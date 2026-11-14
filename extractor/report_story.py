@@ -34,6 +34,11 @@ _L: Dict[str, Tuple[str, str]] = {
     "ev_ran_undecided_nw": ("the related check ran but could not decide", "관련 검사는 실행됐으나 결론을 내지 못함"),
     "ev_clean": ("no sign of it", "이 원인의 징후 없음"),
     "ev_found": ("problem found", "이상 발견"),
+    "ev_contra": ("{obs}: does not fit this cause", "{obs}: 이 원인과 맞지 않음"),
+    "ev_contra_by": ("{chk} saw that {obs}: does not fit this cause", "{chk}에서 {obs}: 이 원인과 맞지 않음"),
+    "ev_shared": ("the evidence does not distinguish it from: {rivals}", "증거가 이 원인을 다음과 구별하지 못함: {rivals}"),
+    "ev_shared_nr": ("the evidence does not distinguish it (its own sign was not observed)",
+                     "증거가 이 원인을 구별하지 못함 (이 원인만의 징후는 관측되지 않음)"),
     "tl_head": ("Course of the diagnosis", "진행 순서"),
     "tl_note": ("In time order: how the symptom was read, the checks that ran (offset from the first check, duration), what "
                 "they showed, the verdict.", "시간 순서입니다: 증상 해석, 실행한 검사(첫 검사로부터의 시각, 걸린 시간), 관찰한 것, 결론."),
@@ -80,6 +85,54 @@ CAUSE_KO: Dict[str, str] = {
     "Candidate Memory Integrity or Allocator Metadata Violation": "메모리 무결성 또는 할당자 메타데이터 위반",
     "Candidate Thread Deadlock or Lock Contention": "스레드 교착 또는 락 경합",
 }
+
+# an observed signal value (extractor.cause_predictions.SIGNALS) in plain words
+SIGNAL_TEXT: Dict[Tuple[str, str], Tuple[str, str]] = {
+    ("heap_in_use_trend", "SUSTAINED"): ("the in-use heap grew across the whole window without a drop",
+                                         "사용 중인 힙이 관측 내내 줄지 않고 늘어남"),
+    ("heap_in_use_trend", "TRANSIENT"): ("the in-use heap rose and then fell", "사용 중인 힙이 늘었다가 줄어듦"),
+    ("heap_in_use_trend", "GREW"): ("the in-use heap was larger at the end than at the start",
+                                    "사용 중인 힙이 처음보다 커짐 (중간 경과는 관측하지 않음)"),
+    ("heap_in_use_trend", "FLAT"):("the in-use heap did not grow", "사용 중인 힙이 늘지 않음"),
+    ("growth_owner", "REFERENCED"): ("the blocks that grew are still referenced from a container or global",
+                                     "늘어난 블록이 컨테이너·전역 변수에서 계속 참조됨"),
+    ("growth_owner", "UNREACHABLE"): ("nothing references the blocks that grew", "늘어난 블록을 가리키는 참조가 없음"),
+    ("alloc_counter_balance", "IMBALANCED"): ("allocations outnumber frees", "할당 횟수가 해제 횟수보다 많음"),
+    ("alloc_counter_balance", "BALANCED"): ("allocations and frees balance", "할당과 해제 횟수가 맞음"),
+    ("memory_bounded", "UNBOUNDED"): ("memory keeps growing", "메모리가 계속 늘어남"),
+    ("memory_bounded", "BOUNDED"): ("memory did not keep growing", "메모리가 계속 늘지는 않음"),
+    ("resource_bounded", "UNBOUNDED"): ("descriptors or threads keep growing", "파일·스레드 같은 자원이 계속 늘어남"),
+    ("resource_bounded", "BOUNDED"): ("descriptors and threads did not keep growing", "파일·스레드 같은 자원이 늘지 않음"),
+    ("wait_cycle", "PERSISTENT"): ("a wait-for cycle between threads persisted", "스레드 사이의 대기 고리가 계속 유지됨"),
+    ("wait_cycle", "SEEN"): ("a wait-for cycle was seen but did not persist", "대기 고리가 잠깐 보였으나 유지되지 않음"),
+    ("wait_cycle", "NONE"): ("there is no wait-for cycle", "대기 고리가 없음"),
+    ("threads_blocked", "BLOCKED"): ("threads stayed blocked without progress", "스레드가 진행 없이 계속 막혀 있음"),
+    ("threads_blocked", "NOT_BLOCKED"): ("no thread stayed blocked", "계속 막힌 스레드가 없음"),
+    ("thread_state", "ANOMALOUS"): ("a thread is in an abnormal state", "비정상 상태의 스레드가 있음"),
+    ("thread_state", "NORMAL"): ("all threads are in normal states", "모든 스레드가 정상 상태"),
+    ("lock_queueing", "QUEUED"): ("threads queue on a held lock", "쥐고 있는 락 앞에 대기열이 생김"),
+    ("lock_queueing", "NOT_QUEUED"): ("no queue forms on any lock", "락 앞에 대기열이 없음"),
+    ("lock_owner_gone", "GONE"): ("the thread that holds the lock no longer exists", "락을 쥔 스레드가 이미 없음"),
+    ("lock_owner_gone", "ALIVE"): ("lock owners are alive", "락을 쥔 스레드가 살아 있음"),
+    ("self_wait", "PRESENT"): ("a thread waits on a lock it already holds", "스레드가 자기가 쥔 락을 다시 기다림"),
+    ("self_wait", "ABSENT"): ("no thread waits on its own lock", "자기 락을 기다리는 스레드 없음"),
+    ("heap_header_damage", "DAMAGED"): ("a heap chunk header is damaged", "힙 청크 헤더가 손상됨"),
+    ("heap_header_damage", "INTACT"): ("the heap chunk headers are intact", "힙 청크 헤더가 온전함"),
+    ("freed_block_use", "USED"): ("a freed block is still in use", "해제된 블록이 아직 사용됨"),
+    ("freed_block_use", "NONE"): ("no freed block is in use", "해제된 블록을 쓰는 곳 없음"),
+    ("free_list_repeat", "REPEATED"): ("a block is on the free list twice", "같은 블록이 해제 목록에 두 번 있음"),
+    ("free_list_repeat", "NONE"): ("no block is on the free list twice", "해제 목록에 중복된 블록 없음"),
+    ("address_validity", "INVALID"): ("a pointer targets unmapped memory", "포인터가 매핑되지 않은 주소를 가리킴"),
+    ("address_validity", "VALID"): ("the probed pointers target mapped memory", "확인한 포인터가 올바른 주소를 가리킴"),
+    ("state_consistency", "VIOLATED"): ("a state value is outside its domain", "상태 값이 허용 범위를 벗어남"),
+    ("state_consistency", "LEGAL"): ("state values stay in their domain", "상태 값이 허용 범위 안에 있음"),
+}
+
+
+def signal_text(lang: str, signal: str, value: str) -> str:
+    t = SIGNAL_TEXT.get((str(signal), str(value)))
+    return t[1 if lang == "ko" else 0] if t else f"{signal} = {value}"
+
 
 _SUPPORTED = {"CONFIRMED", "LIKELY", "SUPPORTED", "OBSERVED", "CONFIRMED_ROOT_CAUSE", "PROBABLE_CAUSE"}
 _RULED_OUT = {"REFUTED", "CONTRADICTED"}
@@ -149,24 +202,74 @@ def _belongs(cand: Dict[str, Any], f: Dict[str, Any], doms: set) -> bool:
     vs = cand.get("verdict_source") if isinstance(cand.get("verdict_source"), dict) else {}
     if cat and cat in (str(cand.get("category") or ""), str(vs.get("category") or "")):
         return True
-    if set(str(x) for x in cand.get("applicable_diagnostic_rules") or []) & set(str(x) for x in f.get("recipe_ids") or []):
+    rules = set(str(x) for x in cand.get("applicable_diagnostic_rules") or []) | set(str(x) for x in vs.get("rules") or [])
+    if rules & set(str(x) for x in f.get("recipe_ids") or []):
         return True
     return bool(doms) and str(cand.get("domain") or "") in doms
 
 
-def _cause_row(lang: str, cand: Dict[str, Any], by_rid: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
+def _cause_name(lang: str, title: str) -> str:
+    return CAUSE_KO.get(title, title) if lang == "ko" else title
+
+
+def _ran(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    return [r for r in rows if r.get("planned", True) and r["status"] in ("FAIL", "PASS", "INCONCLUSIVE")]
+
+
+def _outcome_evidence(lang: str, vs: Dict[str, Any], out: str, by_rid: Dict[str, Dict[str, Any]],
+                      titles: Dict[str, str]) -> Optional[Tuple[str, Optional[str]]]:
+    """What decided the outcome of a cause bound by the evidence-outcome model (``verdict_source.outcome``): the
+    contradicting observation of a ruled-out cause, the rivals a shared observation cannot tell apart.  None: the
+    generic wording applies (a supported cause shows the check that found it; nothing observed)."""
+    from .human_report import check_name
+    sig = [s for s in vs.get("signals") or [] if isinstance(s, dict)]
+    if out == "supported" and sig:
+        # the check that found it (one of the checks whose evidence decided it), else the observation itself
+        fails = [by_rid[r] for r in vs.get("rules") or [] if r in by_rid and by_rid[r]["status"] == "FAIL"]
+        if fails:
+            # prefer a check whose observation can be said in the report language over a bare "problem found"
+            texts = [(_check_text(lang, row), row) for row in fails]
+            text, row = next(((t, rw) for t, rw in texts if ": " in t), texts[0])
+            return (text if ": " in text else _check_text(lang, row, _t(lang, "ev_found"))), row["rid"]
+        return "; ".join(signal_text(lang, s.get("signal"), s.get("observed")) for s in sig), None
+    if out == "ruled_out" and sig:
+        s = sig[0]
+        obs = signal_text(lang, s.get("signal"), s.get("observed"))
+        row = next((by_rid[r] for r in s.get("rules") or [] if r in by_rid), None)
+        if row is not None:
+            return _t(lang, "ev_contra_by", chk=check_name(row["rid"], 1 if lang == "ko" else 0, row.get("name")),
+                      obs=obs), row["rid"]
+        return _t(lang, "ev_contra", obs=obs), None
+    if out == "undecided" and vs.get("reason") == "NOT_DISTINGUISHED":
+        rivals = [_cause_name(lang, titles.get(r, r)) for r in vs.get("rivals_not_distinguished") or []]
+        if rivals:
+            return _t(lang, "ev_shared", rivals=", ".join(rivals)), None
+        return _t(lang, "ev_shared_nr"), None
+    return None
+
+
+def _cause_row(lang: str, cand: Dict[str, Any], by_rid: Dict[str, Dict[str, Any]],
+               titles: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
     from .human_report import ko_text
     i = 1 if lang == "ko" else 0
     title = str(cand.get("title") or cand.get("hypothesis_id") or "")
     out = outcome_of(cand.get("status"))
-    rows = [by_rid[str(r)] for r in cand.get("applicable_diagnostic_rules") or [] if str(r) in by_rid]
-    ran = [r for r in rows if r.get("planned", True) and r["status"] in ("FAIL", "PASS", "INCONCLUSIVE")]
+    vs = cand.get("verdict_source") if isinstance(cand.get("verdict_source"), dict) else {}
+    # the checks that decided it first (the evidence-outcome model binds a cause to the checks that observed what it
+    # predicts), then the rules the candidate declares
+    rule_ids = list(dict.fromkeys([str(r) for r in vs.get("rules") or []]
+                                  + [str(r) for r in cand.get("applicable_diagnostic_rules") or []]))
+    rows = [by_rid[r] for r in rule_ids if r in by_rid]
+    ran = _ran(rows)
+    decided = _outcome_evidence(lang, vs, out, by_rid, titles or {}) if vs.get("outcome") else None
     pick: Optional[Dict[str, Any]] = None
-    if out == "supported":
+    if out == "supported" and decided is None:
         pick = next((r for r in ran if r["status"] == "FAIL"), None)
-    elif out == "ruled_out":
+    elif out == "ruled_out" and decided is None:
         pick = next((r for r in ran if r["status"] == "PASS"), None)
-    if pick is not None:
+    if decided is not None:
+        evidence, rid = decided
+    elif pick is not None:
         evidence = _check_text(lang, pick, _t(lang, "ev_clean") if out == "ruled_out" else _t(lang, "ev_found"))
         rid = pick["rid"]
     else:
@@ -209,7 +312,8 @@ def competing_causes(lang: str, res: Dict[str, Any], report: Optional[Dict[str, 
             out.append({"finding": n, "category": str(f.get("category")), "same_as": seen[key], "causes": []})
             continue
         seen[key] = n
-        causes = [_cause_row(lang, c, by_rid) for c in mine]
+        titles = {str(c.get("hypothesis_id")): str(c.get("title") or c.get("hypothesis_id") or "") for c in cands}
+        causes = [_cause_row(lang, c, by_rid, titles) for c in mine]
         causes.sort(key=lambda c: _OUTCOME_ORDER.index(c["outcome"]))
         out.append({"finding": n, "category": str(f.get("category")), "same_as": None, "causes": causes})
     return out

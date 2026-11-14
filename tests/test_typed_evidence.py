@@ -20,7 +20,7 @@ import unittest
 from types import SimpleNamespace
 from typing import Any, Dict, List, Tuple
 
-from extractor import competing_hypotheses, diagnostic_verdict_aggregator, healthy_verdict, typed_evidence
+from extractor import cause_predictions, competing_hypotheses, diagnostic_verdict_aggregator, healthy_verdict, typed_evidence
 from extractor.diagnostic_recipes import ALL_PROBLEM_CATEGORIES, DiagnosticRecipeRegistry
 from extractor.expert_diagnostic_engine import AdaptiveInvestigationSession
 from extractor.typed_evidence import (
@@ -534,12 +534,28 @@ class NoStringSearchInVerificationPathTest(unittest.TestCase):
         competing_hypotheses._validate_rule_deadlock_cycle,
         competing_hypotheses._validate_rule_oom_kill,
         competing_hypotheses._validate_rule_clean_refutation,
+        # the outcome of each competing cause (what the evidence says about that cause) and its binding
+        competing_hypotheses._verdict_source_from_outcome,
+        cause_predictions.observe_signals,
+        cause_predictions.evaluate_causes,
+        cause_predictions._contradictions,
+        cause_predictions._matches,
+        cause_predictions._defining_satisfied,
+        cause_predictions._rivals,
+        cause_predictions.Signal.reads,
+        cause_predictions.predicted_outcomes,
     )
 
     def test_guarded_functions(self):
         for fn in self.GUARDED:
             with self.subTest(fn=fn.__qualname__):
                 self.assertEqual(_violations(_func_tree(fn)), [])
+
+    def test_signal_extractors_are_guarded(self):
+        # every signal a competing cause is judged by is read from typed fields only
+        for sig in cause_predictions.SIGNALS.values():
+            with self.subTest(signal=sig.name):
+                self.assertEqual(_violations(_func_tree(sig.extract)), [])
 
     def test_primary_rules_are_guarded(self):
         # every built-in primary evidence rule's criteria function is in the guarded set
