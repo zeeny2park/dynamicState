@@ -199,6 +199,29 @@ class AdversarialHealthyMatrixTest(unittest.TestCase):
         self.assertEqual(bad, [], f"{name}: healthy program diagnosed as faulty")
 
 
+@unittest.skipUnless(HAVE_CC, "needs gcc and g++")
+class BenchmarkSuiteMachineryTest(unittest.TestCase):
+    """The benchmark's separately reported suite counts a fault verdict or a finding as a false positive."""
+
+    def test_counts_false_positives_per_run(self):
+        import sys
+        sys.path.insert(0, os.path.join(adv.ROOT, "benchmarks", "diagnosis_accuracy"))
+        import run_benchmark as rb
+        seen = []
+
+        def fake(pid, image, kind, corpus):
+            seen.append(kind)
+            return {"verdict": "PROBABLE_FAULT" if kind == "crash_corruption" else "HEALTHY",
+                    "findings": [{"category": "X"}] if kind == "memory_growth" else []}
+
+        rep = rb.run_adversarial(fake, programs=["state"])
+        self.assertEqual(seen, list(adv.SYMPTOM_KINDS))
+        self.assertEqual(rep["runs"], len(adv.SYMPTOM_KINDS))
+        self.assertEqual(rep["false_positives"], 2)
+        self.assertEqual(rep["fault_verdicts"], 1)
+        self.assertIn("adversarial healthy suite", rb.format_adversarial(rep))
+
+
 def _add_matrix_tests():
     for n in adv.programs():
         setattr(AdversarialHealthyMatrixTest, f"test_{n}", lambda self, n=n: self._matrix(n))
