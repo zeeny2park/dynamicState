@@ -135,9 +135,8 @@ class TestReports(unittest.TestCase):
                 r = _render_dict(_load(name), lang)
                 md, tl = r["report_markdown"], r["investigation_timeline"]
                 self.assertEqual(md.count(head), 1, (name, lang))
-                checks_at = md.index("\n## 5" if "\n## 5" in md else "\n## 4")
-                self.assertGreater(md.index(head), checks_at)
-                self.assertLess(md.index(head), md.index("\n## ", md.index(head)))     # still inside the checks section
+                section = re.findall(r"^## \d+\. (.+)$", md[:md.index(head)], re.M)[-1]
+                self.assertEqual(section, "검사" if lang == "ko" else "Checks", (name, lang))   # inside the checks section
                 kinds = [s["kind"] for s in tl["steps"]]
                 self.assertEqual(kinds[0], "symptom")
                 self.assertEqual(kinds[-1], "verdict")
@@ -145,7 +144,7 @@ class TestReports(unittest.TestCase):
                 ts = [s["t"] for s in tl["steps"]]
                 self.assertEqual(ts, sorted(ts), (name, lang))
                 self.assertEqual(r["verdict"], tl["steps"][-1]["verdict"])
-                self.assertEqual(r["html_timeline_ok"] if False else r["report_html"].count('id="dsv-timeline"'), 1)
+                self.assertEqual(r["report_html"].count('id="dsv-timeline"'), 1)
 
     def test_a_growth_check_shows_its_observation_window(self):
         r = _render_dict(_load("leak_lru_cache"), "ko")
@@ -164,8 +163,11 @@ class TestReports(unittest.TestCase):
         html = r["report_html"]
         self.assertIn('<details class="collapsible collapsible-plain"><summary>' + group["text"].replace("&", "&amp;"), html)
         # a short course shows every step
-        small = _render_dict(_load("request_threads"), "ko")["investigation_timeline"]
+        d = _load("spin_flag")
+        rows = [r for r in check_rows(d, d.get("report")) if r["status"] in ("FAIL", "PASS")][:3]
+        small = rs.build_timeline("ko", d, d.get("report"), rows, [], "결함", "CONFIRMED_FAULT")
         self.assertFalse(small["folded"])
+        self.assertEqual([s["kind"] for s in small["steps"]], ["symptom"] + ["check"] * len(rows) + ["verdict"])
 
     def test_no_figure_or_score_in_the_course(self):
         for lang in ("ko", "en"):
