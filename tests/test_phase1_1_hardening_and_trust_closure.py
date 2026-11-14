@@ -58,6 +58,8 @@ from extractor.expert_diagnostic_engine import (
     TargetAssessor,
 )
 from extractor.target_adapter import LocalTargetAdapter, inspect_elf
+from tests.support.fixture_process import fixture_popen
+from tests.support.tmpdirs import temp_dir
 
 
 class TestPhase11HardeningAndTrustClosure(unittest.TestCase):
@@ -66,7 +68,7 @@ class TestPhase11HardeningAndTrustClosure(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.companion_elf, _ = ensure_expert_diagnostic_fixture(need_stripped=False)
-        cls.proc = subprocess.Popen([cls.companion_elf, "healthy"], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        cls.proc = fixture_popen([cls.companion_elf, "healthy"], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         time.sleep(0.15)
         cls.pid = cls.proc.pid
         cls.target_adapter = LocalTargetAdapter()
@@ -108,7 +110,7 @@ class TestPhase11HardeningAndTrustClosure(unittest.TestCase):
 
     def test_01_string_provenance_label_cannot_create_trusted_evidence(self):
         """Passing LIVE_RUNTIME_CAPTURE as a string without a receipt must downgrade to IMPORTED_UNVERIFIED."""
-        engine = ExpertDiagnosticEngine(corpus_dir="/tmp/p1_1_test_corpus")
+        engine = ExpertDiagnosticEngine(corpus_dir=temp_dir(self, "corpus_"))
         session = engine.start_investigation(
             problem_statement="Investigate memory without capture receipt",
             pid=self.pid,
@@ -434,7 +436,7 @@ class TestPhase11HardeningAndTrustClosure(unittest.TestCase):
 
     def test_12_no_fabricated_build_id(self):
         """Missing Build ID is preserved as None, never fabricated as 'sha1:runtime_verified_build'."""
-        engine = ExpertDiagnosticEngine(corpus_dir="/tmp/p1_1_test_corpus")
+        engine = ExpertDiagnosticEngine(corpus_dir=temp_dir(self, "corpus_"))
         session = engine.start_investigation(
             problem_statement="Offline investigation without binary",
             pid=None,
@@ -477,7 +479,7 @@ class TestPhase11HardeningAndTrustClosure(unittest.TestCase):
         self.assertEqual(d["process_identity"], self.proc_identity)
         self.assertEqual(d["executable_identity"], self.exe_identity)
 
-        engine = ExpertDiagnosticEngine(corpus_dir="/tmp/p1_1_test_corpus")
+        engine = ExpertDiagnosticEngine(corpus_dir=temp_dir(self, "corpus_"))
         session = engine.start_investigation(
             problem_statement="Target identity test",
             pid=self.pid,
@@ -577,7 +579,7 @@ class TestPhase11HardeningAndTrustClosure(unittest.TestCase):
 
     def test_18_end_to_end_investigation_step_acquires_genuine_live_receipt(self):
         """Full end-to-end investigation step against a live companion process acquires authentic receipt."""
-        engine = ExpertDiagnosticEngine(corpus_dir="/tmp/p1_1_test_corpus")
+        engine = ExpertDiagnosticEngine(corpus_dir=temp_dir(self, "corpus_"))
         session = engine.start_investigation(
             problem_statement="0x7fff0038 주소 메모리 오염 의심",
             pid=self.pid,

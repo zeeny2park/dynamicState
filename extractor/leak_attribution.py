@@ -21,7 +21,9 @@ One investigation observes the target's memory several times within a single run
    referenced, so leak vs intended accumulation is undecidable from memory alone - reported as
    unbounded growth under that owner, never as a confirmed leak).  Growth held only by thread stacks /
    locals (working sets), untyped data, RSS growth without in-use growth, shrinking or flat in-use heap
-   -> no leak (at most "growth observed, not established as a leak").
+   -> no leak (at most "growth observed, not established as a leak").  A fall of the in-use TOTAL is "released,
+   not a leak" only when no unreachable size class and no global/static owner grew across every walk: a
+   leak under a periodic working set (sawtooth) makes the total rise and fall too.
 """
 
 import re
@@ -156,11 +158,41 @@ def cheap_trend(samples: Sequence[Dict[str, Any]], cfg: MemoryObservationConfig)
         steps_ok = all(b - a >= -cfg.trend_step_tolerance_kb for a, b in zip(series, series[1:]))
         return steps_ok and series[-1] - series[0] >= cfg.trend_min_growth_kb
 
+    def max_move(series: List[int], sign: int) -> int:
+        """Largest rise (sign 1) or fall (sign -1) between any earlier and later sample."""
+        ref, best = None, 0
+        for v in series:
+            ref = v if ref is None else (min(ref, v) if sign > 0 else max(ref, v))
+            best = max(best, (v - ref) * sign)
+        return best
+
     if ss:
         out["rss_growth_kb"] = ss[-1]["rss_kb"] - ss[0]["rss_kb"]
         out["anon_rw_growth_kb"] = ss[-1]["anon_rw_kb"] - ss[0]["anon_rw_kb"]
         out["indicates_growth"] = grows(out["rss_kb_series"]) or grows(out["anon_rw_kb_series"])
+        # The cheap trend clears growth only for a series that stayed flat within its resolution.  A series that
+        # moved by at least the resolution without a growth trend (rose and fell back, or only fell) is periodic or
+        # transient use, and one window of it cannot tell a periodic working set from one with a leak under it
+        # (both rise and fall; a window may also see only the fall of a cycle): the heap walks decide.
+        rs, an = out["rss_kb_series"], out["anon_rw_kb_series"]
+        out["max_rise_kb"] = max(max_move(rs, 1), max_move(an, 1))
+        out["max_fall_kb"] = max(max_move(rs, -1), max_move(an, -1))
+        out["unsettled"] = (not out["indicates_growth"] and len(ss) >= 3
+                            and max(out["max_rise_kb"], out["max_fall_kb"]) >= cfg.trend_min_growth_kb)
+        out["rose_and_fell"] = bool(out["unsettled"] and out["max_rise_kb"] >= cfg.trend_min_growth_kb
+                                    and out["max_fall_kb"] >= cfg.trend_min_growth_kb)
     return out
+
+
+def _movement_text(trend: Dict[str, Any], cfg: MemoryObservationConfig) -> str:
+    rise, fall = float(trend.get("max_rise_kb") or 0), float(trend.get("max_fall_kb") or 0)
+    win = float(trend.get("window_s") or 0.0)
+    if trend.get("rose_and_fell"):
+        return "rose by %.1f MiB and fell back by %.1f MiB within %.2f s" % (rise / 1024.0, fall / 1024.0, win)
+    if fall >= cfg.trend_min_growth_kb:
+        return "fell by %.1f MiB within %.2f s (memory released; the rise before or after it was not observed)" % (
+            fall / 1024.0, win)
+    return "rose by %.1f MiB with drops in between within %.2f s" % (rise / 1024.0, win)
 
 
 # --------------------------------------------------------------------------------------------- census
@@ -244,6 +276,8 @@ def census(analysis: Any) -> Dict[str, Any]:
     norm = _NormPaths(an)
     owners: Dict[str, Dict[str, Any]] = {}
     unreach: Dict[int, Dict[str, Any]] = {}
+    cpaths = _container_paths(an)
+    crefs: Dict[str, Any] = {}
     for ci in range(len(ct)):
         st = ct.states[ci]
         if st != ST_IN_USE and st != ST_MMAPPED:
@@ -270,6 +304,13 @@ def census(analysis: Any) -> Dict[str, Any]:
         else:
             node, suffix, root, _slot, _interior = lst[0]
             key, kind, label, rname, path = _owner_of(an, norm, node, suffix, root)
+            if cpaths is not None and path and kind in OWNED_KINDS:
+                # stage 3: a path through a C++ container's private members names the container instead
+                hit = cpaths.resolve(key.split(":", 2)[1] or None, path)
+                if hit is not None:
+                    path = hit[1]
+                    if key not in crefs:
+                        crefs[key] = hit[0]
         o = owners.get(key)
         if o is None:
             o = owners[key] = {"kind": kind, "label": label, "root": rname, "count": 0, "bytes": 0, "paths": Counter(),
@@ -279,9 +320,103 @@ def census(analysis: Any) -> Dict[str, Any]:
         o["bytes"] += sz
         if path:
             o["paths"][path] += 1
+    for key, ref in crefs.items():
+        owners[key]["container"] = {"path": ref.path, "kind": ref.layout.kind, "type": ref.layout.type_name}
     out["owners"] = owners
     out["unreachable"] = unreach
+    out["_container_refs"] = crefs
     return out
+
+
+# --------------------------------------------------------------------------------------------- C++ containers (stage 3)
+MAX_CONTAINER_DECODES_PER_WALK = 16
+CONTAINER_DECODE_BYTES_PER_WALK = 64 * 1024
+
+
+def _container_paths(an: Any) -> Any:
+    try:
+        from .cpp_containers import ContainerPaths
+        return ContainerPaths(an.modules) if getattr(an, "modules", None) else None
+    except Exception:  # noqa: BLE001 - the container view is an addition; the raw paths stay without it
+        return None
+
+
+def decode_owner_containers(analysis: Any, c: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+    """Validated decode (extractor.cpp_containers) of the C++ containers the census found under global/static owners,
+    read through the walk's budgeted reader right after the walk: {owner key: summary}.  Pops the census's
+    internal references.  At most ``MAX_CONTAINER_DECODES_PER_WALK`` owners (largest first), a few small reads each."""
+    refs = c.pop("_container_refs", None) or {}
+    if not refs or analysis is None or analysis.analyzer is None:
+        return {}
+    from .cpp_containers import ContainerMemory, decode, summary
+    mem = ContainerMemory.from_analysis(analysis, max_bytes=CONTAINER_DECODE_BYTES_PER_WALK)
+    out: Dict[str, Dict[str, Any]] = {}
+    order = sorted(refs, key=lambda k: -int((c.get("owners") or {}).get(k, {}).get("bytes") or 0))
+    for k in order[:MAX_CONTAINER_DECODES_PER_WALK]:
+        ref = refs[k]
+        d = summary(decode(ref.layout, ref.address, mem))
+        d["path"] = ref.path
+        out[k] = d
+    c["container_decode_bytes"] = mem.bytes_read
+    return out
+
+
+def _container_row(ok: List[Dict[str, Any]], key: str) -> Optional[Dict[str, Any]]:
+    """The container under an owner across the walks: size series (None where a walk's decode failed), the last
+    decode, and the reason when no walk could be decoded (the raw path then stands alone)."""
+    decs = [(w.get("containers") or {}).get(key) for w in ok]
+    if not any(decs):
+        return None
+    good = [d for d in decs if d and d.get("decoded")]
+    last = next((d for d in reversed(decs) if d), {})
+    row: Dict[str, Any] = {"path": last.get("path"), "kind": last.get("kind"), "type": last.get("type"),
+                           "walks_decoded": len(good), "walks": len(decs)}
+    if last.get("element_type"):
+        row["element_type"] = last["element_type"]
+    if not good:
+        row["decoded"] = False
+        row["reason"] = last.get("reason")
+        row["limitation"] = ("the owner %s is a %s, but its contents could not be decoded (%s): reported by its raw "
+                             "path only" % (last.get("path"), last.get("type"), last.get("reason")))
+        return row
+    row["decoded"] = True
+    if any("size" in d for d in good):
+        row["size_series"] = [d.get("size") if d and d.get("decoded") else None for d in decs]
+        sizes = [d["size"] for d in good if "size" in d]
+        row["size_first"], row["size_last"] = sizes[0], sizes[-1]
+        row["size_delta"] = sizes[-1] - sizes[0]
+    lg = good[-1]
+    row["last"] = lg
+    for k in ("capacity", "buckets", "use_count", "weak_count", "pointee", "null"):
+        if k in lg:
+            row[k] = lg[k]
+    bad = [d for d in decs if d and not d.get("decoded")]
+    if len(good) < len(decs):
+        row["partial_reason"] = "%d of %d walks decoded%s" % (
+            len(good), len(decs), (": " + str(bad[0].get("reason"))) if bad else "")
+    return row
+
+
+def container_observations(walks: List[Dict[str, Any]], skip_roots: Sequence[str] = ()) -> List[Dict[str, Any]]:
+    """Containers under global/static owners whose decoded size changed across the walks without making the owner a
+    growth owner (e.g. one std::string whose single block grows): an observation, never a verdict input."""
+    ok = [w for w in walks if w.get("ok")]
+    keys: List[str] = []
+    for w in ok:
+        for k in (w.get("containers") or {}):
+            if k not in keys:
+                keys.append(k)
+    out = []
+    for k in keys:
+        root = k.split(":", 2)[-1]
+        if root in skip_roots:
+            continue
+        row = _container_row(ok, k)
+        if row and row.get("decoded") and row.get("size_delta"):
+            row["variable"] = root
+            out.append(row)
+    out.sort(key=lambda r: -abs(int(r.get("size_delta") or 0)))
+    return out[:8]
 
 
 # --------------------------------------------------------------------------------------------- corroboration
@@ -289,7 +424,10 @@ def _request2chunk(req: int) -> int:
     return max(32, (req + 8 + 15) & ~15)
 
 
-_TYPE_SIZE_CACHE: Dict[int, Dict[int, List[str]]] = {}
+# The size-class table is stored on the DWARF index object itself (not in a module dict keyed by ``id(idx)``): Python
+# reuses ids after garbage collection, so in a long-lived process an index of a different binary could inherit the
+# table of a collected one.  The table now lives and dies with the index it was built from.
+_TYPE_SIZE_ATTR = "_leak_attribution_type_size_table"
 
 
 def candidate_types(analysis: Any, chunk_size: int) -> List[str]:
@@ -298,7 +436,7 @@ def candidate_types(analysis: Any, chunk_size: int) -> List[str]:
     if an is None or not an.modules:
         return []
     idx = an.modules[0][1]
-    table = _TYPE_SIZE_CACHE.get(id(idx))
+    table = getattr(idx, _TYPE_SIZE_ATTR, None)
     if table is None:
         table = {}
         for t in getattr(idx, "types_by_die", {}).values():
@@ -307,7 +445,10 @@ def candidate_types(analysis: Any, chunk_size: int) -> List[str]:
                 label = ("struct " if t.tag == "DW_TAG_structure_type" else "class ") + t.name
                 if label not in lst:
                     lst.append(label)
-        _TYPE_SIZE_CACHE[id(idx)] = table
+        try:
+            setattr(idx, _TYPE_SIZE_ATTR, table)
+        except (AttributeError, TypeError):   # an index that cannot take attributes: rebuilt per call, never shared
+            pass
     return list(table.get(int(chunk_size), []))
 
 
@@ -426,19 +567,12 @@ def judge(walks: List[Dict[str, Any]], cfg: MemoryObservationConfig) -> Dict[str
     tol = max(cfg.churn_tolerance_bytes, int(cfg.churn_tolerance_fraction * max(inuse)))
     drops = [(i, a - b) for i, (a, b) in enumerate(zip(inuse, inuse[1:])) if a - b > tol]
     res["in_use_monotonic_growth"] = False
-    if drops:
-        i, d = max(drops, key=lambda x: x[1])
-        res["verdict"] = V_SHRANK
-        res["facts"].append("in-use heap fell by %d KB between observations %d and %d (%s KB series): memory is "
-                            "released (transient or periodic use), not a leak"
-                            % (d // 1024, i + 1, i + 2, [x // 1024 for x in inuse]))
-        return res
-    if inuse[-1] - inuse[0] < cfg.min_inuse_growth_bytes:
+    if not drops and inuse[-1] - inuse[0] < cfg.min_inuse_growth_bytes:
         res["verdict"] = V_NO_GROWTH
         res["facts"].append("in-use heap stable across %d walks over %.2f s (%+d KB, %+d blocks)"
                             % (len(ok), dt, (inuse[-1] - inuse[0]) // 1024, counts[-1] - counts[0]))
         return res
-    res["in_use_monotonic_growth"] = True
+    res["in_use_monotonic_growth"] = not drops
 
     def series_of(get) -> List[int]:
         return [get(w) for w in ok]
@@ -464,6 +598,9 @@ def judge(walks: List[Dict[str, Any]], cfg: MemoryObservationConfig) -> Dict[str
                        growing_paths={p: pdelta[p] for p in top},
                        arena_index=(ar.most_common(1)[0][0] if ar else None),
                        mmapped=bool(ar) and ar.most_common(1)[0][0] == -1)
+            cont = _container_row(ok, k)
+            if cont is not None:
+                row["container"] = cont
             res["growth_owners"].append(row)
             res["facts"].append(
                 "unbounded growth under %s: +%d blocks / +%d KB in use over %.2f s (%.1f KB/s), still referenced "
@@ -489,6 +626,23 @@ def judge(walks: List[Dict[str, Any]], cfg: MemoryObservationConfig) -> Dict[str
         res["unreachable_growth"].append(row)
     res["unreachable_growth"].sort(key=lambda r: -r["bytes_delta"])
     res["held_growth"].sort(key=lambda r: -r["bytes_delta"])
+    if drops:
+        # The total fell: part of the heap is released (a transient or periodic working set).  A fall of the TOTAL
+        # does not refute steady growth of one component under it (a leak under a sawtooth rises and falls too):
+        # only when no unreachable size class and no global/static owner grew monotonically across the walks is
+        # the fall evidence of "released, not a leak".
+        i, d = max(drops, key=lambda x: x[1])
+        fell = ("in-use heap fell by %d KB between observations %d and %d (%s KB series)"
+                % (d // 1024, i + 1, i + 2, [x // 1024 for x in inuse]))
+        if res["unreachable_growth"] or res["growth_owners"]:
+            res["facts"].insert(0, fell + ", but blocks under it kept growing across every walk: a leak under a "
+                                "periodic working set")
+        else:
+            res["verdict"] = V_SHRANK
+            res["held_growth"] = []
+            res["facts"].append(fell + ": memory is released (transient or periodic use) and no unreachable size "
+                                "class or global/static owner grew across the walks: not a leak")
+            return res
     if res["unreachable_growth"]:
         res["verdict"] = V_LEAK_UNREACHABLE
     elif res["growth_owners"]:
@@ -593,13 +747,20 @@ def run_walk_series(adapter: Any, pid: int, companion_elf: Optional[str], cfg: M
             break
         we = time.monotonic()
         last_wall = we - ws
-        out["bytes_read"] += int(an.reader.bytes_read)
         if an.walk.status in _WALK_STATUS_UNSUPPORTED:
+            out["bytes_read"] += int(an.reader.bytes_read)
             out["status"] = INV_UNSUPPORTED
             out["unsupported_status"] = an.walk.status
             out["unsupported_reason"] = an.walk.message
             return out
         c = census(an)
+        try:
+            c["containers"] = decode_owner_containers(an, c)
+        except Exception as exc:  # noqa: BLE001 - never lose the walk over the container view
+            c.pop("_container_refs", None)
+            c["containers"] = {}
+            c["container_decode_error"] = "%s: %s" % (type(exc).__name__, exc)
+        out["bytes_read"] += int(an.reader.bytes_read)
         c["t"] = (ws + we) / 2.0
         c["ok"] = an.ok and an.walk.status in ("OK", "PARTIAL") and not an.info.get("reachability_error")
         c["wall_ms"] = round(last_wall * 1000.0, 1)
@@ -650,6 +811,9 @@ def investigate(adapter: Any, pid: int, companion_elf: Optional[str], cfg: Memor
             inv["limitations"].extend(v)
         else:
             inv[k] = v
+    cobs = container_observations(series["walks"], [str(r.get("variable")) for r in j.get("growth_owners") or []])
+    if cobs:
+        inv["container_observations"] = cobs
     an = series.get("last_analysis")
     # IMP-009: the last walk (object, not plain data) is handed to the session state by attach_memory_observation
     # so the integrity check can re-use it instead of walking again; never part of the recorded investigation
@@ -695,6 +859,53 @@ def investigate(adapter: Any, pid: int, companion_elf: Optional[str], cfg: Memor
         inv["cost"]["bytes_read"] += int(an.reader.bytes_read) - before
     inv["summary"] = "; ".join(inv.get("facts") or []) or "; ".join(inv["limitations"]) or inv.get("verdict", "")
     return inv
+
+
+_WALK_BYTES_RE = re.compile(r"estimated (\d+)B > max (\d+)B")
+
+
+def not_judged_explanation(inv: Dict[str, Any], trend: Dict[str, Any],
+                           cfg: MemoryObservationConfig) -> Optional[Dict[str, Any]]:
+    """Plain-language reason why memory growth could not be judged, when the heap walks did not reach the
+    minimum (None otherwise).  The case it is written for: a heap larger than the read budget of one walk, on a
+    process whose /proc samples rose and fell (a sawtooth) - the cheap samples cannot clear it (a leak under a
+    sawtooth rises and falls too, and a leak into memory the allocator already holds does not move RSS), and the
+    walks that could were not affordable.  docs/HEALTHY_VERDICT.md, "Scope limit: memory that rises and falls"."""
+    if inv.get("verdict") != V_INSUFFICIENT or inv.get("status") == INV_UNSUPPORTED:
+        return None
+    lims = " ".join(str(x) for x in inv.get("limitations") or [])
+    out: Dict[str, Any] = {"walks_usable": int(inv.get("walks") or 0), "walks_needed": cfg.min_walks}
+    m = _WALK_BYTES_RE.search(lims)
+    if m:
+        heap_b, allow_b = int(m.group(1)), int(m.group(2))
+        out.update(cause="heap_above_walk_budget", walk_bytes_estimated=heap_b, walk_budget_bytes=allow_b,
+                   bytes_needed=heap_b * cfg.min_walks)
+        head = ("memory growth not judged: one heap walk of this process needs about %.1f MiB of reads, more than the "
+                "%.1f MiB budget left for it, so whether in-use memory grows could not be measured (%d walks, about "
+                "%.0f MiB of reads, would be needed)"
+                % (heap_b / 1048576.0, allow_b / 1048576.0, cfg.min_walks, heap_b * cfg.min_walks / 1048576.0))
+    elif "budget" in lims or "BUDGET" in lims:
+        out["cause"] = "walk_budget"
+        head = ("memory growth not judged: the observation budget left room for fewer than %d heap walks, so whether "
+                "in-use memory grows could not be measured" % cfg.min_walks)
+    else:
+        out["cause"] = "walks_failed"
+        head = ("memory growth not judged: fewer than %d heap walks completed, so whether in-use memory grows could "
+                "not be measured" % cfg.min_walks)
+    rss = trend.get("rss_kb_series") or []
+    out.update(unsettled=bool(trend.get("unsettled")), rose_and_fell=bool(trend.get("rose_and_fell")),
+               rise_kb=trend.get("max_rise_kb"), fall_kb=trend.get("max_fall_kb"), window_s=trend.get("window_s"))
+    if trend.get("unsettled") and rss:
+        tail = (". The /proc samples %s: one window of memory that rises and falls cannot tell a periodic working "
+                "set from one with a leak under it, which rises and falls too" % _movement_text(trend, cfg))
+    elif trend.get("indicates_growth") and rss:
+        tail = (". The /proc samples grew by %+d KB over %.2f s without falling back"
+                % (int(trend.get("rss_growth_kb") or 0), float(trend.get("window_s") or 0.0)))
+    else:
+        tail = (". The /proc samples alone cannot answer a leak question: a leak into memory the allocator already "
+                "holds does not move RSS")
+    out["text"] = head + tail          # one limitation, no "; " inside: it is quoted as the reason
+    return out
 
 
 # --------------------------------------------------------------------------------------------- provider glue
@@ -771,6 +982,9 @@ def attach_memory_observation(provider: Any, recipe: Any, pid: int, companion_el
         if trend["indicates_growth"]:
             reason = "cheap /proc trend shows growth (RSS %+d KB, anonymous mappings %+d KB over %.2f s)" % (
                 trend.get("rss_growth_kb", 0), trend.get("anon_rw_growth_kb", 0), trend["window_s"])
+        elif trend.get("unsettled"):
+            reason = ("cheap /proc trend %s: memory that moves without a growth trend cannot be cleared from /proc "
+                      "alone" % _movement_text(trend, cfg))
         else:
             reason = _memory_interest(rid, classification, cfg)
         if reason:
@@ -779,6 +993,11 @@ def attach_memory_observation(provider: Any, recipe: Any, pid: int, companion_el
             an_obj = inv.pop("_analysis", None)
             if an_obj is not None:
                 st.setdefault("analyses", {})[key] = an_obj
+            nj = not_judged_explanation(inv, trend, cfg)
+            if nj is not None:
+                inv["not_judged"] = nj
+                inv["limitations"].insert(0, nj["text"])
+                inv["summary"] = nj["text"]
         else:
             inv = {"status": INV_NOT_RUN, "verdict": V_NO_TREND if trend["established"] else V_INSUFFICIENT,
                    "walks": 0, "limitations": [] if trend["established"] else

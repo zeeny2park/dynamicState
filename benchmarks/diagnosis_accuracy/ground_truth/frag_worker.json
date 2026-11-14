@@ -1,0 +1,34 @@
+{
+  "id": "frag_worker",
+  "origin": "new",
+  "naming": "neutral",
+  "kind": "heap_retention",
+  "scored": false,
+  "scored_reason": "Not scored: heap retention (fragmentation) is a degradation, not a defect. The expected answer is a HEAP_RETENTION finding with a non-fault verdict (DEGRADED). A HEALTHY verdict is not a dangerous miss here (nothing leaks or is broken), so the defect scoring (HEALTHY = false clear) and the healthy-control scoring (any finding = false positive) both misdescribe it. The check is planned only for a memory symptom; any verdict is reported informationally.",
+  "source": "benchmarks/diagnosis_accuracy/targets/frag_worker.c",
+  "language": "c",
+  "symptom": "RSS stays high although the work is done, is memory leaking?",
+  "ready": {
+    "mode": "stdout_marker"
+  },
+  "causes": {
+    "variables": [
+      "nodes"
+    ],
+    "locks": [],
+    "threads": [
+      "indexer"
+    ],
+    "functions": [
+      "indexer"
+    ]
+  },
+  "locations": [
+    {
+      "file": "benchmarks/diagnosis_accuracy/targets/frag_worker.c",
+      "line": 25,
+      "text": "free(nodes[i])"
+    }
+  ],
+  "notes": "110000 x 200 B in a thread arena, four of every five freed, then idle: about 22 MiB arena memory, 17 MiB free but held, in-use flat"
+}

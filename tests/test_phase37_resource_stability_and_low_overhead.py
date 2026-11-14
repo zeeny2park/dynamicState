@@ -24,6 +24,7 @@ from extractor.static_analyzer import (
     resolve_function_candidates,
 )
 from extractor.watch_session import WatchSessionManager
+from tests.support.fixture_process import fixture_popen
 
 
 class TestPhase37ResourceStabilityAndLowOverhead(unittest.TestCase):
@@ -73,7 +74,7 @@ int main() {
             ["g++", "-g", "-O0", cls.src_path, "-o", cls.bin_path],
             check=True,
         )
-        cls.proc = subprocess.Popen([cls.bin_path])
+        cls.proc = fixture_popen([cls.bin_path])
         time.sleep(0.15)
 
     @classmethod

@@ -1,0 +1,47 @@
+{
+  "id": "ho_plugin_registry",
+  "suite": "heldout",
+  "origin": "new",
+  "naming": "neutral",
+  "kind": "self_deadlock",
+  "source": "benchmarks/diagnosis_accuracy/heldout/targets/ho_plugin_registry.cpp",
+  "sources": [
+    "benchmarks/diagnosis_accuracy/heldout/targets/ho_plugin_registry.cpp"
+  ],
+  "language": "c++",
+  "build": {
+    "compiler": "g++",
+    "opt": "-O0",
+    "flags": [
+      "-std=c++17"
+    ]
+  },
+  "style": "C++ member std::mutex, lock_guard in two member functions",
+  "symptom": "the process hangs",
+  "ready": {
+    "mode": "stdout_marker"
+  },
+  "causes": {
+    "variables": [],
+    "locks": [
+      "g_registry.mu_"
+    ],
+    "threads": [
+      "plugin_loader"
+    ],
+    "functions": []
+  },
+  "locations": [
+    {
+      "file": "benchmarks/diagnosis_accuracy/heldout/targets/ho_plugin_registry.cpp",
+      "line": 14,
+      "text": "std::lock_guard<std::mutex> hold(mu_);"
+    },
+    {
+      "file": "benchmarks/diagnosis_accuracy/heldout/targets/ho_plugin_registry.cpp",
+      "line": 21,
+      "text": "if (count() < 64)"
+    }
+  ],
+  "notes": "add() holds mu_ and calls count(), which locks mu_ again"
+}

@@ -1,0 +1,44 @@
+{
+  "id": "ho_outbox_flush",
+  "suite": "heldout",
+  "origin": "new",
+  "naming": "neutral",
+  "kind": "double_free",
+  "source": "benchmarks/diagnosis_accuracy/heldout/targets/ho_outbox_flush/main.c",
+  "sources": [
+    "benchmarks/diagnosis_accuracy/heldout/targets/ho_outbox_flush/main.c",
+    "benchmarks/diagnosis_accuracy/heldout/targets/ho_outbox_flush/msg.c"
+  ],
+  "language": "c",
+  "build": {
+    "compiler": "gcc",
+    "opt": "-O2",
+    "flags": []
+  },
+  "style": "multi-file, frees in two helper functions, -O2",
+  "symptom": "this program crashes sometimes and data looks wrong",
+  "ready": {
+    "mode": "stdout_marker"
+  },
+  "causes": {
+    "variables": [
+      "outbox"
+    ],
+    "locks": [],
+    "threads": [],
+    "functions": []
+  },
+  "locations": [
+    {
+      "file": "benchmarks/diagnosis_accuracy/heldout/targets/ho_outbox_flush/msg.c",
+      "line": 27,
+      "text": "free(outbox[i]);"
+    },
+    {
+      "file": "benchmarks/diagnosis_accuracy/heldout/targets/ho_outbox_flush/main.c",
+      "line": 17,
+      "text": "msg_done(first);"
+    }
+  ],
+  "notes": "a queued message is released by msg_done and again by outbox_flush (fastbin cycle, tcache full)"
+}

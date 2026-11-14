@@ -111,6 +111,8 @@ from extractor.expert_diagnostic_engine import (
     TargetAssessor,
 )
 from extractor.watch_session import WatchSessionManager
+from tests.support.fixture_process import fixture_popen
+from tests.support.tmpdirs import temp_dir
 
 
 def make_authoritative_record(
@@ -127,6 +129,7 @@ def make_authoritative_record(
     operation_id: str = "",
     receipt: LiveCaptureReceipt = None,
     parent_evidence_ids: list = None,
+    extra_details: dict = None,
 ) -> EvidenceRecord:
     """Creates a cryptographically receipted authoritative EvidenceRecord in ledger."""
     eff_proc = process_identity or f"proc_{pid}_start1000"
@@ -167,6 +170,7 @@ def make_authoritative_record(
             "live_capture_receipt": receipt.to_dict(),
             "target_pid": pid,
             "operation_id": operation_id,
+            **(extra_details or {}),
         },
         target_identity=t_ident,
         snapshot_ref=snap_ref,
@@ -208,7 +212,7 @@ class TestPhase218CompleteValidation(unittest.TestCase):
 
     def _spawn(self, mode: str, stripped: bool = False) -> subprocess.Popen:
         binary = self.stripped_bin if stripped else self.debug_bin
-        proc = subprocess.Popen([binary, mode], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        proc = fixture_popen([binary, mode], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         self._spawned_procs.append(proc)
         time.sleep(0.08)
         return proc
@@ -630,11 +634,14 @@ class TestPhase218CompleteValidation(unittest.TestCase):
             ledger,
             "EV_CANARY_GOOD",
             observation="Canary word overwritten with 0x41414141 in chunk header",
+            # stage 1: the rule reads the structured reading, not the words of the observation
+            extra_details={"canary_corrupted": True},
         )
         make_authoritative_record(
             ledger,
             "EV_CANARY_CLEAN",
             observation="Canary intact and zero corrupt headers found",
+            extra_details={"canaries_intact": True},
         )
 
         # 1. Built-in rules cannot be overwritten by external registration
@@ -723,6 +730,8 @@ class TestPhase218CompleteValidation(unittest.TestCase):
             status=CheckStatus.FAIL,
             is_required=True,
         )
+        # stage 1: "manual" is a structured flag of the check, not a word in its name
+        chk_manual.manual_override = True
         agg = DiagnosticVerdictAggregator.aggregate(
             lifecycle_state=STATE_COMPLETED,
             stop_reason="ALL_HYPOTHESES_REFUTED",
@@ -785,7 +794,7 @@ class TestPhase218CompleteValidation(unittest.TestCase):
 
     def test_matrix_U_real_cpp_memory_growth_scenarios_c1_01_to_c1_05(self):
         """Matrix U (Part C1.1–C1.5): Validates live C++ memory growth, transient warmup, container accumulation, fragmentation, and alloc/free imbalance."""
-        wsm = WatchSessionManager(corpus_dir="/tmp/dynamicstate_corpus")
+        wsm = WatchSessionManager(corpus_dir=temp_dir(self, "corpus_"))
 
         # C1-01: Continuous Heap Leak -> SUPPORTED
         p_leak = self._spawn("c1_01_heap_leak")
@@ -814,13 +823,19 @@ class TestPhase218CompleteValidation(unittest.TestCase):
 
         # C1-03: Container Accumulation -> SUPPORTED
         p_cont = self._spawn("c1_03_container_accumulation")
+        # accumulation = the count GROWS over a window and memory grows with it (a size read once is not)
+        def _rss_kb(pid):
+            with open(f"/proc/{pid}/statm") as fh:
+                return int(fh.read().split()[1]) * os.sysconf("SC_PAGE_SIZE") // 1024
         c_sz1 = int(wsm.evaluate_symbol_paths(p_cont.pid, self.debug_bin, ["g_container_size"])["results"][0]["value"])
-        time.sleep(0.06)
+        rss1 = _rss_kb(p_cont.pid)
+        time.sleep(1.6)
         c_sz2 = int(wsm.evaluate_symbol_paths(p_cont.pid, self.debug_bin, ["g_container_size"])["results"][0]["value"])
+        rss2 = _rss_kb(p_cont.pid)
         self.assertGreaterEqual(c_sz2, c_sz1)
         res_c1_03 = self.registry.evaluate_recipe(
             "RECIPE_LONG_LIVED_OBJECT_ACCUMULATION",
-            {"active_chunk_count": c_sz2, "chunk_growth_rate": max(10, c_sz2 - c_sz1)},
+            {"active_chunk_count": c_sz2, "container_size_delta": c_sz2 - c_sz1, "rss_history_kb": [rss1, rss2]},
         )
         self.assertEqual(res_c1_03.status, RECIPE_STATUS_SUPPORTED)
 
@@ -837,18 +852,23 @@ class TestPhase218CompleteValidation(unittest.TestCase):
 
         # C1-05: Allocation/Free Counter Imbalance -> SUPPORTED
         p_imb = self._spawn("c1_05_alloc_free_imbalance")
+        # an imbalance is a gap that GROWS over the window (a static ratio is not): two reads
+        imb_0 = wsm.evaluate_symbol_paths(p_imb.pid, self.debug_bin, ["g_alloc_count", "g_free_count"])
+        time.sleep(0.5)
         imb_res = wsm.evaluate_symbol_paths(p_imb.pid, self.debug_bin, ["g_alloc_count", "g_free_count"])
         a_cnt = int(imb_res["results"][0]["value"])
         f_cnt = int(imb_res["results"][1]["value"])
         res_c1_05 = self.registry.evaluate_recipe(
             "RECIPE_ALLOCATION_FREE_IMBALANCE",
-            {"alloc_count": a_cnt, "free_count": f_cnt, "temporal_observations": 3},
+            {"alloc_count": a_cnt, "free_count": f_cnt, "temporal_observations": 3,
+             "alloc_delta": a_cnt - int(imb_0["results"][0]["value"]),
+             "free_delta": f_cnt - int(imb_0["results"][1]["value"])},
         )
         self.assertEqual(res_c1_05.status, RECIPE_STATUS_SUPPORTED)
 
     def test_matrix_V_real_cpp_memory_corruption_scenarios_c1_06_to_c1_12(self):
         """Matrix V (Part C1.6–C1.12): Validates live C++ UAF, double free, invalid free, heap overflow, adjacent corruption, stack corruption, and wild pointer."""
-        wsm = WatchSessionManager(corpus_dir="/tmp/dynamicstate_corpus")
+        wsm = WatchSessionManager(corpus_dir=temp_dir(self, "corpus_"))
 
         # C1-06: Use-After-Free
         p_uaf = self._spawn("c1_06_use_after_free")
@@ -930,7 +950,7 @@ class TestPhase218CompleteValidation(unittest.TestCase):
 
     def test_matrix_W_real_cpp_concurrency_scenarios_c2_01_to_c2_08(self):
         """Matrix W (Part C2.1–C2.8): Validates live C++ 2-thread deadlock, 3-thread deadlock, contention, slow progress, starvation, normal sync, lock-order risk, and transient wait."""
-        wsm = WatchSessionManager(corpus_dir="/tmp/dynamicstate_corpus")
+        wsm = WatchSessionManager(corpus_dir=temp_dir(self, "corpus_"))
 
         # C2-01: 2-Thread AB-BA Deadlock
         p_dl2 = self._spawn("c2_01_abba_deadlock")

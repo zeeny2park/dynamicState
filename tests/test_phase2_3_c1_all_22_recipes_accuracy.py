@@ -27,6 +27,7 @@ from extractor.diagnostic_recipes import (
     RECIPE_STATUS_NOT_APPLICABLE,
 )
 from extractor.expert_diagnostic_engine import ExpertDiagnosticEngine
+from tests.support.fixture_process import fixture_popen
 
 
 CPP_CONTROLLED_TARGET_SRC = """
@@ -105,7 +106,7 @@ class TestPhase23C1All22RecipesAccuracy(unittest.TestCase):
 
     def _start_proc(self, bin_path: str, args=None):
         cmd = [bin_path] + (args or [])
-        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        proc = fixture_popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         line = proc.stdout.readline()
         self.assertIn("READY_PID=", line)
         return proc
@@ -147,7 +148,8 @@ class TestPhase23C1All22RecipesAccuracy(unittest.TestCase):
             "RECIPE_SUSPICIOUS_ALLOCATION_PATTERNS": {"requested_bytes": 2147483648},
             "RECIPE_PROCESS_MEMORY_GROWTH": {"is_monotonic": True, "rss_growth_bytes": 1048576, "epoch_count": 4, "rss_history_kb": [1000, 1500, 2000, 2500]},
             "RECIPE_HEAP_GROWTH": {"heap_growth_bytes": 524288, "heap_series_kb": [1024, 1536, 2048], "epoch_count": 3},
-            "RECIPE_ALLOCATION_FREE_IMBALANCE": {"alloc_count": 1000, "free_count": 50},
+            "RECIPE_ALLOCATION_FREE_IMBALANCE": {"alloc_count": 1000, "free_count": 50,
+                                                 "alloc_delta": 900, "free_delta": 20},  # static ratio is not a leak: the gap grew over the window
             "RECIPE_OBJECT_LIFETIME_ANOMALIES": {"lifetime_expired": True},
             "RECIPE_REPEATED_ALLOCATION_PATTERNS": {"unreclaimed_site_growth": True},
             "RECIPE_LONG_LIVED_OBJECT_ACCUMULATION": {"object_count_delta": 5000, "is_accumulating": True, "monotonic_growth": True, "delta_bytes": 1048576},
@@ -155,7 +157,7 @@ class TestPhase23C1All22RecipesAccuracy(unittest.TestCase):
             "RECIPE_STATE_TRANSITION_VIOLATIONS": {"allowed_states": [0, 1, 2], "current_state": 999, "state_specification": "spec1"},
             "RECIPE_INCONSISTENT_RELATED_VARIABLES": {"buffer_capacity": 100, "buffer_length": 500},
             "RECIPE_UNEXPECTED_NULL_OR_INVALID_POINTERS": {"pointer_value": "0x0", "is_null_allowed": False, "is_active_lifecycle": True},
-            "RECIPE_SUSPICIOUS_BOUNDARY_VALUES": {"value": 0x7FFFFFFF},
+            "RECIPE_SUSPICIOUS_BOUNDARY_VALUES": {"value": 0x7FFFFFFF, "valid_range": (0, 1000)},  # a sentinel is an anomaly only against an expected range
             "RECIPE_THREAD_STATE_ANOMALIES": {"zombie_threads": True},
             "RECIPE_SUSPICIOUS_LOCK_OWNERSHIP": {"orphan_lock_owner": True},
             "RECIPE_POTENTIAL_DEADLOCK_PATTERNS": {"cycle_detected": True, "is_persistent": True, "historical_observations": 3},

@@ -44,6 +44,7 @@ from extractor.static_analyzer import (
     LINK_KIND_UNRESOLVED,
 )
 from extractor.modules import RuntimeModule
+from tests.support.fixture_process import fixture_popen
 
 
 class TestLiveCaptureIntegrityAndValidation(unittest.TestCase):
@@ -77,7 +78,7 @@ class TestLiveCaptureIntegrityAndValidation(unittest.TestCase):
         self.runtime = AgentRuntime(corpus_dir=self.corpus_dir)
 
     def _start_target_process(self):
-        proc = subprocess.Popen(
+        proc = fixture_popen(
             [self.stripped_bin],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,

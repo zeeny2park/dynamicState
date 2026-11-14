@@ -97,6 +97,7 @@ from extractor.watch_session import (
     WatchSessionManager,
 )
 from extractor.web.server import WebApiAdapter
+from tests.support.fixture_process import fixture_popen
 
 
 class TestPhase26RealExecutionQuality(unittest.TestCase):
@@ -195,7 +196,7 @@ class TestPhase26RealExecutionQuality(unittest.TestCase):
     def test_01_real_runtime_execution_negative_control(self):
         """REAL-RUNTIME test: spawns live C++ process, observes memory, and verifies negative control."""
         # 1. Spawn live child process
-        proc = subprocess.Popen(
+        proc = fixture_popen(
             [self.debug_bin],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,

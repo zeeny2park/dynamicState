@@ -48,6 +48,7 @@ from extractor.diagnostic_recipes import (
 from extractor.expert_diagnostic_engine import ExpertDiagnosticEngine
 from extractor.runtime_evidence_provider import RuntimeEvidenceProvider
 from extractor.target_adapter import LocalTargetAdapter
+from tests.support.fixture_process import fixture_popen
 
 
 class TestPhase242RealProcessTemporalGrowthAndAccuracy(unittest.TestCase):
@@ -118,6 +119,11 @@ class TestPhase242RealProcessTemporalGrowthAndAccuracy(unittest.TestCase):
                             g_alloc_count += 100;
                         }
                         usleep(150000);
+                        /* FIXTURE_CAP: 2 MiB per 150 ms (~13 MiB/s); stop at 512 MiB (~38 s), stay alive. The test
+                           observes the process for about a second. */
+                        if (g_alloc_count >= 1000 + 100 * 256) {
+                            while (1) pause();
+                        }
                     }
                     return 0;
                 }
@@ -176,7 +182,7 @@ class TestPhase242RealProcessTemporalGrowthAndAccuracy(unittest.TestCase):
         shutil.rmtree(cls.tmp_dir, ignore_errors=True)
 
     def _spawn_target(self, binary_path: str, ready_prefix: str) -> subprocess.Popen:
-        proc = subprocess.Popen(
+        proc = fixture_popen(
             [binary_path],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -250,6 +256,7 @@ class TestPhase242RealProcessTemporalGrowthAndAccuracy(unittest.TestCase):
         res_imbal = DiagnosticRecipeRegistry.evaluate_recipe(RECIPE_ALLOCATION_FREE_IMBALANCE, {
             "alloc_count": 1000,
             "free_count": 10,
+            "alloc_delta": 900, "free_delta": 0,  # static ratio is not a leak: the gap grew over the window
         })
         self.assertEqual(res_imbal.status, RECIPE_STATUS_SUPPORTED)
 
@@ -311,7 +318,7 @@ class TestPhase242RealProcessTemporalGrowthAndAccuracy(unittest.TestCase):
             },
             "RECIPE_ALLOCATION_FREE_IMBALANCE": {
                 "healthy": {"alloc_count": 100, "free_count": 100},
-                "defect": {"alloc_count": 10000, "free_count": 10},
+                "defect": {"alloc_count": 10000, "free_count": 10, "alloc_delta": 9000, "free_delta": 5},
             },
             "RECIPE_OBJECT_LIFETIME_ANOMALIES": {
                 "healthy": {"lifetime_valid": True},
@@ -351,7 +358,7 @@ class TestPhase242RealProcessTemporalGrowthAndAccuracy(unittest.TestCase):
             },
             "RECIPE_SUSPICIOUS_BOUNDARY_VALUES": {
                 "healthy": {"value": 42, "negative_evidence_found": True},
-                "defect": {"value": 0x7FFFFFFF},
+                "defect": {"value": 0x7FFFFFFF, "valid_range": (0, 1000)},  # a sentinel is an anomaly only against an expected range
             },
             "RECIPE_THREAD_STATE_ANOMALIES": {
                 "healthy": {"threads_healthy": True},

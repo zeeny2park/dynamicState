@@ -43,6 +43,7 @@ from extractor.watch_session import (
 )
 from extractor.web.server import WebApiAdapter
 import scripts.mcp_server as mcp_srv
+from tests.support.fixture_process import fixture_popen
 
 
 class TestPhase23RemoteWatchSession(unittest.TestCase):
@@ -118,7 +119,7 @@ class TestPhase23RemoteWatchSession(unittest.TestCase):
                             pass
 
     def _start_target_process(self, bin_path):
-        proc = subprocess.Popen(
+        proc = fixture_popen(
             [bin_path],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,

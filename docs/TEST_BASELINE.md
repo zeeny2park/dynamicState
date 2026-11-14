@@ -106,6 +106,39 @@ gh auth refresh -s workflow
 git add .github/workflows && git commit -m "ci: enable GitHub Actions workflows" && git push
 ```
 
+## 픽스처 프로세스 격리 (fixture containment)
+
+배경: 벤치마크 러너를 `pkill`로 죽이자 진단 대상 `leak_scenario_b`(1 MB를 30 ms마다 할당, 끝나지 않음)가 고아로 남아 16분 만에
+상주 21.8 GB까지 커졌고 24 GB 호스트가 스왑 → ssh 끊김 → OOM killer로 끝났다. 같은 시기 다른 고아 픽스처 5개도 몇 시간째 살아 있었다.
+
+규칙: **오래 사는 픽스처/타깃 프로세스는 `subprocess.Popen`으로 직접 띄우지 않는다.** `tests/support/fixture_process.py`의
+`fixture_process(...)`(컨텍스트 매니저) 또는 `fixture_popen(...)`(`Popen` 대체, 인자·객체 API 동일)을 쓴다. gcc/gdb/readelf 같은 짧은
+도구 호출은 해당 없다. `tests/test_fixture_process_policy.py`가 정적으로 검사한다: 허용 목록(`ALLOWED_POPEN`)에 이유와 함께 적히지 않은
+직접 `Popen`, 허용 목록 밖의 `multiprocessing`, 셸 스크립트의 `cmd &`는 실패한다. 셸 스크립트는 `tests/support/fixture_process.sh`의
+`start_fixture LOG CMD...` 또는 `python3 -m tests.support.fixture_process --pidfile F -- CMD...`를 쓴다.
+
+런처가 겹쳐 쓰는 방어층(어느 하나만으로는 모든 종료 경로를 못 덮는다):
+
+1. 부모와 함께 죽기: fork와 exec 사이에 `PR_SET_PDEATHSIG(SIGKILL)`, 별도 세션/프로세스 그룹. PDEATHSIG는 fork한 *스레드*가 끝날 때 발동하므로 모든 fork는
+   프로세스 수명 동안 사는 런처 스레드 하나에서 한다(작업 스레드에서 띄워도 안전). setuid 바이너리를 exec하면 해제되지만 픽스처에는 해당 없다.
+2. 외부 감시 프로세스(픽스처마다 하나, 표준 라이브러리만): 러너가 죽으면(러너가 쥔 파이프의 EOF, SIGKILL 포함), 최대 수명(기본 600 s)을 넘기면,
+   프로세스 그룹+자손의 상주 메모리(`/proc/<pid>/statm`) 합이 상한(기본 1536 MiB)을 넘기면 트리를 SIGKILL한다. 한도에 걸리면
+   `FixtureMemoryCeilingExceeded`("fixture exceeded memory ceiling") 또는 `FixtureLifetimeExceeded`가 `poll()/wait()/check()`와 컨텍스트 종료에서
+   올라온다. 조용한 통과나 엉뚱한 진단 결과로 보이지 않는다. 확장: `max_rss_mib=`, `max_lifetime_s=`, 환경변수
+   `DYNAMICSTATE_FIXTURE_MAX_RSS_MIB` / `..._MAX_LIFETIME_S`, 픽스처별 상한은 `FIXTURE_RSS_OVERRIDES_MIB`(측정값을 주석으로 남긴다. 현재 없음).
+3. 러너의 정리: `atexit`와 SIGTERM/SIGINT/SIGHUP 핸들러가 시작한 모든 픽스처를 죽이고 신호를 다시 올린다.
+4. 끝없이 자라는 픽스처는 소스에서 스스로 멈춘다(`FIXTURE_CAP` 주석): 할당을 멈추되 프로세스는 살아 있고 이미 샌 메모리는 그대로다.
+
+쓰지 않는 것: `RLIMIT_AS`(스레드가 많은 픽스처는 스택/아레나로 수 GB의 주소 공간을 정당하게 매핑하므로 안전하면서 유효한 값이 없다),
+cgroup `memory.max`(`systemd-run --user --scope`는 GitHub 러너에서 사용자 세션 없이는 안 되고, 이식 가능한 감시 프로세스가 어차피 필요하다).
+CI 잡에는 `timeout-minutes`를 추가했다(test 180, gdb92 30).
+
+측정(aarch64, 30 s/120 s, 단독 픽스처; 20분은 선형 외삽): `proc_scenario_b_growing_mem` 약 32 MiB/s(30 s에 975 MiB, 20분 약 39 GB),
+`proc_leak_large_blocks` 15.5 MiB/s, `mapgrow_pool` 6.6 MiB/s(소스 상한 600 MiB에서 멈춤), `mapgrow_slabs` 5 MiB/s(750 MiB에서 멈춤),
+`leak_registry` 1.7 MiB/s, `leak_lru_cache` 1.5 MiB/s, `proc_leak_append_list`/`dropped_ptrs` 0.36 MiB/s, `proc_leak_sawtooth_*` 0.2-0.35 MiB/s,
+테스트 내 인라인 `target_growing.c`(temporal growth) 13 MiB/s. 나머지 픽스처의 상주는 30 s 동안 일정(최대 약 100 MiB, `ok_sawtooth`).
+스레드 증가 픽스처(`accept_workers`, `request_threads`)는 10 스레드/s로 늘지만 소스 상한(400/300)에서 멈추고 상주는 4 MiB 미만이다.
+
 ## 확인하지 못한 것
 
 - x86_64 Ubuntu 22.04, Python 3.10에서의 실행. 아키텍처 의존 단언(`test_phase2_4_real_world_targets`, `test_phase2_4_1_mcp_protocol_transport`, `test_dwarf_evaluator_correctness`, `test_ebpf_integration`)은 호스트 중립으로 고쳤지만 정적 검토만 했다.

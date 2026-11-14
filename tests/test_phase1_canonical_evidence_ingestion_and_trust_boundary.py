@@ -38,6 +38,8 @@ from extractor.expert_diagnostic_engine import (
 )
 from extractor.agent_runtime import AgentRuntime
 import scripts.mcp_server as mcp_srv
+from tests.support.fixture_process import fixture_popen
+from tests.support.tmpdirs import temp_dir
 
 
 class TestPhase1CanonicalEvidenceIngestion(unittest.TestCase):
@@ -98,7 +100,7 @@ class TestPhase1CanonicalEvidenceIngestion(unittest.TestCase):
 
     def test_group_a_expert_engine_session_records_via_adapter_no_private_mutation(self):
         """Verifies AdaptiveInvestigationSession routes evidence through adapter and does NOT touch private collections directly."""
-        engine = ExpertDiagnosticEngine(corpus_dir="/tmp/phase1_test_corpus")
+        engine = ExpertDiagnosticEngine(corpus_dir=temp_dir(self, "corpus_"))
         session = engine.start_investigation(
             problem_statement="0x7fff0038 주소에서 세그폴트 및 메모리 오염 의심",
             pid=self.target_pid,
@@ -267,7 +269,7 @@ class TestPhase1CanonicalEvidenceIngestion(unittest.TestCase):
         self.assertIn("evi_leak_parent", retrieved_child.parent_evidence_ids)
 
         # Semantic deduplication through session._record_authoritative_evidence_in_ledger
-        engine = ExpertDiagnosticEngine(corpus_dir="/tmp/phase1_test_corpus")
+        engine = ExpertDiagnosticEngine(corpus_dir=temp_dir(self, "corpus_"))
         session = engine.start_investigation(
             problem_statement="메모리 누수 의심",
             pid=self.target_pid,
@@ -355,12 +357,12 @@ class TestPhase1CanonicalEvidenceIngestion(unittest.TestCase):
     def test_group_e_mcp_lifecycle_and_canonical_evidence_flow(self):
         """Verifies MCP tools invoke canonical evidence ingestion and reports reflect valid evidence."""
         companion_elf, _ = ensure_expert_diagnostic_fixture(need_stripped=False)
-        proc = subprocess.Popen([companion_elf, "healthy"], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        proc = fixture_popen([companion_elf, "healthy"], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         time.sleep(0.15)
         pid = proc.pid
 
         try:
-            runtime = AgentRuntime(corpus_dir="/tmp/phase1_mcp_test_corpus")
+            runtime = AgentRuntime(corpus_dir=temp_dir(self, "corpus_"))
             mcp_srv.runtime = runtime
 
             # 1. Start investigation via MCP tool

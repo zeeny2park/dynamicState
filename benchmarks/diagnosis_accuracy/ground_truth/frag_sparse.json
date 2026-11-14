@@ -1,0 +1,32 @@
+{
+  "id": "frag_sparse",
+  "origin": "new",
+  "naming": "neutral",
+  "kind": "heap_retention",
+  "scored": false,
+  "scored_reason": "Not scored: heap retention (fragmentation) is a degradation, not a defect. The expected answer is a HEAP_RETENTION finding with a non-fault verdict (DEGRADED). A HEALTHY verdict is not a dangerous miss here (nothing leaks or is broken), so the defect scoring (HEALTHY = false clear) and the healthy-control scoring (any finding = false positive) both misdescribe it. The check is planned only for a memory symptom; any verdict is reported informationally.",
+  "source": "benchmarks/diagnosis_accuracy/targets/frag_sparse.c",
+  "language": "c",
+  "symptom": "memory usage looks high, is it leaking?",
+  "ready": {
+    "mode": "stdout_marker"
+  },
+  "causes": {
+    "variables": [
+      "recs"
+    ],
+    "locks": [],
+    "threads": [],
+    "functions": [
+      "main"
+    ]
+  },
+  "locations": [
+    {
+      "file": "benchmarks/diagnosis_accuracy/targets/frag_sparse.c",
+      "line": 22,
+      "text": "free(recs[i])"
+    }
+  ],
+  "notes": "80000 x 240 B in the main arena, three of every four freed, then idle: about 20 MiB arena memory, 15 MiB free but held, in-use flat"
+}

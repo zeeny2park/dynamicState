@@ -50,6 +50,7 @@ from extractor.target_adapter import (
     TargetExecutionAdapter,
 )
 from extractor.watch_session import read_process_memory_slice
+from tests.support.fixture_process import fixture_popen
 
 
 # C++ Source for comprehensive real-world target
@@ -351,7 +352,7 @@ class TestPhase24RealWorldTargets(unittest.TestCase):
         - Verify threads enumeration (main, poller, workers, alloc_worker >= 5 threads)
         - Read shared memory IPC segment via /proc/<pid>/maps and target memory
         """
-        proc = subprocess.Popen(
+        proc = fixture_popen(
             [self.bin_debug],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -449,7 +450,7 @@ class TestPhase24RealWorldTargets(unittest.TestCase):
 
     def test_04_target_restart_and_pid_reuse_detection(self):
         """Verify that adapter detects PID reuse / target restart via start_time and boot_id."""
-        proc1 = subprocess.Popen(
+        proc1 = fixture_popen(
             [self.bin_debug],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -483,7 +484,7 @@ class TestPhase24RealWorldTargets(unittest.TestCase):
             proc1.wait()
 
         # Simulate process restart or PID reuse with a new process
-        proc2 = subprocess.Popen(
+        proc2 = fixture_popen(
             [self.bin_opt],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,

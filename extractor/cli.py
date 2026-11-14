@@ -82,7 +82,6 @@ def main():
     srv_parser.add_argument("--port", type=int, default=8000, help="HTTP port to bind (default: 8000)")
     srv_parser.add_argument("--corpus", type=str, default="corpus", help="Path to State Corpus directory (default: corpus)")
     srv_parser.add_argument("--mode", type=str, default="LOW_IMPACT", choices=["CONSISTENT", "LOW_IMPACT"], help="Observation mode (default: LOW_IMPACT)")
-    srv_parser.add_argument("--allow-mutation", action="store_true", default=False, help="Explicitly enable live state-changing operations (checkpoint/restore/transition/explore/replay); without it the runtime is read-only regardless of --mode")
     srv_parser.add_argument("--snapshot", type=str, default=None, help="Optional snapshot file to load into corpus")
     srv_parser.add_argument("--binary", type=str, default=None, help="Optional target binary path")
     srv_parser.add_argument("--debug-image", type=str, default=None, help="Optional external debug image path")
@@ -205,12 +204,6 @@ def main():
     own_p.add_argument("--ssh-key", type=str, default=None)
     own_p.add_argument("--ssh-proxy-jump", type=str, default=None)
     own_p.add_argument("--corpus", type=str, default="corpus")
-
-    # 13d. workspace (Phase 9 Minimalist Chat + Trace Workspace Web UI)
-    ws_p = subparsers.add_parser("workspace", help="Launch the minimalist Gemini-style Chat + Process Trace Workspace Web UI")
-    ws_p.add_argument("--host", type=str, default="127.0.0.1", help="HTTP host to bind (default: 127.0.0.1)")
-    ws_p.add_argument("--port", type=int, default=8080, help="HTTP port to bind (default: 8080)")
-    ws_p.add_argument("--corpus", type=str, default="corpus", help="Corpus directory")
 
     # 14. recipe (Phase 4 guided diagnostic recipes & Golden Baselines)
     rec_p = subparsers.add_parser("recipe", help="Run a guided diagnostic recipe (instant_xray, before_after_diff, timeseries_watch) or Golden Baseline check")
@@ -515,6 +508,12 @@ def main():
     er_p.add_argument("-a", "--assertions", type=str, default=None)
     er_p.add_argument("-o", "--output", dest="output_path", type=str, default=None)
     er_p.add_argument("--report-html", dest="report_html_path", type=str, default=None, help="Optional output path for standalone Zero-CDN HTML incident report")
+    er_p.add_argument("--report-json", dest="report_json_path", type=str, default=None, help="Optional output path for the JSON report")
+    er_p.add_argument("--remote-host", "--host", dest="remote_host", type=str, default=None, help="SSH host/IP of a REMOTE target")
+    er_p.add_argument("--ssh-user", "--user", dest="ssh_user", type=str, default=None, help="SSH username")
+    er_p.add_argument("--ssh-port", "--port", dest="ssh_port", type=int, default=22, help="SSH port (default: 22)")
+    er_p.add_argument("--ssh-key", "--identity", dest="ssh_key", type=str, default=None, help="SSH private key path")
+    er_p.add_argument("--ssh-proxy-jump", dest="ssh_proxy_jump", type=str, default=None, help="Optional SSH ProxyJump")
     er_p.add_argument("--template", dest="template_path", type=str, default=None, help="Optional custom HTML template path")
     er_p.add_argument("-p", "--pid", type=int, default=None)
     er_p.add_argument("-d", "--debug-image", "--companion-elf", dest="debug_image", type=str, default=None)
@@ -526,7 +525,17 @@ def main():
     dx_p.add_argument("-d", "--debug-image", "--companion-elf", dest="debug_image", type=str, default=None,
                       help="ELF with DWARF symbols (default: the target's own executable)")
     dx_p.add_argument("--symptom", type=str, default=None, help="Optional natural-language symptom (default: general health check)")
+    from .symptom_interpretation import add_cli_arguments as _add_symptom_field_arguments
+    _add_symptom_field_arguments(dx_p)   # optional structured symptom input, shared with the MCP tool and the web API
     dx_p.add_argument("--time-limit", dest="time_limit_s", type=float, default=None, help="Wall-clock observation budget in seconds")
+    dx_p.add_argument("--default-check-budget", dest="default_check_budget_s", type=float, default=None,
+                      help="Time budget in seconds for the default checks the symptom did not ask for (env "
+                           "DYNAMICSTATE_DEFAULT_CHECK_BUDGET_S, default 6; <= 0: no limit)")
+    dx_p.add_argument("--default-check-max", dest="default_check_max_s", type=float, default=None,
+                      help="Per-check limit in seconds for a default check (env DYNAMICSTATE_DEFAULT_CHECK_MAX_S, "
+                           "default 2.5; <= 0: no limit)")
+    dx_p.add_argument("--enable-tracing", "--tracing", dest="enable_tracing", action="store_true", default=None,
+                      help="Enable selective eBPF/uprobe dynamic event tracing mode (default: disabled, zero-stop read-only)")
     dx_p.add_argument("--corpus", type=str, default="corpus", help="State Corpus directory (reports are written under <corpus>/reports)")
     dx_p.add_argument("--json", action="store_true", default=False,
                       help="Print the full result as JSON (the readable summary is under 'human_summary')")
@@ -542,7 +551,14 @@ def main():
     dx_p.add_argument("--collector-path", dest="collector_path", type=str, default=None,
                       help="Path of an already installed collector on the remote target")
 
+    from .skill_cli import add_parsers as _add_skill_parsers, dispatch as _skill_dispatch
+    _add_skill_parsers(subparsers)
+
     args = parser.parse_args()
+
+    _rc = _skill_dispatch(args)
+    if _rc is not None:
+        sys.exit(_rc)
 
     if args.command == "capture-memory":
         capturer = MemoryCapture()
@@ -694,8 +710,8 @@ def main():
         from .web.server import run_server, run_server_loop
         corpus_dir = os.path.abspath(args.corpus)
         os.makedirs(corpus_dir, exist_ok=True)
-        eff_mode = "CONSISTENT" if getattr(args, "allow_mutation", False) else args.mode
-        runtime = AgentRuntime(corpus_dir=corpus_dir, observation_mode=eff_mode, allow_mutation=getattr(args, "allow_mutation", False))
+        # the web server is read-only towards the target: no --allow-mutation (no route writes, stops or restores)
+        runtime = AgentRuntime(corpus_dir=corpus_dir, observation_mode=args.mode)
 
         if args.snapshot:
             if os.path.exists(args.snapshot):
@@ -722,7 +738,7 @@ def main():
         print("========================================")
         print(" dynamicState Web UI")
         print(f" {url}")
-        print(f" Mode: {runtime.observation_mode}" + (" (mutation enabled)" if runtime.allow_mutation else " (read-only)"))
+        print(f" Mode: {runtime.observation_mode} (read-only)")
         print(f" Corpus: {corpus_dir}")
         print(" Press Ctrl+C to terminate.")
         print("========================================")
@@ -1291,20 +1307,6 @@ def main():
         print(json.dumps({"success": True, **res}, indent=2, ensure_ascii=False))
         sys.exit(0)
 
-    elif args.command == "workspace":
-        from .agent_runtime import AgentRuntime
-        from .web.server import run_server, run_server_loop
-        from .web.workspace import get_workspace_static_dir
-        corpus_dir = os.path.abspath(args.corpus)
-        os.makedirs(corpus_dir, exist_ok=True)
-        rt = AgentRuntime(corpus_dir=corpus_dir)
-        rt.observation_mode = "LOW_IMPACT"
-        srv = run_server(runtime=rt, host=args.host, port=args.port, static_dir=get_workspace_static_dir())
-        print(f"dynamicState Trace Workspace running at http://{args.host}:{args.port}")
-        sys.stdout.flush()
-        run_server_loop(srv)
-        sys.exit(0)
-
     elif args.command == "recipe":
         from .watch_session import WatchSessionManager
         wm = WatchSessionManager(corpus_dir=args.corpus)
@@ -1780,9 +1782,12 @@ def main():
             assertions=a_list,
             output_path=args.output_path,
             report_html_path=getattr(args, "report_html_path", None),
+            report_json_path=args.report_json_path,
             template_path=getattr(args, "template_path", None),
             pid=args.pid,
             companion_elf_path=args.debug_image,
+            remote_host=args.remote_host, ssh_user=args.ssh_user, ssh_port=args.ssh_port,
+            ssh_key=args.ssh_key, ssh_proxy_jump=args.ssh_proxy_jump,
             language=getattr(args, "lang", "en") or "en",
         )
         if res.get("save_error"):
@@ -1802,10 +1807,18 @@ def main():
             remote_target = {"remote_host": args.remote_host, "ssh_user": args.ssh_user, "ssh_port": args.ssh_port,
                              "ssh_key": args.ssh_key, "ssh_proxy_jump": args.ssh_proxy_jump,
                              "auto_deploy_collector": args.auto_deploy_collector, "collector_path": args.collector_path}
+        from .symptom_interpretation import SymptomFieldError, fields_from_mapping
+        try:
+            symptom_fields = fields_from_mapping(vars(args))
+        except SymptomFieldError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            sys.exit(2)
         result, summary = diagnose_with_summary(
             args.pid, debug_image=args.debug_image, symptom=args.symptom, time_limit_s=args.time_limit_s,
             engine=ExpertDiagnosticEngine(corpus_dir=os.path.abspath(args.corpus)), lang=args.lang,
-            target=remote_target,
+            target=remote_target, symptom_fields=symptom_fields,
+            default_check_budget_s=args.default_check_budget_s, default_check_max_s=args.default_check_max_s,
+            enable_tracing=args.enable_tracing,
         )
         if args.json:
             result["human_summary"] = summary

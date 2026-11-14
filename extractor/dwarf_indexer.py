@@ -272,6 +272,35 @@ class DwarfIndex:
                 chain.append({"function": fn, "file": os.path.basename(m.group(1)), "line": int(m.group(2)),
                               "path": m.group(1)})
             if chain:
+                # Align source file with DWARF DIE subprogram declaration file when addr2line
+                # attributes an out-of-line or inlined header function to the compilation unit's base source file (DWARF-5 addr2line issue).
+                code_addr = self.resolve_code_address(link_time_pc)
+                if code_addr and code_addr.get("decl_file"):
+                    decl_file = code_addr["decl_file"]
+                    decl_base = os.path.basename(decl_file)
+                    target_frame = chain[-1] if len(chain) > 1 else chain[0]
+                    if target_frame["file"] != decl_base and (decl_file.endswith((".h", ".hpp", ".hxx", ".tcc")) or not target_frame["file"].endswith((".h", ".hpp", ".hxx"))):
+                        target_frame["file"] = decl_base
+                        target_frame["path"] = decl_file
+                    if len(chain) == 1:
+                        chain[0]["file"] = decl_base
+                        chain[0]["path"] = decl_file
+
+                for fr in chain:
+                    fn_raw = fr.get("function") or ""
+                    fn_base = re.sub(r"\(.*\)$", "", fn_raw).strip()
+                    candidates = []
+                    for fn_key in (fn_base, fn_base.split("::")[-1], fn_raw):
+                        if fn_key in self.subprograms_by_name:
+                            candidates.extend(self.subprograms_by_name[fn_key])
+                    for subp in candidates:
+                        if subp.decl_file and (subp.decl_file.endswith((".h", ".hpp", ".hxx", ".tcc")) or "/include/" in subp.decl_file):
+                            decl_base = os.path.basename(subp.decl_file)
+                            if fr["file"] != decl_base and not fr["file"].endswith((".h", ".hpp", ".hxx")):
+                                fr["file"] = decl_base
+                                fr["path"] = subp.decl_file
+                            break
+
                 res = {"file": chain[0]["file"], "line": chain[0]["line"], "path": chain[0]["path"],
                        "inlined_chain": chain}
             break
@@ -558,7 +587,7 @@ class DwarfIndex:
     def to_cache_dict(self) -> Dict[str, Any]:
         """Serialize DwarfIndex to a JSON-compatible dictionary for persistent disk caching."""
         return {
-            "schema_version": "1.1.1",
+            "schema_version": "1.1.2",
             "artifact_path": self.artifact_path,
             "build_id": self.build_id,
             "pointer_size": self.pointer_size,
@@ -963,10 +992,14 @@ class DwarfIndexer:
                 try:
                     with open(disk_cache_file, "r", encoding="utf-8") as cf:
                         cached_data = json.load(cf)
-                    if (cached_data.get("schema_version") == "1.1.1"
+                    if (cached_data.get("schema_version") == "1.1.2"
                             and cached_data.get("build_id") == elf_info.build_id):
                         index = DwarfIndex.from_cache_dict(cached_data)
                         index.artifact_path = abs_path  # the image actually opened, not the path recorded at write time
+                        try:
+                            os.utime(disk_cache_file, None)  # LRU recency; the file may have been pruned meanwhile
+                        except OSError:
+                            pass
                         with cls._lock:
                             cls._cache[cache_key] = index
                         return index
@@ -981,6 +1014,8 @@ class DwarfIndexer:
                     with os.fdopen(tmp_fd, "w", encoding="utf-8") as tf:
                         json.dump(index.to_cache_dict(), tf, ensure_ascii=False)
                     os.replace(tmp_path, disk_cache_file)
+                    from .corpus_retention import prune_cache_dir
+                    prune_cache_dir(os.path.dirname(disk_cache_file), protect=[disk_cache_file])
                 except Exception:
                     pass
 
@@ -1168,10 +1203,16 @@ class DwarfIndexer:
         return 0
 
     @classmethod
-    def _parse_line_file_table(cls, path: str) -> Dict[int, str]:
-        """Extract the File Name Table and Directory Table from .debug_line via streaming Popen."""
+    def _parse_line_file_table(cls, path: str, per_unit: Optional[Dict[int, Dict[int, str]]] = None) -> Dict[int, str]:
+        """Extract the File Name Table and Directory Table from .debug_line via streaming Popen.
+
+        Returns the merged table (later units overwrite earlier indices; kept for callers that only know a file
+        index).  ``per_unit``, when given, receives one table per line-program unit keyed by its .debug_line offset
+        (a compilation unit's ``DW_AT_stmt_list``): ``DW_AT_decl_file`` indices are local to their unit, so a
+        multi-file program needs the unit's own table."""
         files: Dict[int, str] = {}
         dirs: Dict[int, str] = {}
+        unit: Optional[Dict[int, str]] = None
         try:
             cmd = ["readelf", "--debug-dump=line", path]
             proc = subprocess.Popen(
@@ -1188,6 +1229,13 @@ class DwarfIndexer:
                 in_file = False
                 for raw_line in proc.stdout:
                     line = raw_line.rstrip("\r\n")
+                    m_off = re.match(r"^\s*Offset:\s+(0x[0-9a-fA-F]+|\d+)\s*$", line)
+                    if m_off:
+                        dirs = {}
+                        unit = {}
+                        if per_unit is not None:
+                            per_unit[int(m_off.group(1), 0)] = unit
+                        continue
                     if "The Directory Table" in line:
                         in_dir = True
                         in_file = False
@@ -1216,6 +1264,8 @@ class DwarfIndexer:
                         dir_name = dirs.get(dir_idx, "")
                         full_path = f"{dir_name}/{name}" if dir_name else name
                         files[idx] = full_path
+                        if unit is not None:
+                            unit[idx] = full_path
             finally:
                 try:
                     proc.stdout.close()  # type: ignore[union-attr]
@@ -1230,7 +1280,8 @@ class DwarfIndexer:
     def _build_index(cls, path: str, elf_info: BinaryIdentity) -> DwarfIndex:
         pointer_size = 8 if elf_info.elf_class == "ELF64" else 4
         endianness = elf_info.endianness
-        file_table = cls._parse_line_file_table(path)
+        unit_tables: Dict[int, Dict[int, str]] = {}
+        file_table = cls._parse_line_file_table(path, unit_tables)
 
         index = DwarfIndex(
             artifact_path=path,
@@ -1303,6 +1354,19 @@ class DwarfIndexer:
 
         by_offset: Dict[int, Dict[str, Any]] = {d["offset"]: d for d in dies}
 
+        # DW_AT_decl_file is an index into the file table of the DIE's own compilation unit (its DW_AT_stmt_list).
+        # One merged table attributed every function of a multi-file program to a file of the last unit.
+        unit_ft: Dict[int, Dict[int, str]] = {}      # id(die attrs) -> file table of its unit
+        cur_ft: Dict[int, str] = file_table
+        for d in dies:
+            if d["depth"] == 0:
+                sl = d["attrs"].get("DW_AT_stmt_list")
+                cur_ft = unit_tables.get(cls._parse_int(sl), file_table) if sl is not None else file_table
+            unit_ft[id(d["attrs"])] = cur_ft
+
+        def ft(a: Dict[str, Any]) -> Dict[int, str]:
+            return unit_ft.get(id(a), file_table)
+
         # First pass: parse all types
         i = 0
         while i < len(dies):
@@ -1329,7 +1393,7 @@ class DwarfIndexer:
             ):
                 target_type_offset = cls._parse_offset(attrs.get("DW_AT_type", ""))
                 t_file_idx = cls._parse_int(attrs.get("DW_AT_decl_file", "0"))
-                t_file = file_table.get(t_file_idx) or (cls._clean_str(attrs.get("DW_AT_decl_file", "")) if attrs.get("DW_AT_decl_file") else None)
+                t_file = ft(attrs).get(t_file_idx) or (cls._clean_str(attrs.get("DW_AT_decl_file", "")) if attrs.get("DW_AT_decl_file") else None)
                 t_line = cls._parse_int(attrs.get("DW_AT_decl_line", "0")) or None
 
                 d_type = DwarfType(
@@ -1357,7 +1421,7 @@ class DwarfIndexer:
                                 m_access_val = c_attrs.get("DW_AT_accessibility", "1")
                                 m_access = "public" if "1" in m_access_val else ("protected" if "2" in m_access_val else "private")
                                 m_file_idx = cls._parse_int(c_attrs.get("DW_AT_decl_file", "0"))
-                                m_file = file_table.get(m_file_idx) or (cls._clean_str(c_attrs.get("DW_AT_decl_file", "")) if c_attrs.get("DW_AT_decl_file") else t_file)
+                                m_file = ft(c_attrs).get(m_file_idx) or (cls._clean_str(c_attrs.get("DW_AT_decl_file", "")) if c_attrs.get("DW_AT_decl_file") else t_file)
                                 m_line = cls._parse_int(c_attrs.get("DW_AT_decl_line", "0")) or None
 
                                 d_type.members.append(DwarfMember(
@@ -1434,7 +1498,7 @@ class DwarfIndexer:
                 is_decl = attrs.get("DW_AT_declaration") == "1"
                 spec_offset = cls._parse_offset(attrs.get("DW_AT_specification", ""))
                 v_file_idx = cls._parse_int(attrs.get("DW_AT_decl_file", "0"))
-                v_file = file_table.get(v_file_idx) or (cls._clean_str(attrs.get("DW_AT_decl_file", "")) if attrs.get("DW_AT_decl_file") else None)
+                v_file = ft(attrs).get(v_file_idx) or (cls._clean_str(attrs.get("DW_AT_decl_file", "")) if attrs.get("DW_AT_decl_file") else None)
                 v_line = cls._parse_int(attrs.get("DW_AT_decl_line", "0")) or None
 
                 # If this variable is an out-of-line definition referring to a specification
@@ -1450,7 +1514,7 @@ class DwarfIndexer:
                         is_ext = True
                     if not v_file:
                         sf_idx = cls._parse_int(spec_die["attrs"].get("DW_AT_decl_file", "0"))
-                        v_file = file_table.get(sf_idx) or (cls._clean_str(spec_die["attrs"].get("DW_AT_decl_file", "")) if spec_die["attrs"].get("DW_AT_decl_file") else None)
+                        v_file = ft(spec_die["attrs"]).get(sf_idx) or (cls._clean_str(spec_die["attrs"].get("DW_AT_decl_file", "")) if spec_die["attrs"].get("DW_AT_decl_file") else None)
                     if not v_line:
                         v_line = cls._parse_int(spec_die["attrs"].get("DW_AT_decl_line", "0")) or None
 
@@ -1507,7 +1571,7 @@ class DwarfIndexer:
                 is_decl = attrs.get("DW_AT_declaration") == "1"
                 spec_offset = cls._parse_offset(attrs.get("DW_AT_specification", ""))
                 sp_file_idx = cls._parse_int(attrs.get("DW_AT_decl_file", "0"))
-                sp_file = file_table.get(sp_file_idx) or (cls._clean_str(attrs.get("DW_AT_decl_file", "")) if attrs.get("DW_AT_decl_file") else None)
+                sp_file = ft(attrs).get(sp_file_idx) or (cls._clean_str(attrs.get("DW_AT_decl_file", "")) if attrs.get("DW_AT_decl_file") else None)
                 sp_line = cls._parse_int(attrs.get("DW_AT_decl_line", "0")) or None
 
                 if spec_offset and spec_offset in by_offset:
@@ -1518,7 +1582,7 @@ class DwarfIndexer:
                         linkage_name = cls._clean_str(spec_die["attrs"].get("DW_AT_linkage_name", ""))
                     if not sp_file:
                         sf_idx = cls._parse_int(spec_die["attrs"].get("DW_AT_decl_file", "0"))
-                        sp_file = file_table.get(sf_idx)
+                        sp_file = ft(spec_die["attrs"]).get(sf_idx)
                     if not sp_line:
                         sp_line = cls._parse_int(spec_die["attrs"].get("DW_AT_decl_line", "0")) or None
 
@@ -1583,7 +1647,7 @@ class DwarfIndexer:
                                     m_expr = re.search(r"\((DW_OP_[^)]+)\)", c_loc_raw)
                                     c_loc_expr = m_expr.group(1).strip() if m_expr else c_loc_raw.strip()
                             c_file_idx = cls._parse_int(c_attrs.get("DW_AT_decl_file", "0"))
-                            c_file = file_table.get(c_file_idx) or (cls._clean_str(c_attrs.get("DW_AT_decl_file", "")) if c_attrs.get("DW_AT_decl_file") else None)
+                            c_file = ft(c_attrs).get(c_file_idx) or (cls._clean_str(c_attrs.get("DW_AT_decl_file", "")) if c_attrs.get("DW_AT_decl_file") else None)
                             c_line = cls._parse_int(c_attrs.get("DW_AT_decl_line", "0")) or None
                             if c_name:
                                 subp.variables.append(DwarfVariable(

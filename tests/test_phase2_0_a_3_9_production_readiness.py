@@ -40,6 +40,7 @@ from extractor.raw_snapshot import RawRuntimeSnapshot
 from extractor.target_adapter import LocalTargetAdapter, RemoteSshTargetAdapter
 from extractor.verdict_engine import sanitize_report_output_path
 from extractor.watch_session import WatchSessionManager, calculate_load_bias
+from tests.support.fixture_process import fixture_popen
 
 
 def _approved_full_plan():
@@ -104,7 +105,7 @@ class TestPhase20A39ProductionReadiness(unittest.TestCase):
         shutil.rmtree(cls.tmp_dir, ignore_errors=True)
 
     def _spawn_stripped_target(self):
-        proc = subprocess.Popen([self.stripped_elf], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        proc = fixture_popen([self.stripped_elf], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         line = proc.stdout.readline().strip()
         self.assertTrue(line.startswith("READY"))
         return proc, int(line.split()[1], 16)

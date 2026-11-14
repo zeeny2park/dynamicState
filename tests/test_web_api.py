@@ -1,4 +1,10 @@
-"""Unit and integration tests for dynamicState Web API and Server."""
+"""Unit and integration tests for dynamicState Web API and Server.
+
+The state / object / mutation / transition behaviour of WebApiAdapter is exercised by calling the adapter directly:
+its HTTP routes (the previous 8-tab UI's /api/runtime, /api/states, /api/mutation, ...) were removed with that UI.
+Over HTTP this suite checks the kept /api/health route, that the removed and dangerous routes are 404, and the
+static-file traversal guard of the root UI.
+"""
 
 import http.client
 import json
@@ -182,6 +188,15 @@ class TestWebApi(unittest.TestCase):
         cls.server.server_close()
         shutil.rmtree(cls.tmp_dir, ignore_errors=True)
 
+    @property
+    def adapter(self):
+        return self.server.adapter
+
+    @staticmethod
+    def _api(result):
+        """An adapter result as a client sees it (JSON round trip, as the server's _send_json did)."""
+        return json.loads(json.dumps(result, default=str))
+
     def _get(self, path):
         req = urllib.request.Request(self.base_url + path, headers={"X-Session-Token": self.server.session_token})
         try:
@@ -225,8 +240,7 @@ class TestWebApi(unittest.TestCase):
         self.assertEqual(data.get("mode"), "CONSISTENT")
 
     def test_02_capabilities_endpoint(self):
-        status, data = self._get("/api/capabilities")
-        self.assertEqual(status, 200)
+        data = self._api(self.adapter.get_capabilities())
         self.assertTrue(data.get("success"))
         caps = data.get("data", {})
         self.assertIn("runtime", caps)
@@ -234,8 +248,7 @@ class TestWebApi(unittest.TestCase):
         self.assertIn("limits", caps)
 
     def test_03_runtime_info_metadata_honesty(self):
-        status, data = self._get("/api/runtime")
-        self.assertEqual(status, 200)
+        data = self._api(self.adapter.get_runtime_info())
         self.assertTrue(data.get("success"))
         info = data.get("data", {})
         self.assertEqual(info.get("mode"), "CONSISTENT")
@@ -247,8 +260,7 @@ class TestWebApi(unittest.TestCase):
 
     def test_04_states_listing_and_inspection(self):
         # List states
-        status, data = self._get("/api/states")
-        self.assertEqual(status, 200)
+        data = self._api(self.adapter.list_states())
         self.assertTrue(data.get("success"))
         states = data.get("data", [])
         self.assertGreaterEqual(len(states), 1)
@@ -258,19 +270,17 @@ class TestWebApi(unittest.TestCase):
 
         # Inspect specific state
         sid = first_state["state_id"]
-        status, s_data = self._get(f"/api/states/{sid}")
-        self.assertEqual(status, 200)
+        s_data = self._api(self.adapter.inspect_state(sid))
         self.assertTrue(s_data.get("success"))
         self.assertEqual(s_data["data"]["state_id"], sid)
 
         # Missing state returns STATE_NOT_FOUND
-        status, err_data = self._get("/api/states/nonexistent_state_999")
+        err_data = self._api(self.adapter.inspect_state("nonexistent_state_999"))
         self.assertFalse(err_data.get("success"))
         self.assertEqual(err_data["error"]["code"], "STATE_NOT_FOUND")
 
     def test_05_objects_and_field_inspection(self):
-        status, data = self._get("/api/states/state_000001/objects")
-        self.assertEqual(status, 200)
+        data = self._api(self.adapter.list_state_objects("state_000001"))
         self.assertTrue(data.get("success"))
         objs = data.get("data", [])
         self.assertEqual(len(objs), 2)
@@ -279,61 +289,53 @@ class TestWebApi(unittest.TestCase):
         self.assertIn("obj_0002", obj_ids)
 
         # Inspect object
-        status, o_data = self._get("/api/objects/obj_0001")
-        self.assertEqual(status, 200)
+        o_data = self._api(self.adapter.inspect_object("obj_0001"))
         self.assertTrue(o_data.get("success"))
         obj1 = o_data["data"]
         self.assertEqual(obj1["type"], "ServerConfig")
 
         # Inspect fields
-        status, f_data = self._get("/api/objects/obj_0001/fields")
-        self.assertEqual(status, 200)
+        f_data = self._api(self.adapter.inspect_fields("obj_0001"))
         self.assertTrue(f_data.get("success"))
         field_names = [f["name"] for f in f_data["data"]]
         self.assertIn("retry", field_names)
         self.assertIn("state", field_names)
 
         # Inspect single field
-        status, sf_data = self._get("/api/objects/obj_0001/fields?field=retry")
-        self.assertEqual(status, 200)
+        sf_data = self._api(self.adapter.inspect_fields("obj_0001", field_path="retry"))
         self.assertTrue(sf_data.get("success"))
         self.assertEqual(sf_data["data"]["mutability"], "mutable")
         self.assertEqual(sf_data["data"]["value"], 2)
 
     def test_06_mutation_candidates_and_filtering(self):
-        status, data = self._get("/api/mutation-candidates")
-        self.assertEqual(status, 200)
+        data = self._api(self.adapter.list_mutation_candidates())
         self.assertTrue(data.get("success"))
         cands = data.get("data", [])
         self.assertGreaterEqual(len(cands), 3)
 
         # Filter by field
-        status, f_data = self._get("/api/mutation-candidates?field=retry")
-        self.assertEqual(status, 200)
+        f_data = self._api(self.adapter.list_mutation_candidates(field_name="retry"))
         self.assertTrue(f_data.get("success"))
         filtered = f_data.get("data", [])
         self.assertTrue(all(c["field"] == "retry" for c in filtered))
 
     def test_07_execute_transition_and_inspect_result(self):
         # First ensure candidates are loaded
-        self._get("/api/mutation-candidates")
+        self.adapter.list_mutation_candidates()
 
         # Execute mutation transition
-        status, data = self._post("/api/mutation", {"candidate_id": "M001", "timeout_ms": 1000})
-        self.assertEqual(status, 200)
+        data = self._api(self.adapter.execute_transition({"candidate_id": "M001", "timeout_ms": 1000}))
         self.assertTrue(data.get("success"))
         trans = data.get("data", {})
         self.assertEqual(trans.get("transition_id"), "T001")
         self.assertEqual(trans.get("execution", {}).get("status"), "STOPPED")
 
         # Verify transition can be inspected
-        status, t_data = self._get("/api/transitions/T001")
-        self.assertEqual(status, 200)
+        t_data = self._api(self.adapter.inspect_transition("T001"))
         self.assertTrue(t_data.get("success"))
 
         # Verify state graph contains the new transition edge
-        status, g_data = self._get("/api/state-graph")
-        self.assertEqual(status, 200)
+        g_data = self._api(self.adapter.get_state_graph())
         self.assertTrue(g_data.get("success"))
         edges = g_data.get("data", {}).get("edges", [])
         t_ids = [e["id"] for e in edges]
@@ -341,8 +343,7 @@ class TestWebApi(unittest.TestCase):
 
     def test_08_snapshots_diff_endpoint(self):
         # Diff between S001 and S002
-        status, data = self._get("/api/snapshots/S001/diff/S002")
-        self.assertEqual(status, 200)
+        data = self._api(self.adapter.diff_snapshots("S001", "S002"))
         self.assertTrue(data.get("success"))
         diff = data.get("data", {})
         self.assertIn("summary", diff)
@@ -355,29 +356,38 @@ class TestWebApi(unittest.TestCase):
         self.runtime.observation_mode = "LOW_IMPACT"
         try:
             # Candidates must be rejected with CAPABILITY_UNSUPPORTED
-            status, c_data = self._get("/api/mutation-candidates")
+            c_data = self._api(self.adapter.list_mutation_candidates())
             self.assertFalse(c_data.get("success"))
             self.assertEqual(c_data["error"]["code"], "CAPABILITY_UNSUPPORTED")
 
             # Mutation must be rejected with CAPABILITY_UNSUPPORTED
-            status, m_data = self._post("/api/mutation", {"candidate_id": "M001"})
+            m_data = self._api(self.adapter.execute_transition({"candidate_id": "M001"}))
             self.assertFalse(m_data.get("success"))
             self.assertEqual(m_data["error"]["code"], "CAPABILITY_UNSUPPORTED")
 
             # Checkpoint must be rejected with CAPABILITY_UNSUPPORTED
-            status, cp_data = self._post("/api/checkpoint", {})
+            cp_data = self._api(self.adapter.checkpoint({}))
             self.assertFalse(cp_data.get("success"))
             self.assertEqual(cp_data["error"]["code"], "CAPABILITY_UNSUPPORTED")
         finally:
             self.runtime.observation_mode = prev_mode
 
     def test_10_security_boundary_no_gdb_or_arbitrary_shell(self):
-        # Verify prohibited endpoints return 403 Forbidden
+        # Command / memory-write endpoints do not exist (404), with a valid session token, GET or POST
         for bad_endpoint in ["/api/gdb-command", "/api/write-memory", "/api/eval-expression", "/api/arbitrary-command"]:
             status, data = self._post(bad_endpoint, {"cmd": "print 1"})
-            self.assertEqual(status, 403)
+            self.assertEqual(status, 404, bad_endpoint)
             self.assertFalse(data.get("success"))
-            self.assertEqual(data["error"]["code"], "CAPABILITY_UNSUPPORTED")
+            self.assertEqual(data["error"]["code"], "NOT_FOUND")
+            self.assertEqual(self._get(bad_endpoint)[0], 404, bad_endpoint)
+
+        # The removed state-changing / legacy routes are gone as well (the adapter methods above are not reachable)
+        for path in ("/api/mutation", "/api/transition", "/api/checkpoint", "/api/restore", "/api/explore",
+                     "/api/runtime/verify_determinism", "/api/snapshots/S001/branch", "/api/snapshots/S001/mutate"):
+            self.assertEqual(self._post(path, {"candidate_id": "M001"})[0], 404, path)
+        for path in ("/api/runtime", "/api/capabilities", "/api/states", "/api/mutation-candidates", "/api/state-graph",
+                     "/api/memory-summary", "/api/snapshots/S001/diff/S002"):
+            self.assertEqual(self._get(path)[0], 404, path)
 
         # Unknown route returns 404
         status, data = self._get("/api/unmapped_route_xyz")
@@ -385,45 +395,40 @@ class TestWebApi(unittest.TestCase):
         self.assertFalse(data.get("success"))
 
     def test_11_static_file_serving_and_traversal_guard(self):
-        # Root index.html
+        # The root page is the diagnosis UI
         req = urllib.request.Request(self.base_url + "/")
         with urllib.request.urlopen(req) as resp:
             self.assertEqual(resp.status, 200)
             self.assertIn("text/html", resp.headers.get("Content-Type", ""))
-            html = resp.read().decode("utf-8")
-            self.assertIn("dynamicState", html)
-            self.assertIn("Runtime State Explorer", html)
+            self.assertIn("dynamicState", resp.read().decode("utf-8"))
 
-        # Static CSS
-        req = urllib.request.Request(self.base_url + "/static/app.css")
-        with urllib.request.urlopen(req) as resp:
-            self.assertEqual(resp.status, 200)
-            self.assertIn("text/css", resp.headers.get("Content-Type", ""))
+        # The previous UI's asset URLs serve nothing
+        for path in ("/static/app.css", "/static/app.js", "/static/index.html"):
+            with self.assertRaises(urllib.error.HTTPError) as ctx:
+                urllib.request.urlopen(urllib.request.Request(self.base_url + path))
+            self.assertEqual(ctx.exception.code, 404, path)
 
-        # Static JS
-        req = urllib.request.Request(self.base_url + "/static/app.js")
-        with urllib.request.urlopen(req) as resp:
-            self.assertEqual(resp.status, 200)
-
-        # Directory traversal attempt must be blocked
-        try:
-            req = urllib.request.Request(self.base_url + "/static/../../etc/passwd")
-            urllib.request.urlopen(req)
-            self.fail("Traversal request should have failed")
-        except urllib.error.HTTPError as exc:
-            self.assertIn(exc.code, (403, 404))
+        # Directory traversal attempts must be blocked (raw paths: urllib would normalise them)
+        for path in ("/static/../../etc/passwd", "/../../etc/passwd", "/%2e%2e/%2e%2e/etc/passwd"):
+            conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=10)
+            try:
+                conn.request("GET", path)
+                resp = conn.getresponse()
+                body = resp.read()
+            finally:
+                conn.close()
+            self.assertIn(resp.status, (403, 404), path)
+            self.assertNotIn(b"root:", body, path)
 
     def test_12_explore_endpoint(self):
-        status, data = self._post("/api/explore", {"max_steps": 5, "timeout_ms": 1000, "max_states": 10})
-        self.assertEqual(status, 200)
+        data = self._api(self.adapter.explore({"max_steps": 5, "timeout_ms": 1000, "max_states": 10}))
         self.assertTrue(data.get("success"))
         res = data.get("data", {})
         self.assertEqual(res.get("steps"), 5)
         self.assertEqual(res.get("new_states"), 3)
 
     def test_13_memory_summary_endpoint(self):
-        status, data = self._get("/api/memory-summary")
-        self.assertEqual(status, 200)
+        data = self._api(self.adapter.get_memory_summary())
         self.assertTrue(data.get("success"))
         summary = data.get("data", {})
         self.assertIn("breakdown", summary)
@@ -433,29 +438,25 @@ class TestWebApi(unittest.TestCase):
         self.assertEqual(summary.get("objects", {}).get("total_objects"), 2)
 
         # Test state-specific memory summary
-        status, s_data = self._get("/api/states/state_000001/memory-summary")
-        self.assertEqual(status, 200)
+        s_data = self._api(self.adapter.get_state_memory_summary("state_000001"))
         self.assertTrue(s_data.get("success"))
         self.assertEqual(s_data.get("data", {}).get("objects", {}).get("total_objects"), 2)
 
     def test_14_verify_restart_determinism_endpoint(self):
         # GET
-        status, data = self._get("/api/runtime/verify_determinism")
-        self.assertEqual(status, 200)
+        data = self._api(self.adapter.verify_restart_determinism({}))
         self.assertTrue(data.get("success"))
         self.assertTrue(data.get("data", {}).get("deterministic"))
         self.assertEqual(data.get("data", {}).get("status"), "VERIFIED")
 
         # POST
-        status, p_data = self._post("/api/runtime/verify_determinism", {})
-        self.assertEqual(status, 200)
+        p_data = self._api(self.adapter.verify_restart_determinism({}))
         self.assertTrue(p_data.get("success"))
         self.assertTrue(p_data.get("data", {}).get("deterministic"))
 
     def test_15_enriched_human_centric_metadata(self):
         # 1. Runtime info threads_detail & observation_point
-        status, data = self._get("/api/runtime")
-        self.assertEqual(status, 200)
+        data = self._api(self.adapter.get_runtime_info())
         info = data.get("data", {})
         self.assertIn("threads_detail", info)
         self.assertIn("observation_point", info)
@@ -470,8 +471,7 @@ class TestWebApi(unittest.TestCase):
         self.assertIn("location", obs)
 
         # 2. Objects enriched with semantic names & cleaned types
-        status, o_data = self._get("/api/states/state_000001/objects")
-        self.assertEqual(status, 200)
+        o_data = self._api(self.adapter.list_state_objects("state_000001"))
         objs = o_data.get("data", [])
         obj1 = next(o for o in objs if o["object_id"] == "obj_0001")
         self.assertEqual(obj1.get("semantic_name"), "server_inst")
@@ -480,63 +480,28 @@ class TestWebApi(unittest.TestCase):
         self.assertTrue(any(f.get("mutability") == "mutable" for f in obj1.get("fields", [])))
 
         # 3. Candidates enriched with semantic targets
-        status, c_data = self._get("/api/mutation-candidates")
-        self.assertEqual(status, 200)
+        c_data = self._api(self.adapter.list_mutation_candidates())
         cands = c_data.get("data", [])
         c1 = next(c for c in cands if c["object_id"] == "obj_0001" and c["field"] == "retry")
         self.assertEqual(c1.get("semantic_name"), "server_inst")
         self.assertEqual(c1.get("semantic_target"), "server_inst.retry")
 
         # 4. Mutation enriched with restore_backend, timeout, and hashes
-        status, m_data = self._post("/api/mutation", {"candidate_id": "M001", "timeout_ms": 500})
-        self.assertEqual(status, 200)
+        m_data = self._api(self.adapter.execute_transition({"candidate_id": "M001", "timeout_ms": 500}))
         trans = m_data.get("data", {})
         self.assertEqual(trans.get("timeout_ms"), 500)
         self.assertIn("restore_backend", trans)
         self.assertIn("child_state_hash", trans)
 
         # 5. Mutation with candidate payload dict
-        status, m_custom = self._post("/api/mutation", {
+        m_custom = self._api(self.adapter.execute_transition({
             "candidate": {
                 "candidate_id": "M001",
                 "proposed_value": 9
             },
             "timeout_ms": 250
-        })
-        self.assertEqual(status, 200)
+        }))
         self.assertEqual(m_custom.get("data", {}).get("timeout_ms"), 250)
-
-    def test_16_static_assets_and_html_elements(self):
-        # 1. Root index.html
-        req_root = urllib.request.Request(self.base_url + "/")
-        with urllib.request.urlopen(req_root) as resp:
-            self.assertEqual(resp.status, 200)
-            html_str = resp.read().decode("utf-8")
-            self.assertIn("btn-mode-basic", html_str)
-            self.assertIn("btn-mode-advanced", html_str)
-            self.assertIn("modal-mutation-preview", html_str)
-            self.assertIn("card-thread-explorer", html_str)
-            self.assertIn("trans-flow-container", html_str)
-            self.assertIn("exec-timeline-list", html_str)
-            self.assertIn("table-exec-diff", html_str)
-
-        # 2. Static CSS
-        req_css = urllib.request.Request(self.base_url + "/static/app.css")
-        with urllib.request.urlopen(req_css) as resp:
-            self.assertEqual(resp.status, 200)
-            css_text = resp.read().decode("utf-8")
-            self.assertIn(".mode-toggle-group", css_text)
-            self.assertIn(".execution-timeline", css_text)
-            self.assertIn(".flow-card", css_text)
-
-        # 3. Static JS
-        req_js = urllib.request.Request(self.base_url + "/static/app.js")
-        with urllib.request.urlopen(req_js) as resp:
-            self.assertEqual(resp.status, 200)
-            js_text = resp.read().decode("utf-8")
-            self.assertIn("initModeToggle", js_text)
-            self.assertIn("openMutationPreview", js_text)
-            self.assertIn("renderThreads", js_text)
 
     def test_17_mutability_normalization_and_lowercase(self):
         """Verify _is_field_mutable returns canonical lowercase 'mutable', 'read_only', or 'unsupported'."""
@@ -552,8 +517,7 @@ class TestWebApi(unittest.TestCase):
 
     def test_18_runtime_honesty_no_fake_obs_point_or_thread_name(self):
         """Verify no fake 'observation_checkpoint' or fake thread names are fabricated."""
-        status, data = self._get("/api/runtime")
-        self.assertEqual(status, 200)
+        data = self._api(self.adapter.get_runtime_info())
         rt = data.get("data", {})
         
         # When no observation point is active, it must be None (never fake 'observation_checkpoint')
@@ -572,8 +536,7 @@ class TestWebApi(unittest.TestCase):
 
     def test_19_capability_vs_verification_separation(self):
         """Verify capability (Supported) vs verification (Verified) are distinct fields."""
-        status, data = self._get("/api/runtime")
-        self.assertEqual(status, 200)
+        data = self._api(self.adapter.get_runtime_info())
         rt = data.get("data", {})
         
         self.assertIn("branch_isolation_capability", rt)
@@ -590,8 +553,7 @@ class TestWebApi(unittest.TestCase):
 
     def test_20_object_reference_relationships_incoming_outgoing(self):
         """Verify incoming and outgoing reference relations in state objects and object inspector."""
-        status, data = self._get("/api/states/state_seed/objects")
-        self.assertEqual(status, 200)
+        data = self._api(self.adapter.list_state_objects("state_seed"))
         objects = data.get("data", [])
         self.assertIsInstance(objects, list)
         
@@ -603,72 +565,16 @@ class TestWebApi(unittest.TestCase):
 
             # Inspect object endpoint
             oid = first_obj["object_id"]
-            istatus, idata = self._get(f"/api/states/state_seed/objects/{oid}")
-            self.assertEqual(istatus, 200)
+            idata = self._api(self.adapter.inspect_object(oid, snapshot_id="state_seed"))
             iobj = idata.get("data", {})
             self.assertIn("incoming_references", iobj)
             self.assertIn("outgoing_references", iobj)
             self.assertIsInstance(iobj["incoming_references"], list)
             self.assertIsInstance(iobj["outgoing_references"], list)
 
-    def test_21_object_explorer_html_workspace_and_components(self):
-        """Verify 3-Pane Object Explorer workspace elements, summary bar, CSS and JS."""
-        # 1. HTML elements
-        req_root = urllib.request.Request(self.base_url + "/")
-        with urllib.request.urlopen(req_root) as resp:
-            html = resp.read().decode("utf-8")
-            # Summary Bar
-            self.assertIn("runtime-summary-bar", html)
-            self.assertIn("sum-runtime-status", html)
-            self.assertIn("sum-thread-count", html)
-            self.assertIn("sum-object-count", html)
-            self.assertIn("sum-root-count", html)
-            self.assertIn("sum-state-hash", html)
-            self.assertIn("sum-checkpoint-status", html)
-            self.assertIn("sum-isolation-status", html)
-            self.assertIn("sum-determinism-status", html)
-            self.assertIn("sum-obs-point", html)
-            self.assertIn("select-global-timeout", html)
-
-            # 3-Pane Workspace
-            self.assertIn("explorer-workspace", html)
-            self.assertIn("pane-object-explorer", html)
-            self.assertIn("filter-obj-group", html)
-            self.assertIn("select-obj-sort", html)
-            self.assertIn("pane-reference-center", html)
-            self.assertIn("tree-reference-container", html)
-            self.assertIn("table-objects-summary", html)
-            self.assertIn("topology-graph-svg", html)
-            self.assertIn("pane-object-inspector", html)
-            self.assertIn("table-semantic-fields", html)
-            self.assertIn("inspector-outgoing-refs", html)
-            self.assertIn("inspector-incoming-refs", html)
-            self.assertIn("card-integrated-mutation", html)
-
-        # 2. CSS classes
-        req_css = urllib.request.Request(self.base_url + "/static/app.css")
-        with urllib.request.urlopen(req_css) as resp:
-            css = resp.read().decode("utf-8")
-            self.assertIn(".runtime-summary-bar", css)
-            self.assertIn(".explorer-workspace", css)
-            self.assertIn(".pane-card", css)
-            self.assertIn(".ref-tree-node", css)
-            self.assertIn(".outgoing-chip", css)
-            self.assertIn(".incoming-chip", css)
-
-        # 3. JS functions
-        req_js = urllib.request.Request(self.base_url + "/static/app.js")
-        with urllib.request.urlopen(req_js) as resp:
-            js = resp.read().decode("utf-8")
-            self.assertIn("normalizeMutability", js)
-            self.assertIn("renderReferenceTree", js)
-            self.assertIn("renderReferenceTable", js)
-            self.assertIn("switchCenterView", js)
-
     def test_22_test_a_capability_vs_verification_separation(self):
         """Test A: Verify SUPPORTED capability does not automatically mean VERIFIED even for single-thread."""
-        status, data = self._get("/api/runtime")
-        self.assertEqual(status, 200)
+        data = self._api(self.adapter.get_runtime_info())
         rt = data.get("data", {})
 
         # Capability is SUPPORTED
@@ -700,8 +606,7 @@ class TestWebApi(unittest.TestCase):
 
             self.controller.get_capabilities = mock_verified_caps
 
-            status, data = self._get("/api/runtime")
-            self.assertEqual(status, 200)
+            data = self._api(self.adapter.get_runtime_info())
             rt = data.get("data", {})
             self.assertTrue(rt.get("branch_isolation_verified"))
             self.assertTrue(rt.get("branch_isolation", {}).get("verified"))
@@ -726,8 +631,7 @@ class TestWebApi(unittest.TestCase):
                 return c
 
             self.controller.get_capabilities = mock_det_only_caps
-            status, data = self._get("/api/runtime")
-            self.assertEqual(status, 200)
+            data = self._api(self.adapter.get_runtime_info())
             rt = data.get("data", {})
             self.assertTrue(rt.get("determinism_verified"))
             self.assertFalse(rt.get("branch_isolation_verified"), "Determinism VERIFIED must NOT infer branch isolation VERIFIED")
@@ -745,8 +649,7 @@ class TestWebApi(unittest.TestCase):
                 return c
 
             self.controller.get_capabilities = mock_branch_only_caps
-            status, data = self._get("/api/runtime")
-            self.assertEqual(status, 200)
+            data = self._api(self.adapter.get_runtime_info())
             rt = data.get("data", {})
             self.assertTrue(rt.get("branch_isolation_verified"))
             self.assertFalse(rt.get("determinism_verified"), "Branch isolation VERIFIED must NOT infer determinism VERIFIED")
@@ -763,8 +666,7 @@ class TestWebApi(unittest.TestCase):
         self.controller._latest = snap_copy
 
         try:
-            status, data = self._get("/api/runtime")
-            self.assertEqual(status, 200)
+            data = self._api(self.adapter.get_runtime_info())
             rt = data.get("data", {})
             obs = rt.get("observation_point")
             self.assertIsNotNone(obs)
@@ -790,8 +692,7 @@ class TestWebApi(unittest.TestCase):
         self.controller._latest = snap_copy
 
         try:
-            status, data = self._get("/api/runtime")
-            self.assertEqual(status, 200)
+            data = self._api(self.adapter.get_runtime_info())
             rt = data.get("data", {})
             threads = rt.get("threads_detail", [])
             self.assertEqual(len(threads), 1)
@@ -806,29 +707,25 @@ class TestWebApi(unittest.TestCase):
     def test_27_test_f_timeout_source_of_truth_consistency(self):
         """Test F: Timeout source of truth is backend default and is consistent across capabilities, runtime, and execution."""
         # 1. Capabilities endpoint
-        status, caps_data = self._get("/api/capabilities")
-        self.assertEqual(status, 200)
+        caps_data = self._api(self.adapter.get_capabilities())
         c_data = caps_data.get("data", {})
         backend_default = c_data.get("default_timeout_ms") or c_data.get("mutation", {}).get("default_timeout_ms")
         self.assertEqual(backend_default, 1000)
 
         # 2. Runtime endpoint
-        status, rt_data = self._get("/api/runtime")
-        self.assertEqual(status, 200)
+        rt_data = self._api(self.adapter.get_runtime_info())
         rt_default = rt_data.get("data", {}).get("default_timeout_ms")
         self.assertEqual(rt_default, backend_default)
 
         # 3. Execute transition with default (no timeout specified in payload)
         payload = {"candidate_id": "M001", "proposed_value": 5}
-        status, trans_data = self._post("/api/mutation", payload)
-        self.assertEqual(status, 200)
+        trans_data = self._api(self.adapter.execute_transition(payload))
         t_res = trans_data.get("data", {})
         self.assertEqual(t_res.get("timeout_ms"), backend_default)
 
         # 4. Execute transition with explicit user override (e.g. 5000ms)
         payload_override = {"candidate_id": "M001", "proposed_value": 7, "timeout_ms": 5000}
-        status, trans_override = self._post("/api/mutation", payload_override)
-        self.assertEqual(status, 200)
+        trans_override = self._api(self.adapter.execute_transition(payload_override))
         t_res_override = trans_override.get("data", {})
         self.assertEqual(t_res_override.get("timeout_ms"), 5000)
 
@@ -875,8 +772,7 @@ class TestWebApi(unittest.TestCase):
         sid, _ = self.runtime.corpus.add(session_snap, metadata={"interesting_reasons": ["SEED"]})
 
         # 1. Check list_state_objects
-        status, data = self._get(f"/api/states/{sid}/objects")
-        self.assertEqual(status, 200)
+        data = self._api(self.adapter.list_state_objects(sid))
         objects = data.get("data", [])
         self.assertEqual(len(objects), 3)
 
@@ -893,8 +789,7 @@ class TestWebApi(unittest.TestCase):
         self.assertEqual(counter_field.get("semantic_path"), "Session.worker.state.counter")
 
         # 2. Check inspect_object endpoint
-        istatus, idata = self._get(f"/api/states/{sid}/objects/obj_state")
-        self.assertEqual(istatus, 200)
+        idata = self._api(self.adapter.inspect_object("obj_state", snapshot_id=sid))
         iobj = idata.get("data", {})
         self.assertEqual(iobj.get("primary_path"), "Session.worker.state")
         self.assertEqual(iobj.get("semantic_path"), "Session.worker.state")
@@ -905,8 +800,7 @@ class TestWebApi(unittest.TestCase):
             MutationCandidate("M_CNT", "S_SESSION", "obj_state", "counter", 10, 20, "int", "INCREMENT")
         ]
         try:
-            cstatus, cdata = self._get("/api/mutation/candidates?snapshot_id=S_SESSION")
-            self.assertEqual(cstatus, 200)
+            cdata = self._api(self.adapter.list_mutation_candidates(snapshot_id="S_SESSION"))
             cands = cdata.get("data", [])
             cnt_cand = next((c for c in cands if c.get("candidate_id") == "M_CNT"), None)
             self.assertIsNotNone(cnt_cand)
@@ -914,25 +808,6 @@ class TestWebApi(unittest.TestCase):
             self.assertEqual(cnt_cand.get("semantic_name"), "Session.worker.state")
         finally:
             self.controller.propose_mutations = old_propose
-
-    def test_29_frontend_regression_checks(self):
-        """Test Frontend checks: SUPPORTED is not shown as Verified, honest unavailable observation, and timeout source of truth."""
-        req_js = urllib.request.Request(self.base_url + "/static/app.js")
-        with urllib.request.urlopen(req_js) as resp:
-            js = resp.read().decode("utf-8")
-            # 1. SUPPORTED without verification displays Supported (Not verified)
-            self.assertIn("Supported (Not verified)", js)
-            self.assertIn("SUPPORTED (NOT VERIFIED)", js)
-            # 2. Verified only displayed when verified is true
-            self.assertIn("Supported (Verified)", js)
-            self.assertIn("SUPPORTED (VERIFIED)", js)
-            # 3. Unavailable observation metadata rendered as Unavailable
-            self.assertIn("'Unavailable'", js)
-            # 4. Semantic path / primary path priority
-            self.assertIn("primary_path", js)
-            self.assertIn("additional_paths", js)
-            # 5. Provenance timeline steps
-            self.assertIn("semanticStatus", js)
 
 
 if __name__ == "__main__":

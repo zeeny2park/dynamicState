@@ -1,0 +1,32 @@
+{
+  "id": "mapgrow_slabs",
+  "origin": "new",
+  "naming": "neutral",
+  "kind": "mapping_growth",
+  "source": "benchmarks/diagnosis_accuracy/targets/mapgrow_slabs.c",
+  "language": "c",
+  "symptom": "memory usage of this process keeps growing",
+  "ready": {
+    "mode": "stdout_marker"
+  },
+  "causes": {
+    "variables": [
+      "slabs"
+    ],
+    "locks": [],
+    "threads": [
+      "loader"
+    ],
+    "functions": [
+      "loader"
+    ]
+  },
+  "locations": [
+    {
+      "file": "benchmarks/diagnosis_accuracy/targets/mapgrow_slabs.c",
+      "line": 19,
+      "text": "mmap(NULL, SLAB"
+    }
+  ],
+  "notes": "256 KiB anonymous mmap every 50 ms, pointers kept in a static array, never unmapped; malloc heap flat"
+}

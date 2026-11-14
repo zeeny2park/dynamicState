@@ -158,6 +158,7 @@ class TargetABI:
     libc_path: Optional[str] = None          # mapped libc file used as evidence
     evidence: List[str] = field(default_factory=list)
     error: Optional[str] = None
+    kernel_release: Optional[str] = None     # /proc/sys/kernel/osrelease of the TARGET host (read via the adapter)
 
     @property
     def detected(self) -> bool:
@@ -176,6 +177,7 @@ class TargetABI:
             "libc_path": self.libc_path,
             "evidence": list(self.evidence),
             "error": self.error,
+            "kernel_release": self.kernel_release,
         }
 
     @classmethod
@@ -192,6 +194,7 @@ class TargetABI:
             libc_path=d.get("libc_path"),
             evidence=list(d.get("evidence") or []),
             error=d.get("error"),
+            kernel_release=d.get("kernel_release"),
         )
 
 
@@ -293,6 +296,9 @@ def _classify_libc_name(path: str) -> Tuple[str, Optional[str]]:
     return LIBC_UNKNOWN, None
 
 
+_NOT_READ = object()   # sentinel: the kernel release of this adapter's target has not been read yet
+
+
 def detect_target_abi(
     adapter: Any, pid: int, probe_version: bool = True, maps: Optional[List[Dict[str, Any]]] = None
 ) -> TargetABI:
@@ -305,6 +311,22 @@ def detect_target_abi(
     """
     abi = TargetABI()
     reader = getattr(adapter, "read_target_file", None)
+    if callable(reader):  # kernel release of the target host (local or remote); anything not a release string is dropped
+        # Read once per adapter: ABI detection runs many times per diagnosis and on a remote target this read is one
+        # ssh command each time (18 per diagnosis before the cache). The host's kernel does not change mid-diagnosis.
+        cached = getattr(adapter, "_target_kernel_release", _NOT_READ)
+        if cached is _NOT_READ:
+            try:
+                raw = reader(int(pid), "/proc/sys/kernel/osrelease", 256)
+                txt = raw.decode("ascii").strip() if raw else ""
+                cached = txt if re.fullmatch(r"\d+\.\d+[\w.+~-]*", txt) else None
+            except Exception:  # noqa: BLE001
+                cached = None
+            try:
+                setattr(adapter, "_target_kernel_release", cached)
+            except Exception:  # noqa: BLE001 - an adapter that refuses attributes is simply read again next time
+                pass
+        abi.kernel_release = cached
     hdr: Optional[bytes] = None
     if callable(reader):
         try:

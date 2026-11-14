@@ -1061,12 +1061,10 @@ class TemporalInvestigationService:
             # Inspect pointer / array index proximity if requested or if guard is known
             guard_target = plan.guard_address
             # If no explicit guard address was given, but goal mentions guard and item looks like a pointer/buffer
+            # the type decides (a pointer, or an address-sized integer); a name such as "node_count" does not
             is_pointer_or_addr = (
                 item.type_name in ("pointer", "uint64_t", "uint32_t", "void*")
-                or "ptr" in item.name.lower()
-                or "node" in item.name.lower()
-                or "buffer" in item.name.lower()
-                or "shared" in item.name.lower()
+                or str(item.type_name or "").rstrip().endswith("*")
             )
 
             if guard_target is not None and is_pointer_or_addr:

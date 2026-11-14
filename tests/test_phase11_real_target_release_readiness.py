@@ -72,6 +72,7 @@ from extractor.investigation import (
     TrustedCausalVerifier,
 )
 from extractor.raw_snapshot import RawRuntimeSnapshot
+from tests.support.fixture_process import fixture_popen
 
 
 def _approved_full_plan():
@@ -119,7 +120,7 @@ class BasePhase11ProcessTestCase(unittest.TestCase):
         shutil.rmtree(cls.work_dir, ignore_errors=True)
 
     def _start_process(self, bin_path: str) -> subprocess.Popen:
-        proc = subprocess.Popen(
+        proc = fixture_popen(
             [bin_path],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,

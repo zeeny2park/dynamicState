@@ -26,9 +26,19 @@ import threading
 import time
 from typing import Any, Callable, Dict, List, Optional
 
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO_ROOT = os.path.abspath(os.path.join(HERE, "..", ".."))
+if REPO_ROOT not in sys.path:
+    sys.path.insert(0, REPO_ROOT)
+from tests.support.fixture_process import FixtureLimitExceeded, FixtureProcess, fixture_popen  # noqa: E402
+
 GT_DIR = os.path.join(HERE, "ground_truth")
+# Held-out suite (stage 3 validation): programs written after the static-candidate heuristics, in other styles
+# (C++, multi-file, wrappers, function pointers, macros, -O2). Own manifest directory, run only with
+# --suite heldout and reported in its own results file; it never enters the main suite's totals.
+HELDOUT_GT_DIR = os.path.join(HERE, "heldout", "ground_truth")
+SUITES = {"main": GT_DIR, "heldout": HELDOUT_GT_DIR}
 RESULTS_DIR = os.path.join(HERE, "results")
 
 SCHEMA_VERSION = 1
@@ -44,11 +54,19 @@ KIND_CATEGORIES: Dict[str, frozenset] = {
     "memory_leak": frozenset({"MEMORY_LEAK"}),
     "heap_overflow": frozenset({"MEMORY_CORRUPTION"}),
     "use_after_free": frozenset({"USE_AFTER_FREE"}),
+    "double_free": frozenset({"INVALID_DOUBLE_FREE"}),
     "deadlock": frozenset({"DEADLOCK_INDICATORS"}),
     "busy_wait": frozenset({"PROCESS_INSTABILITY", "RESOURCE_EXHAUSTION"}),
+    "thread_growth": frozenset({"THREAD_LEAK"}),
     "long_stall": frozenset({"PROCESS_INSTABILITY"}),
+    "mapping_growth": frozenset({"MAPPING_GROWTH"}),   # memory growth outside malloc (mmap, custom pool)
+    "heap_retention": frozenset({"HEAP_RETENTION"}),   # fragmentation: a degradation, its targets are unscored
+    "lock_contention": frozenset({"LOCK_CONTENTION"}),  # a degradation: its targets are unscored
+    "orphan_lock": frozenset({"ORPHAN_LOCK"}),
+    "self_deadlock": frozenset({"SELF_DEADLOCK"}),
 }
-# `long_stall` stays here only so unscored stall rows can be labelled and described; it never enters a total.
+# `long_stall`, `heap_retention` and `lock_contention` stay here only so unscored rows can be labelled and described; they never
+# enter a total.
 DEFECT_KINDS = tuple(KIND_CATEGORIES)
 # A ground-truth record may carry "scored": false (+ "scored_reason"). Such targets are still built, run and
 # printed, but are excluded from every detection / cause-name / location / false-positive total and rate.
@@ -106,7 +124,21 @@ def validate_ground_truth(gt: Dict[str, Any], repo_root: str = REPO_ROOT) -> Lis
     if not os.path.isfile(src):
         errs.append(f"source not found: {gt['source']}")
         return errs
-    lines = open(src, encoding="utf-8").read().splitlines()
+    sources = source_files(gt)
+    if gt["source"] not in sources:
+        errs.append("sources must include source")
+    for extra in sources:
+        if not os.path.isfile(os.path.join(repo_root, extra)):
+            errs.append(f"source not found: {extra}")
+    if errs:
+        return errs
+    b = gt.get("build")
+    if b is not None:
+        if (not isinstance(b, dict) or b.get("compiler") not in ("gcc", "g++")
+                or b.get("opt") not in ("-O0", "-O1", "-O2", "-O3", "-Os")):
+            errs.append("build needs compiler gcc|g++ and opt -O0..-O3|-Os")
+        elif not isinstance(b.get("flags", []), list):
+            errs.append("build.flags must be a list")
     if gt["kind"] == HEALTHY_KIND:
         if gt["locations"] or any(gt["causes"][c] for c in NAME_CLASSES):
             errs.append("healthy control must have no causes and no locations")
@@ -116,8 +148,10 @@ def validate_ground_truth(gt: Dict[str, Any], repo_root: str = REPO_ROOT) -> Lis
         if not any(gt["causes"][c] for c in NAME_CLASSES):
             errs.append("defect target needs at least one cause name")
         for loc in gt["locations"]:
-            if loc.get("file") != gt["source"]:
-                errs.append(f"location file {loc.get('file')} != source")
+            if loc.get("file") not in sources:
+                errs.append(f"location file {loc.get('file')} is not one of the sources")
+                continue
+            lines = open(os.path.join(repo_root, loc["file"]), encoding="utf-8").read().splitlines()
             ln = loc.get("line")
             if not isinstance(ln, int) or not (1 <= ln <= len(lines)):
                 errs.append(f"bad line {ln}")
@@ -126,11 +160,30 @@ def validate_ground_truth(gt: Dict[str, Any], repo_root: str = REPO_ROOT) -> Lis
     if gt["origin"] == "project_fixture" and not gt["source"].startswith("tests/fixtures/real_runtime/"):
         errs.append("project_fixture must reference tests/fixtures/real_runtime")
     if gt["origin"] != "project_fixture":
-        text = open(src, encoding="utf-8").read().lower()
+        text = "\n".join(_with_headers(repo_root, sources)).lower()
+        text = text.replace("lock_guard", "")  # the C++ standard library's name, not an announcing word
         for banned in ("leak", "overflow", "canary", "guard", "deadbeef", "uaf", "dangling"):
             if banned in text:
                 errs.append(f"source contains announcing word {banned!r}")
     return errs
+
+
+def source_files(gt: Dict[str, Any]) -> List[str]:
+    """Translation units of a target (repository-relative): ``sources`` when given (multi-file targets), else
+    the single ``source``."""
+    return list(gt.get("sources") or [gt["source"]])
+
+
+def _with_headers(repo_root: str, sources: List[str]) -> List[str]:
+    """Text of the sources and of the local headers next to them (for the announcing-word check)."""
+    out, seen = [], set()
+    for s in sources:
+        d = os.path.dirname(os.path.join(repo_root, s))
+        for p in [os.path.join(repo_root, s)] + sorted(glob.glob(os.path.join(d, "*.h"))):
+            if p not in seen and os.path.isfile(p):
+                seen.add(p)
+                out.append(open(p, encoding="utf-8").read())
+    return out
 
 
 # ------------------------------------------------------------------------------------------------ scoring
@@ -159,7 +212,9 @@ def score_result(gt: Dict[str, Any], result: Optional[Dict[str, Any]], error: Op
         if gt["kind"] == HEALTHY_KIND:
             row.update(false_positive=False, not_cleared=False, cleared=False)
         else:
-            row.update(detected=False, name_match="none", location_match=False, false_clear=False)
+            row.update(detected=False, name_match="none", location_match=False, false_clear=False,
+                       location_candidate_rank=None, location_candidate_hit=False,
+                       location_candidates_shown=False, location_candidate_wrong=False)
         return row
 
     findings = list(result.get("findings") or [])
@@ -210,7 +265,38 @@ def score_result(gt: Dict[str, Any], result: Optional[Dict[str, Any]], error: Op
     row["location_match"] = bool(matching) and any(
         os.path.basename(loc["file"]) == f and abs(loc["line"] - ln) <= LINE_TOLERANCE
         for loc in gt["locations"] for f, ln in fl)
+    # Static location candidates (findings[].location_candidates): statically derived, never observed. Scored
+    # separately from `location_match` (which counts only subjects, i.e. what the diagnosis observed / named):
+    # the best (lowest) rank among the matching findings' candidates that lies within the same tolerance.
+    row["location_candidate_rank"] = candidate_rank(gt, matching)
+    row["location_candidate_hit"] = row["location_candidate_rank"] is not None
+    # A candidate list that is shown but does not contain the true location misleads the reader (worse than none).
+    row["location_candidates_shown"] = candidates_shown(matching)
+    row["location_candidate_wrong"] = row["location_candidates_shown"] and not row["location_candidate_hit"]
+    # time the engine spent deriving them (all findings; part of diagnose_s)
+    row["location_candidates_s"] = round(sum(float((f.get("location_candidates") or {}).get("elapsed_s") or 0.0)
+                                             for f in findings if isinstance(f.get("location_candidates"), dict)), 3)
     return row
+
+
+def candidate_rank(gt: Dict[str, Any], findings: List[Dict[str, Any]]) -> Optional[int]:
+    best: Optional[int] = None
+    for f in findings:
+        lc = f.get("location_candidates") if isinstance(f.get("location_candidates"), dict) else {}
+        for c in lc.get("candidates") or []:
+            if not isinstance(c, dict) or not isinstance(c.get("rank"), int):
+                continue
+            m = re.match(r"^(.*):(\d+)$", str(c.get("location") or ""))
+            if m and any(os.path.basename(loc["file"]) == os.path.basename(m.group(1))
+                         and abs(loc["line"] - int(m.group(2))) <= LINE_TOLERANCE for loc in gt["locations"]):
+                best = c["rank"] if best is None else min(best, c["rank"])
+    return best
+
+
+def candidates_shown(findings: List[Dict[str, Any]]) -> bool:
+    """Some matching finding carries at least one static location candidate."""
+    return any(isinstance(f.get("location_candidates"), dict) and bool(f["location_candidates"].get("candidates"))
+               for f in findings)
 
 
 def _stats(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -222,6 +308,11 @@ def _stats(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
         "name_full": sum(1 for r in d if r.get("name_match") == "full"),
         "name_partial": sum(1 for r in d if r.get("name_match") == "partial"),
         "location_match": sum(1 for r in d if r.get("location_match")),
+        # static candidates (not observed): reported next to, never added to, location_match
+        "location_candidate_hit": sum(1 for r in d if r.get("location_candidate_hit")),
+        "location_candidate_rank1": sum(1 for r in d if r.get("location_candidate_rank") == 1),
+        "location_candidates_shown": sum(1 for r in d if r.get("location_candidates_shown")),
+        "location_candidate_wrong": sum(1 for r in d if r.get("location_candidate_wrong")),
         "false_clears": sum(1 for r in d if r.get("false_clear")),
         "healthy_targets": len(h),
         "cleared": sum(1 for r in h if r.get("cleared")),
@@ -245,7 +336,9 @@ def summarize(all_rows: List[Dict[str, Any]]) -> Dict[str, Any]:
         "unscored": {
             "note": "informational; excluded from every total and rate in this report",
             "targets": [{k: r.get(k) for k in ("id", "kind", "scored_reason", "verdict", "detected", "name_match",
-                                                "location_match", "false_clear", "finding_categories", "subjects",
+                                                "location_match", "location_candidate_rank",
+                                                "location_candidate_wrong", "false_clear",
+                                                "finding_categories", "subjects",
                                                 "error")}
                         for r in unscored],
         },
@@ -253,6 +346,71 @@ def summarize(all_rows: List[Dict[str, Any]]) -> Dict[str, Any]:
                      if any(r["kind"] == k for r in rows)},
         "per_origin": {o: _stats([r for r in rows if r["origin"] == o]) for o in ORIGINS},
         "per_naming": {n: _stats([r for r in rows if r["naming"] == n]) for n in ("neutral", "project")},
+    }
+
+
+# ------------------------------------------------------------------------------------------------ timing / repeat
+def check_timings(result: Optional[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Per executed check wall time, from the engine's own ``checks_run[].duration_s``. Pure function."""
+    out = []
+    for c in (result or {}).get("checks_run") or []:
+        d = c.get("duration_s")
+        out.append({"check_id": c.get("check_id"), "recipe_id": c.get("recipe_id"), "name": c.get("name"),
+                    "status": c.get("status"), "duration_s": float(d) if isinstance(d, (int, float)) else None})
+    return out
+
+
+def verdict_agreement(verdicts: List[Optional[str]]) -> Dict[str, Any]:
+    """Distribution of verdicts over repeated runs and the share equal to the most common one. Pure function.
+    A run without a verdict (error) counts as the verdict "ERROR"; ties go to the verdict seen first."""
+    labels = [v if v else "ERROR" for v in verdicts]
+    dist: Dict[str, int] = {}
+    for v in labels:
+        dist[v] = dist.get(v, 0) + 1
+    if not labels:
+        return {"runs": 0, "distribution": {}, "modal_verdict": None, "agreement_rate": None}
+    modal = max(dist, key=lambda k: (dist[k], -labels.index(k)))
+    return {"runs": len(labels), "distribution": dist, "modal_verdict": modal,
+            "agreement_rate": round(dist[modal] / len(labels), 4)}
+
+
+def summarize_repeat(rows: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """Overall repeat-verdict agreement over rows that carry a ``repeat`` entry (None if no row does).
+    ``mean_agreement_rate`` = mean of per-target rates; ``pooled_agreement_rate`` = sum of modal counts / sum of runs.
+    Unscored targets are listed per target but kept out of the overall figures. Pure function."""
+    rep = [r for r in rows if isinstance(r.get("repeat"), dict) and r["repeat"].get("runs")]
+    if not rep:
+        return None
+    use = [r for r in rep if r.get("scored", True)]
+    rates = [r["repeat"]["agreement_rate"] for r in use]
+    modal = sum(r["repeat"]["distribution"][r["repeat"]["modal_verdict"]] for r in use)
+    runs = sum(r["repeat"]["runs"] for r in use)
+    return {
+        "targets": len(use),
+        "runs_per_target": sorted({r["repeat"]["runs"] for r in use}),
+        "mean_agreement_rate": round(sum(rates) / len(rates), 4) if rates else None,
+        "pooled_agreement_rate": round(modal / runs, 4) if runs else None,
+        "fully_agreeing_targets": sum(1 for x in rates if x == 1.0),
+        "per_target": {r["id"]: {**r["repeat"], "scored": r.get("scored", True)} for r in rep},
+    }
+
+
+def summarize_timing(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Diagnosis wall time over rows (all targets, scored or not) and per-check mean/max/count keyed by check_id.
+    Uses every run of a row when ``check_runs`` is present, else its single ``checks``. Pure function."""
+    diag = [r["diagnose_s"] for r in rows if isinstance(r.get("diagnose_s"), (int, float))]
+    per: Dict[str, List[float]] = {}
+    names: Dict[str, str] = {}
+    for r in rows:
+        for run in (r.get("check_runs") or [r.get("checks") or []]):
+            for c in run:
+                if isinstance(c.get("duration_s"), (int, float)):
+                    per.setdefault(str(c["check_id"]), []).append(float(c["duration_s"]))
+                    names[str(c["check_id"])] = c.get("name") or ""
+    return {
+        "diagnose_s": {"mean": round(sum(diag) / len(diag), 3), "max": max(diag), "n": len(diag)} if diag else None,
+        "per_check": {k: {"name": names[k], "mean_s": round(sum(v) / len(v), 4), "max_s": round(max(v), 4),
+                          "n": len(v)} for k, v in sorted(per.items(), key=lambda kv: -max(kv[1]))},
     }
 
 
@@ -282,10 +440,17 @@ def environment() -> Dict[str, Any]:
     }
 
 
+def build_command(gt: Dict[str, Any], out: str) -> List[str]:
+    """``gcc -g -O0`` on the single source unless the record has a ``build`` block (compiler, optimisation
+    level, extra flags) and/or ``sources`` (multi-file targets)."""
+    b = gt.get("build") or {}
+    return ([b.get("compiler", "gcc"), "-g", b.get("opt", "-O0")] + list(b.get("flags") or [])
+            + ["-pthread", "-Wl,--build-id=sha1"] + source_files(gt) + ["-o", out])
+
+
 def build_target(gt: Dict[str, Any], out_dir: str) -> str:
     out = os.path.join(out_dir, gt["id"])
-    subprocess.run(["gcc", "-g", "-O0", "-pthread", "-Wl,--build-id=sha1", gt["source"], "-o", out],
-                   cwd=REPO_ROOT, check=True, capture_output=True, timeout=120)
+    subprocess.run(build_command(gt, out), cwd=REPO_ROOT, check=True, capture_output=True, timeout=120)
     return out
 
 
@@ -313,18 +478,24 @@ def _wait_ready(proc: subprocess.Popen, gt: Dict[str, Any]) -> None:
     raise RuntimeError("timeout waiting for READY")
 
 
-def _kill(proc: subprocess.Popen) -> None:
-    try:
-        os.killpg(proc.pid, signal.SIGKILL)
-    except OSError:
-        try:
-            proc.kill()
-        except OSError:
-            pass
-    try:
-        proc.wait(timeout=10)
-    except subprocess.SubprocessError:
-        pass
+# Defect kinds whose target keeps allocating or spawning while it runs. With --repeat each repeat gets a fresh
+# process, so every repeat diagnoses the target at the same age (a single process would grow for minutes and
+# the later repeats would see a different, much larger state than the first).
+GROWTH_KINDS = frozenset({"memory_leak", "mapping_growth", "thread_growth"})
+
+
+def _launch(binary: str, gt: Dict[str, Any], repeat_slots: int = 1) -> FixtureProcess:
+    """Start the target through the shared containment launcher (tests/support/fixture_process.py): it dies with the
+    benchmark however the benchmark ends (SIGKILL included), is killed by a resident-memory watchdog and by a hard
+    lifetime limit. A benchmark killed from outside once left a leak target growing to 21 GB."""
+    lifetime = READY_TIMEOUT_S + repeat_slots * DIAGNOSE_TIMEOUT_S + 60.0
+    return fixture_popen([binary], stdin=subprocess.DEVNULL,
+                         stdout=subprocess.PIPE if gt["ready"]["mode"] == "stdout_marker" else subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL, max_lifetime_s=lifetime, name=gt["id"])
+
+
+def _kill(proc: FixtureProcess) -> None:
+    proc.kill_tree()
     if proc.stdout:
         proc.stdout.close()
 
@@ -338,8 +509,9 @@ def _default_diagnose(pid, debug_image, symptom, corpus_dir):
 GENERIC_SYMPTOM = "general health check"
 
 
-def run_target(gt: Dict[str, Any], tmp: str, diagnose_fn: Callable, symptom_mode: str = "ground_truth") -> Dict[str, Any]:
-    """Build, launch, diagnose once, kill, score. ``diagnose_fn(pid, debug_image, symptom, corpus_dir)`` -> dict."""
+def run_target(gt: Dict[str, Any], tmp: str, diagnose_fn: Callable, symptom_mode: str = "ground_truth",
+               repeat: int = 1) -> Dict[str, Any]:
+    """Build, launch, diagnose once (``repeat`` times if > 1, same process, or a fresh one per repeat for growth-type targets; scoring uses the first run), kill, score. ``diagnose_fn(pid, debug_image, symptom, corpus_dir)`` -> dict."""
     t_start = time.monotonic()
     symptom = gt["symptom"] if symptom_mode == "ground_truth" else GENERIC_SYMPTOM
     try:
@@ -348,72 +520,176 @@ def run_target(gt: Dict[str, Any], tmp: str, diagnose_fn: Callable, symptom_mode
         row = score_result(gt, None, f"build failed: {exc}")
         row["wall_s"] = round(time.monotonic() - t_start, 2)
         return row
-    proc = subprocess.Popen([binary], stdin=subprocess.DEVNULL,
-                            stdout=subprocess.PIPE if gt["ready"]["mode"] == "stdout_marker" else subprocess.DEVNULL,
-                            stderr=subprocess.DEVNULL, start_new_session=True)
+    restart = repeat > 1 and gt.get("kind") in GROWTH_KINDS
+    proc = _launch(binary, gt, 1 if restart else max(1, repeat))
     result, error, diag_s = None, None, None
+    runs: List[Dict[str, Any]] = []  # one entry per diagnose call: {"result", "error", "diagnose_s"}
     try:
         _wait_ready(proc, gt)
-        box: Dict[str, Any] = {}
+        for _i in range(max(1, repeat)):
+            if _i > 0 and restart:
+                _kill(proc)
+                proc = _launch(binary, gt, 1)
+                _wait_ready(proc, gt)
+            box: Dict[str, Any] = {}
 
-        def _call():
+            def _call():
+                try:
+                    box["result"] = diagnose_fn(proc.pid, binary, symptom, os.path.join(tmp, "corpus"))
+                except BaseException as exc:  # noqa: BLE001 - a crash in the system under test is a result row
+                    box["error"] = f"{type(exc).__name__}: {exc}"
+
+            t0 = time.monotonic()
+            th = threading.Thread(target=_call, daemon=True)
+            th.start()
+            th.join(DIAGNOSE_TIMEOUT_S)
+            run_s = round(time.monotonic() - t0, 2)
+            if th.is_alive():
+                runs.append({"result": None, "diagnose_s": run_s,
+                             "error": f"diagnose did not return within {DIAGNOSE_TIMEOUT_S:.0f}s (hang)"})
+                break  # the hung thread still uses the target; do not call again
             try:
-                box["result"] = diagnose_fn(proc.pid, binary, symptom, os.path.join(tmp, "corpus"))
-            except BaseException as exc:  # noqa: BLE001 - a crash in the system under test is a result row
-                box["error"] = f"{type(exc).__name__}: {exc}"
-
-        t0 = time.monotonic()
-        th = threading.Thread(target=_call, daemon=True)
-        th.start()
-        th.join(DIAGNOSE_TIMEOUT_S)
-        diag_s = round(time.monotonic() - t0, 2)
-        if th.is_alive():
-            error = f"diagnose did not return within {DIAGNOSE_TIMEOUT_S:.0f}s (hang)"
-        else:
-            result, error = box.get("result"), box.get("error")
+                proc.check()  # the watchdog killed the target (memory ceiling / lifetime): never score that run
+            except FixtureLimitExceeded as exc:
+                runs.append({"result": None, "diagnose_s": run_s, "error": f"target setup failed: {exc}"})
+                break
+            runs.append({"result": box.get("result"), "error": box.get("error"), "diagnose_s": run_s})
+            # Each diagnosis leaves tens of MB of session and report files in the corpus; the benchmark only uses the
+            # returned result, so drop them per run (35 targets x 20 repeats filled a 45 GB disk otherwise).
+            shutil.rmtree(os.path.join(tmp, "corpus"), ignore_errors=True)
+        result, error, diag_s = runs[0]["result"], runs[0]["error"], runs[0]["diagnose_s"]
     except (RuntimeError, OSError) as exc:
         error = f"target setup failed: {exc}"
     finally:
         _kill(proc)
     row = score_result(gt, result, error)
     row["diagnose_s"] = diag_s
+    row["checks"] = check_timings(result)
+    if repeat > 1 and runs:
+        row["repeat"] = verdict_agreement([(r["result"] or {}).get("verdict") for r in runs])
+        row["repeat"]["requested"] = repeat
+        row["repeat"]["diagnose_s"] = [r["diagnose_s"] for r in runs]
+        row["check_runs"] = [check_timings(r["result"]) for r in runs]
     row["wall_s"] = round(time.monotonic() - t_start, 2)
     row["symptom"] = symptom
     return row
 
 
 def run_all(targets: List[Dict[str, Any]], diagnose_fn: Callable = _default_diagnose,
-            symptom_mode: str = "ground_truth") -> Dict[str, Any]:
+            symptom_mode: str = "ground_truth", repeat: int = 1, suite: str = "main") -> Dict[str, Any]:
     t0 = time.monotonic()
     tmp = tempfile.mkdtemp(prefix="diagacc_")
     try:
-        rows = [run_target(gt, tmp, diagnose_fn, symptom_mode) for gt in targets]
+        rows = [run_target(gt, tmp, diagnose_fn, symptom_mode, repeat) for gt in targets]
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
-    return {
+    report = {
         "schema_version": SCHEMA_VERSION,
         "environment": environment(),
         "symptom_mode": symptom_mode,
+        "suite": suite,
         "category_to_kind": {k: sorted(v) for k, v in KIND_CATEGORIES.items()},
         "line_tolerance": LINE_TOLERANCE,
         "totals": summarize(rows),
         "total_wall_s": round(time.monotonic() - t0, 1),
+        "timing": summarize_timing(rows),
+        "rows": rows,
+    }
+    if repeat > 1:
+        report["repeat_requested"] = repeat
+        report["repeat_agreement"] = summarize_repeat(rows)
+    try:
+        report["host_loadavg"] = list(os.getloadavg())  # at the end of the run; other jobs may share the host
+    except OSError:
+        pass
+    return report
+
+
+def _adversarial_diagnose(pid, debug_image, kind, corpus_dir):
+    from extractor.expert_diagnostic_engine import diagnose
+    from tests.support import adversarial_healthy as adv
+    return diagnose(pid, debug_image, corpus_dir=corpus_dir, **adv.diagnose_kwargs(kind)).to_dict()
+
+
+def run_adversarial(diagnose_fn: Callable = _adversarial_diagnose,
+                    programs: Optional[List[str]] = None) -> Dict[str, Any]:
+    """The "adversarial healthy" suite: healthy programs whose names / values look like faults
+    (tests/fixtures/adversarial_healthy), each diagnosed under every symptom kind.  Reported on its own: it is not
+    part of the scored 21 defect + 8 healthy targets.  A fault verdict or any finding is a false positive."""
+    from tests.support import adversarial_healthy as adv
+    t0 = time.monotonic()
+    tmp = tempfile.mkdtemp(prefix="diagacc_adv_")
+    rows: List[Dict[str, Any]] = []
+    try:
+        corpus = os.path.join(tmp, "corpus")
+        for name in programs or adv.programs():
+            try:
+                binary = adv.build(name, tmp)
+            except subprocess.CalledProcessError as e:
+                rows.append({"program": name, "kind": None, "error": f"build failed: {e.stderr[-300:]}"})
+                continue
+            for kind in adv.SYMPTOM_KINDS:
+                row: Dict[str, Any] = {"program": name, "symptom_kind": kind}
+                proc = fixture_popen([binary], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                     stderr=subprocess.DEVNULL, max_lifetime_s=READY_TIMEOUT_S + DIAGNOSE_TIMEOUT_S + 60,
+                                     name="adv_" + name)
+                try:
+                    proc.stdout.readline()
+                    time.sleep(0.3)
+                    t1 = time.monotonic()
+                    res = diagnose_fn(proc.pid, binary, kind, corpus)
+                    row["diagnose_s"] = round(time.monotonic() - t1, 2)
+                    row["verdict"] = res.get("verdict")
+                    row["violations"] = adv.violations(res)
+                    row["false_positive"] = bool(row["violations"])
+                except Exception as e:  # noqa: BLE001 - one failing run is an error row, not a crashed suite
+                    row["error"] = f"{type(e).__name__}: {e}"[:300]
+                finally:
+                    _kill(proc)
+                rows.append(row)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    ok_rows = [r for r in rows if "error" not in r]
+    return {
+        "programs": sorted({r["program"] for r in rows}),
+        "runs": len(ok_rows),
+        "false_positives": sum(1 for r in ok_rows if r["false_positive"]),
+        "fault_verdicts": sum(1 for r in ok_rows if r.get("verdict") in adv.FAULT_VERDICTS),
+        "errors": len(rows) - len(ok_rows),
+        "verdicts": {v: sum(1 for r in ok_rows if r.get("verdict") == v) for v in sorted({str(r.get("verdict")) for r in ok_rows})},
+        "wall_s": round(time.monotonic() - t0, 1),
         "rows": rows,
     }
 
 
+def format_adversarial(adv_report: Dict[str, Any]) -> str:
+    lines = ["", f"adversarial healthy suite (separate; not in the totals above): {len(adv_report['programs'])} programs, "
+                 f"{adv_report['runs']} runs, false positives {adv_report['false_positives']} "
+                 f"(fault verdicts {adv_report['fault_verdicts']}), errors {adv_report['errors']}; verdicts "
+                 + ", ".join(f"{k} {n}" for k, n in adv_report["verdicts"].items())]
+    for r in adv_report["rows"]:
+        if r.get("false_positive") or r.get("error"):
+            lines.append(f"  {r['program']:24} {str(r.get('symptom_kind')):20} {str(r.get('verdict')):16} "
+                         f"{r.get('error') or '; '.join(r['violations'])}")
+    return "\n".join(lines)
+
+
 def format_table(report: Dict[str, Any]) -> str:
-    lines = [f"{'target':20} {'kind':15} {'origin':15} {'verdict':16} {'det':>3} {'names':>7} {'loc':>3}  categories"]
+    lines = [f"{'target':20} {'kind':15} {'origin':15} {'verdict':16} {'det':>3} {'names':>7} {'loc':>3} {'cand':>5}"
+             f"  categories"]
     def row_line(r):
         if r["kind"] == HEALTHY_KIND:
             det = "FP" if r.get("false_positive") else ("ok" if r.get("cleared") else "nc")
-            names = loc = "-"
+            names = loc = cand = "-"
         else:
             det = "yes" if r.get("detected") else "no"
             names = r.get("name_match", "none")
             loc = "yes" if r.get("location_match") else "no"
+            cand = (f"#{r['location_candidate_rank']}" if r.get("location_candidate_rank")
+                    else "WRONG" if r.get("location_candidate_wrong") else "-")
         extra = f"ERROR {r['error']}" if r.get("error") else ",".join(sorted(set(r["finding_categories"]))) or "-"
-        return f"{r['id']:20} {r['kind']:15} {r['origin']:15} {str(r['verdict']):16} {det:>3} {names:>7} {loc:>3}  {extra}"
+        return (f"{r['id']:20} {r['kind']:15} {r['origin']:15} {str(r['verdict']):16} {det:>3} {names:>7} {loc:>3}"
+                f" {cand:>5}  {extra}")
 
     lines.extend(row_line(r) for r in report["rows"] if r.get("scored", True))
     unscored_rows = [r for r in report["rows"] if not r.get("scored", True)]
@@ -422,6 +698,10 @@ def format_table(report: Dict[str, Any]) -> str:
     lines.append("")
     lines.append(f"scored defects: detected {o['detected']}/{o['defect_targets']}, cause names full {o['name_full']}"
                  f" partial {o['name_partial']}, location {o['location_match']}")
+    lines.append(f"static location candidates (not observed; not in 'location'): contain the true location "
+                 f"{o['location_candidate_hit']}/{o['defect_targets']}, at rank 1 {o['location_candidate_rank1']}; "
+                 f"shown {o['location_candidates_shown']}, wrong (shown, true location not among them) "
+                 f"{o['location_candidate_wrong']}")
     lines.append(f"healthy: cleared {o['cleared']}, not cleared {o['not_cleared']}, false positives "
                  f"{o['false_positives']} (of {o['healthy_targets']}), false clears {o['false_clears']} (of "
                  f"{o['defect_targets']} defects); errors {o['errors']}; "
@@ -441,6 +721,23 @@ def format_table(report: Dict[str, Any]) -> str:
         lines.extend(row_line(r) for r in unscored_rows)
         for r in unscored_rows:
             lines.append(f"  {r['id']}: {r.get('scored_reason', '')}")
+    tm = report.get("timing") or {}
+    if tm.get("diagnose_s"):
+        lines.append("")
+        lines.append(f"diagnose time per target (first run): mean {tm['diagnose_s']['mean']}s max {tm['diagnose_s']['max']}s; "
+                     f"slowest checks (mean/max s over {'all runs' if report.get('repeat_requested') else 'targets'}):")
+        for cid, c in list(tm["per_check"].items())[:5]:
+            lines.append(f"  {cid:28} {c['mean_s']:7.3f} {c['max_s']:7.3f}  n={c['n']}  {c['name']}")
+    ra = report.get("repeat_agreement")
+    if ra:
+        lines.append("")
+        lines.append(f"repeat-verdict agreement ({ra['runs_per_target']} runs/target): mean {ra['mean_agreement_rate']}, "
+                     f"pooled {ra['pooled_agreement_rate']}, fully agreeing {ra['fully_agreeing_targets']}/{ra['targets']} scored targets")
+        for tid, v in ra["per_target"].items():
+            dist = ", ".join(f"{k} {n}" for k, n in sorted(v["distribution"].items(), key=lambda kv: -kv[1]))
+            lines.append(f"  {tid:20} {v['agreement_rate']:5}  {dist}{'' if v['scored'] else '  (unscored)'}")
+    if report.get("host_loadavg"):
+        lines.append("host loadavg at end of run: " + " ".join(f"{x:.2f}" for x in report["host_loadavg"]))
     lines.append(f"total wall time {report['total_wall_s']}s")
     return "\n".join(lines)
 
@@ -451,9 +748,17 @@ def main(argv: Optional[List[str]] = None) -> int:
     ap.add_argument("--output", help="results JSON path (default results/<date>-<arch>-<commit>.json)")
     ap.add_argument("--symptom", choices=("ground_truth", "generic"), default="ground_truth",
                     help="symptom text: the ground-truth file's (default) or 'general health check' for every target")
+    ap.add_argument("--repeat", type=int, default=1, metavar="N",
+                    help="diagnose each target N times (default 1 = off) and report verdict agreement")
+    ap.add_argument("--suite", choices=tuple(SUITES), default="main",
+                    help="target set: the main benchmark (default) or the held-out validation suite, reported "
+                         "separately (results file suffix -heldout)")
     ap.add_argument("--list", action="store_true", help="list targets and exit")
+    ap.add_argument("--adversarial", choices=("on", "off", "only"), default="on",
+                    help="the separately reported adversarial-healthy suite (tests/fixtures/adversarial_healthy): "
+                         "on (default, after the targets), off, or only")
     args = ap.parse_args(argv)
-    targets = load_ground_truth()
+    targets = load_ground_truth(SUITES[args.suite])
     if args.list:
         for gt in targets:
             print(f"{gt['id']:20} {gt['kind']:15} {gt['origin']:15} {gt['naming']:8} {gt['source']}")
@@ -465,16 +770,31 @@ def main(argv: Optional[List[str]] = None) -> int:
             print(f"unknown target(s): {bad}", file=sys.stderr)
             return 2
         targets = [g for g in targets if g["id"] in args.only]
-    report = run_all(targets, symptom_mode=args.symptom)
+    if args.adversarial == "only":
+        adv_report = run_adversarial()
+        out = args.output or os.path.join(RESULTS_DIR, f"{datetime.date.today().isoformat()}-adversarial.json")
+        with open(out, "w", encoding="utf-8") as fh:
+            json.dump(adv_report, fh, indent=2)
+            fh.write("\n")
+        print(format_adversarial(adv_report))
+        print(f"results written to {out}")
+        return 0
+    report = run_all(targets, symptom_mode=args.symptom, repeat=max(1, args.repeat), suite=args.suite)
+    if args.adversarial == "on" and not args.only:
+        report["adversarial_healthy"] = run_adversarial()
     env = report["environment"]
     out = args.output or os.path.join(
         RESULTS_DIR, f"{datetime.date.today().isoformat()}-{env['arch']}-{env['commit'][:7]}"
-        f"{'' if args.symptom == 'ground_truth' else '-generic-symptom'}.json")
+        f"{'' if args.suite == 'main' else '-' + args.suite}"
+        f"{'' if args.symptom == 'ground_truth' else '-generic-symptom'}"
+        f"{'' if args.repeat <= 1 else '-repeat%d' % args.repeat}.json")
     os.makedirs(os.path.dirname(os.path.abspath(out)), exist_ok=True)
     with open(out, "w", encoding="utf-8") as fh:
         json.dump(report, fh, indent=2)
         fh.write("\n")
     print(format_table(report))
+    if report.get("adversarial_healthy"):
+        print(format_adversarial(report["adversarial_healthy"]))
     print(f"results written to {out}")
     sys.stdout.flush()
     if any(r.get("error", "").endswith("(hang)") for r in report["rows"]):

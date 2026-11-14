@@ -1,0 +1,38 @@
+{
+  "id": "self_deadlock_state",
+  "origin": "new",
+  "naming": "neutral",
+  "kind": "self_deadlock",
+  "source": "benchmarks/diagnosis_accuracy/targets/self_deadlock_state.c",
+  "language": "c",
+  "symptom": "the process hangs",
+  "ready": {
+    "mode": "stdout_marker"
+  },
+  "causes": {
+    "variables": [],
+    "locks": [
+      "m_state"
+    ],
+    "threads": [
+      "refresher"
+    ],
+    "functions": [
+      "refresh",
+      "worker"
+    ]
+  },
+  "locations": [
+    {
+      "file": "benchmarks/diagnosis_accuracy/targets/self_deadlock_state.c",
+      "line": 9,
+      "text": "pthread_mutex_lock(&m_state)"
+    },
+    {
+      "file": "benchmarks/diagnosis_accuracy/targets/self_deadlock_state.c",
+      "line": 17,
+      "text": "pthread_mutex_lock(&m_state)"
+    }
+  ],
+  "notes": "a worker locks a normal mutex, then calls a helper that locks the same mutex again"
+}

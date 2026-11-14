@@ -1,0 +1,32 @@
+{
+  "id": "mapgrow_pool",
+  "origin": "new",
+  "naming": "neutral",
+  "kind": "mapping_growth",
+  "source": "benchmarks/diagnosis_accuracy/targets/mapgrow_pool.c",
+  "language": "c",
+  "symptom": "memory usage of this process keeps growing",
+  "ready": {
+    "mode": "stdout_marker"
+  },
+  "causes": {
+    "variables": [
+      "store"
+    ],
+    "locks": [],
+    "threads": [
+      "filler"
+    ],
+    "functions": [
+      "refill"
+    ]
+  },
+  "locations": [
+    {
+      "file": "benchmarks/diagnosis_accuracy/targets/mapgrow_pool.c",
+      "line": 26,
+      "text": "mmap(NULL, REGION"
+    }
+  ],
+  "notes": "custom region pool: a 1 MiB mmap'ed region every 150 ms chained from a static pool struct (store.head), never returned; malloc heap flat"
+}

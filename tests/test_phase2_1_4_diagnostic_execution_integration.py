@@ -91,6 +91,8 @@ from extractor.expert_diagnostic_engine import (
     STATE_INCONCLUSIVE,
 )
 from extractor.target_adapter import TargetExecutionAdapter, LocalTargetAdapter
+from tests.support.fixture_process import fixture_popen
+from tests.support.tmpdirs import temp_dir
 
 
 # =============================================================================
@@ -658,8 +660,9 @@ class TestIntegrationParity(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.fixture_src = "/tmp/phase214_test_fixture.cpp"
-        cls.fixture_bin = "/tmp/phase214_test_fixture.elf"
+        _work = temp_dir(cls, "phase214_")
+        cls.fixture_src = os.path.join(_work, "phase214_test_fixture.cpp")
+        cls.fixture_bin = os.path.join(_work, "phase214_test_fixture.elf")
         cpp_code = """
         #include <iostream>
         #include <vector>
@@ -700,7 +703,7 @@ class TestIntegrationParity(unittest.TestCase):
 
     def test_case_af_process_tests_using_fixture(self):
         """Test AF: Live target process assessment using companion ELF fixture."""
-        proc = subprocess.Popen([self.fixture_bin])
+        proc = fixture_popen([self.fixture_bin])
         try:
             assessor = TargetAssessor()
             result = assessor.assess(pid=proc.pid, companion_elf=self.fixture_bin)

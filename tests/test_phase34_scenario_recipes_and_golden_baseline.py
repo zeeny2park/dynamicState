@@ -23,6 +23,7 @@ from extractor.agent_runtime import AgentRuntime
 from extractor.watch_session import WatchSessionManager
 from extractor.web.server import WebApiAdapter
 import scripts.mcp_server as mcp_srv
+from tests.support.fixture_process import fixture_popen
 
 
 class TestPhase34ScenarioRecipesAndGoldenBaseline(unittest.TestCase):
@@ -66,7 +67,7 @@ class TestPhase34ScenarioRecipesAndGoldenBaseline(unittest.TestCase):
                         pass
 
     def _start_target(self, bin_path: str) -> subprocess.Popen:
-        p = subprocess.Popen(
+        p = fixture_popen(
             [bin_path],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
@@ -211,28 +212,6 @@ class TestPhase34ScenarioRecipesAndGoldenBaseline(unittest.TestCase):
         # g_session.worker.state.counter and g_heap_state->counter stay fixed without MUTATE command
         self.assertIn("g_session.worker.state.counter", stuck_names)
         self.assertIn("g_heap_state->counter", stuck_names)
-
-    def test_04_phase3_web_ui_elements_and_routes(self):
-        """Verify Phase 3 UI elements exist in index.html."""
-        html_path = os.path.join(PROJECT_ROOT, "extractor", "web", "static", "index.html")
-        with open(html_path, "r", encoding="utf-8") as f:
-            html = f.read()
-        for el_id in (
-            "te-smart-watch-chips-card",
-            "te-smart-watch-chips",
-            "scenario-recipes-launchpad",
-            "btn-recipe-instant-xray",
-            "btn-recipe-before-after",
-            "btn-recipe-auto-watch",
-            "scenario-recipe-output",
-            "card-golden-baseline",
-            "input-golden-baseline-label",
-            "btn-save-golden-baseline",
-            "select-golden-baseline",
-            "btn-compare-golden-baseline",
-            "golden-baseline-diff-output",
-        ):
-            self.assertIn(f'id="{el_id}"', html, f"Missing Phase 3 UI element #{el_id}")
 
 
 if __name__ == "__main__":

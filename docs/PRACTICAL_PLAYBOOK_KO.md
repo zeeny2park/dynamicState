@@ -64,12 +64,10 @@
    ```bash
    ./bin/dynamic-state-ui --host 0.0.0.0 --port 8080
    ```
-2. **Step 1 (Target 연결 및 레시피 실행)**:
-   - `Matching Companion Nostrip / Debug ELF`에 호스트의 디버그 바이너리 경로를 입력합니다.
-   - 원격 임베디드 장비라면 `🌐 Remote Embedded Target (SSH)` 드로어를 열어 장비 IP, 계정, `Process Name`을 입력하고 `Find` → `🔍 Validate Target`을 클릭합니다.
-   - 검증 완료 후 나타나는 **💡 Smart Recommended Symbols** 칩을 클릭하거나, **🩺 Quick Diagnostic Recipes**의 3가지 버튼(`Instant X-Ray`, `500ms State Diff`, `Auto-Watch`) 중 하나를 눌러 즉시 결과를 확인합니다.
-3. **Tab 4 (Golden Baseline & 시계열 비교)**:
-   - 정상 동작 중일 때 `📌 Save Golden Baseline`을 눌러 기준점을 저장하고, 문제 발생 시 `⚖️ Compare vs Golden`으로 변질된 구조체 필드를 즉시 찾아냅니다.
+   - 접속 주소: `http://<호스트>:8080/` 가 진단 화면입니다. PID 또는 프로세스 이름(원격이면 SSH 정보도)을 넣고
+     **진단**을 누르면 검사가 끝나는 대로 화면이 채워지고, 끝나면 그 화면이 보고서입니다(HTML · Markdown · JSON 내려받기).
+   - 이전 8탭 화면(`/legacy/`)과 채팅 워크스페이스(`/legacy/workspace`)는 제거되었고, 옛 주소는 `/` 로 옮겨 갑니다.
+     레시피 · Golden Baseline · 시계열 비교는 CLI(위 2장의 `dynamic-state recipe`)와 MCP 도구로 씁니다.
 
 ---
 
@@ -85,3 +83,34 @@ MCP 서버(`scripts/mcp_server.py`)가 연결된 코딩 에이전트(Claude Code
 
 > **프롬프트 예시 3 (코드 수정 전후 라이브 메모리 검증)**:
 > "방금 분석한 `g_session.worker.state`와 `g_heap_state->counter` 경로를 `runtime_eval_memory_path`로 읽어서 현재 메모리 값이 무엇인지 보여주고, 내가 이벤트를 발생시키는 동안 `runtime_capture_and_diff(wait_ms=2000)`로 상태 전이가 정상적으로 일어나는지 검증해 줘."
+
+---
+
+## 5. MCP를 쓸 수 없는 에이전트: 스킬 설치와 사용
+
+`diagnose-process` 스킬([skills/diagnose-process/SKILL.md](../skills/diagnose-process/SKILL.md))은 에이전트가 따르는 진단 절차입니다(언제 진단하는지, 사용자에게 무엇을 물어야 하는지, 판정을 어떻게 읽는지, `INCONCLUSIVE`와 `HEALTHY`가 무슨 뜻인지, 어떤 후속 도구를 쓰는지, 어떻게 정직하게 보고하는지). 파일은 하나이고 호출 방식만 둘입니다. 각 단계에 `[mcp]` 줄(도구 호출)과 `[cli]` 줄(셸 명령)이 짝으로 들어 있고, `tests/test_skill_transports.py`가 둘이 어긋나거나 없는 도구·명령·옵션을 가리키면 실패합니다.
+
+- **MCP를 쓸 수 있으면** MCP 서버를 연결하세요(위 4장). 서버가 스킬의 `[mcp]` 부분을 지침으로 보내 주므로 별도 설치가 필요 없습니다.
+- **MCP를 쓸 수 없거나 설정할 수 없지만 셸이 있으면** 스킬을 설치하세요. 에이전트가 `dynamic-state` 명령을 실행하고 JSON 결과를 읽습니다. 스킬에는 도구가 설치되어 있는지 확인하는 방법과, 없을 때의 설치 방법도 들어 있습니다.
+
+1. **도구 설치**: `README.md`의 Install 절(`python3 -m pip install .`). 에이전트의 `PATH`에 `dynamic-state`가 있어야 하고, 심볼 수준 진단에는 `readelf`(binutils)가 필요합니다. 대상 프로세스를 읽으려면 같은 사용자이거나 `CAP_SYS_PTRACE`가 있고 `kernel.yama.ptrace_scope`가 허용해야 합니다. 그렇지 않으면 결과는 `not_covered`에 `target_unreadable`이 있는 `INCONCLUSIVE`이며, "정상"이라고 하지 않습니다.
+2. **스킬 설치**: 스킬은 설치된 패키지에 들어 있으므로 명령 하나로 복사됩니다.
+
+   ```bash
+   dynamic-state skill install            # ~/.claude/skills/diagnose-process/  (모든 프로젝트)
+   dynamic-state skill install --project  # ./.claude/skills/diagnose-process/  (이 프로젝트만)
+   dynamic-state skill install --dir DIR  # DIR/diagnose-process/               (임의의 스킬 디렉터리)
+   ```
+
+   이미 있으면 `--force` 없이는 덮어쓰지 않습니다. 설치 없이 체크아웃만 있으면 `cp -r skills/diagnose-process ~/.claude/skills/`도 같습니다.
+   - **Claude Code**는 `~/.claude/skills/<이름>/SKILL.md`(개인)와 `.claude/skills/<이름>/SKILL.md`(프로젝트)에서 스킬을 읽습니다. 위 명령이 그 위치에 씁니다. 새 세션에서 "PID 1234 진단해줘"라고 요청하세요.
+   - **그 밖의 에이전트**(Codex CLI, Gemini CLI, Cursor, Copilot, 셸 도구가 있는 채팅 모델 등)는 공통된 스킬 디렉터리가 없습니다. 공통으로 통하는 방법은 스킬 본문을 그 에이전트가 상시 지침으로 읽는 파일에 넣거나 대화 처음에 붙여 넣는 것입니다. `dynamic-state skill show`가 frontmatter 없이 명령줄용 본문을 출력합니다(`dynamic-state skill show >> AGENTS.md`). `AGENTS.md`는 Codex CLI 등이 읽고, Gemini CLI는 `GEMINI.md`, GitHub Copilot은 `.github/copilot-instructions.md`를 읽습니다. 그 외 에이전트는 해당 에이전트의 규칙/시스템 프롬프트 파일을 쓰세요(현재 파일 이름과 위치는 그 에이전트 문서로 확인). 에이전트에게 셸 명령 실행 권한이 있어야 합니다.
+3. **에이전트가 실행하는 명령** (교착 데모 대상):
+
+   ```bash
+   dynamic-state find-process deadlock_demo
+   dynamic-state diagnose -p $PID --corpus /tmp/ds-example/corpus --json > /tmp/ds-example/result.json
+   dynamic-state export-report -p $PID -d /proc/$PID/exe --corpus /tmp/ds-example/corpus -o report.md --report-html report.html --report-json report.json
+   ```
+
+   `result.json`의 `verdict`가 `CONFIRMED_FAULT`이고 `findings[0].subjects`에 `ingest`, `m_out`, `flush`, `m_in`, `deadlock_pipeline.c:15` 같은 이름이 나오며, `collection_impact.zero_stop`은 `true`입니다. 단계별 MCP 도구와 명령의 대응표는 `README.md`의 "Agents without MCP: the skill" 절에 있습니다.

@@ -4,11 +4,11 @@ Verifies that:
 1. All MCP tools (`scripts/mcp_server.py`) catch every exception, reject reserved/invalid PIDs
    (`pid=1`, `pid=0`, `pid=-1936537`, `pid=True`), coerce string/list/JSON parameters gracefully,
    and guard against writing reports to protected system paths (`/etc`, `/proc`, etc.).
-2. All Web Service endpoints (`extractor/web/server.py`) safely handle malformed JSON, non-object
-   JSON payloads (`[...]`, `"str"`), invalid numeric strings (`ssh_port="abc"`, `wait_ms="xyz"`),
-   reserved/negative PIDs, and per-card partial failures in `/api/workspace/chat`.
-3. The Workspace Web UI (`extractor/web/workspace_static/index.html`) includes `AbortController`
-   request timeouts, non-JSON error handling, and live-polling re-entrancy/circuit-breaker guards.
+2. The web server (`extractor/web/server.py`) safely handles malformed JSON and non-object JSON payloads, and the
+   WebApiAdapter functions behind the removed workspace routes handle invalid numeric strings (`ssh_port="abc"`),
+   reserved/negative PIDs, and per-card partial failures in the workspace chat (called directly: the chat workspace
+   UI and its `/api/workspace/chat`, `/api/watch/*` routes were removed and are 404).
+3. Session token, Origin/Host and Content-Type guards on the kept routes; the root UI receives the session token.
 """
 
 import http.client
@@ -23,6 +23,7 @@ import unittest
 from extractor.agent_runtime import AgentRuntime
 from extractor.web.server import run_server
 import scripts.mcp_server as mcp_srv
+from tests.support.fixture_process import fixture_popen
 
 
 TARGET_C_SRC = r"""
@@ -84,7 +85,7 @@ class TestPhase52WebAndMcpDefensiveHardening(unittest.TestCase):
             ["gcc", "-g", "-O0", cls.src_path, "-o", cls.bin_path],
             check=True,
         )
-        cls.target_proc = subprocess.Popen(
+        cls.target_proc = fixture_popen(
             [cls.bin_path],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
@@ -196,30 +197,26 @@ class TestPhase52WebAndMcpDefensiveHardening(unittest.TestCase):
     def test_03_web_api_handles_malformed_json_and_adversarial_params(self) -> None:
         """Verifies Web API returns structured JSON errors on invalid JSON, non-dict bodies, and bad parameters."""
         # 1. Malformed JSON syntax
-        st, body, _ = self._http_post_raw("/api/workspace/chat", b"{not valid json")
+        st, body, _ = self._http_post_raw("/api/diagnose", b"{not valid json")
         self.assertEqual(st, 400)
         self.assertFalse(body["success"])
         self.assertEqual(body["error"]["code"], "BAD_REQUEST")
 
         # 2. Non-object JSON payload (e.g. JSON array or string)
         for non_obj in (b"[1, 2, 3]", b'"just_a_string"', b"12345"):
-            st, body, _ = self._http_post_raw("/api/workspace/chat", non_obj)
+            st, body, _ = self._http_post_raw("/api/diagnose", non_obj)
             self.assertEqual(st, 400)
             self.assertFalse(body["success"])
             self.assertEqual(body["error"]["code"], "BAD_REQUEST")
 
-        # 3. Reserved/negative PIDs rejected cleanly
+        # 3. Reserved/negative PIDs rejected cleanly (WebApiAdapter.scan_memory_pool_api; its route is gone)
+        adapter = self.server.adapter
         for bad_pid in (1, -1936537, True):
-            st, body, _ = self._http_post_raw(
-                "/api/watch/scan-pool",
-                json.dumps({"pid": bad_pid, "companion_elf": self.bin_path, "base_expression": "*gpMem"}).encode("utf-8"),
-            )
+            body = adapter.scan_memory_pool_api({"pid": bad_pid, "companion_elf": self.bin_path, "base_expression": "*gpMem"})
             self.assertFalse(body["success"])
 
-        # 4. Non-numeric parameter strings coerced safely to defaults without ValueError
-        st, body, _ = self._http_post_raw(
-            "/api/watch/smart-compact",
-            json.dumps({
+        # 4. Non-numeric parameter strings coerced safely to defaults without ValueError (smart_compact_query_api)
+        body = adapter.smart_compact_query_api({
                 "pid": self.target_proc.pid,
                 "companion_elf": self.bin_path,
                 "query": "*gpMem",
@@ -227,45 +224,36 @@ class TestPhase52WebAndMcpDefensiveHardening(unittest.TestCase):
                 "cursor_offset": "invalid_offset",
                 "page_size": "-999",
                 "ssh_port": "invalid_port",
-            }).encode("utf-8"),
-        )
-        self.assertEqual(st, 200)
+        })
         self.assertTrue(body["success"])
         self.assertEqual(body["data"]["pid"], self.target_proc.pid)
+        for path in ("/api/workspace/chat", "/api/watch/scan-pool", "/api/watch/smart-compact"):
+            self.assertEqual(self._http_post_raw(path, b"{}")[0], 404, path)
 
-    def test_04_workspace_chat_isolates_per_card_errors_and_serves_hardened_ui(self) -> None:
-        """Verifies /api/workspace/chat isolates per-card failures and /workspace serves hardened JS."""
-        st, body, _ = self._http_post_raw(
-            "/api/workspace/chat",
-            json.dumps({
-                "pid": self.target_proc.pid,
-                "companion_elf": self.bin_path,
-                "message": "존재하지 않는 *gpNonExistentPool 메모리 풀 맵과 콜스택을 함께 보여주세요",
-            }).encode("utf-8"),
-        )
-        self.assertEqual(st, 200)
+    def test_04_workspace_chat_isolates_per_card_errors(self) -> None:
+        """Verifies the workspace chat (WebApiAdapter.workspace_chat_api) isolates per-card failures."""
+        adapter = self.server.adapter
+        body = adapter.workspace_chat_api({
+            "pid": self.target_proc.pid,
+            "companion_elf": self.bin_path,
+            "message": "존재하지 않는 *gpNonExistentPool 메모리 풀 맵과 콜스택을 함께 보여주세요",
+        })
         self.assertTrue(body["success"])
         cards = body["data"]["trace_cards"]
         self.assertGreaterEqual(len(cards), 1)
 
-        # Verify /api/watch/callstack-locks alias works
-        st2, body2, _ = self._http_post_raw(
-            "/api/watch/callstack-locks",
-            json.dumps({"pid": self.target_proc.pid, "companion_elf": self.bin_path}).encode("utf-8"),
-        )
-        self.assertEqual(st2, 200)
+        # The thread call stacks / lock owners (formerly /api/watch/callstack-locks) still answer when called directly
+        body2 = adapter.inspect_thread_callstacks_api({"pid": self.target_proc.pid, "companion_elf": self.bin_path})
         self.assertTrue(body2["success"])
 
-        # Verify /workspace HTML includes AbortController and _refreshInFlight guards
+        # The removed chat workspace page now redirects to the root UI (relative Location: works behind a path prefix)
         conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=10)
-        conn.request("GET", "/workspace")
+        conn.request("GET", "/legacy/workspace")
         resp = conn.getresponse()
-        html_text = resp.read().decode("utf-8")
+        resp.read()
         conn.close()
-        self.assertEqual(resp.status, 200)
-        self.assertIn("new AbortController()", html_text)
-        self.assertIn("_refreshInFlight", html_text)
-
+        self.assertEqual(resp.status, 301)
+        self.assertEqual(resp.getheader("Location"), "../")
 
     def test_05_imp019_default_runtime_is_low_impact_and_rejects_mutations(self) -> None:
         """IMP-019: Runtime started without options defaults to LOW_IMPACT and rejects all mutation/checkpoint actions."""
@@ -299,9 +287,9 @@ class TestPhase52WebAndMcpDefensiveHardening(unittest.TestCase):
         self.assertIn(resp.status, (401, 403))
         self.assertFalse(body["success"])
 
-        # 2. Wrong token on POST /api/workspace/chat -> 401
+        # 2. Wrong token on POST /api/diagnose -> 401
         st_bad, body_bad, _ = self._http_post_raw(
-            "/api/workspace/chat",
+            "/api/diagnose",
             b"{}",
             headers={"X-Session-Token": "wrong_forged_token"},
             include_token=False,
@@ -322,7 +310,7 @@ class TestPhase52WebAndMcpDefensiveHardening(unittest.TestCase):
         """IMP-019: Cross-origin requests never receive wildcard CORS, bad Host is rejected, and POST requires JSON Content-Type."""
         # 1. Cross-origin request must be rejected (403) and must NOT have Access-Control-Allow-Origin: *
         st_orig, body_orig, hdrs_orig = self._http_post_raw(
-            "/api/workspace/chat",
+            "/api/diagnose",
             b"{}",
             headers={"Origin": "https://evil.example.com"},
         )
@@ -332,7 +320,7 @@ class TestPhase52WebAndMcpDefensiveHardening(unittest.TestCase):
 
         # 2. OPTIONS preflight from external origin must NOT return wildcard CORS
         conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=10)
-        conn.request("OPTIONS", "/api/workspace/chat", headers={"Origin": "https://evil.example.com"})
+        conn.request("OPTIONS", "/api/diagnose", headers={"Origin": "https://evil.example.com"})
         resp_opt = conn.getresponse()
         resp_opt.read()
         opt_hdrs = {k.lower(): v for k, v in resp_opt.getheaders()}
@@ -342,7 +330,7 @@ class TestPhase52WebAndMcpDefensiveHardening(unittest.TestCase):
 
         # 3. Untrusted Host header (DNS rebinding defense) -> 403
         st_host, body_host, _ = self._http_post_raw(
-            "/api/workspace/chat",
+            "/api/diagnose",
             b"{}",
             headers={"Host": "rebind.attacker.com"},
         )
@@ -351,7 +339,7 @@ class TestPhase52WebAndMcpDefensiveHardening(unittest.TestCase):
 
         # 4. POST without application/json Content-Type -> 415
         st_ct, body_ct, _ = self._http_post_raw(
-            "/api/workspace/chat",
+            "/api/diagnose",
             b"pid=1234",
             headers={"Content-Type": "text/plain"},
         )
@@ -359,9 +347,9 @@ class TestPhase52WebAndMcpDefensiveHardening(unittest.TestCase):
         self.assertFalse(body_ct["success"])
 
     def test_08_imp019_ui_receives_token_and_authorize_target_is_not_auto_enabled(self) -> None:
-        """IMP-019: Existing UI receives session token via HTML/Cookie and works, and authorize_target is not auto-enabled by PID."""
+        """IMP-019: The UI receives session token via HTML/Cookie and works, and authorize_target is not auto-enabled by PID."""
         conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=10)
-        conn.request("GET", "/workspace")
+        conn.request("GET", "/")
         resp = conn.getresponse()
         html_text = resp.read().decode("utf-8")
         set_cookie = resp.getheader("Set-Cookie") or ""
@@ -380,11 +368,9 @@ class TestPhase52WebAndMcpDefensiveHardening(unittest.TestCase):
         self.assertEqual(body2["status"], "ok")
 
         # Providing pid without authorize_target=True must NOT auto-authorize live target capture
-        st_inv, body_inv, _ = self._http_post_raw(
-            "/api/investigation/start",
-            json.dumps({"goal": "Test unauth PID", "pid": self.target_proc.pid}).encode("utf-8"),
-        )
-        self.assertEqual(st_inv, 200)
+        # (WebApiAdapter.start_investigation; its /api/investigation/start route was removed and is 404)
+        body_inv = self.server.adapter.start_investigation({"goal": "Test unauth PID", "pid": self.target_proc.pid})
+        self.assertEqual(self._http_post_raw("/api/investigation/start", b"{}")[0], 404)
         self.assertEqual(body_inv["data"]["status"], "BLOCKED")
         self.assertFalse(body_inv["data"]["safety"]["target_authorized"])
 

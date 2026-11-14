@@ -1,0 +1,42 @@
+{
+  "id": "ho_detached_sessions",
+  "suite": "heldout",
+  "origin": "new",
+  "naming": "neutral",
+  "kind": "thread_growth",
+  "source": "benchmarks/diagnosis_accuracy/heldout/targets/ho_detached_sessions.cpp",
+  "sources": [
+    "benchmarks/diagnosis_accuracy/heldout/targets/ho_detached_sessions.cpp"
+  ],
+  "language": "c++",
+  "build": {
+    "compiler": "g++",
+    "opt": "-O2",
+    "flags": [
+      "-std=c++17"
+    ]
+  },
+  "style": "C++ detached std::thread per client, condition variable wait, -O2",
+  "symptom": "the number of threads of this process keeps increasing",
+  "ready": {
+    "mode": "stdout_marker"
+  },
+  "causes": {
+    "variables": [],
+    "locks": [],
+    "threads": [
+      "session"
+    ],
+    "functions": [
+      "serve"
+    ]
+  },
+  "locations": [
+    {
+      "file": "benchmarks/diagnosis_accuracy/heldout/targets/ho_detached_sessions.cpp",
+      "line": 28,
+      "text": "std::thread(serve, c).detach();"
+    }
+  ],
+  "notes": "one never-ending session thread per accepted client"
+}

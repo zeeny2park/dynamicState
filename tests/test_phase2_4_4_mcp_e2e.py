@@ -28,6 +28,7 @@ import sys
 import tempfile
 import unittest
 from typing import Any, Dict, Optional
+from tests.support.fixture_process import fixture_popen
 
 PYTHONPATH = os.path.join(os.path.dirname(__file__), "..")
 if PYTHONPATH not in sys.path:
@@ -67,7 +68,7 @@ class TestPhase244McpE2EAdaptiveInvestigation(unittest.IsolatedAsyncioTestCase):
             [cc, "-g", "-O0", "-no-pie", "-o", self.bin_file, src_path],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         )
-        self.proc = subprocess.Popen(
+        self.proc = fixture_popen(
             [self.bin_file],
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,

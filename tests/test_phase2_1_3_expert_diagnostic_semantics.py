@@ -200,6 +200,8 @@ class TestPhase213DiagnosticSemantics(unittest.TestCase):
         # Container growing monotonically
         context["container_delta"] = 50_000
         context["monotonic_growth"] = True
+        # a count that grows is accumulation only with memory growing in the same window
+        context["heap_growth_bytes"] = 8 * 1024 * 1024
         res_accum = self.registry.evaluate_recipe("RECIPE_LONG_LIVED_OBJECT_ACCUMULATION", context)
         self.assertEqual(res_accum.status, RECIPE_STATUS_SUPPORTED)
 
@@ -220,6 +222,7 @@ class TestPhase213DiagnosticSemantics(unittest.TestCase):
             "incompatible_counters": False,
             "alloc_count": 5000,
             "free_count": 1000,
+            "alloc_delta": 4000, "free_delta": 100,  # static ratio is not a leak: the gap grew over the window
             "counter1_unit": "chunks",
             "counter2_unit": "chunks",
         }

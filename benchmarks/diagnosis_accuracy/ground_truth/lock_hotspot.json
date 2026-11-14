@@ -1,0 +1,35 @@
+{
+  "id": "lock_hotspot",
+  "origin": "new",
+  "naming": "neutral",
+  "kind": "lock_contention",
+  "scored": false,
+  "scored_reason": "Not scored: lock contention is a degradation, not a defect. The expected answer is a LOCK_CONTENTION finding with a non-fault verdict (DEGRADED). A HEALTHY verdict is not a dangerous miss here (nothing is stuck or broken), so the defect scoring (HEALTHY = false clear) and the healthy-control scoring (any finding = false positive) both misdescribe it. The check is planned only for a concurrency/slowness symptom; any verdict is reported informationally.",
+  "source": "benchmarks/diagnosis_accuracy/targets/lock_hotspot.c",
+  "language": "c",
+  "symptom": "requests are slow, is something wrong with locking?",
+  "ready": {
+    "mode": "stdout_marker"
+  },
+  "causes": {
+    "variables": [],
+    "locks": [
+      "conn_mu"
+    ],
+    "threads": [
+      "handler"
+    ],
+    "functions": [
+      "handler",
+      "spin_ms"
+    ]
+  },
+  "locations": [
+    {
+      "file": "benchmarks/diagnosis_accuracy/targets/lock_hotspot.c",
+      "line": 28,
+      "text": "pthread_mutex_lock(&conn_mu)"
+    }
+  ],
+  "notes": "four handlers hold conn_mu for 3 ms per request and sleep 200 us between requests: the lock is nearly always held with about three waiters"
+}

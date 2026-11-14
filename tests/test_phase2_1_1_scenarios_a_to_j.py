@@ -34,6 +34,8 @@ from extractor.expert_diagnostic_engine import (
     ExpertDiagnosticEngine,
     TargetAssessor,
 )
+from tests.support.fixture_process import fixture_popen
+from tests.support.tmpdirs import temp_dir
 
 
 class TestPhase211ScenariosAToJ(unittest.TestCase):
@@ -46,7 +48,7 @@ class TestPhase211ScenariosAToJ(unittest.TestCase):
         ensure_expert_diagnostic_fixture()
 
     def setUp(self):
-        self.engine = ExpertDiagnosticEngine(corpus_dir="/tmp/phase2_1_1_scenarios_corpus")
+        self.engine = ExpertDiagnosticEngine(corpus_dir=temp_dir(self, "corpus_"))
         self.procs = []
 
     def tearDown(self):
@@ -62,7 +64,7 @@ class TestPhase211ScenariosAToJ(unittest.TestCase):
 
     def _spawn_target(self, mode: str, use_debug: bool = True) -> subprocess.Popen:
         elf = self.debug_elf if use_debug else self.stripped_elf
-        p = subprocess.Popen([elf, mode], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        p = fixture_popen([elf, mode], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         self.procs.append(p)
         time.sleep(0.12)
         return p
@@ -153,10 +155,12 @@ class TestPhase211ScenariosAToJ(unittest.TestCase):
 
         self.assertEqual(session.state, STATE_COMPLETED)
         self.assertIsNotNone(conclusion)
-        trans = [c for c in session.checks if c.recipe_id == "RECIPE_STATE_TRANSITION_VIOLATIONS"]
-        self.assertTrue(trans)
-        self.assertNotEqual(trans[0].status, "FAIL")  # no confirmed transition violation from a value alone
-        self.assertTrue(any("g_worker_state" in str(c.actual_observations.get("variable_name") or "") for c in trans))
+        # The transition check needs a state machine from the caller (declared capability), so zero-stop plans
+        # leave it out instead of running a check that can only end INCONCLUSIVE; a value alone confirms nothing.
+        self.assertFalse([c for c in session.checks if c.recipe_id == "RECIPE_STATE_TRANSITION_VIOLATIONS"])
+        self.assertNotIn("RECIPE_STATE_TRANSITION_VIOLATIONS", [s.recipe_id for s in session.plan.steps])
+        self.assertFalse([c for c in session.checks if c.status == "FAIL"
+                          and c.recipe_id in ("RECIPE_STATE_TRANSITION_VIOLATIONS", "RECIPE_UNEXPECTED_VARIABLE_CHANGES")])
 
     def test_scenario_f_related_field_inconsistency(self):
         """Scenario F: Buffer length > capacity invariant violation confirmed."""

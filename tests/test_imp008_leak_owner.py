@@ -35,6 +35,7 @@ from extractor.leak_attribution import (
     _NormPaths,
     judge,
 )
+from tests.support.fixture_process import fixture_popen
 
 FIXTURES = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures", "real_runtime")
 READY_TIMEOUT_S = 60.0
@@ -70,7 +71,7 @@ class TestImp008LeakOwner(unittest.TestCase):
 
     def _launch(self, src: str):
         binary = self._binary(src)
-        proc = subprocess.Popen([binary], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL)
+        proc = fixture_popen([binary], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL)
         self.addCleanup(self._kill, proc)
         gt = {}
         buf = b""

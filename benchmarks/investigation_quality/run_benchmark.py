@@ -72,6 +72,7 @@ from extractor.investigation import (
     InvestigationSession,
 )
 from extractor.llm_provider import LLMProviderConfig, LLMProviderManager
+from tests.support.fixture_process import fixture_popen
 
 
 def _readline_with_timeout(stream, timeout_sec: float = 5.0) -> str:
@@ -173,7 +174,7 @@ class RealRuntimeExecutionHarness:
         bin_hash = compute_file_sha256(bin_path)
 
         try:
-            proc = subprocess.Popen(
+            proc = fixture_popen(
                 [bin_path],
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,

@@ -37,6 +37,53 @@ from ..target_adapter import TargetExecutionAdapter
 # ------------------------------------------------------------------------------------------
 # IMP-011: CFI unwinding helpers shared by the call-stack and frame-locals inspectors
 # ------------------------------------------------------------------------------------------
+_LOCK_TOKEN_RE = re.compile(r"[A-Z]+(?=[A-Z][a-z])|[A-Z]?[a-z]+|[A-Z]+|[0-9]+")
+_LOCK_TYPE_TOKENS = frozenset({"mutex", "lock", "rwlock", "spinlock", "sem"})
+
+
+def _lock_tokens(text: str) -> Set[str]:
+    """Whole-word tokens of a type or variable name: "clock_t" / "block_hdr" are not locks, "pthread_mutex_t" is."""
+    return {t.lower() for t in _LOCK_TOKEN_RE.findall(text or "")}
+
+
+_GLIBC_MUTEX_TYPEDEFS = frozenset({"pthread_mutex_t", "__gthread_mutex_t", "__gthread_recursive_mutex_t"})
+
+
+def glibc_mutex_layout(idx: Any, type_offset: Optional[int], depth: int = 0) -> bool:
+    """Does an object of this DWARF type start with a glibc ``pthread_mutex_t`` (so that its first words are the
+    mutex lock word, count and owner tid)?  True for ``pthread_mutex_t`` itself (any typedef chain reaching it, or the
+    ``struct __pthread_mutex_s``) and for a struct / class / union whose base class or member at offset 0 does,
+    recursively: ``std::mutex`` / ``std::recursive_mutex`` / ``std::timed_mutex`` wrap one at offset 0.  sem_t,
+    pthread_rwlock_t, pthread_spinlock_t, clock_t or a custom struct are not read with that layout."""
+    if type_offset is None or depth > 6 or idx is None:
+        return False
+    types = getattr(idx, "types_by_die", {}) or {}
+    off, seen = type_offset, set()
+    while off in types and off not in seen:
+        seen.add(off)
+        t = types[off]
+        if t.name in _GLIBC_MUTEX_TYPEDEFS:
+            return True
+        if t.tag in ("DW_TAG_typedef", "DW_TAG_const_type", "DW_TAG_volatile_type", "DW_TAG_atomic_type") \
+                and t.target_type_offset is not None:
+            off = t.target_type_offset
+            continue
+        break
+    t = idx.resolve_canonical_type(type_offset)
+    if t is None:
+        return False
+    if t.name == "__pthread_mutex_s":
+        return True
+    if t.tag in ("DW_TAG_structure_type", "DW_TAG_class_type", "DW_TAG_union_type"):
+        for b in getattr(t, "base_classes", []) or []:
+            if int(b.offset or 0) == 0 and glibc_mutex_layout(idx, b.type_offset, depth + 1):
+                return True
+        for m in getattr(t, "members", []) or []:
+            if int(m.offset or 0) == 0 and glibc_mutex_layout(idx, m.type_offset, depth + 1):
+                return True
+    return False
+
+
 def _imp011_prepare_unwinder(
     target_adapter: TargetExecutionAdapter, pid: int, target_abi: TargetABI,
     map_data: Dict[str, Any], endian: str,
@@ -155,6 +202,37 @@ def _apply_exact_source_line(resolved: Dict[str, Any], idx: "DwarfIndex", lookup
         out["inlined_chain"] = [{k: c[k] for k in ("function", "file", "line")} for c in chain]
         out["inlined_function"] = chain[0]["function"]
         out["inlined_into"] = chain[1]["function"]
+    return out
+
+
+LINE_BASIS_NOT_OBSERVED = "NOT_OBSERVED_RUNNING_THREAD_STACK_SAMPLE"
+_NOT_OBSERVED_NOTE = ("the thread was running on a CPU and no program counter of it can be read without stopping it "
+                      "(/proc reports no PC/SP and the syscall record says 'running'); this address is a return "
+                      "address found by scanning its stack and may be stale, so its line is not where the thread "
+                      "is executing")
+
+
+def _unobserved_line_frame(fr: Dict[str, Any]) -> Dict[str, Any]:
+    """A frame of a thread whose PC was not observed (running thread: stack sample / scan).  Its address is a
+    return address read from the stack, possibly left there by an earlier call, not an observed PC, so its
+    line-table line is neither exact nor "where the thread executes".  The function stays (it is what the
+    estimated unwind names, labelled ``estimated``); the location falls back to the function's definition line
+    (as for any frame without an exact line) and the scanned line is kept apart as ``sampled_source_location``."""
+    if not fr.get("source_line_exact"):
+        return fr
+    out = dict(fr)
+    out["sampled_source_location"] = fr.get("source_location")
+    out["sampled_source_line"] = fr.get("source_line")
+    if "source_line_text" in out:
+        out["sampled_source_line_text"] = out.pop("source_line_text")
+    for k in ("inlined_chain", "inlined_function", "inlined_into"):
+        if k in out:
+            out["sampled_" + k] = out.pop(k)
+    out["source_location"] = fr.get("function_decl_location")
+    out["source_line"] = fr.get("function_decl_line")
+    out["source_line_exact"] = False
+    out["source_line_basis"] = LINE_BASIS_NOT_OBSERVED
+    out["source_line_note"] = _NOT_OBSERVED_NOTE
     return out
 
 
@@ -339,8 +417,9 @@ def inspect_thread_callstacks_and_locks(
             tl = t_name.lower()
             is_explicit = bool(lock_expressions and var.name in lock_expressions)
             # IMP-018: a lock is selected by its TYPE; the name is used only when the type name is unknown
-            is_lock_like = any(k in tl for k in ("mutex", "lock", "rwlock", "spinlock", "sem_t")) or (
-                not tl.strip() and any(k in nl for k in ("mutex", "lock", "rwlock", "spinlock")))
+            # whole tokens, not substrings: a clock_t / struct block_hdr is not a lock
+            is_lock_like = bool(_lock_tokens(t_name) & _LOCK_TYPE_TOKENS) or (
+                not tl.strip() and bool(_lock_tokens(var.name) & (_LOCK_TYPE_TOKENS - {"sem"})))
             if (is_explicit or is_lock_like) and var.name not in seen_lock_names:
                 seen_lock_names.add(var.name)
                 rt_addr = (m_bias + var.link_time_address) if m_dyn else var.link_time_address
@@ -358,7 +437,31 @@ def inspect_thread_callstacks_and_locks(
     if not all_threads:
         limitations.append(f"Process thread list (/proc/{pid}/task) could not be read.")
 
+    not_interpreted: List[str] = []
     for l_name, l_addr, l_size, l_toff, l_idx in candidate_locks:
+        layout = glibc_mutex_layout(l_idx, l_toff)
+        if not layout:
+            # A lock-like type without the glibc pthread_mutex_t layout (sem_t, rwlock, spinlock, a custom struct)
+            # is reported but not interpreted: its words are not a mutex lock word / owner tid, and futex waits on
+            # it are not attributed to it.
+            locks_report.append({
+                "name": l_name,
+                "runtime_address": f"0x{l_addr:x}",
+                "runtime_address_int": l_addr,
+                "type_name": l_idx.get_type_name(l_toff),
+                "glibc_mutex_layout": False,
+                "is_locked": None,
+                "lock_state_word": None,
+                "recursion_count": None,
+                "owner_tid": None,
+                "owner_thread_name": None,
+                "owner_status": "NOT_INTERPRETED",
+                "owner_status_reason": "type has no glibc pthread_mutex_t layout (sem_t / rwlock / custom lock)",
+                "waiting_tids": [],
+                "inferred_waiting_tids": [],
+            })
+            not_interpreted.append(l_name)
+            continue
         if not owner_support.supported:
             # IMP-015: the glibc pthread_mutex_t owner layout is not valid (or not verifiable) for this
             # target -> report the lock without any owner / locked-state interpretation.
@@ -367,6 +470,7 @@ def inspect_thread_callstacks_and_locks(
                 "runtime_address": f"0x{l_addr:x}",
                 "runtime_address_int": l_addr,
                 "type_name": l_idx.get_type_name(l_toff),
+                "glibc_mutex_layout": True,
                 "is_locked": None,
                 "lock_state_word": None,
                 "recursion_count": None,
@@ -375,6 +479,7 @@ def inspect_thread_callstacks_and_locks(
                 "owner_status": owner_support.status,
                 "owner_status_reason": owner_support.message,
                 "waiting_tids": [],
+                "inferred_waiting_tids": [],
             }
             locks_report.append(l_info)
             locks_by_addr[l_addr] = l_info
@@ -389,21 +494,8 @@ def inspect_thread_callstacks_and_locks(
         i_fmt = "<iii" if endian == "little" else ">iii"
         lock_word, count_word, owner_tid = struct.unpack(i_fmt, raw_lock[:12])
 
-        # Also check custom struct members if DWARF has explicit owner_tid / locked fields
-        canon_l = l_idx.resolve_canonical_type(l_toff)
-        if canon_l and canon_l.tag in ("DW_TAG_structure_type", "DW_TAG_class_type"):
-            for m in canon_l.members:
-                if not m.name:
-                    continue
-                mnl = m.name.lower()
-                if ("owner" in mnl or "tid" in mnl) and m.offset + 4 <= len(raw_lock):
-                    custom_tid = struct.unpack("<i" if endian == "little" else ">i", raw_lock[m.offset:m.offset + 4])[0]
-                    if custom_tid > 0:
-                        owner_tid = custom_tid
-                elif ("lock" in mnl or "held" in mnl) and m.offset + 4 <= len(raw_lock):
-                    custom_lk = struct.unpack("<i" if endian == "little" else ">i", raw_lock[m.offset:m.offset + 4])[0]
-                    if custom_lk != 0:
-                        lock_word = custom_lk
+        # The words are those of the pthread_mutex_t at offset 0 (glibc_mutex_layout).  Members of an enclosing
+        # struct named like "owner" / "tid" / "lock" / "held" are application data, never the lock word or owner.
 
         is_locked = (lock_word != 0) or (owner_tid > 0)
         owner_thread_name = threads_by_tid[owner_tid]["name"] if owner_tid in threads_by_tid else ("DEAD_OR_EXTERNAL_THREAD" if owner_tid > 0 else None)
@@ -412,6 +504,7 @@ def inspect_thread_callstacks_and_locks(
             "runtime_address": f"0x{l_addr:x}",
             "runtime_address_int": l_addr,
             "type_name": l_idx.get_type_name(l_toff),
+            "glibc_mutex_layout": True,
             "is_locked": is_locked,
             "lock_state_word": lock_word,
             "recursion_count": count_word,
@@ -419,6 +512,7 @@ def inspect_thread_callstacks_and_locks(
             "owner_thread_name": owner_thread_name,
             "owner_status": owner_support.status,
             "waiting_tids": [],
+            "inferred_waiting_tids": [],
         }
         locks_report.append(l_info)
         locks_by_addr[l_addr] = l_info
@@ -448,6 +542,9 @@ def inspect_thread_callstacks_and_locks(
             sc_info = dict(t.get("syscall") or {"state": "unavailable"})   # adapter-provided (IMP-011 part 3)
         else:
             sc_info = mgr._imp011_read_syscall(pid, t_tid)
+        # Is the precise source unusable?  Only then may the stack-scan fallback below run.
+        syscall_record_unusable = (sc_info.get("state") not in ("blocked", "running", "not_in_syscall")
+                                   or (sc_info.get("state") == "blocked" and not sc_info.get("args")))
         if sc_info.get("state") == "blocked":
             syscall_nr = int(sc_info["nr"])
             # IMP-015: number -> name via the table of the TARGET architecture; None when unsupported/undetected
@@ -541,7 +638,8 @@ def inspect_thread_callstacks_and_locks(
             if cfi_res is not None:
                 frames = _cfi_callstack_frames(cfi_res)
             # The raw stack read is still needed by the scan fallback and by the mutex-pointer fallback below.
-            need_raw = cfi_res is None or (waiting_on_lock is None and bool(locks_by_addr) and t_state in ("S", "D"))
+            need_raw = cfi_res is None or (waiting_on_lock is None and syscall_record_unusable and bool(locks_by_addr)
+                                           and t_state in ("S", "D"))
             if scan_len >= ptr_size and need_raw:
                 try:
                     raw_stack, sst, s_err = target_adapter.read_memory(pid, scan_from, scan_len)
@@ -595,9 +693,15 @@ def inspect_thread_callstacks_and_locks(
                                     "estimated": True,
                                 })
 
-                    # Fallback when /proc/<pid>/task/<tid>/syscall is unavailable:
+                    # Fallback ONLY when the syscall record of this thread could not be read (unavailable, remote adapter
+                    # without it, or a blocked record without arguments).  A readable record is authoritative: "blocked"
+                    # names the futex address the thread waits on, "running" / "not in syscall" say it is not waiting in
+                    # the kernel at all (the stack of such a thread still holds stale &mutex values from earlier calls;
+                    # measured on lock_hotspot / lock_convoy: every stack-only "waiter" was a thread whose record said
+                    # "running").  Waiters found here are inferred and marked so (``inferred`` / ``confidence``) and are
+                    # kept out of ``waiting_tids`` (which the lock-contention and lock-fault judgements count).
                     # Scan active stack frames (from innermost SP upward) for pointers into locked pthread_mutex_t objects
-                    if waiting_on_lock is None and locks_by_addr and t_state in ("S", "D"):
+                    if waiting_on_lock is None and syscall_record_unusable and locks_by_addr and t_state in ("S", "D"):
                         matched_lock_info = None
                         for w_i in range(num_words):
                             cand_val = struct.unpack_from(ptr_fmt, raw_stack, w_i * ptr_size)[0]
@@ -625,9 +729,11 @@ def inspect_thread_callstacks_and_locks(
                                 "held_by_tid": matched_lock_info["owner_tid"],
                                 "held_by_thread_name": matched_lock_info["owner_thread_name"],
                                 "resolved_via": "STACK_MUTEX_POINTER_SCAN",
+                                "inferred": True,
+                                "confidence": "LOW",
                             }
-                            if t_tid not in matched_lock_info["waiting_tids"]:
-                                matched_lock_info["waiting_tids"].append(t_tid)
+                            if t_tid not in matched_lock_info["inferred_waiting_tids"]:
+                                matched_lock_info["inferred_waiting_tids"].append(t_tid)
                             if matched_lock_info["owner_tid"] and matched_lock_info["owner_tid"] != t_tid:
                                 wait_for_edges.append({
                                     "waiter_tid": t_tid,
@@ -636,12 +742,20 @@ def inspect_thread_callstacks_and_locks(
                                     "lock_address": matched_lock_info["runtime_address"],
                                     "owner_tid": matched_lock_info["owner_tid"],
                                     "owner_name": matched_lock_info["owner_thread_name"],
+                                    "inferred": True,
                                 })
+
+        # No kernel-reported PC (a thread running on a CPU): every frame came from a stack sample / scan, so no
+        # frame line is an observed position (see _unobserved_line_frame).
+        pc_observed = pc_int > 0
+        if not pc_observed and (sc_info.get("state") == "running" or t_state == "R"):
+            frames = [_unobserved_line_frame(f) if f.get("estimated") else f for f in frames]
 
         thread_reports.append({
             "tid": t_tid,
             "name": t_name,
             "state": t_state,
+            "pc_observed": pc_observed,
             "syscall": syscall_name,
             "syscall_nr": syscall_nr,
             "syscall_status": syscall_support.status,
@@ -722,6 +836,7 @@ def inspect_thread_callstacks_and_locks(
         "threads_inspected": len(thread_reports),
         "threads": thread_reports,
         "locks_inspected": len(locks_report),
+        "locks_not_interpreted": not_interpreted,
         "locks": locks_report,
         "wait_for_edges": wait_for_edges,
         "deadlock_detected": len(deadlock_cycles) > 0,
@@ -828,7 +943,13 @@ def inspect_thread_locals_and_frame_vars(
         target_adapter, pid, target_abi, map_data, endian
     )
     try:
-        main_exe_real = os.path.realpath(f"/proc/{pid}/exe")
+        if target_adapter.is_remote():
+            # a pid on the remote side must never be resolved in the local /proc: the main image is the one the
+            # unwinder's remote image provider names
+            _rp = getattr(getattr(unwinder, "remote_image_provider", None), "main_remote_path", None)
+            main_exe_real = os.path.realpath(_rp) if _rp else None
+        else:
+            main_exe_real = os.path.realpath(f"/proc/{pid}/exe")
     except Exception:
         main_exe_real = None
     sp_dw = {"x86_64": 7, "aarch64": 31}.get(target_abi.architecture or "")

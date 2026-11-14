@@ -22,8 +22,10 @@ cleanup() {
     if [[ -n "${TARGET_PID}" ]] && kill -0 "${TARGET_PID}" 2>/dev/null; then
         kill -9 "${TARGET_PID}" 2>/dev/null || true
     fi
+    stop_fixture_runner
     rm -rf "${TMP_DIR}"
 }
+. "${ROOT_DIR}/tests/support/fixture_process.sh"
 trap cleanup EXIT
 
 echo "=== Phase 5.2 Production-Grade Low-Impact Observation Hardening Integration Test ==="
@@ -55,8 +57,8 @@ echo "int main() { return 42; }" | gcc -g -x c - -o "${TMP_DIR}/mismatch.debug"
 
 # Step 3: Launch target process in background
 echo "[3/10] Launching stripped target process..."
-"${TMP_DIR}/target_app_stripped" 10 > "${TMP_DIR}/app.log" 2>&1 &
-TARGET_PID=$!
+start_fixture "${TMP_DIR}/app.log" "${TMP_DIR}/target_app_stripped" 10
+TARGET_PID="${FIXTURE_PID}"
 
 for i in {1..30}; do
     if grep -q "READY: PID=" "${TMP_DIR}/app.log" 2>/dev/null; then
@@ -215,7 +217,7 @@ PY
 echo "[10/10] Verifying process exit resilience and CLI runtime-info..."
 # Terminate the target process
 kill -9 "${TARGET_PID}" 2>/dev/null || true
-wait "${TARGET_PID}" 2>/dev/null || true
+wait "${FIXTURE_RUNNER_PID}" 2>/dev/null || true
 
 # Test capturing already exited process
 EXIT_SNAP_DIR="${TMP_DIR}/snap_exited"

@@ -16,9 +16,10 @@ Covers:
    - Availability status truthful distinctions (BINARY_AVAILABLE vs DETERMINISTIC_RULES vs UNAVAILABLE).
    - No silent fallback when an explicit provider is requested: raises ProviderUnavailableError / ProviderExecutionError.
    - Explicit fallback preserves truthful audit trail (invoked_provider, execution_status, fallback_reason).
-4. End-to-End Browser/API Integration:
-   - POST /api/investigation/chat with mock executable.
-   - POST /api/investigation/chat/cancel terminates child process cleanly.
+4. End-to-End adapter integration (WebApiAdapter.analyze_investigation_chat / cancel_investigation_chat; their HTTP
+   routes /api/investigation/chat and /api/investigation/chat/cancel were removed with the previous web UI: 404):
+   - chat with mock executable.
+   - cancel terminates child process cleanly.
 """
 
 import json
@@ -61,6 +62,7 @@ from extractor.llm_provider import (
 )
 from extractor.web.server import run_server
 from tests.fake_cli_tools import fake_cli_environment
+from tests.support.fixture_process import fixture_popen
 
 
 class TestCLISecurityDefaults(unittest.TestCase):
@@ -256,7 +258,7 @@ class TestCancellationAndProcessRegistry(unittest.TestCase):
         req_id = "test_cancel_req_001"
 
         script = "import time; time.sleep(10)"
-        proc = subprocess.Popen([sys.executable, "-c", script], start_new_session=True)
+        proc = fixture_popen([sys.executable, "-c", script], start_new_session=True)
         prov.register_process(req_id, proc)
 
         self.assertIsNone(proc.poll(), "Process should be running")
@@ -274,7 +276,7 @@ class TestCancellationAndProcessRegistry(unittest.TestCase):
         prov = mgr.get_provider("cli")
         req_id = "mgr_cancel_req_002"
 
-        proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(10)"], start_new_session=True)
+        proc = fixture_popen([sys.executable, "-c", "import time; time.sleep(10)"], start_new_session=True)
         prov.register_process(req_id, proc)
 
         res = mgr.cancel_request(req_id)
@@ -406,7 +408,7 @@ class TestTruthfulProviderReporting(unittest.TestCase):
 
 
 class TestEndToEndWebAPIAndCancellation(unittest.TestCase):
-    """Test full HTTP API routes: chat execution, status check, and cancellation."""
+    """WebApiAdapter chat execution and cancellation (the HTTP routes are gone: 404)."""
 
     @classmethod
     def setUpClass(cls):
@@ -436,12 +438,12 @@ class TestEndToEndWebAPIAndCancellation(unittest.TestCase):
             return json.loads(err.read().decode("utf-8"))
 
     def test_post_chat_truthful_failure_on_unavailable_provider(self):
-        """POST /api/investigation/chat returns error when an unavailable provider is explicitly requested."""
+        """analyze_investigation_chat returns error when an unavailable provider is explicitly requested."""
         inv_res = self.runtime.start_investigation(goal="E2E test")
         inv_id = inv_res.data["investigation_id"]
 
         with patch.object(GeminiCLIProvider, "resolve_binary", return_value=None):
-            res = self._post("/api/investigation/chat", {
+            res = self.server.adapter.analyze_investigation_chat({
                 "investigation_id": inv_id,
                 "message": "Analyze system state",
                 "provider_override": "gemini",
@@ -453,14 +455,16 @@ class TestEndToEndWebAPIAndCancellation(unittest.TestCase):
             self.assertIn("was not found on PATH", res["error"]["message"])
 
     def test_post_chat_cancel_endpoint(self):
-        """POST /api/investigation/chat/cancel successfully accepts cancellation."""
+        """cancel_investigation_chat successfully accepts cancellation."""
         req_id = "test_e2e_cancel_001"
-        res = self._post("/api/investigation/chat/cancel", {"request_id": req_id})
+        res = self.server.adapter.cancel_investigation_chat({"request_id": req_id})
         self.assertTrue(res["success"])
         self.assertEqual(res["data"]["request_id"], req_id)
+        for path in ("/api/investigation/chat", "/api/investigation/chat/cancel"):
+            self.assertEqual(self._post(path, {"request_id": req_id})["error"]["code"], "NOT_FOUND", path)
 
     def test_post_chat_success_with_mock_cli(self):
-        """POST /api/investigation/chat succeeds end-to-end with a controlled mock CLI."""
+        """analyze_investigation_chat succeeds end-to-end with a controlled mock CLI."""
         inv_res = self.runtime.start_investigation(goal="Mock CLI test")
         inv_id = inv_res.data["investigation_id"]
 
@@ -496,7 +500,7 @@ class TestEndToEndWebAPIAndCancellation(unittest.TestCase):
         with patch.object(GeminiCLIProvider, "check_health", return_value=mock_health):
             with patch.object(GeminiCLIProvider, "resolve_binary", return_value="/mock/bin/agy"):
                 with patch.object(GeminiCLIProvider, "chat_completion", return_value=mock_out):
-                    res = self._post("/api/investigation/chat", {
+                    res = self.server.adapter.analyze_investigation_chat({
                         "investigation_id": inv_id,
                         "message": "Explain the change",
                         "provider_override": "gemini",

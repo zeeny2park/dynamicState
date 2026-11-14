@@ -28,6 +28,7 @@ from unittest import mock
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import scripts.mcp_server as mcp_srv
+from tests.support.fixture_process import fixture_popen
 
 
 DIAGNOSTIC_FIXTURE_C = r"""#define _GNU_SOURCE
@@ -375,7 +376,7 @@ class TestMcpRuntimeDiagnostics(unittest.TestCase):
 
     def setUp(self) -> None:
         # Launch a fresh, disposable process per test method to eliminate inter-test state leakage
-        self.proc = subprocess.Popen([self.bin_path])
+        self.proc = fixture_popen([self.bin_path])
         # Register structured cleanup immediately so cleanup runs on any setUp failure path
         self.addCleanup(self._cleanup_target_and_context)
 
@@ -1130,7 +1131,7 @@ class TestMcpRuntimeDiagnostics(unittest.TestCase):
         - Simultaneous failures in tearDownClass preserve both error details.
         """
         # 1. Verify cleanup escalation on failure paths: process ignoring SIGTERM is killed via SIGKILL
-        dummy_stubborn = subprocess.Popen([
+        dummy_stubborn = fixture_popen([
             "python3", "-c", "import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(10)"
         ])
         try:

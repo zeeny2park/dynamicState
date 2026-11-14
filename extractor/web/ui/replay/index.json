@@ -1,0 +1,46 @@
+[
+ {
+  "name": "deadlock",
+  "about": "confirmed fault with a picture",
+  "verdict": "CONFIRMED_FAULT",
+  "verdict_word": {
+   "ko": "확인된 결함",
+   "en": "confirmed fault"
+  },
+  "process_name": "deadlock_pipeli",
+  "pid": 17673
+ },
+ {
+  "name": "healthy",
+  "about": "healthy within the checked scope",
+  "verdict": "HEALTHY",
+  "verdict_word": {
+   "ko": "점검한 범위 안에서 정상",
+   "en": "healthy within the checked scope"
+  },
+  "process_name": "ok_idle_server",
+  "pid": 17424
+ },
+ {
+  "name": "inconclusive",
+  "about": "could not decide (budget ran out)",
+  "verdict": "INCONCLUSIVE",
+  "verdict_word": {
+   "ko": "판단 불가",
+   "en": "could not decide"
+  },
+  "process_name": "request_threads",
+  "pid": 3735613
+ },
+ {
+  "name": "degraded",
+  "about": "degraded, not a fault",
+  "verdict": "DEGRADED",
+  "verdict_word": {
+   "ko": "성능 저하 (결함 아님)",
+   "en": "degraded, not a fault"
+  },
+  "process_name": "lock_convoy",
+  "pid": 3736820
+ }
+]

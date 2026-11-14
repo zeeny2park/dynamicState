@@ -22,6 +22,7 @@ import unittest
 from extractor.agent_runtime import AgentRuntime
 from extractor.diagnostic_recipes import DiagnosticRecipeRegistry
 from scripts.mcp_server import runtime_run_diagnostic_recipe
+from tests.support.fixture_process import fixture_popen
 
 
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
@@ -76,7 +77,7 @@ class TestPhase23McpRecipeIntegration(unittest.TestCase):
                         pass
 
     def _start_target(self) -> subprocess.Popen:
-        p = subprocess.Popen(
+        p = fixture_popen(
             [self.stripped_bin],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,

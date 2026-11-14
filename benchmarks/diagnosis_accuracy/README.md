@@ -10,8 +10,43 @@ on real processes. It replaces self-declared completion: a low score is a valid 
     python3 benchmarks/diagnosis_accuracy/run_benchmark.py --only deadlock_pipeline spin_flag --output /tmp/r.json
     python3 benchmarks/diagnosis_accuracy/run_benchmark.py --symptom generic   # every target gets "general health check"
 
+    python3 benchmarks/diagnosis_accuracy/run_benchmark.py --repeat 20 --only spin_yield ok_sawtooth   # repeat-verdict agreement
+
 Needs gcc and permission to read same-user process memory. About 20 s on this host. Exit status is non-zero only if
 the runner crashes. Tests of the machinery (not of accuracy): `python3 -m unittest tests/test_diagnosis_accuracy_benchmark.py`.
+
+## Diagnosis time and repeat-verdict agreement (additive; scoring is unchanged)
+
+- Timing, always on. Per row: `diagnose_s` (wall time of the first `diagnose` call, as before) and `checks`, a list of
+  `{check_id, recipe_id, name, status, duration_s}` for every executed check, copied from the engine's own
+  `checks_run[].duration_s` (no engine change). Top level `timing`: `diagnose_s` {mean, max, n} and `per_check`
+  {check_id: {name, mean_s, max_s, n}} sorted slowest first; `host_loadavg` is `os.getloadavg()` at the end of the run.
+  Only the checks that ran for a target appear, so `n` differs per check; with `--symptom generic` only the always-run
+  default checks (17-18 per target; checks that need tracing, a stopped snapshot or a caller specification are not planned) appear, which is the cleanest view of their cost. Timings depend on host load:
+  results files made on a shared host say so in the commit/report, and `host_loadavg` is recorded for that purpose.
+- `--repeat N` (default 1 = off, normal run costs the same): the target is built and launched once and `diagnose` is
+  called N times against the same live process, one after another. The row is scored from the first run only. Rows then
+  carry `repeat` {runs, requested, distribution {verdict: count}, modal_verdict, agreement_rate (share of runs equal to
+  the most common verdict, ties to the first seen), diagnose_s [per run]} and `check_runs` (per-run check timings, used for
+  the per-check statistics); a run that errors counts as verdict `ERROR`, a hang ends the repetition. Top level
+  `repeat_agreement`: `mean_agreement_rate` (mean over scored targets), `pooled_agreement_rate` (modal runs / all runs),
+  `fully_agreeing_targets`, and `per_target` (unscored targets listed but not in the overall figures). The results file name
+  gets a `-repeatN` suffix. Agreement measures stability of the verdict only, not correctness. Repeated calls on one
+  process also exercise the engine against a process it has already been diagnosed on. Exception: targets whose kind is
+  `memory_leak`, `mapping_growth` or `thread_growth` get a fresh process for every repeat, so each repeat diagnoses the
+  target at the same age instead of at an ever larger state (one leak target would otherwise grow for minutes).
+  Cost: roughly N x the per-target diagnose time (3-15 s each), so 20 repeats of all 21 targets is about 30-60 min.
+
+## Containment (targets cannot outlive the benchmark or eat the host)
+
+Every target is started through `tests/support/fixture_process.py` (`fixture_popen`): `PR_SET_PDEATHSIG(SIGKILL)` plus its
+own process group, an external watchdog that kills the target tree when the benchmark dies (also on `SIGKILL`), when a
+hard lifetime (`READY_TIMEOUT_S` + the diagnose budget + 60 s) expires, or when its resident memory exceeds 1.5 GiB, and an
+`atexit`/SIGTERM/SIGINT sweep. A target killed by the watchdog is an error row (`target setup failed: fixture exceeded
+memory ceiling ...`), never a scored diagnosis. The old `RLIMIT_AS` limit is gone (thread-heavy targets legitimately map
+several GB of stacks, so no safe value is useful). The growing targets also cap themselves in their source
+(`FIXTURE_CAP` comments, after the point where any diagnosis window ends), so even a hand-started target is bounded.
+Rule and details: `docs/TEST_BASELINE.md`, section "Fixture process containment".
 
 ## Targets
 
@@ -19,22 +54,61 @@ the runner crashes. Tests of the machinery (not of accuracy): `python3 -m unitte
 Each record holds: defect kind or `none`, cause names (variables, locks, threads, functions), `file:line` of the defect,
 the symptom text, `origin` (`project_fixture`, `external_style`, `new`) and `naming` (`neutral`, `project`).
 New programs print `READY` once in the faulty steady state and stay alive; reused fixtures use a fixed settle time.
-Heap-corruption targets do the bad write once, then idle without calling malloc/free again.
+Heap-corruption targets do the bad write (or the second free) once, then idle without calling malloc/free again.
 
-11 scored defect targets (memory_leak 3, heap_overflow 2, use_after_free 2, deadlock 2, busy_wait 2), 2 unscored
-`long_stall` targets (`stall_pipe`, `stall_sleep`), 8 healthy controls, 3 `external_style` (small LRU cache, ring buffer, job queue written in a neutral style).
+21 scored defect targets (memory_leak 3, heap_overflow 2, use_after_free 2, double_free 2, deadlock 2, busy_wait 2,
+mapping_growth 2: `mapgrow_slabs` mmap()s without munmap, `mapgrow_pool` a custom region pool; orphan_lock 2,
+self_deadlock 2, thread_growth 2: `accept_workers`, `request_threads`), 6 unscored targets (`long_stall`: `stall_pipe`,
+`stall_sleep`; `heap_retention`: `frag_sparse`, `frag_worker`; `lock_contention`: `lock_convoy`, `lock_hotspot`), 8 healthy controls, 4 `external_style` (small LRU cache,
+ring buffer, job queue, message outbox written in a neutral style). The `double_free` targets leave states glibc's own
+checks let through: `dfree_outbox` a fastbin cycle (free a, free b, free a with the size's tcache full), `dfree_reqbuf`
+one block on the tcache and the unsorted bin (freed while the tcache was full, tcache drained, freed again). For
+`double_free` and `thread_growth` the `file:line` (the free / pthread_create calls) is not expected to match: which code
+made the call is not observable from memory.
+
+## Held-out suite (`--suite heldout`, reported separately)
+
+    python3 benchmarks/diagnosis_accuracy/run_benchmark.py --suite heldout     # writes results/<date>-<arch>-<commit>-heldout.json
+
+`heldout/ground_truth/*.json` + `heldout/targets/`: 21 defect programs written after the static location candidate
+heuristics (`extractor/static_location_candidates.py`) and deliberately in other styles than the main targets: C++
+(classes, `std::mutex` / `lock_guard`, `new` / `delete`, `std::vector` / `std::map`, `std::thread`, `std::atomic`),
+multi-file programs (`sources` lists every translation unit; a ground-truth location may lie in any of them),
+allocation / locking / thread creation through wrapper functions and function pointers, macros, and 11 of them built
+at `-O2` (`build`: `compiler`, `opt`, `flags`). Every scored defect kind is covered. Its own manifest directory: it is
+never loaded by the default run and never changes the main suite's totals. Growing targets cap themselves
+(`FIXTURE_CAP`), launches go through `fixture_popen` as for the main suite. Purpose: measure whether the candidates
+generalise. The first-run result (before any heuristic was changed for these programs) is committed unchanged.
+
+| held-out, 21 defects | first run (`c8509f1`, `...-c8509f1-heldout-first-run.json`) | after (`9e9e6c0`, `...-9e9e6c0-heldout.json`) |
+|---|---|---|
+| detected | 20 | 20 |
+| strict location | 6 | 5 (the running-thread line of `ho_ring_poll` was a stale stack-sample address) |
+| candidates shown | 6 | 18 |
+| contain the true location / at rank 1 | 5 / 4 | 18 / 16 |
+| wrong (shown, truth not among them) | 1 (`ho_session_table`) | 0 |
+
+The "after" column is no longer a held-out measurement: the rules were improved while looking at these programs
+(only where they failed for a general reason, see the commit messages). A new held-out set is needed to measure
+generalisation again. Engine-level misses found by the suite are listed in the commit that records these results.
 
 ## Scoring (per target, one `diagnose` call)
 
 - Unscored targets: a ground-truth record with `"scored": false` (and a mandatory `"scored_reason"`) is still built, run
   and printed, but under a separate "unscored (informational)" heading in the table and an `unscored` section in the
   results JSON (`totals.unscored`; rows carry `"scored": false`). It is excluded from every detection, cause-name,
-  location, per-kind/origin/naming, false-positive and error total and rate. Currently only the `long_stall` targets
-  (`stall_pipe`, `stall_sleep`) are unscored (owner decision): from outside, a thread blocked forever and an idle worker
+  location, per-kind/origin/naming, false-positive and error total and rate. The `heap_retention` targets
+  (`frag_sparse`, `frag_worker`) are unscored because fragmentation is a degradation, not a defect: the expected answer
+  is a `HEAP_RETENTION` finding with a DEGRADED (non-fault) verdict, a HEALTHY verdict on it is not a dangerous miss, and
+  neither the defect scoring (HEALTHY = false clear) nor the healthy-control scoring (any finding = false positive) can
+  express that. The `lock_contention` targets (`lock_convoy`, `lock_hotspot`) are unscored for the same reason: threads queued
+  on a mutex whose owner keeps running are slow, not broken, and the expected answer is a `LOCK_CONTENTION` finding with a
+  DEGRADED verdict. The healthy control `ok_contention` (short critical sections, `usleep` between turns) must stay
+  HEALTHY: it is scored as any healthy control. The `long_stall` targets (`stall_pipe`, `stall_sleep`) are unscored (owner decision): from outside, a thread blocked forever and an idle worker
   look identical, so the tool deliberately answers "long wait observed, cannot determine whether expected" rather than a
   fault, and counting that as a miss gave no actionable signal. A stall target is defective, so a fault-class verdict on it
   is not a false positive (false positives are defined for healthy controls only); the verdict is just reported.
-  `KIND_CATEGORIES` keeps `long_stall` only to label and describe those rows.
+  `KIND_CATEGORIES` keeps `long_stall`, `heap_retention` and `lock_contention` only to label and describe those rows.
 
 - False clear (defect): a scored defect target whose verdict is `HEALTHY` (the diagnoser told the user "nothing is
   wrong" about a real defect), the most dangerous miss. Counted as `false_clears` in the overall and per-kind totals,
@@ -49,8 +123,30 @@ Heap-corruption targets do the bad write once, then idle without calling malloc/
   `full` = all declared variables/locks/threads found (functions only if nothing else is declared); `partial` = some name
   of any class found. Per-class detail is in `names_by_class`.
 - Location: a `file:line` subject with the same file name and a line within +-3 of any listed ground-truth location.
+  Only subjects count (what the diagnosis observed and named); static candidates never do.
+- Location candidates (separate metric, roadmap stage 3): the matching findings' `location_candidates.candidates`
+  (statically derived from DWARF + source text, labelled "not observed", ranked, at most 3; see
+  `extractor/static_location_candidates.py`). Per row `location_candidate_rank` = best rank of a candidate within the
+  same +-3 lines of a ground-truth location (None if none), `location_candidate_hit`; totals
+  `location_candidate_hit` ("candidates contain the true location") and `location_candidate_rank1`. Printed on their
+  own line and as the table's `cand` column (`#rank`); they are never added to `location_match`.
+  `location_candidates_shown` (a matching finding carries at least one candidate) and `location_candidate_wrong`
+  (candidates shown, the true location not among them: a misleading list, worse than none; `WRONG` in the `cand`
+  column) are counted per row and in the totals.
 - Also recorded: verdict, categories, subjects, `not_covered` kinds, wall time, capture mode, measured stop time;
   `non_zero_stop` flags any non-zero-stop collection. A `diagnose` exception or hang becomes a row with `error`.
+
+## Adversarial healthy suite (separate; not in the totals)
+
+`tests/fixtures/adversarial_healthy/*.c|*.cpp`: healthy programs whose names and values look like faults (0xDEADBEEF
+as the valid magic, unrelated `alloc_*` / `free_*` statistics, `max_*` next to `*_len`, growing statistics in
+pointer+count structs, sentinel -1 / all-ones states, `clock_t` / `struct block_stats`, integers named like
+pointers). Each is diagnosed under every symptom kind (`None` = default check, crash_corruption, memory_growth,
+hang_deadlock, state_inconsistency, variable_anomaly). Any fault verdict (CONFIRMED/PROBABLE_FAULT, FAULT, DEGRADED)
+or any finding is a false positive. Reported after the table and as `adversarial_healthy` in the results JSON
+(`programs`, `runs`, `false_positives`, `fault_verdicts`, `verdicts`, `rows`); it never changes the scored 21 + 8
+numbers. `--adversarial on` (default; skipped with `--only`), `off`, or `only`. Cost: about 4 s per run, ~6 min.
+The same matrix is a unit test: `tests/test_adversarial_healthy.py`.
 
 ## Baseline (2026-11-12, aarch64, commit in file name)
 

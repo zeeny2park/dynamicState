@@ -61,6 +61,11 @@ class ThreadSamplingConfig:
     runaway_runnable_fraction: float = 0.90
     # A runnable thread that received (almost) no CPU is starved, not "monopolising": require a sliver of real CPU.
     runaway_min_cpu_share_when_runnable: float = 0.02
+    # ... unless the thread was demonstrably put on a CPU again and again (schedstat run count) and never blocked:
+    # a sched_yield() poller on a saturated machine runs for microseconds per turn and receives ~0.1% of a CPU, yet
+    # every turn it chose to stay runnable. That is direct evidence of a busy wait; the CPU-share floor would turn it
+    # into HEALTHY exactly when the machine is loaded. A thread starved on the run queue has no such turns.
+    runaway_min_dispatches_per_sec_when_starved: float = 10.0
     # Fallback only (schedstat absent or all zero): the old absolute rule, which a contended machine can defeat.
     runaway_cpu_share: float = 0.50
     # A spinner can still take a stray voluntary switch (page-fault lock, start-up tail). Requiring exactly zero
@@ -239,11 +244,18 @@ def _walk_members(idx: Any, type_offset: Optional[int], prefix: str, base_off: i
         return
     if canon.tag not in ("DW_TAG_structure_type", "DW_TAG_class_type"):
         return
+    from .inspection.threads import glibc_mutex_layout
     for m in canon.members:
         if not m.name:
             continue
-        mname = idx.get_type_name(m.type_offset)
-        if _is_mutex_type_name(mname):
+        # the layout decides (pthread_mutex_t, or std::mutex & co. wrapping one at offset 0), not a type name
+        # ending in "mutex" (a custom spin "my_mutex" struct has no glibc word layout)
+        mc = idx.resolve_canonical_type(m.type_offset)
+        # the mutex itself (pthread_mutex_t, or a one-member wrapper such as std::mutex), not a user struct that
+        # merely starts with one: recurse into that to name the member
+        wrapper_only = (idx.get_type_name(m.type_offset) in ("pthread_mutex_t", "__gthread_mutex_t")
+                        or mc is None or len([x for x in (getattr(mc, "members", None) or []) if x.name]) <= 1)
+        if glibc_mutex_layout(idx, m.type_offset) and wrapper_only:
             out.append((f"{prefix}.{m.name}", base_off + int(m.offset or 0)))
         else:
             _walk_members(idx, m.type_offset, f"{prefix}.{m.name}", base_off + int(m.offset or 0), depth + 1, out)
@@ -400,6 +412,7 @@ def augment_lock_info(
                 "runtime_address": f"0x{addr:x}",
                 "runtime_address_int": addr,
                 "type_name": "pthread_mutex_t",
+                "glibc_mutex_layout": True,     # a validated member layout or a validated futex word
                 "discovered_via": source,
                 "waiting_tids": [],
             }
@@ -668,6 +681,9 @@ def _top_frame(thread_report: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         "inlined_into": f.get("inlined_into"),
         "estimated": bool(f.get("estimated")),
         "unwind": f.get("unwind"),
+        # the line was not observed (running thread, stack-sample frame): `source_location` is the definition line
+        "location_observed": f.get("source_line_basis") != "NOT_OBSERVED_RUNNING_THREAD_STACK_SAMPLE",
+        "sampled_source_location": f.get("sampled_source_location"),
     }
 
 
@@ -761,6 +777,7 @@ class ThreadSampler:
                 continue
             threads: Dict[int, Dict[str, Any]] = {int(r["tid"]): r for r in recs}
             info = None
+            lock_digest: Optional[List[Dict[str, Any]]] = None
             if inspect_fn is not None:
                 try:
                     info = inspect_fn()
@@ -778,6 +795,7 @@ class ThreadSampler:
                     if series.abi is None and info.get("target_abi"):
                         series.abi = TargetABI.from_dict(info["target_abi"])
                     series.lock_series.add_sample(i, info)
+                    lock_digest = _lock_digest(info)
                     by_tid = {int(t["tid"]): t for t in info.get("threads", []) if t.get("tid") is not None}
                     for tid, rec in threads.items():
                         tr = by_tid.get(tid)
@@ -793,7 +811,7 @@ class ThreadSampler:
                     self.budget_tracker.record_sample()
                 except Exception:  # noqa: BLE001
                     pass
-            series.samples.append({"index": i, "t": t_now, "threads": threads})
+            series.samples.append({"index": i, "t": t_now, "threads": threads, "locks": lock_digest})
         if series.abi is None:
             try:
                 series.abi = detect_target_abi(self.adapter, pid)
@@ -866,6 +884,7 @@ def derive(series: ThreadSeries) -> Dict[str, Any]:
         d["schedstat_available"] = bool(usable)
         d["runnable_fraction"] = None
         d["runnable_cpu_received"] = None
+        d["cpu_dispatches"] = None
         if usable:
             (ta, a), (tb, b) = ss_pts[0], ss_pts[-1]
             span_ns = max(1.0, (tb - ta) * 1e9)
@@ -873,6 +892,9 @@ def derive(series: ThreadSeries) -> Dict[str, Any]:
             if dr >= 0 and dw >= 0 and tb > ta:
                 d["runnable_fraction"] = round(min(1.0, (dr + dw) / span_ns), 3)
                 d["runnable_cpu_received"] = round(min(1.0, dr / span_ns), 3)
+                # times the thread was put on a CPU in the window (schedstat third field, pcount)
+                if isinstance(a.get("timeslices"), int) and isinstance(b.get("timeslices"), int):
+                    d["cpu_dispatches"] = max(0, b["timeslices"] - a["timeslices"])
             else:
                 d["schedstat_available"] = False
         vols = [r.get("voluntary_ctxt_switches") for r in recs]
@@ -900,9 +922,18 @@ def derive(series: ThreadSeries) -> Dict[str, Any]:
         d["top_frames"] = frames
         known = [f for f in frames if f]
         d["top_function"] = known[-1] if known else None
-        d["top_source_location"] = next(((r.get("top_frame") or {}).get("source_location") for r in reversed(recs)
-                                         if (r.get("top_frame") or {}).get("function")), None)
         _tf = next(((r.get("top_frame") or {}) for r in reversed(recs) if (r.get("top_frame") or {}).get("function")), {})
+        # `top_source_location` is where the thread was observed.  For a running thread no PC is readable without
+        # stopping it; its frames come from a stack sample whose return addresses can be stale, so it has no
+        # observed location: only the definition of the function (`top_function_decl_location`) is given.
+        if _tf.get("location_observed", True):
+            d["top_source_location"] = _tf.get("source_location")
+        else:
+            d["top_source_location"] = None
+            d["top_location_observed"] = False
+            d["top_function_decl_location"] = _tf.get("function_decl_location") or _tf.get("source_location")
+            if _tf.get("sampled_source_location"):
+                d["top_sampled_return_location"] = _tf.get("sampled_source_location")
         d["top_source_line_exact"] = bool(_tf.get("source_line_exact"))
         if _tf.get("source_line_text"):
             d["top_source_text"] = _tf.get("source_line_text")
@@ -934,6 +965,52 @@ def derive(series: ThreadSeries) -> Dict[str, Any]:
         d["lock_owner_name"] = wl[-1].get("held_by_thread_name") if wl[-1] else None
         d["_sc_keys"] = sc_keys
         out["threads"][tid] = d
+    return out
+
+
+def _lock_digest(info: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Per mutex of one lock inspection: owner, state word and the threads blocked in a futex wait on it (the
+    per-sample evidence of the lock-contention check; ``judge`` adds the owner's progress counters)."""
+    waiters: Dict[str, List[int]] = {}
+    inferred: Dict[str, List[int]] = {}
+    for t in info.get("threads") or []:
+        w = t.get("waiting_on_lock") if isinstance(t, dict) else None
+        if isinstance(w, dict) and t.get("tid") is not None:
+            # a waiter inferred from the stack (the futex record was unreadable) is not counted as a waiter
+            (inferred if w.get("inferred") else waiters).setdefault(str(w.get("lock_address")), []).append(int(t["tid"]))
+    out = []
+    for l in info.get("locks") or []:
+        if not isinstance(l, dict):
+            continue
+        addr = str(l.get("runtime_address"))
+        out.append({"lock": l.get("name"), "address": addr, "type": l.get("type_name"),
+                    "state_word": l.get("lock_state_word"), "owner_tid": l.get("owner_tid"),
+                    "owner_name": l.get("owner_thread_name"), "waiter_tids": sorted(waiters.get(addr, [])),
+                    "inferred_waiter_tids": sorted(inferred.get(addr, []))})
+    return out
+
+
+def lock_wait_samples(series: "ThreadSeries") -> List[Dict[str, Any]]:
+    """One row per sample that has a lock inspection: ``t_s`` since the first sample, the mutexes with owner and
+    waiters, and ``owner_work`` = {owner tid: cpu ticks + context switches so far} (an owner whose counter rose
+    between two samples made progress; the owner's counters are read from the same sample's /proc reading)."""
+    out: List[Dict[str, Any]] = []
+    if not series.samples:
+        return out
+    t0 = series.samples[0]["t"]
+    for smp in series.samples:
+        digest = smp.get("locks")
+        if digest is None:
+            continue
+        work: Dict[str, int] = {}
+        for l in digest:
+            o = l.get("owner_tid")
+            r = smp["threads"].get(int(o)) if isinstance(o, int) else None
+            if r:
+                work[str(o)] = int(r["utime_ticks"] + r["stime_ticks"] + (r.get("voluntary_ctxt_switches") or 0)
+                                   + (r.get("nonvoluntary_ctxt_switches") or 0))
+        out.append({"index": smp["index"], "t_s": round(smp["t"] - t0, 3), "locks": digest, "owner_work": work,
+                    "thread_ids": sorted(int(k) for k in smp["threads"])})
     return out
 
 
@@ -997,9 +1074,14 @@ def judge(series: ThreadSeries) -> Dict[str, Any]:
         # --- CPU monopoly without observable progress -----------------------------------
         share = d["cpu_share"] or 0.0
         rf = d["runnable_fraction"]
+        dispatched_often = False
         if rf is not None:
             got = d["runnable_cpu_received"]
-            wanted = rf >= cfg.runaway_runnable_fraction and got >= cfg.runaway_min_cpu_share_when_runnable
+            disp = d.get("cpu_dispatches")
+            dispatched_often = (isinstance(disp, int) and disp >= max(
+                cfg.min_samples_for_verdict, cfg.runaway_min_dispatches_per_sec_when_starved * window))
+            wanted = rf >= cfg.runaway_runnable_fraction and (
+                got >= cfg.runaway_min_cpu_share_when_runnable or dispatched_often)
             basis = "schedstat_runnable_fraction"
         else:
             got = share
@@ -1017,8 +1099,13 @@ def judge(series: ThreadSeries) -> Dict[str, Any]:
             if rf is not None:
                 contended = got < 0.8 * min(1.0, rf)
                 r["contended_machine"] = contended
+                turns = ""
+                if got < cfg.runaway_min_cpu_share_when_runnable and dispatched_often:
+                    r["judgement_basis"] = "schedstat_runnable_fraction_dispatches"
+                    turns = (f", was put on a CPU {d['cpu_dispatches']} times and stayed runnable after every "
+                             f"turn (it gives the CPU back without waiting for anything)")
                 msg = (f"Thread {label} was runnable {_fmt_pct(rf)} of the {window:.2f}s window and received "
-                       f"{_fmt_pct(got)} of a CPU{' (machine contended)' if contended else ''}, "
+                       f"{_fmt_pct(got)} of a CPU{' (machine contended)' if contended else ''}{turns}, "
                        f"with no voluntary context switch, no read/write syscall, and {tail}.")
             else:
                 r["limitation"] = SCHEDSTAT_FALLBACK_NOTE
@@ -1053,6 +1140,8 @@ def judge(series: ThreadSeries) -> Dict[str, Any]:
             )
     anomalous = bool(runaway or zombies or d_state)
     result["thread_summary"] = summary
+    result["lock_wait_samples"] = lock_wait_samples(series)
+    result["lock_cycle_seen"] = any(smp["cycles"] for smp in series.lock_series.samples)
     result["thread_findings"] = findings
     result["long_wait_findings"] = long_wait_findings
     result["long_wait_threads"] = long_waits

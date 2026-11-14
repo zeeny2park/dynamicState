@@ -12,7 +12,8 @@ Orchestrates:
 8. Structured Diagnostic Conclusion & Incident Reporting
 """
 
-from dataclasses import asdict, dataclass, field, fields
+from dataclasses import dataclass, field, fields
+from .dataclass_dict import asdict  # same result as dataclasses.asdict, much faster on large observations
 from datetime import datetime, timezone
 from enum import Enum
 import hashlib
@@ -27,6 +28,7 @@ import uuid
 from .diagnostic_recipes import (
     recipe_requires_lock_owner,
     BASELINE_RECIPE_IDS,
+    CAPABILITY_DESCRIPTIONS,
     CATEGORY_ABNORMAL_VARIABLE_CHANGES,
     CATEGORY_DATA_RACE_INDICATORS,
     CATEGORY_DEADLOCK_INDICATORS,
@@ -73,7 +75,9 @@ from .temporal_observation_window import (
     MemoryBehavior,
     MemoryAnalysisResult,
 )
+from .cause_predictions import evaluate_causes
 from .competing_hypotheses import (
+    candidate_verdict_source,
     CompetingHypothesis,
     CompetingHypothesisManager,
     HypothesisComparisonResult,
@@ -176,6 +180,7 @@ from .diagnostic_verdict_aggregator import (
     VERDICT_INCONCLUSIVE,
     VERDICT_ABORTED,
 )
+from .check_budget import DefaultCheckBudget
 from .healthy_verdict import (
     HEALTHY_RULE_ID,
     evaluate as evaluate_healthy,
@@ -185,6 +190,17 @@ from .healthy_verdict import (
 )
 from .modules import ModuleAddressResolver
 from .debug_image import inspect_elf
+from .typed_evidence import (
+    CRITERION_INVARIANT,
+    FAMILY_CORRUPTION,
+    FAMILY_DEADLOCK,
+    FAMILY_GROWTH,
+    FAMILY_STATE,
+    POLARITY_SUPPORTS,
+    attach_typed_evidence,
+    criteria_family,
+    typed_evidence_of,
+)
 
 
 class DurableCommitOutcome(str, Enum):
@@ -266,6 +282,12 @@ class ProblemClassificationResult:
     extracted_entities: Dict[str, List[str]]
     is_vague: bool
     screening_strategy: Optional[str] = None
+    # Stage 2 (symptom_interpretation): the symptom class behind primary_category, whether the symptom was
+    # understood specifically (False: LOW confidence, the broad plan was used) and the full interpretation.
+    symptom_class: str = ""
+    understood: bool = True
+    confidence_level: str = "HIGH"
+    interpretation: Optional[Dict[str, Any]] = None
 
 
 class ProblemClassifier:
@@ -327,110 +349,58 @@ class ProblemClassifier:
         },
     }
 
-    # Indicators that a query is vague / broad screening
-    VAGUE_PATTERNS = [
-        r"check\s+(?:whether|if)\s+(?:this\s+|the\s+|target\s+)?process",
-        r"is\s+(?:the\s+|this\s+)?(?:target\s+)?process\s+(?:healthy|ok|running\s+fine)",
-        r"health\s*check",
-        r"status\s*check",
-        r"diagnose\s+process",
-        r"investigate\s+process",
-        r"any\s+problems?",
-        r"find\s+bugs?",
-        r"overall\s+check",
-        r"이\s*프로세스(?:에)?\s*문제(?:가)?\s*있(?:는지|나)",
-        r"상태\s*검사",
-        r"이상\s*유무",
-        r"프로세스\s*점검",
-        r"건강\s*상태",
-        r"전체적(?:인)?\s*문제",
-        r"종합\s*분석",
-        r"왜\s*멈췄지",
-        r"뭐가\s*문제",
-    ]
+    def classify(self, query: str, fields: Any = None) -> ProblemClassificationResult:
+        """Classify a symptom (free text and/or structured fields) into a symptom class and plan categories.
 
-    def classify(self, query: str) -> ProblemClassificationResult:
-        """Classifies a problem query into candidate categories and extracts entities."""
+        Delegates the interpretation to :func:`extractor.symptom_interpretation.interpret_symptom` (normalisation,
+        bilingual vocabulary per class, precedence, explicit confidence).  CATEGORY_KEYWORDS above is the legacy
+        keyword table; it is no longer used for classification.
+        """
+        from .symptom_interpretation import interpret_symptom, parse_symptom_fields, related_identifiers
         raw_query = query or ""
-        normalized = raw_query.strip().lower()
-
-        # Check for vague / broad query
-        is_vague = False
-        for pat in self.VAGUE_PATTERNS:
-            if re.search(pat, normalized, re.IGNORECASE):
-                is_vague = True
-                break
-
-        # If query is very short and generic, also mark as vague
-        if len(normalized.split()) <= 4 and any(w in normalized for w in ["check", "inspect", "검사", "점검", "확인"]):
-            is_vague = True
-
-        # Entity extraction
+        parsed = parse_symptom_fields(fields)
+        interp = interpret_symptom(raw_query, parsed)
         extracted_entities = self._extract_entities(raw_query)
+        if parsed and parsed.related_objects:
+            variables, functions = related_identifiers(parsed.related_objects)
+            for key, vals in (("variables", variables), ("functions", functions)):
+                for v in vals:
+                    if v not in extracted_entities[key]:
+                        extracted_entities[key].append(v)
+            extracted_entities["related_objects"] = list(parsed.related_objects)
 
-        # Category scoring
-        category_scores: Dict[str, float] = {}
-        for cat, lang_dict in self.CATEGORY_KEYWORDS.items():
-            score = 0.0
-            for lang, keywords in lang_dict.items():
-                for kw in keywords:
-                    if kw in normalized:
-                        # Longer matching keywords have higher weight
-                        score += 1.0 + 0.1 * len(kw.split())
-            if score > 0.0:
-                category_scores[cat] = score
-
-        # If entities point to specific categories, boost them
-        if extracted_entities.get("error_codes"):
-            for err in extracted_entities["error_codes"]:
-                if "SEGV" in err or "BUS" in err:
-                    category_scores[CATEGORY_MEMORY_CORRUPTION] = category_scores.get(CATEGORY_MEMORY_CORRUPTION, 0.0) + 3.0
-                elif "ABRT" in err:
-                    category_scores[CATEGORY_STACK_CORRUPTION] = category_scores.get(CATEGORY_STACK_CORRUPTION, 0.0) + 2.0
-                    category_scores[CATEGORY_INVALID_DOUBLE_FREE] = category_scores.get(CATEGORY_INVALID_DOUBLE_FREE, 0.0) + 2.0
-                elif "DEADLK" in err:
-                    category_scores[CATEGORY_DEADLOCK_INDICATORS] = category_scores.get(CATEGORY_DEADLOCK_INDICATORS, 0.0) + 3.0
-
-        # Determine primary and ranked candidates
-        if category_scores:
-            max_score = max(category_scores.values())
-            normalized_scores = [(cat, round(sc / (max_score + 1.0), 3)) for cat, sc in category_scores.items()]
-            normalized_scores.sort(key=lambda x: x[1], reverse=True)
-            primary_cat = normalized_scores[0][0]
-            confidence = min(0.95, round(normalized_scores[0][1] + 0.2, 2))
-        else:
-            # Fallback for completely unknown or totally vague query
-            if is_vague:
-                primary_cat = CATEGORY_PROCESS_INSTABILITY
-                normalized_scores = [
-                    (CATEGORY_PROCESS_INSTABILITY, 0.50),
-                    (CATEGORY_DEADLOCK_INDICATORS, 0.45),
-                    (CATEGORY_MEMORY_LEAK, 0.40),
-                    (CATEGORY_MEMORY_CORRUPTION, 0.35),
-                ]
-                confidence = 0.45
-            else:
-                primary_cat = CATEGORY_FUNCTIONAL_STATE_INCONSISTENCY
-                normalized_scores = [(primary_cat, 0.30)]
-                confidence = 0.30
-
-        screening_strategy = None
-        if is_vague:
+        if interp.broad_plan:
+            # Broad multi-domain screening: asked for (health check / no text) or the fallback of LOW confidence.
+            normalized_scores = [
+                (CATEGORY_PROCESS_INSTABILITY, 0.50),
+                (CATEGORY_DEADLOCK_INDICATORS, 0.45),
+                (CATEGORY_MEMORY_LEAK, 0.40),
+                (CATEGORY_MEMORY_CORRUPTION, 0.35),
+            ]
+            confidence = 0.45 if interp.understood else 0.0
             screening_strategy = (
                 "BROAD_MULTI_DOMAIN_SCREENING: Multi-domain assessment across "
                 "Memory Integrity (null/guard probes), Memory Growth (RSS/heap delta), "
                 "Abnormal State (variable boundaries), and Concurrency (thread blocking & deadlock check)."
             )
+        else:
+            normalized_scores = list(interp.candidate_categories)
+            confidence = interp.confidence
+            screening_strategy = None
 
         return ProblemClassificationResult(
             raw_query=raw_query,
-            normalized_query=normalized,
-            primary_category=primary_cat,
+            normalized_query=raw_query.strip().lower(),
+            primary_category=interp.primary_category,
             candidate_categories=normalized_scores,
             confidence=confidence,
             extracted_entities=extracted_entities,
-            is_vague=is_vague,
+            is_vague=interp.broad_plan,
             screening_strategy=screening_strategy,
+            symptom_class=interp.symptom_class,
+            understood=interp.understood,
+            confidence_level=interp.confidence_level,
+            interpretation=interp.to_dict(),
         )
 
     def _extract_entities(self, text: str) -> Dict[str, List[str]]:
@@ -510,6 +480,8 @@ class TargetAssessmentResult:
     build_id: Optional[str] = None
     process_identity: Optional[str] = None
     executable_identity: Optional[str] = None
+    build_id_check: Optional[Dict[str, Any]] = None  # {status MATCHED|MISMATCHED|UNKNOWN, process_build_id, debug_build_id}
+    target_abi: Optional[Dict[str, Any]] = None  # TargetABI.to_dict() read through the adapter at diagnosis time
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -533,6 +505,8 @@ class TargetAssessmentResult:
             "build_id": self.build_id,
             "process_identity": self.process_identity,
             "executable_identity": self.executable_identity,
+            "build_id_check": self.build_id_check,
+            "target_abi": self.target_abi,
         }
 
 
@@ -692,10 +666,17 @@ class TargetAssessor:
             except Exception:
                 pass
 
+        process_build_id = build_id
+        build_id_check: Optional[Dict[str, Any]] = None
         if companion_elf and os.path.exists(companion_elf):
             try:
                 from .target_adapter import inspect_elf
                 companion_info = inspect_elf(companion_elf)
+                build_id_check = {"status": "UNKNOWN", "process_build_id": process_build_id,
+                                  "debug_build_id": companion_info.build_id or None}
+                if companion_info.build_id and process_build_id:
+                    same = str(process_build_id).strip().lower() == str(companion_info.build_id).strip().lower()
+                    build_id_check["status"] = "MATCHED" if same else "MISMATCHED"
                 if companion_info.build_id:
                     if build_id and str(build_id).strip().lower() != str(companion_info.build_id).strip().lower():
                         limitations.append(
@@ -733,12 +714,19 @@ class TargetAssessor:
             build_id=build_id,
             process_identity=proc_identity,
             executable_identity=executable_identity,
+            build_id_check=build_id_check,
+            target_abi=allocator_abi.to_dict() if allocator_abi is not None else None,
         )
 
 
 # -----------------------------------------------------------------------------
 # 5. Stage C: Investigation Planner & Step Representation
 # -----------------------------------------------------------------------------
+
+# Recipes whose confirmed growth schedules the heap follow-ups (the recipe ids containing "GROWTH" when the former
+# substring test was written; explicit so a new recipe is added deliberately)
+_GROWTH_FOLLOWUP_TRIGGERS = frozenset({"RECIPE_PROCESS_MEMORY_GROWTH", "RECIPE_HEAP_GROWTH", "RECIPE_MAPPING_GROWTH"})
+
 
 @dataclass
 class InvestigationStep:
@@ -757,6 +745,17 @@ class InvestigationStep:
     status: str = "PENDING"  # PENDING, RUNNING, COMPLETED, SKIPPED, FAILED
     result: Optional[Dict[str, Any]] = None
     executed_at: Optional[str] = None
+    dynamic_followup: bool = False  # scheduled by a confirmed growth step (IMP-004); structured, not the rationale
+    # Time budget of the default checks (extractor.check_budget): a baseline step the symptom did not ask for is a
+    # default check; one left out records not_run_reason "time_budget" and the numbers of the decision in ``budget``
+    # ({expected_cost_s, spent_s, total_s, per_check_s, limit}); an executed default check records its estimate there.
+    default_check: bool = False
+    not_run_reason: Optional[str] = None
+    budget: Optional[Dict[str, Any]] = None
+    # An optional follow-up the adaptive loop added (a discriminating check after a clean result, a growth follow-up
+    # after a supported trend), as opposed to a check the symptom asked for or a baseline check.  Only these are
+    # decided by their expected outcome when expensive (extractor.followup_value).
+    optional_followup: bool = False
 
 
 @dataclass
@@ -857,23 +856,22 @@ class InvestigationPlanner:
                 "RECIPE_PROCESS_MEMORY_GROWTH",
                 "RECIPE_SUSPICIOUS_LOCK_OWNERSHIP",
                 "RECIPE_POTENTIAL_DEADLOCK_PATTERNS",
-                "RECIPE_UNEXPECTED_VARIABLE_CHANGES",
             ]
             for r_id in domain_reps:
-                r = self.recipe_registry.get_recipe(r_id)
+                r = self.recipe_registry.get_plannable_recipe(r_id)
                 if r:
                     candidate_recipes.append((r, 0.75))
         else:
             # Map candidate categories to matching recipes
             for cat, weight in classification.candidate_categories:
-                recs = self.recipe_registry.get_recipes_for_category(cat)
+                recs = self.recipe_registry.get_recipes_for_category(cat, plannable_only=True)
                 for r in recs:
                     if not any(cr[0].recipe_id == r.recipe_id for cr in candidate_recipes):
                         candidate_recipes.append((r, weight))
 
         # If no recipes found, fallback to generic screening
         if not candidate_recipes:
-            for r in self.recipe_registry.list_recipes()[:4]:
+            for r in self.recipe_registry.list_recipes(plannable_only=True)[:4]:
                 candidate_recipes.append((r, 0.5))
 
         # Baseline checks always run; the symptom only orders them (relevance) and adds recipes around them.
@@ -909,6 +907,11 @@ class InvestigationPlanner:
             f"category '{classification.primary_category}'. Ordered by relevance, diagnostic value, "
             f"and zero-stop safety. Baseline checks always planned: {', '.join(BASELINE_RECIPE_IDS)}."
         )
+        if not getattr(classification, "understood", True):
+            plan_rationale = (
+                "Symptom not understood specifically (low classification confidence): broad multi-domain plan "
+                "used instead of a narrow one. " + plan_rationale
+            )
 
         return InvestigationPlan(
             steps=steps,
@@ -988,8 +991,15 @@ class EvidenceToSourceCorrelator:
     Source file/line -> Function candidates -> Hypothesis -> Verification.
     """
 
-    def __init__(self, companion_elf: Optional[str] = None):
+    def __init__(self, companion_elf: Optional[str] = None, adapter: Optional[Any] = None):
         self.companion_elf = companion_elf
+        self.adapter = adapter   # a remote adapter supplies /proc/<pid>/maps (a local file would be another host's)
+        self._remote_maps: Dict[int, List[Dict[str, Any]]] = {}   # per pid: the load bias does not change mid-diagnosis
+
+    def _remote_proc_maps(self, pid: int) -> List[Dict[str, Any]]:
+        if pid not in self._remote_maps:
+            self._remote_maps[pid] = list(self.adapter.get_proc_maps(pid) or [])
+        return self._remote_maps[pid]
 
     def correlate(
         self,
@@ -1042,21 +1052,31 @@ class EvidenceToSourceCorrelator:
                         load_bias_status = "RESOLVED"
                     elif target_pid and target_pid > 0:
                         maps_path = f"/proc/{target_pid}/maps"
-                        if os.path.exists(maps_path):
+                        remote = self.adapter is not None and self.adapter.is_remote()
+                        if remote or os.path.exists(maps_path):
                             elf_base = os.path.basename(self.companion_elf)
                             mappings = []
-                            with open(maps_path, "r", errors="replace") as f:
-                                for line in f:
-                                    parts = line.split()
-                                    if len(parts) >= 6 and elf_base in parts[5]:
-                                        addr_range = parts[0].split("-")
+                            if remote:
+                                for m in self._remote_proc_maps(target_pid):
+                                    if elf_base in str(m.get("pathname") or ""):
                                         mappings.append({
-                                            "start": int(addr_range[0], 16),
-                                            "end": int(addr_range[1], 16),
-                                            "permissions": parts[1],
-                                            "offset": int(parts[2], 16),
-                                            "pathname": parts[5],
+                                            "start": m["start_int"], "end": m["end_int"],
+                                            "permissions": m["permissions"], "offset": m["offset_int"],
+                                            "pathname": m["pathname"],
                                         })
+                            else:
+                                with open(maps_path, "r", errors="replace") as f:
+                                    for line in f:
+                                        parts = line.split()
+                                        if len(parts) >= 6 and elf_base in parts[5]:
+                                            addr_range = parts[0].split("-")
+                                            mappings.append({
+                                                "start": int(addr_range[0], 16),
+                                                "end": int(addr_range[1], 16),
+                                                "permissions": parts[1],
+                                                "offset": int(parts[2], 16),
+                                                "pathname": parts[5],
+                                            })
                             if mappings and elf_info:
                                 try:
                                     load_bias = ModuleAddressResolver.calculate_load_bias(mappings, elf_info)
@@ -1192,8 +1212,17 @@ class DiagnosticConclusion:
 _REPORTABLE_WITHOUT_CHECKS = {STATE_BLOCKED, STATE_FAILED, STATE_BUDGET_EXHAUSTED, STATE_INCONCLUSIVE}
 
 
+# run_to_completion without an explicit max_steps: at least DEFAULT_MIN_STEP_CAP steps, and never fewer than the
+# plan's own steps plus STEP_MARGIN_BEYOND_PLAN.
+DEFAULT_MIN_STEP_CAP = 30
+STEP_MARGIN_BEYOND_PLAN = 10
+
+
 class AdaptiveInvestigationSession:
     """Represents a single active or completed expert investigation session."""
+
+    # Optional read-only observer of the timeline (web UI progress events): callable(session, entry); never affects a diagnosis.
+    timeline_listener: Optional[Callable[["AdaptiveInvestigationSession", Dict[str, Any]], None]] = None
 
     def __init__(
         self,
@@ -1212,12 +1241,23 @@ class AdaptiveInvestigationSession:
         recipe_thresholds: Optional[Dict[str, Any]] = None,
         budget_tracker: Optional[ObservationBudgetTracker] = None,
         budget_limits: Optional[ObservationBudgetLimits] = None,
+        symptom_fields: Any = None,
+        default_check_budget: Any = None,
+        _persist_on_create: bool = True,
     ):
+        from .symptom_interpretation import parse_symptom_fields
+        from .check_budget import DefaultCheckBudget
+        # time budget of the default checks: a DefaultCheckBudget, a dict {total_s, per_check_s}, or None (environment
+        # / defaults; extractor.check_budget)
+        self.default_check_budget = (DefaultCheckBudget.from_dict(default_check_budget)
+                                     if default_check_budget is not None else DefaultCheckBudget.resolve())
         self.investigation_id = investigation_id
         self.raw_problem_statement = problem_statement
+        self.symptom_fields = parse_symptom_fields(symptom_fields)   # structured symptom input (stage 2), or None
         self.pid = pid
         self.companion_elf = companion_elf
-        self.corpus_dir = corpus_dir or "/tmp/dynamicstate_corpus"
+        from .corpus_retention import resolve_corpus_dir
+        self.corpus_dir = resolve_corpus_dir(corpus_dir)
         self._investigations_dir = os.path.join(self.corpus_dir, "investigations")
         os.makedirs(self._investigations_dir, exist_ok=True)
         self.adapter = adapter or LocalTargetAdapter()
@@ -1242,7 +1282,7 @@ class AdaptiveInvestigationSession:
         self.assessor = TargetAssessor()
         self.recipe_registry = DiagnosticRecipeRegistry()
         self.planner = InvestigationPlanner(self.recipe_registry)
-        self.correlator = EvidenceToSourceCorrelator(companion_elf)
+        self.correlator = EvidenceToSourceCorrelator(companion_elf, self.adapter)
         self.ledger = EvidenceLedger(session_id=self.investigation_id)
         self.evidence_adapter = EvidenceAdapter()
         self.evidence_provider = RuntimeEvidenceProvider(
@@ -1270,6 +1310,8 @@ class AdaptiveInvestigationSession:
         )
         self.competing_hypotheses: List[CompetingHypothesis] = []
         self.observation_selection_log: List[Dict[str, Any]] = []  # discriminating-selector decisions (replanning)
+        # expensive optional follow-ups decided by their expected outcome (extractor.followup_value), in order
+        self.followup_decisions: List[Dict[str, Any]] = []
         self.invariant_evaluator = InvariantEvaluator()
         self.allocator_inspector: Optional[AllocatorInspector] = None
         self.structural_discovery = CppStructuralDiscovery()
@@ -1294,7 +1336,9 @@ class AdaptiveInvestigationSession:
         self.checks: List[DiagnosticCheck] = []
 
         self._record_timeline_event("SESSION_CREATED", {"investigation_id": investigation_id, "pid": pid})
-        self._save_to_disk()
+        if _persist_on_create:
+            # A reload (from_dict) must not overwrite the file it is being restored from with an empty session.
+            self._save_to_disk()
 
     def _save_to_disk(self) -> DurableCommitOutcome:
         """Persists authoritative investigation state atomically to disk.
@@ -1331,17 +1375,14 @@ class AdaptiveInvestigationSession:
             if hasattr(os, "O_NOFOLLOW"):
                 flags |= os.O_NOFOLLOW
 
+            # Serialized before the temp file exists: an encoding failure leaves nothing behind (NOT_COMMITTED).
+            # Each large observation is serialized once and stored once (extractor.session_store); C encoder only
+            # (json.dump() and indent= run the pure-Python encoder).
+            text = self._persist_text()
             fd = os.open(tmp_path, flags, 0o600)
             try:
-                def _serialize_fallback(o):
-                    if hasattr(o, "to_dict"):
-                        return o.to_dict()
-                    if hasattr(o, "value"):
-                        return o.value
-                    return str(o)
-
                 with os.fdopen(fd, "w", encoding="utf-8") as f:
-                    json.dump(self.to_dict(), f, indent=2, default=_serialize_fallback)
+                    f.write(text)
                     f.flush()
                     # Apply and verify chmod 0600 - DO NOT SWALLOW
                     os.chmod(tmp_path, 0o600)
@@ -1418,12 +1459,19 @@ class AdaptiveInvestigationSession:
 
     def _record_timeline_event(self, event_type: str, details: Dict[str, Any]) -> None:
         """Appends an event to the chronological timeline."""
-        self.timeline.append({
+        entry = {
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "state": self.state,
             "event_type": event_type,
             "details": details,
-        })
+        }
+        self.timeline.append(entry)
+        listener = self.timeline_listener
+        if listener is not None:
+            try:
+                listener(self, entry)
+            except Exception:  # noqa: BLE001 - an observer must never be able to affect a diagnosis
+                pass
 
     def pause(self) -> None:
         """Pauses the investigation session."""
@@ -1438,7 +1486,18 @@ class AdaptiveInvestigationSession:
         self._save_to_disk()
 
     def step(self) -> Dict[str, Any]:
-        """Advances the investigation session by exactly one state transition or collection step."""
+        """Advances the investigation session by exactly one state transition or collection step.
+
+        A caller-driven step (MCP / web step tools, tests) is a durable point: the session is saved after it so a
+        restarted server can reload it.  ``run_to_completion`` advances through ``_advance`` instead and saves only at
+        its own durable points (see there)."""
+        res = self._advance()
+        if res.get("status") not in ("PAUSED", "TERMINATED"):
+            self._save_to_disk()
+        return res
+
+    def _advance(self) -> Dict[str, Any]:
+        """One state transition without persisting (the caller decides when the session is durable)."""
         if self.is_paused:
             return {"status": "PAUSED", "state": self.state, "investigation_id": self.investigation_id}
 
@@ -1468,20 +1527,41 @@ class AdaptiveInvestigationSession:
             res = self._step_narrow()
         else:
             res = {"status": "UNKNOWN_STATE", "state": self.state}
-
-        self._save_to_disk()
         return res
 
-    def run_to_completion(self, max_steps: int = 30) -> DiagnosticConclusion:
-        """Runs the investigation state machine iteratively until a terminal state is reached."""
+    def run_to_completion(self, max_steps: Optional[int] = None) -> DiagnosticConclusion:
+        """Runs the investigation state machine iteratively until a terminal state is reached.
+
+        ``max_steps``: an explicit number is a hard cap (the run ends INCONCLUSIVE / STEP_BUDGET_REACHED when it is
+        hit).  None (the default) sizes the cap from the plan, so a plan is never cut short by a constant chosen
+        when there were fewer baseline recipes.
+        """
         steps_executed = 0
-        while self.state not in TERMINAL_STATES and steps_executed < max_steps:
+
+        def limit() -> int:
+            if max_steps is not None:
+                return int(max_steps)
+            # Auto: the guard against a state machine that never terminates.  The plan grows with every registered
+            # baseline recipe (recipe_plugins); allow its steps plus a margin for classify / assess / plan /
+            # replan / conclude.
+            planned = int(getattr(self.plan, "total_steps", 0) or 0) if self.plan is not None else 0
+            return max(DEFAULT_MIN_STEP_CAP, planned + STEP_MARGIN_BEYOND_PLAN)
+
+        # Durable points of a run: the plan (a crashed / restarted run reloads it and can be continued from the
+        # collection phase) and the end (a completed diagnosis is fully on disk before its result is returned).
+        # Nothing reads the investigation file between those points: the web progress stream and the MCP tools read
+        # the in-memory session.  Saving after every collection step rewrote the whole, growing session each time
+        # (tens of MB per save on a many-thread target; most of a diagnosis's CPU time).
+        while self.state not in TERMINAL_STATES and steps_executed < limit():
             if self.is_paused:
                 break
-            self.step()
+            before = self.state
+            self._advance()
             steps_executed += 1
+            if before != STATE_COLLECTING and self.state == STATE_COLLECTING:
+                self._save_to_disk()
 
-        if self.state not in TERMINAL_STATES and steps_executed >= max_steps:
+        if self.state not in TERMINAL_STATES and steps_executed >= limit():
             self.state = STATE_INCONCLUSIVE
             self._finalize_conclusion(
                 stop_reason="STEP_BUDGET_REACHED",
@@ -1497,7 +1577,7 @@ class AdaptiveInvestigationSession:
 
     def _step_classify(self) -> Dict[str, Any]:
         self.state = STATE_CLASSIFYING
-        self.classification_result = self.classifier.classify(self.raw_problem_statement)
+        self.classification_result = self.classifier.classify(self.raw_problem_statement, self.symptom_fields)
         if self.target_expressions:
             for exp in self.target_expressions:
                 if exp not in self.classification_result.extracted_entities.setdefault("variables", []):
@@ -1519,6 +1599,9 @@ class AdaptiveInvestigationSession:
             "primary_category": self.classification_result.primary_category,
             "confidence": self.classification_result.confidence,
             "is_vague": self.classification_result.is_vague,
+            "symptom_class": self.classification_result.symptom_class,
+            "understood": self.classification_result.understood,
+            "confidence_level": self.classification_result.confidence_level,
             "extracted_entities": self.classification_result.extracted_entities,
             "competing_hypotheses_count": len(self.competing_hypotheses),
         })
@@ -1617,6 +1700,7 @@ class AdaptiveInvestigationSession:
                     self.plan.steps.insert(0, override_step)
             self.plan.total_steps = len(self.plan.steps)
 
+        self._mark_and_order_default_checks()
         self._record_timeline_event("PLAN_GENERATED", {
             "total_steps": self.plan.total_steps,
             "rationale": self.plan.plan_rationale,
@@ -1624,6 +1708,183 @@ class AdaptiveInvestigationSession:
         })
         self.state = STATE_COLLECTING
         return {"action": "PLAN", "state": self.state, "plan": self.plan.to_dict()}
+
+    # ---- time budget of the default checks (roadmap decision 6.1-2; extractor.check_budget) ----
+    def _symptom_categories(self) -> List[str]:
+        """The problem categories a specific symptom asks about (none for a vague / general health check)."""
+        cls = self.classification_result
+        if cls is None or cls.is_vague or not getattr(cls, "understood", True):
+            return []
+        return [str(c) for c, _w in (cls.candidate_categories or [])]
+
+    def _recipe_cost_s(self, recipe_id: str, collected: Any = None) -> float:
+        """Declared cost on this target; ``collected``: shared collections already paid (None: all of them)."""
+        from .check_budget import SHARED_COSTS, declared_cost_s
+        r = self.recipe_registry.get_recipe(recipe_id)
+        threads = int(getattr(self.target_assessment, "thread_count", 0) or 0)
+        return declared_cost_s(r, threads, SHARED_COSTS if collected is None else collected) if r else 0.0
+
+    def _mark_and_order_default_checks(self) -> None:
+        """Mark the plan's default checks (baseline recipes the symptom did not ask for) and order them: the steps
+        the symptom asked for keep their order and run first; default checks follow, cheapest expected cost first,
+        so the time budget leaves out the costliest ones."""
+        from .check_budget import is_default_check
+        if not self.plan:
+            return
+        cats = self._symptom_categories()
+        for s in self.plan.steps:
+            r = self.recipe_registry.get_recipe(s.recipe_id)
+            rcats = list(dict.fromkeys([r.problem_category] + list(r.applicable_problem_categories or []))) if r else []
+            s.default_check = is_default_check(s.recipe_id, BASELINE_RECIPE_IDS, cats, rcats, self.target_recipe)
+        requested = [s for s in self.plan.steps if not s.default_check]
+        default = sorted((s for s in self.plan.steps if s.default_check),
+                         key=lambda s: self._recipe_cost_s(s.recipe_id))
+        self.plan.steps = requested + default
+        for i, s in enumerate(self.plan.steps, 1):
+            s.priority = i
+
+    def _default_check_spending(self) -> Tuple[float, float, Set[str]]:
+        """(seconds spent by the default checks run so far, the run's cost correction, shared collections paid)."""
+        from .check_budget import correction
+        steps = {s.recipe_id: s for s in (self.plan.steps if self.plan else []) if s.default_check}
+        spent = 0.0
+        pairs = []
+        collected: Set[str] = set()
+        for c in self.checks:
+            r = self.recipe_registry.get_recipe(c.recipe_id)
+            if r is not None and getattr(r, "shared_cost", ""):
+                collected.add(r.shared_cost)
+            st = steps.get(c.recipe_id)
+            if st is None or not isinstance(c.duration_seconds, (int, float)):
+                continue
+            spent += float(c.duration_seconds)
+            est = (st.budget or {}).get("expected_cost_s")
+            pairs.append((est, float(c.duration_seconds)))
+        return spent, correction(pairs), collected
+
+    def _time_budget_decision(self, step: InvestigationStep) -> str:
+        """Decide a default check against the time budget: "run", "skip" (SKIPPED with the structured reason) or
+        "defer" (once: it is over the per-check limit only because of a shared collection no check has paid yet; a
+        later step may pay it, so it is decided again at the end of the plan)."""
+        from .check_budget import LIMIT_PER_CHECK, NOT_RUN_TIME_BUDGET
+        budget = self.default_check_budget
+        spent, corr, collected = self._default_check_spending()
+        expected = round(self._recipe_cost_s(step.recipe_id, collected) * corr, 4)
+        limit = budget.decide(expected, spent)
+        deferred = bool((step.budget or {}).get("deferred"))
+        step.budget = {"expected_cost_s": expected, "spent_s": round(spent, 4), "correction": round(corr, 3),
+                       **budget.to_dict(), "limit": limit, "deferred": deferred}
+        if limit is None:
+            return "run"
+        r = self.recipe_registry.get_recipe(step.recipe_id)
+        shared = getattr(r, "shared_cost", "") if r is not None else ""
+        if limit == LIMIT_PER_CHECK and shared and shared not in collected and not deferred:
+            step.budget["deferred"] = True
+            return "defer"
+        step.status = "SKIPPED"
+        step.not_run_reason = NOT_RUN_TIME_BUDGET
+        self._record_timeline_event("CHECK_NOT_RUN_TIME_BUDGET", {"step_id": step.step_id, "recipe_id": step.recipe_id,
+                                                                   **step.budget})
+        return "skip"
+
+    # ---- expensive optional follow-ups: expected outcomes and stop condition (extractor.followup_value) ----
+    def _followup_cost_s(self, recipe_id: str) -> float:
+        """Expected seconds of a follow-up run now: declared cost (shared collections not yet paid included) x the
+        run's measured correction (the same estimate as the default-check time budget)."""
+        _spent, corr, collected = self._default_check_spending()
+        return round(self._recipe_cost_s(recipe_id, collected) * corr, 4)
+
+    def _followup_context(self) -> Dict[str, Any]:
+        """What an expected-outcome table needs: the open competing causes, the signals observed so far, the signals
+        and direct-evidence categories of the pending required checks, the categories already decided directly."""
+        from .cause_predictions import OUTCOME_REFUTED, evaluate_causes, observe_signals
+        from .recipe_metadata import EVIDENCE_DIRECT, proof_of
+        observed = observe_signals(self.collected_evidence)
+        outcomes = evaluate_causes([(c.hypothesis_id, c.domain) for c in self.competing_hypotheses],
+                                   self.collected_evidence, observed=observed)
+        open_causes = [cid for cid, o in outcomes.items() if o["outcome"] != OUTCOME_REFUTED]
+        idx = self.plan.current_step_index if self.plan else 0
+        pending = [s for s in (self.plan.steps[idx + 1:] if self.plan else [])
+                   if s.status == "PENDING" and not s.optional_followup]
+        pending_signals: Set[str] = set()
+        pending_direct: Set[str] = set()
+        for s in pending:
+            pr = proof_of(s.recipe_id)
+            if pr is None:
+                continue
+            pending_signals.update(pr.observes)
+            if pr.evidence == EVIDENCE_DIRECT:
+                pending_direct.update(pr.supports)
+        decided: Set[str] = set()
+        for c in self.checks:
+            pr = proof_of(c.recipe_id)
+            if pr is not None and pr.evidence == EVIDENCE_DIRECT and c.status in (CheckStatus.PASS, CheckStatus.FAIL):
+                decided.update(pr.supports)
+        return {"open_causes": open_causes, "observed": set(observed), "pending_signals": pending_signals,
+                "pending_direct": pending_direct, "decided": decided}
+
+    def _evaluate_followup(self, recipe_id: str, after_recipe: str,
+                           ctx: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
+        """None for a cheap follow-up (fixed order, nothing decided); for an expensive one its expected-outcome table,
+        gain and decision, recorded in ``followup_decisions``."""
+        from .followup_value import evaluate_followup, is_expensive
+        cost = self._followup_cost_s(recipe_id)
+        if not is_expensive(cost):
+            return None
+        ctx = ctx or self._followup_context()
+        ev = evaluate_followup(recipe_id, cost, ctx["open_causes"], ctx["observed"], ctx["pending_signals"],
+                               ctx["decided"], ctx["pending_direct"])
+        ev["after_recipe"] = after_recipe
+        self.followup_decisions.append(ev)
+        self._record_timeline_event("FOLLOWUP_EVALUATED", {k: ev[k] for k in ("recipe_id", "decision", "gain",
+                                                                              "expected_cost_s", "after_recipe")})
+        return ev
+
+    def adaptive_stop_record(self) -> Optional[Dict[str, Any]]:
+        """Why the loop stopped adding follow-ups: the expensive follow-ups left out (last decision per check, only
+        checks that never ran), with gain, cost and expected-outcome table (followup_value.stop_record)."""
+        from .followup_value import DECISION_RUN, stop_record
+        ran = {c.recipe_id for c in self.checks}
+        last: Dict[str, Dict[str, Any]] = {}
+        for d in self.followup_decisions:
+            last[str(d.get("recipe_id"))] = d
+        return stop_record([d for rid, d in last.items() if rid not in ran and d.get("decision") != DECISION_RUN])
+
+    def _select_followup(self, after_recipe: str, select: Callable[[Set[str]], Tuple[Optional[str], Any, str]],
+                         plan_ids: Set[str]) -> Tuple[Optional[str], Any, str, List[Dict[str, Any]], Set[str]]:
+        """Run the discriminating selector, deciding the expensive new follow-ups it proposes by expected outcome.
+
+        ``select(excluded)`` is the selector over the candidate recipes minus ``excluded``.  A pick that is already in
+        the plan (a required check moved forward) or a cheap new follow-up is returned as the selector made it.  An
+        expensive new pick is decided with every other expensive new candidate: the one with most gain per expected
+        second runs; those that cannot change the causes or the verdict, or whose gain is below their cost, are left
+        out and the selector is asked again without them.  Returns (pick, log, rationale, evaluations, left out)."""
+        from .followup_value import choose
+        excluded: Set[str] = set()
+        evaluations: List[Dict[str, Any]] = []
+        ctx: Optional[Dict[str, Any]] = None
+        while True:
+            sel_rid, sel_log, sel_why = select(excluded)
+            if not sel_rid or sel_rid in plan_ids:
+                return sel_rid, sel_log, sel_why, evaluations, excluded
+            ctx = ctx or self._followup_context()
+            first = self._evaluate_followup(sel_rid, after_recipe, ctx)
+            if first is None:
+                return sel_rid, sel_log, sel_why, evaluations, excluded
+            evs = [first]
+            for entry in sel_log or []:
+                rid = entry.get("recipe_id")
+                if entry.get("eligible") and rid not in plan_ids and rid != sel_rid and rid not in excluded:
+                    e = self._evaluate_followup(rid, after_recipe, ctx)
+                    if e is not None:
+                        evs.append(e)
+            evaluations += evs
+            best = choose(evs)
+            if best is not None:
+                why = (f"Expected outcomes: {best['recipe_id']} separates {best['separates']} "
+                       f"(gain {best['gain']}, {best['expected_cost_s']} s): " + "; ".join(best["outcome_lines"]))
+                return best["recipe_id"], sel_log, why, evaluations, excluded
+            excluded.update(e["recipe_id"] for e in evs)
 
     def _step_start_collection(self) -> Dict[str, Any]:
         return self._step_collect_next()
@@ -1762,14 +2023,32 @@ class AdaptiveInvestigationSession:
         except Exception as le:
             return f"FAILED: {type(le).__name__}: {le}"
 
+    def _halt_on_budget(self) -> str:
+        """End the collection because the observation budget ran out.
+
+        What the checks that DID run found is kept: when one of them supported a problem, the hypotheses are formed
+        from the evidence already collected (``_step_analyze`` groups that evidence; it reads nothing from the
+        target) before the conclusion is sealed.  Otherwise a check that had already found the problem (e.g. lock
+        contention, a spinning thread) was dropped whenever a loaded host made the run slower than the budget, and
+        the verdict said "no problem finding was produced".  The findings stay probable (the verify / narrow steps
+        that could confirm them did not run) and the run is still never HEALTHY: budget_exhausted blocks it."""
+        self.state = STATE_BUDGET_EXHAUSTED
+        reason = self.budget_tracker.exhaustion_reason or "Observation resource budget exhausted."
+        if any(isinstance(e, dict) and e.get("status") == "SUPPORTED" for e in self.collected_evidence):
+            try:
+                self._step_analyze()
+            except Exception as exc:  # noqa: BLE001 - never let the synthesis hide the budget stop
+                self._record_timeline_event("ANALYZE_AFTER_BUDGET_FAILED", {"error": f"{type(exc).__name__}: {exc}"})
+            self.state = STATE_BUDGET_EXHAUSTED
+        self._finalize_conclusion(
+            stop_reason="BUDGET_EXHAUSTED",
+            summary=f"Investigation halted: {reason}",
+        )
+        return reason
+
     def _step_collect_next(self) -> Dict[str, Any]:
         if self.budget_tracker and not self.budget_tracker.can_continue():
-            self.state = STATE_BUDGET_EXHAUSTED
-            reason = self.budget_tracker.exhaustion_reason or "Observation resource budget exhausted."
-            self._finalize_conclusion(
-                stop_reason="BUDGET_EXHAUSTED",
-                summary=f"Investigation halted: {reason}",
-            )
+            reason = self._halt_on_budget()
             return {"action": "BUDGET_EXHAUSTED", "state": self.state, "reason": reason}
 
         if not self.plan:
@@ -1787,15 +2066,18 @@ class AdaptiveInvestigationSession:
                 cand_step.status = "SKIPPED"
                 self.plan.current_step_index += 1
                 continue
+            if cand_step.default_check and cand_step.status == "PENDING":
+                decision = self._time_budget_decision(cand_step)
+                if decision == "defer":
+                    self.plan.steps.append(self.plan.steps.pop(self.plan.current_step_index))
+                    continue
+                if decision == "skip":
+                    self.plan.current_step_index += 1
+                    continue
             break
 
         if self.budget_tracker and not self.budget_tracker.can_continue():
-            self.state = STATE_BUDGET_EXHAUSTED
-            reason = self.budget_tracker.exhaustion_reason or "Observation resource budget exhausted."
-            self._finalize_conclusion(
-                stop_reason="BUDGET_EXHAUSTED",
-                summary=f"Investigation halted: {reason}",
-            )
+            self._halt_on_budget()
             return {"action": "BUDGET_EXHAUSTED", "state": self.state}
 
         if self.plan.current_step_index >= len(self.plan.steps):
@@ -1992,7 +2274,7 @@ class AdaptiveInvestigationSession:
                 **({"live_capture_receipt": rcpt_dict_payload} if rcpt_dict_payload else {}),
             }
             correlated = self.correlator.correlate(ev_payload, target_pid=self.pid)
-            enriched_ev = {**ev_payload, "correlation": correlated, "step_id": step.step_id}
+            enriched_ev = attach_typed_evidence({**ev_payload, "correlation": correlated, "step_id": step.step_id})
 
             ledger_status = self._record_authoritative_evidence_in_ledger(
                 ev_id=ev_id,
@@ -2027,7 +2309,7 @@ class AdaptiveInvestigationSession:
                 **({"live_capture_receipt": rcpt_dict_payload} if rcpt_dict_payload else {}),
             }
             correlated = self.correlator.correlate(ev_payload, target_pid=self.pid)
-            enriched_ev = {**ev_payload, "correlation": correlated, "step_id": step.step_id}
+            enriched_ev = attach_typed_evidence({**ev_payload, "correlation": correlated, "step_id": step.step_id})
             enriched_ev["ledger_status"] = self._record_authoritative_evidence_in_ledger(
                 ev_id=contra_ev_id,
                 recipe_id=recipe.recipe_id,
@@ -2060,7 +2342,7 @@ class AdaptiveInvestigationSession:
                 **({"live_capture_receipt": rcpt_dict_payload} if rcpt_dict_payload else {}),
             }
             correlated = self.correlator.correlate(ev_payload, target_pid=self.pid)
-            enriched_ev = {**ev_payload, "correlation": correlated, "step_id": step.step_id}
+            enriched_ev = attach_typed_evidence({**ev_payload, "correlation": correlated, "step_id": step.step_id})
             enriched_ev["ledger_status"] = self._record_authoritative_evidence_in_ledger(
                 ev_id=base_ev_id,
                 recipe_id=recipe.recipe_id,
@@ -2154,7 +2436,7 @@ class AdaptiveInvestigationSession:
         if eval_result.status == RECIPE_STATUS_SUPPORTED:
             # If RSS growth was observed, dynamically schedule heap growth and object accumulation
             dynamic_followups: List[InvestigationStep] = []
-            if "MEMORY_GROWTH" in recipe.recipe_id or "GROWTH" in recipe.recipe_id:
+            if recipe.recipe_id in _GROWTH_FOLLOWUP_TRIGGERS:
                 followup_ids = ["RECIPE_HEAP_GROWTH", "RECIPE_LONG_LIVED_OBJECT_ACCUMULATION"]
                 for fid in reversed(followup_ids):
                     if (
@@ -2172,6 +2454,7 @@ class AdaptiveInvestigationSession:
                                 target_assessment=self.target_assessment,
                                 rationale_override=f"Dynamic follow-up: isolated from confirmed {recipe.recipe_id}",
                             )
+                            new_step.dynamic_followup = True
                             remaining_steps.insert(0, new_step)
                             dynamic_followups.append(new_step)
 
@@ -2193,7 +2476,7 @@ class AdaptiveInvestigationSession:
                 # (IMP-008: also the follow-ups scheduled by an EARLIER growth step - a supported first follow-up
                 # must not cut off the second one.)
                 if (not any(s.status == "PENDING" for s in dynamic_followups)
-                        and not any(s.status == "PENDING" and str(s.rationale or "").startswith("Dynamic follow-up")
+                        and not any(s.status == "PENDING" and s.dynamic_followup
                                     for s in remaining_steps)
                         and not any(s.status == "PENDING" and s.recipe_id in BASELINE_RECIPE_IDS
                                     for s in remaining_steps)):
@@ -2222,7 +2505,7 @@ class AdaptiveInvestigationSession:
             # hypotheses; the comparison's own recommendation is the fallback.
             from .observation_selector import select_discriminating_recipe
             _cand_ids = sorted({r for ch in self.competing_hypotheses for r in (ch.applicable_diagnostic_rules or [])})
-            _cands = [rc for rc in (self.recipe_registry.get_recipe(r) for r in _cand_ids) if rc is not None]
+            _cands = [rc for rc in (self.recipe_registry.get_plannable_recipe(r) for r in _cand_ids) if rc is not None]
             _done = {s.recipe_id for s in self.plan.steps[:self.plan.current_step_index + 1]}
             sel_rid, sel_log, sel_why = select_discriminating_recipe(
                 self.competing_hypotheses, _cands, budget_tracker=self.budget_tracker, executed_recipe_ids=_done)
@@ -2237,7 +2520,7 @@ class AdaptiveInvestigationSession:
                 already_executed = any(s.recipe_id == next_rec_id for s in self.plan.steps[:self.plan.current_step_index + 1])
                 already_in = any(s.recipe_id == next_rec_id for s in remaining_steps)
                 if not already_executed and not already_in:
-                    f_rec = self.recipe_registry.get_recipe(next_rec_id)
+                    f_rec = self.recipe_registry.get_plannable_recipe(next_rec_id)
                     if f_rec:
                         discrim_step = self.planner.score_and_build_step(
                             recipe=f_rec,
@@ -2284,12 +2567,7 @@ class AdaptiveInvestigationSession:
         self.plan.current_step_index += 1
 
         if self.budget_tracker and not self.budget_tracker.can_continue():
-            self.state = STATE_BUDGET_EXHAUSTED
-            reason = self.budget_tracker.exhaustion_reason or "Observation resource budget exhausted."
-            self._finalize_conclusion(
-                stop_reason="BUDGET_EXHAUSTED",
-                summary=f"Investigation halted: {reason}",
-            )
+            reason = self._halt_on_budget()
             return {"action": "BUDGET_EXHAUSTED", "step_id": step.step_id, "state": self.state, "reason": reason}
 
         if self.plan.current_step_index >= len(self.plan.steps):
@@ -2401,23 +2679,24 @@ class AdaptiveInvestigationSession:
         return {"action": "ANALYZE", "state": self.state, "hypotheses_count": len(self.active_hypotheses)}
 
     def _build_verification_criteria_for_category(self, category: str) -> List[Dict[str, Any]]:
-        """Constructs executable verification criteria for a problem category."""
-        if "CORRUPTION" in category or "FREE" in category:
+        """Constructs executable verification criteria for a problem category (its criteria family)."""
+        family = criteria_family(category)
+        if family == FAMILY_CORRUPTION:
             return [
                 {"criterion_id": "CRIT_POINTER_VALID_VMA", "description": "Target address resides in valid mapped VMA and outside NULL page [0, 4096]", "expected": True},
                 {"criterion_id": "CRIT_NO_POISON_PATTERN", "description": "Memory buffer does not contain allocator poison bytes (0xbaadbaad/0xdeadbeef)", "expected": True},
             ]
-        elif "LEAK" in category or "GROWTH" in category:
+        elif family == FAMILY_GROWTH:
             return [
                 {"criterion_id": "CRIT_RSS_GROWTH_STABLE", "description": "Process RSS growth rate across observation window is bounded (< 20%)", "expected": True},
                 {"criterion_id": "CRIT_CHUNK_RECLAMATION", "description": "Allocated heap objects/chunks are reclaimed without sustained accumulation", "expected": True},
             ]
-        elif "DEADLOCK" in category or "CONCURRENCY" in category:
+        elif family == FAMILY_DEADLOCK:
             return [
                 {"criterion_id": "CRIT_NO_CIRCULAR_WAIT", "description": "Thread mutex wait-for graph contains no circular wait cycles", "expected": True},
                 {"criterion_id": "CRIT_THREADS_PROGRESSING", "description": "Threads make execution progress without permanent futex lock stall", "expected": True},
             ]
-        elif "STATE" in category or "VARIABLE" in category:
+        elif family == FAMILY_STATE:
             return [
                 {"criterion_id": "CRIT_VALID_STATE_DOMAIN", "description": "State variable values remain within defined enum/boundary domains", "expected": True},
                 {"criterion_id": "CRIT_LEGAL_STATE_TRANSITION", "description": "Observed state transitions conform to valid state machine edges", "expected": True},
@@ -2433,6 +2712,7 @@ class AdaptiveInvestigationSession:
 
         # Filter out refuted hypotheses
         self.active_hypotheses = [h for h in self.active_hypotheses if h.status != "REFUTED"]
+        self._bind_competing_candidates()
         self._record_timeline_event("HYPOTHESES_VERIFIED", {
             "active_count": len(self.active_hypotheses),
             "rejected_count": len(self.rejected_hypotheses),
@@ -2440,20 +2720,46 @@ class AdaptiveInvestigationSession:
         self.state = STATE_NARROWING
         return {"action": "VERIFY", "state": self.state}
 
+    def _bind_competing_candidates(self) -> None:
+        """Stage 1, one hypothesis model: the verified hypotheses are the source of truth for the final verdict and
+        for the report's competing candidates; each candidate becomes a view of the verified hypothesis that
+        consumed its rules' evidence (competing_hypotheses.candidate_verdict_source)."""
+        verified = list(self.active_hypotheses) + list(self.rejected_hypotheses)
+        if not verified:
+            return
+        # what the collected evidence says about each cause (declared predictions, typed evidence only)
+        outcomes = evaluate_causes([(ch.hypothesis_id, ch.domain) for ch in self.competing_hypotheses],
+                                   self.collected_evidence)
+        for ch in self.competing_hypotheses:
+            ch.bind_verdict(candidate_verdict_source(ch, verified, outcomes.get(ch.hypothesis_id)),
+                            ledger=self.ledger)
+
     def _execute_verification_for_hypothesis(self, hyp: ExpertHypothesis) -> Dict[str, Any]:
-        """Executes explicit verification criteria for a single hypothesis."""
+        """Executes explicit verification criteria for a single hypothesis.
+
+        Stage 1 (typed evidence): every decision below reads only the typed part of the evidence
+        (``extractor.typed_evidence``: polarity, invariant claims, completeness, observed value / subject, certainty
+        cap, confirmed fault) - never the text of a finding, counter-indicator or description.  Which list an item is
+        in (supporting / contradicting) is the hypothesis's classification of it; the rationale strings are output."""
         results: List[Dict[str, Any]] = []
         has_fail = False
         has_pass = False
 
         criteria_list = hyp.verification_criteria if isinstance(hyp.verification_criteria, list) else []
+        supp = [(e, typed_evidence_of(e)) for e in hyp.supporting_evidence]
+        contra = [(e, typed_evidence_of(e)) for e in hyp.contradicting_evidence]
+        both = supp + contra
+
+        def first(pairs: List[Tuple[Dict[str, Any], Any]], pred: Callable[[Any], bool]) -> Optional[Dict[str, Any]]:
+            return next((e for e, t in pairs if pred(t)), None)
+
         # IMP-009: stable heap metadata damage attributed to a named block (uncapped) is the memory-integrity proof;
         # the pointer / poison-word criteria (written for a single probed pointer) do not apply to it.
-        heap_proof = next((e for e in hyp.supporting_evidence if e.get("status") == "SUPPORTED"
-                           and e.get("details", {}).get("corruption_confirmed")
-                           and e.get("details", {}).get("certainty_cap") != "PROBABLE"), None)
+        heap_proof = first(supp, lambda t: t.polarity == POLARITY_SUPPORTS and t.corruption_confirmed
+                           and t.certainty_cap != "PROBABLE")
         for crit in criteria_list:
             cid = crit.get("criterion_id", "")
+            inv = CRITERION_INVARIANT.get(cid)
             outcome = "INCONCLUSIVE"
             rationale = "No observation evidence available to verify criterion."
             consumed_ids: List[str] = []
@@ -2468,8 +2774,8 @@ class AdaptiveInvestigationSession:
                     rationale = "Not applicable: the damage is proven by heap metadata, not by one probed pointer."
             # 1. Pointer & VMA check
             elif cid == "CRIT_POINTER_VALID_VMA":
-                fault_ev = next((e for e in hyp.supporting_evidence if "NULL" in str(e) or "unmapped" in str(e).lower() or e.get("details", {}).get("violation_type") in ("NULL_POINTER_DEREFERENCE", "UNMAPPED_OR_GUARD_PAGE")), None)
-                contra_ev = next((e for e in hyp.contradicting_evidence if "validly mapped" in str(e) or e.get("details", {}).get("is_healthy") or e.get("details", {}).get("violation_type") == "NONE_IDLE_NULL_POINTER"), None)
+                fault_ev = first(supp, lambda t: t.violates(inv))
+                contra_ev = first(contra, lambda t: t.upholds(inv))
                 if fault_ev:
                     outcome = "FAIL"  # Invariant violated -> fault confirmed
                     consumed_ids.append(fault_ev.get("evidence_id", ""))
@@ -2484,8 +2790,8 @@ class AdaptiveInvestigationSession:
 
             # 2. Poison bytes / magic check
             elif cid == "CRIT_NO_POISON_PATTERN":
-                poison_ev = next((e for e in hyp.supporting_evidence if "magic" in str(e).lower() or "poison" in str(e).lower() or e.get("details", {}).get("magic_corrupted")), None)
-                clean_ev = next((e for e in hyp.contradicting_evidence if "clean" in str(e).lower() or "valid" in str(e).lower()), None)
+                poison_ev = first(supp, lambda t: t.violates(inv))
+                clean_ev = first(contra, lambda t: t.upholds(inv))
                 if poison_ev:
                     outcome = "FAIL"
                     consumed_ids.append(poison_ev.get("evidence_id", ""))
@@ -2495,20 +2801,22 @@ class AdaptiveInvestigationSession:
                     consumed_ids.append(clean_ev.get("evidence_id", ""))
                     rationale = "Memory slice verified intact with zero corruption or poison patterns."
                 else:
-                    # Check if memory was actually read and verified
-                    mem_ev = next((e for e in hyp.supporting_evidence + hyp.contradicting_evidence if e.get("observed_value") is not None), None)
-                    if mem_ev and not poison_ev:
-                        outcome = "PASS"
-                        consumed_ids.append(mem_ev.get("evidence_id", ""))
-                        rationale = "Memory slice audited clean without poison markers."
+                    # Verification scope (stage 1): an observed value is not a reading of the memory's bytes.  Only
+                    # a rule that read the bytes (canaries, magic, heap headers) and found them intact clears this.
+                    outcome = "INCONCLUSIVE"
+                    missing_ev.append("memory_slice_read")
+                    cut = first(contra, lambda t: t.claims_hold_without_scope(inv))
+                    if cut is not None:
+                        consumed_ids.append(cut.get("evidence_id", ""))
+                        rationale = ("The memory was reported intact, but the observation did not cover it: "
+                                     + ", ".join(typed_evidence_of(cut).incomplete_reasons) + ".")
                     else:
-                        outcome = "INCONCLUSIVE"
-                        missing_ev.append("memory_slice_read")
+                        rationale = "No rule read the memory's bytes (canaries / magic / heap headers) for this hypothesis."
 
             # 3. Memory growth / leak check
             elif cid in ("CRIT_RSS_GROWTH_STABLE", "CRIT_CHUNK_RECLAMATION"):
-                growth_ev = next((e for e in hyp.supporting_evidence if "growth" in str(e).lower() or "leak" in str(e).lower() or e.get("details", {}).get("growth_confirmed")), None)
-                stable_ev = next((e for e in hyp.contradicting_evidence if "stable" in str(e).lower() or "plateau" in str(e).lower() or e.get("details", {}).get("transient_warmup")), None)
+                growth_ev = first(supp, lambda t: t.violates(inv))
+                stable_ev = first(contra, lambda t: t.upholds(inv))
                 if growth_ev:
                     outcome = "FAIL"
                     consumed_ids.append(growth_ev.get("evidence_id", ""))
@@ -2523,16 +2831,15 @@ class AdaptiveInvestigationSession:
 
             # 4. Circular wait / deadlock check
             elif cid == "CRIT_NO_CIRCULAR_WAIT":
-                incomplete_ev = next((e for e in hyp.supporting_evidence + hyp.contradicting_evidence if e.get("details", {}).get("incomplete_lock_graph")), None)
-                deadlock_ev = next((e for e in hyp.supporting_evidence if "deadlock" in str(e).lower() or e.get("details", {}).get("deadlock_detected")), None)
-                acyclic_ev = next((e for e in hyp.contradicting_evidence if "acyclic" in str(e).lower() or "no circular wait" in str(e).lower()), None)
-                blocked_ev = next((e for e in hyp.supporting_evidence if "blocked" in str(e).lower()), None)
+                incomplete_ev = first(both, lambda t: t.lock_graph_incomplete)
+                deadlock_ev = first(supp, lambda t: t.violates(inv))
+                acyclic_ev = first(contra, lambda t: t.upholds(inv))
 
                 if incomplete_ev:
                     outcome = "INCONCLUSIVE"
                     consumed_ids.append(incomplete_ev.get("evidence_id", ""))
                     missing_ev.append("complete_lock_ownership_info")
-                    rationale = "Lock ownership graph is incomplete (threads waiting on locks with unresolvable owner). Cannot determine whether graph is acyclic."
+                    rationale = "Lock ownership graph is incomplete (threads waiting on locks with unresolvable owner). Cannot determine whether graph is acyclic or contains cycles."
                 elif deadlock_ev:
                     outcome = "FAIL"  # Circular wait confirmed
                     consumed_ids.append(deadlock_ev.get("evidence_id", ""))
@@ -2541,18 +2848,14 @@ class AdaptiveInvestigationSession:
                     outcome = "PASS"
                     consumed_ids.append(acyclic_ev.get("evidence_id", ""))
                     rationale = "Complete lock graph verified acyclic with zero circular wait cycles."
-                elif blocked_ev:
-                    outcome = "PASS"
-                    consumed_ids.append(blocked_ev.get("evidence_id", ""))
-                    rationale = "Thread blocked on lock, but lock graph is verified complete and acyclic (thread contention without deadlock)."
                 else:
                     outcome = "INCONCLUSIVE"
                     missing_ev.append("thread_wait_for_graph")
 
             # 5. State domain / transition check
             elif cid in ("CRIT_VALID_STATE_DOMAIN", "CRIT_LEGAL_STATE_TRANSITION"):
-                trans_ev = next((e for e in hyp.supporting_evidence if "transition" in str(e).lower() or "boundary" in str(e).lower() or e.get("details", {}).get("field_inconsistency")), None)
-                valid_trans_ev = next((e for e in hyp.contradicting_evidence if "authorized" in str(e).lower() or "within bounds" in str(e).lower()), None)
+                trans_ev = first(supp, lambda t: t.violates(inv))
+                valid_trans_ev = first(contra, lambda t: t.upholds(inv))
                 if trans_ev:
                     outcome = "FAIL"
                     consumed_ids.append(trans_ev.get("evidence_id", ""))
@@ -2562,15 +2865,14 @@ class AdaptiveInvestigationSession:
                     consumed_ids.append(valid_trans_ev.get("evidence_id", ""))
                     rationale = "Observed state transitions conform to valid specification."
                 else:
-                    # Check if state variable was actually observed
-                    state_obs_ev = next((e for e in hyp.supporting_evidence + hyp.contradicting_evidence if e.get("symbol")), None)
-                    if state_obs_ev and not trans_ev:
-                        outcome = "PASS"
-                        consumed_ids.append(state_obs_ev.get("evidence_id", ""))
-                        rationale = f"Observed variable '{state_obs_ev.get('symbol')}' conforms to normal operational state."
-                    else:
-                        outcome = "INCONCLUSIVE"
-                        missing_ev.append("state_variable_value")
+                    # Verification scope (stage 1): reading a variable is not checking it against its domain or its
+                    # transitions; without a rule that decided the invariant the criterion stays open.
+                    outcome = "INCONCLUSIVE"
+                    missing_ev.append("state_variable_value_checked_against_domain")
+                    state_obs_ev = first(both, lambda t: bool(t.subject))
+                    rationale = (f"Variable '{state_obs_ev.get('symbol')}' was read, but no rule checked it against its "
+                                 "domain or transitions." if state_obs_ev else
+                                 "No state variable was checked against its domain or transitions.")
 
             # 6. Clean check
             elif cid == "CRIT_ZERO_ANOMALIES":
@@ -2598,32 +2900,26 @@ class AdaptiveInvestigationSession:
 
         hyp.verification_execution_results = results
 
-        # Update hypothesis verdict based on criteria outcomes
-        is_clean_hyp = (
-            "No abnormal runtime indicators observed" in hyp.problem_statement or
-            any(c.get("criterion_id") == "CRIT_ZERO_ANOMALIES" for c in criteria_list)
-        )
+        # Update hypothesis verdict based on criteria outcomes.  The clean (HEALTHY) hypothesis is the one the engine
+        # builds with the zero-anomalies criterion; the engine's own "inconclusive" hypothesis has no criteria and
+        # falls through to INCONCLUSIVE below.
+        is_clean_hyp = any(c.get("criterion_id") == "CRIT_ZERO_ANOMALIES" for c in criteria_list)
         if is_clean_hyp:
             if has_pass and not has_fail:
                 hyp.status = "CONFIRMED"
                 hyp.confidence = 0.90
             else:
                 hyp.status = "INCONCLUSIVE"
-        elif "inconclusive" in hyp.problem_statement.lower():
-            hyp.status = "INCONCLUSIVE"
         else:
             # Fault hypothesis: criteria FAIL means safety invariant was violated (fault verified!)
             # Verification rule: CONFIRMED requires verified primary supporting observations with zero unrefuted counter-indicators
-            has_primary_supp = bool(hyp.supporting_evidence and any(e.get("status") == "SUPPORTED" for e in hyp.supporting_evidence))
-            has_unrefuted_contra = bool(hyp.contradicting_evidence and any(e.get("status") == "CONTRADICTED" for e in hyp.contradicting_evidence))
+            has_primary_supp = any(t.polarity == POLARITY_SUPPORTS for _e, t in supp)
 
             # IMP-008: a rule can cap what its observation proves (e.g. unbounded growth of a still-referenced
             # container: the growth is measured, but leak vs intended accumulation is not decidable from memory)
-            capped = [e for e in hyp.supporting_evidence if e.get("details", {}).get("certainty_cap") == "PROBABLE"]
-            uncapped = [e for e in hyp.supporting_evidence if e.get("status") == "SUPPORTED"
-                        and e.get("details", {}).get("certainty_cap") != "PROBABLE"
-                        and (e.get("details", {}).get("leak_confirmed")
-                             or e.get("details", {}).get("corruption_confirmed"))]
+            capped = [e for e, t in supp if t.certainty_cap == "PROBABLE"]
+            uncapped = [e for e, t in supp if t.polarity == POLARITY_SUPPORTS
+                        and t.certainty_cap != "PROBABLE" and t.fault_confirmed]
             if has_fail and has_primary_supp and not has_pass and capped and not uncapped:
                 hyp.status = "LIKELY"
                 hyp.confidence = min(max(hyp.confidence, 0.70), 0.85)
@@ -2699,6 +2995,24 @@ class AdaptiveInvestigationSession:
 
         return {"action": "NARROW", "state": self.state, "conclusion": asdict(self.conclusion)}
 
+    def _not_run_check(self, s: InvestigationStep) -> DiagnosticCheck:
+        """The report row of a planned step left out for a structured reason (time budget of the default checks).
+        It stays a required check: a baseline check left out is a coverage gap, never a pass."""
+        b = dict(s.budget or {})
+        total = b.get("total_s")
+        why = (f"Not run: time budget of the default checks (expected {b.get('expected_cost_s')} s; "
+               f"{b.get('spent_s')} s of {total if total is not None else 'unlimited'} s already spent; "
+               f"per-check limit {b.get('per_check_s')} s; exceeded: {b.get('limit')}).")
+        return DiagnosticCheck(
+            check_id=f"CHK_{s.recipe_id}_NOT_RUN",
+            methodology_id=self.methodology.methodology_id if self.methodology else "METH_GENERAL",
+            recipe_id=s.recipe_id, recipe_version="2.1.8", name=s.recipe_name,
+            description=f"Planned check {s.recipe_name}", technical_rationale=s.domain,
+            status=CheckStatus.SKIPPED, inspected_entity=f"Target PID {self.pid} ({s.domain})",
+            actual_observations={"not_run": {"reason": s.not_run_reason, **b}},
+            technical_interpretation=why, is_required=True,
+        )
+
     def _build_all_planned_and_executed_checks(self) -> List[DiagnosticCheck]:
         """Returns unified check list combining executed checks with SKIPPED and NOT_EXECUTED planned steps."""
         all_checks = list(self.checks)
@@ -2707,6 +3021,9 @@ class AdaptiveInvestigationSession:
             for s in self.plan.steps:
                 if s.recipe_id not in executed_recipe_ids:
                     is_skipped = (s.status == "SKIPPED")
+                    if is_skipped and s.not_run_reason:
+                        all_checks.append(self._not_run_check(s))
+                        continue
                     chk = DiagnosticCheck(
                         check_id=f"CHK_{s.recipe_id}_{'SKIPPED' if is_skipped else 'UNEXEC'}",
                         methodology_id=self.methodology.methodology_id if self.methodology else "METH_GENERAL",
@@ -2766,24 +3083,26 @@ class AdaptiveInvestigationSession:
                 "Investigation inconclusive due to insufficient evidence or collection failures; "
                 "verify target permissions, debug symbols, and process accessibility before re-running."
             )
-        elif primary_finding:
-            pf_up = primary_finding.upper()
-            if "INCONCLUSIVE" in pf_up:
+        elif primary_finding and self.active_hypotheses:
+            # by the leading hypothesis's category (stage 1: never by the words of the finding text)
+            top = self.active_hypotheses[0]
+            fam = criteria_family(top.category)
+            if top.status == "INCONCLUSIVE" or top.category == "UNKNOWN":
                 remediations.append(
                     "Investigation inconclusive due to insufficient evidence or collection failures; "
                     "verify target permissions, debug symbols, and process accessibility before re-running."
                 )
-            elif "MEMORY" in pf_up or "CORRUPT" in pf_up or "POINTER" in pf_up:
+            elif top.category == "HEALTHY":
+                remediations.append("No active remediation required: runtime state verified clean within investigated scope.")
+            elif fam == FAMILY_CORRUPTION:
                 remediations.append("Audit pointer dereference bounds and verify memory mapping permissions before dereference.")
                 remediations.append("Enable AddressSanitizer (ASan) during build: `-fsanitize=address -g`.")
-            elif "LEAK" in pf_up or "GROWTH" in pf_up or "IMBALANCE" in pf_up:
+            elif fam == FAMILY_GROWTH or top.category in ("HEAP_RETENTION", "RESOURCE_EXHAUSTION"):
                 remediations.append("Profile heap allocations and verify balanced free/delete calls across container lifecycles.")
                 remediations.append("Inspect long-lived container capacities and unbounded cache queue limits.")
-            elif "DEADLOCK" in pf_up or "LOCK" in pf_up:
+            elif fam == FAMILY_DEADLOCK or top.category in ("LOCK_CONTENTION", "ORPHAN_LOCK"):
                 remediations.append("Enforce strict global lock acquisition ordering hierarchy across all threads.")
                 remediations.append("Consider replacing nested mutexes with lock-free structures or fine-grained atomics.")
-            elif "HEALTHY" in pf_up or "CLEAN" in pf_up or "NO ABNORMAL" in pf_up:
-                remediations.append("No active remediation required: runtime state verified clean within investigated scope.")
             else:
                 remediations.append("Review state transition logic and enforce assertions for valid enum state transitions.")
         elif agg.overall_result == VERDICT_HEALTHY:
@@ -3139,6 +3458,8 @@ class AdaptiveInvestigationSession:
             binary_path=self.companion_elf,
             build_id=getattr(self.target_assessment, "build_id", None) if self.target_assessment else None,
             companion_elf=self.companion_elf,
+            build_id_check=getattr(self.target_assessment, "build_id_check", None) if self.target_assessment else None,
+            target_abi=getattr(self.target_assessment, "target_abi", None) if self.target_assessment else None,
             target_capabilities=self.target_assessment.capabilities if self.target_assessment else [],
             collection_mode=actual_collection_mode,
             target_stop_duration_ms=round(measured_stop_ms, 3),
@@ -3160,9 +3481,12 @@ class AdaptiveInvestigationSession:
                 r_obj = self.recipe_registry.get_recipe(rid)
                 r_dom = getattr(r_obj, "domain", "GENERAL") if r_obj else "GENERAL"
                 r_cats = getattr(r_obj, "applicable_problem_categories", []) if r_obj else []
+                _missing_caps = self.recipe_registry.missing_capabilities(rid)
                 excluded_recipes.append({
                     "recipe_id": rid,
+                    **({"unsupported_capability": _missing_caps[0]} if _missing_caps else {}),
                     "reason_excluded": (
+                        f"Not supported in this mode: needs {', '.join(_missing_caps)}" if _missing_caps else
                         f"Excluded by adaptive planner: recipe domain '{r_dom}' (categories {r_cats}) "
                         f"did not match primary symptom classification '{prim_cat}'"
                     ),
@@ -3225,12 +3549,13 @@ class AdaptiveInvestigationSession:
                     epistemic_level="confirmed_root_cause",
                 ))
             elif h.status in ("LIKELY", "PROPOSED", "SUPPORTED") and h.category not in ("HEALTHY", "HEALTHY_PROCESS"):
-                # IMP-009: a rule may mark its observation as a warning (e.g. stack nearly exhausted)
+                # IMP-009: a rule may mark its observation as a warning (e.g. stack nearly exhausted) or as INFO,
+                # a degradation that is not a fault (e.g. heap retention; see diagnose: DEGRADED)
                 sev = [e.get("details", {}).get("finding_severity") for e in h.supporting_evidence
                        if e.get("status") == "SUPPORTED"]
                 findings_sec.probable_causes.append(FindingRecord(
                     finding_id=f_id,
-                    severity="WARNING" if sev and all(x == "WARNING" for x in sev) else "MEDIUM",
+                    severity=sev[0] if sev and sev[0] in ("WARNING", "INFO") and len(set(sev)) == 1 else "MEDIUM",
                     classification=CLASSIFICATION_PROBABLE_CAUSE,
                     problem_description=h.problem_statement,
                     affected_entity=h.category,
@@ -3293,7 +3618,8 @@ class AdaptiveInvestigationSession:
                 {"hypothesis_id": rh.hypothesis_id, "rationale": rh.confidence_basis}
                 for rh in self.rejected_hypotheses
             ] + [
-                {"hypothesis_id": ch.hypothesis_id, "rationale": "; ".join(ch.contradicting_observations)}
+                {"hypothesis_id": ch.hypothesis_id,
+                 "rationale": "; ".join(ch.contradicting_observations) or ch.confidence_basis}
                 for ch in self.competing_hypotheses if ch.status == "REFUTED"
             ],
             missing_evidence_preventing_conclusions=[m for h in self.active_hypotheses for m in h.missing_evidence] + [
@@ -3433,12 +3759,21 @@ class AdaptiveInvestigationSession:
         res["diagnostic_limitations"] = self.target_assessment.limitations if self.target_assessment else []
         return res
 
-    def to_dict(self) -> Dict[str, Any]:
-        """Serializes complete session state to a dictionary for persistence / recovery (Part F)."""
+    def to_dict(self, _parts: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """Serializes complete session state to a dictionary for persistence / recovery (Part F).
+
+        ``_parts`` (internal, ``_persist_text``): ready-made values for the heavy keys, so the session file is built
+        from the one key list below without deep-copying the observations first."""
+        parts = _parts or {}
+
+        def part(key: str, build: Callable[[], Any]) -> Any:
+            return parts[key] if key in parts else build()
+
         return {
             "schema_version": "2.1.8",
             "investigation_id": self.investigation_id,
             "raw_problem_statement": self.raw_problem_statement,
+            "symptom_fields": self.symptom_fields.to_dict() if self.symptom_fields else None,
             "pid": self.pid,
             "companion_elf": self.companion_elf,
             "corpus_dir": self.corpus_dir,
@@ -3446,20 +3781,39 @@ class AdaptiveInvestigationSession:
             "is_paused": self.is_paused,
             "timeline": self.timeline,
             "plan": self.plan.to_dict() if self.plan else None,
-            "collected_evidence": self.collected_evidence,
-            "collected_evidence_records": [r.to_dict() for r in self.collected_evidence_records],
+            "collected_evidence": part("collected_evidence", lambda: self.collected_evidence),
+            "collected_evidence_records": part("collected_evidence_records",
+                                               lambda: [r.to_dict() for r in self.collected_evidence_records]),
             "active_hypotheses": [h.to_dict() for h in self.active_hypotheses],
             "rejected_hypotheses": [h.to_dict() for h in self.rejected_hypotheses],
-            "conclusion": asdict(self.conclusion) if self.conclusion else None,
+            "conclusion": part("conclusion", lambda: asdict(self.conclusion) if self.conclusion else None),
             "classification_result": asdict(self.classification_result) if self.classification_result else None,
             "target_assessment": self.target_assessment.to_dict() if self.target_assessment else None,
             "verified_checks_count": self.verified_checks_count,
             "temporal_memory_samples": self.temporal_memory_samples,
-            "ledger": self.ledger.to_dict() if self.ledger else None,
-            "methodology": self.methodology.to_dict() if self.methodology else None,
-            "checks": [c.to_dict() for c in self.checks],
+            "ledger": part("ledger", lambda: self.ledger.to_dict() if self.ledger else None),
+            "methodology": part("methodology", lambda: self.methodology.to_dict() if self.methodology else None),
+            "checks": part("checks", lambda: [c.to_dict() for c in self.checks]),
             "competing_hypotheses": [h.to_dict() for h in self.competing_hypotheses],
+            "default_check_budget": self.default_check_budget.to_dict(),
+            "followup_decisions": self.followup_decisions,
         }
+
+    def _persist_text(self) -> str:
+        """The session file text: the same content as ``to_dict()`` (a reload gives the same session), with every
+        large observation payload serialized once and stored once (see extractor.session_store).  The heavy parts are
+        handed over as the live objects (dataclasses become their fields while the tree is walked, the same result
+        as their asdict-based to_dict) instead of being deep-copied first."""
+        from .session_store import BlobInterner, encode_document, intern_observations
+        it = BlobInterner()
+        doc = self.to_dict(_parts={
+            "collected_evidence": self.collected_evidence,
+            "collected_evidence_records": self.collected_evidence_records,
+            "conclusion": self.conclusion,
+            "methodology": self.methodology,
+            "checks": self.checks,
+        })
+        return encode_document(intern_observations(doc, it), it.blobs)
 
     def reconcile_durability(self) -> Dict[str, Any]:
         """Reconciles durability state after an unknown commit outcome or crash (Part F)."""
@@ -3515,6 +3869,8 @@ class AdaptiveInvestigationSession:
         """Reconstructs session state from a serialized dictionary with schema migration and authority re-validation (Part A5 & F)."""
         if not isinstance(data, dict) or not data.get("investigation_id"):
             raise ValueError("Invalid or corrupted session dictionary: missing investigation_id")
+        from .session_store import resolve_blobs
+        data = resolve_blobs(data)  # a session file stores each large observation once (extractor.session_store)
 
         sess = cls(
             investigation_id=str(data["investigation_id"]),
@@ -3522,6 +3878,9 @@ class AdaptiveInvestigationSession:
             pid=data.get("pid"),
             companion_elf=data.get("companion_elf"),
             corpus_dir=data.get("corpus_dir"),
+            symptom_fields=data.get("symptom_fields"),
+            default_check_budget=data.get("default_check_budget"),
+            _persist_on_create=False,
         )
         sess.state = data.get("state", STATE_CREATED)
         sess.is_paused = bool(data.get("is_paused", False))
@@ -3544,6 +3903,7 @@ class AdaptiveInvestigationSession:
             if isinstance(h, dict)
         ]
         sess.verified_checks_count = int(data.get("verified_checks_count", 0))
+        sess.followup_decisions = [d for d in data.get("followup_decisions") or [] if isinstance(d, dict)]
         sess.temporal_memory_samples = list(data.get("temporal_memory_samples", []))
         if data.get("classification_result") and isinstance(data["classification_result"], dict):
             valid_cr = {f.name for f in fields(ProblemClassificationResult)}
@@ -3607,6 +3967,9 @@ class AdaptiveInvestigationSession:
                 for h in data["competing_hypotheses"]
                 if isinstance(h, dict)
             ]
+        # one hypothesis model: candidates are re-bound to the verified hypotheses (never trusted from disk)
+        if any(h.verification_execution_results for h in sess.active_hypotheses + sess.rejected_hypotheses):
+            sess._bind_competing_candidates()
         return sess
 
 
@@ -3617,8 +3980,12 @@ class AdaptiveInvestigationSession:
 class ExpertDiagnosticEngine:
     """Session coordinator and registry for adaptive expert investigations."""
 
+    # Optional read-only hook: callable(session) -> timeline listener or None, called when a session is created.
+    session_listener_factory: Optional[Callable[[AdaptiveInvestigationSession], Any]] = None
+
     def __init__(self, corpus_dir: Optional[str] = None):
-        self.corpus_dir = corpus_dir or "/tmp/dynamicstate_corpus"
+        from .corpus_retention import resolve_corpus_dir
+        self.corpus_dir = resolve_corpus_dir(corpus_dir)
         self._investigations_dir = os.path.join(self.corpus_dir, "investigations")
         os.makedirs(self._investigations_dir, exist_ok=True)
         self.sessions: Dict[str, AdaptiveInvestigationSession] = {}
@@ -3639,8 +4006,10 @@ class ExpertDiagnosticEngine:
         recipe_thresholds: Optional[Dict[str, Any]] = None,
         budget_tracker: Optional[ObservationBudgetTracker] = None,
         budget_limits: Optional[ObservationBudgetLimits] = None,
+        symptom_fields: Any = None,
+        default_check_budget: Any = None,
     ) -> AdaptiveInvestigationSession:
-        """Launches a new adaptive investigation session."""
+        """Launches a new adaptive investigation session (symptom_fields: optional structured symptom input)."""
         inv_id = investigation_id or f"inv_{uuid.uuid4().hex[:12]}"
         session = AdaptiveInvestigationSession(
             investigation_id=inv_id,
@@ -3658,8 +4027,16 @@ class ExpertDiagnosticEngine:
             recipe_thresholds=recipe_thresholds,
             budget_tracker=budget_tracker,
             budget_limits=budget_limits,
+            symptom_fields=symptom_fields,
+            default_check_budget=default_check_budget,
         )
         self.sessions[inv_id] = session
+        factory = self.session_listener_factory
+        if factory is not None:
+            try:
+                session.timeline_listener = factory(session)
+            except Exception:  # noqa: BLE001 - a read-only observer hook must never affect a diagnosis
+                pass
         return session
 
     def run_recipe(
@@ -3700,7 +4077,7 @@ class ExpertDiagnosticEngine:
             budget_limits=budget_limits,
         )
 
-        conclusion = session.run_to_completion(max_steps=20)
+        conclusion = session.run_to_completion()
         check = next((c for c in session.checks if c.recipe_id == recipe.recipe_id), None)
         records = session.ledger.get_records()
 
@@ -3793,7 +4170,10 @@ class ExpertDiagnosticEngine:
 #                          concrete names the evidence exposed (lock names, thread ids, function names,
 #                          variable names, "file:line"); [] when the evidence exposed none.
 #                          subject_details = same names as {kind, name}.
-#   checks_run       list  {check_id, recipe_id, name, status, duration_s, limitations}; executed only
+#                          location_candidates = statically derived source-line candidates (never observed, never
+#                          in subjects): {basis "static", observed false, status, candidates [{rank, location,
+#                          function, statement, action, reason, reason_ko}], ...}; extractor.static_location_candidates.
+#   checks_run      list  {check_id, recipe_id, name, status, duration_s, limitations}; executed only
 #   not_covered      list  {kind, item, reason}; everything that could not be examined (check statuses
 #                          INCONCLUSIVE/ERROR/NOT_APPLICABLE/UNSUPPORTED/NOT_EXECUTED, engine limitations,
 #                          features unsupported on the target ABI, budget exhaustion, missing debug image,
@@ -3812,6 +4192,16 @@ class ExpertDiagnosticEngine:
 #                           not_checked [{kind, item, label, label_ko, reason}] (scope limits of a HEALTHY verdict),
 #                           blocking [{kind, item, reason}] (why the run is NOT healthy; empty when HEALTHY)}.
 #                          verdict == HEALTHY  <=>  healthy_scope.healthy.
+#   symptom_interpretation dict  how the symptom was read (extractor.symptom_interpretation): {symptom_class,
+#                          source (text|structured|default), understood (False: LOW confidence, the broad plan
+#                          was used and the report says so), confidence_level (HIGH|LOW), confidence, reason
+#                          (clear|no_match|weak_evidence|conflicting_classes), primary_category, broad_plan,
+#                          scores, competing_class, text_class, fields}; {} when the run ended before classification.
+#   process_profile  dict  what the diagnosis learned about the process itself, from data it already collected
+#                          (extractor.process_profile.build_process_profile; docs/ui-redesign/API_CONTRACT.md):
+#                          {version, available, window, summary, runtime, threads, memory, locks, resources, modules,
+#                           not_observed}; a section is present only when something was observed for it; {} when the
+#                          run ended before any check ran.  The same dict is the report's ``process_profile`` key.
 DIAGNOSE_SCHEMA_VERSION = "1"
 DIAGNOSE_DEFAULT_SYMPTOM = "general health check"
 
@@ -3860,6 +4250,8 @@ class DiagnoseResult:
     duration_s: float = 0.0
     schema_version: str = DIAGNOSE_SCHEMA_VERSION
     healthy_scope: Dict[str, Any] = field(default_factory=dict)
+    symptom_interpretation: Dict[str, Any] = field(default_factory=dict)
+    process_profile: Dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
         return json.loads(json.dumps(asdict(self), default=str))
@@ -4032,9 +4424,13 @@ def diagnose(
     target: Optional[Any] = None,
     corpus_dir: Optional[str] = None,
     time_limit_s: Optional[float] = None,
-    max_steps: int = 30,
+    max_steps: Optional[int] = None,
     include_report: bool = False,
     engine: Optional["ExpertDiagnosticEngine"] = None,
+    symptom_fields: Any = None,
+    default_check_budget_s: Optional[float] = None,
+    default_check_max_s: Optional[float] = None,
+    enable_tracing: Optional[bool] = None,
 ) -> DiagnoseResult:
     """Diagnose live process ``pid`` end to end in one call and return a :class:`DiagnoseResult`.
 
@@ -4044,12 +4440,21 @@ def diagnose(
         normally stripped and is not fetched).  A path that does not exist yields an INCONCLUSIVE result.
     symptom: natural-language symptom; default "general health check" (the planner then runs its broad
         recipe set).  adapter: ready target adapter (default local).  time_limit_s: wall-clock observation
-        budget (default: 20 s local, 120 s for a remote target, where every read is an SSH round trip).  max_steps: state-machine step cap.
+        budget (default: 20 s local, 120 s for a remote target, where every read is an SSH round trip).  max_steps: explicit state-machine step cap (default: sized from the plan).
+    symptom_fields: optional structured symptom input (``extractor.symptom_interpretation.SymptomFields`` or a dict
+        with symptom_kind, symptom_frequency, symptom_duration, affected_area, related_objects).  A given
+        symptom_kind decides the investigation plan; the free text ``symptom`` alone behaves as before.  Invalid
+        values give an INCONCLUSIVE result with ``invalid_symptom_fields`` in ``not_covered``.
     target: remote target as a :class:`TargetSpec` or dict (``remote_host``, ``ssh_user``, ``ssh_port``,
         ``ssh_key``, ``ssh_proxy_jump``, ``auto_deploy_collector``, ``collector_path``); builds an SSH
         adapter that is closed again when the call ends.  An unreachable host or failed SSH is INCONCLUSIVE
         with ``target_unreachable`` in ``not_covered``.  ``result.target`` carries host/transport, never
         credentials.
+    default_check_budget_s / default_check_max_s: time budget of the default checks (baseline checks the symptom
+        did not ask for): total seconds and the per-check limit (extractor.check_budget; default from the
+        environment DYNAMICSTATE_DEFAULT_CHECK_BUDGET_S / DYNAMICSTATE_DEFAULT_CHECK_MAX_S, else 6 s / 2.5 s; <= 0
+        disables a limit).  A default check left out is listed as not run (``not_run_reason`` "time_budget") and the
+        diagnosis is then never HEALTHY.
 
     Target-side problems never raise: they produce verdict INCONCLUSIVE with the cause in
     ``not_covered``.  A result is only produced after the session executed to a terminal state; a
@@ -4072,6 +4477,12 @@ def diagnose(
         return r
 
     try:
+        from .symptom_interpretation import SymptomFieldError, parse_symptom_fields
+        try:
+            symptom_fields = parse_symptom_fields(symptom_fields)
+        except SymptomFieldError as exc:
+            return _early("invalid_symptom_fields", "symptom fields", str(exc),
+                          f"The structured symptom input is invalid: {exc}. No conclusion was reached.")
         if target is not None:
             try:
                 spec = TargetSpec.from_value(target)
@@ -4128,7 +4539,9 @@ def diagnose(
                               "matching unstripped ELF. No conclusion was reached.")
         return _diagnose_run(pid, debug_image, symptom, adapter=adapter, corpus_dir=corpus_dir,
                              time_limit_s=time_limit_s, max_steps=max_steps, include_report=include_report,
-                             engine=engine, extra_target=extra_target, pre_nc=pre_nc, t0=t0, remote=remote)
+                             engine=engine, extra_target=extra_target, pre_nc=pre_nc, t0=t0, remote=remote,
+                             symptom_fields=symptom_fields, default_check_budget_s=default_check_budget_s,
+                             default_check_max_s=default_check_max_s, enable_tracing=enable_tracing)
     finally:
         if own_adapter is not None:
             try:
@@ -4174,13 +4587,17 @@ def _diagnose_run(
     adapter: Optional[TargetExecutionAdapter],
     corpus_dir: Optional[str],
     time_limit_s: Optional[float],
-    max_steps: int,
+    max_steps: Optional[int],
     include_report: bool,
     engine: Optional["ExpertDiagnosticEngine"],
     extra_target: Dict[str, Any],
     pre_nc: List[Dict[str, Any]],
     t0: float,
     remote: bool,
+    symptom_fields: Any = None,
+    default_check_budget_s: Optional[float] = None,
+    default_check_max_s: Optional[float] = None,
+    enable_tracing: Optional[bool] = None,
 ) -> DiagnoseResult:
     res = _new_diagnose_result(pid, debug_image)
     res.target.update(extra_target)
@@ -4235,27 +4652,56 @@ def _diagnose_run(
         # IMP-020: bracket the whole collection with the target-load meter (never raises; unmeasured -> None).
         from .collection_impact import CollectionImpactMeter, impact_summary_for_report
         meter = CollectionImpactMeter(adapter, pid).start()
+
+        # Roadmap stage 3: selective tracing mode configuration
+        from .tracing_mode import is_tracing_enabled, check_tracing_support
+        from .diagnostic_recipes import CAP_ALLOCATION_TRACING, temporary_capabilities
+        from contextlib import nullcontext
+
+        tracing_on = is_tracing_enabled(enable_tracing)
+        if tracing_on:
+            supported, reason, prereqs = check_tracing_support()
+            if supported:
+                res.target["tracing_mode"] = "ENABLED_SUPPORTED"
+                caps_ctx = temporary_capabilities([CAP_ALLOCATION_TRACING])
+            else:
+                res.target["tracing_mode"] = "ENABLED_UNSUPPORTED"
+                nc.append({
+                    "kind": "tracing_limitation",
+                    "item": "ebpf_dynamic_tracing",
+                    "reason": f"tracing requested but unsupported: {reason}",
+                })
+                caps_ctx = nullcontext()
+        else:
+            res.target["tracing_mode"] = "DISABLED"
+            caps_ctx = nullcontext()
+
         session = None
         stage = "start_investigation"
-        try:
-            session = engine.start_investigation(
-                problem_statement=symptom or DIAGNOSE_DEFAULT_SYMPTOM,
-                pid=pid, companion_elf=debug_image, adapter=adapter, budget_limits=limits,
-            )
-            res.investigation_id = session.investigation_id
-            if getattr(session, "budget_tracker", None) is not None:
-                session.budget_tracker.attach_target_cpu_probe(meter.attributable_cpu_ms)
-            stage = "run_to_completion"
-            conclusion = session.run_to_completion(max_steps=max_steps)
-        except Exception as exc:  # noqa: BLE001
-            nc.append({"kind": "stage_failed", "item": stage, "reason": f"{type(exc).__name__}: {exc}"})
-            if session is not None:
-                res.state = session.state
-                res.checks_run = [_diagnose_check_row(c) for c in session.checks
-                                  if c.status not in (CheckStatus.NOT_EXECUTED, CheckStatus.SKIPPED)]
-            return _finish(f"The diagnosis failed during '{stage}' ({type(exc).__name__}). No conclusion was reached.")
+        with caps_ctx:
+            try:
+                session = engine.start_investigation(
+                    problem_statement=symptom or ("" if symptom_fields else DIAGNOSE_DEFAULT_SYMPTOM),
+                    pid=pid, companion_elf=debug_image, adapter=adapter, budget_limits=limits,
+                    symptom_fields=symptom_fields,
+                    default_check_budget=DefaultCheckBudget.resolve(default_check_budget_s, default_check_max_s),
+                )
+                res.investigation_id = session.investigation_id
+                if getattr(session, "budget_tracker", None) is not None:
+                    session.budget_tracker.attach_target_cpu_probe(meter.attributable_cpu_ms)
+                stage = "run_to_completion"
+                conclusion = session.run_to_completion(max_steps=max_steps)
+            except Exception as exc:  # noqa: BLE001
+                nc.append({"kind": "stage_failed", "item": stage, "reason": f"{type(exc).__name__}: {exc}"})
+                if session is not None:
+                    res.state = session.state
+                    res.checks_run = [_diagnose_check_row(c) for c in session.checks
+                                      if c.status not in (CheckStatus.NOT_EXECUTED, CheckStatus.SKIPPED)]
+                return _finish(f"The diagnosis failed during '{stage}' ({type(exc).__name__}). No conclusion was reached.")
 
         res.state = session.state
+        if session.classification_result is not None and session.classification_result.interpretation:
+            res.symptom_interpretation = dict(session.classification_result.interpretation)
         res.stop_reason = conclusion.stop_reason if conclusion else None
         executed = [c for c in session.checks if c.status not in (CheckStatus.NOT_EXECUTED, CheckStatus.SKIPPED)]
         res.checks_run = [_diagnose_check_row(c) for c in executed]
@@ -4264,6 +4710,15 @@ def _diagnose_run(
         why_stopped = res.stop_reason or session.state
         for st in (session.plan.steps if session.plan else []):
             if st.recipe_id in BASELINE_RECIPE_IDS and st.recipe_id not in ran:
+                if st.not_run_reason:
+                    # left out by the time budget of the default checks (structured; a coverage gap like any other)
+                    b = dict(st.budget or {})
+                    nc.append({"kind": "baseline_check_not_run", "item": st.recipe_id,
+                               "not_run_reason": st.not_run_reason, "budget": b,
+                               "reason": f"baseline check not run: time budget of the default checks (expected "
+                                         f"{b.get('expected_cost_s')} s, {b.get('spent_s')} s of {b.get('total_s')} s "
+                                         f"spent, per-check limit {b.get('per_check_s')} s)"})
+                    continue
                 nc.append({"kind": "baseline_check_not_run", "item": st.recipe_id,
                            "reason": f"baseline check not executed: investigation ended with {why_stopped}"
                                      f" (step status {st.status})"})
@@ -4313,6 +4768,14 @@ def _diagnose_run(
                            "reason": "the finding named no lock, thread, variable or function, so it was not confirmed"})
         if res.verdict == "CONFIRMED_FAULT" and not any(f["status"] == "CONFIRMED_ROOT_CAUSE" for f in res.findings):
             res.verdict = "PROBABLE_FAULT" if res.findings else "INCONCLUSIVE"
+        # Findings that are all INFO (a degradation the rule marked as not a fault, e.g. heap retention) never
+        # make a fault verdict: DEGRADED (aggregator vocabulary; never HEALTHY either, since there is a finding).
+        if res.findings and res.verdict in ("CONFIRMED_FAULT", "PROBABLE_FAULT", "FAULT") \
+                and all(f.get("severity") == "INFO" for f in res.findings):
+            res.verdict = "DEGRADED"
+            sec_a["overall_result"] = res.verdict
+            sec_a["verdict_rationale"] = ("No fault was found; the finding(s) describe a degradation, not a fault: "
+                                          + ", ".join(dict.fromkeys(str(f["category"]) for f in res.findings)) + ".")
 
         # IMP-008: the leak-owner part (heap walks) could not be done / completed on this target
         leak_nc_seen = set()
@@ -4368,7 +4831,14 @@ def _diagnose_run(
                     + list(sec_b.get("collection_failures") or [])
                     + list(report.get("section_h_limitations_and_unverified", {}).get("missing_symbols_or_dwarf") or [])):
             nc.append({"kind": "limitation", "item": "engine", "reason": str(lim)})
-        excluded = [e.get("recipe_id") for e in report.get("section_c_diagnostic_strategy", {}).get("recipes_excluded", [])]
+        _excl_rows = report.get("section_c_diagnostic_strategy", {}).get("recipes_excluded", [])
+        excluded = [e.get("recipe_id") for e in _excl_rows if not e.get("unsupported_capability")]
+        # Checks this mode cannot execute (declared capability requirement): "not examined", one row per capability.
+        for _cap in dict.fromkeys(e["unsupported_capability"] for e in _excl_rows if e.get("unsupported_capability")):
+            _ids = [e.get("recipe_id") for e in _excl_rows if e.get("unsupported_capability") == _cap]
+            nc.append({"kind": "unsupported_in_mode", "item": ",".join(map(str, _ids)), "recipe_ids": list(_ids),
+                       "capability": _cap,
+                       "reason": "not supported in this mode: needs " + CAPABILITY_DESCRIPTIONS.get(_cap, (_cap, _cap))[0]})
         if excluded:
             nc.append({"kind": "recipes_not_planned", "item": ",".join(map(str, excluded)),
                        "reason": "not selected by the planner for this symptom classification"})
@@ -4382,10 +4852,16 @@ def _diagnose_run(
         # HEALTHY rule (extractor.healthy_verdict): every baseline check cleared, nothing blocking -> HEALTHY
         # within the stated scope; otherwise never HEALTHY (an aggregator HEALTHY is re-checked by the same rule).
         nc.extend(long_wait_scope_items(executed))
+        # Verification scope (stage 1): the categories a specific symptom asks about must each be answered by a
+        # completed check; a vague / general health check is scoped to the baseline.
+        _cls = session.classification_result
+        _sym_cats = ([str(c) for c, _w in (_cls.candidate_categories or [])]
+                     if _cls is not None and not _cls.is_vague and getattr(_cls, "understood", True) else [])
         res.healthy_scope = evaluate_healthy(
             verdict=res.verdict, findings=res.findings, checks=executed, not_covered=nc,
             baseline_ids=BASELINE_RECIPE_IDS,
-            recipe_names={r.recipe_id: r.name for r in DiagnosticRecipeRegistry.list_recipes()})
+            recipe_names={r.recipe_id: r.name for r in DiagnosticRecipeRegistry.list_recipes()},
+            symptom_categories=_sym_cats)
         if res.healthy_scope["healthy"]:
             res.verdict = VERDICT_HEALTHY
         elif res.verdict == VERDICT_HEALTHY:
@@ -4415,16 +4891,45 @@ def _diagnose_run(
             exhaustion_reason=getattr(metrics, "exhaustion_reason", None)))
 
         try:
+            from .process_profile import build_process_profile
+            res.process_profile = build_process_profile({"target": res.target, "collection_impact": res.collection_impact}, report)
+            report["process_profile"] = res.process_profile
+        except Exception:  # noqa: BLE001 - the profile is a presentation of data already collected; never a failure
+            res.process_profile = {}
+        # Roadmap stage 3: statically derived location candidates per finding (findings[].location_candidates).
+        # Never subjects, never a status or verdict input; debug image + source text only (no target access).
+        from .static_location_candidates import attach_location_candidates
+        attach_location_candidates(res.findings, debug_image, report=report, profile=res.process_profile)
+        # Roadmap stage 3: selective tracing mode (findings[].traced_locations).
+        # When enable_tracing=True and supported, extracts runtime observed call sites.
+        try:
+            from .tracing_mode import attach_traced_locations
+            exe_path = debug_image if debug_image and os.path.exists(debug_image) else f"/proc/{pid}/exe"
+            attach_traced_locations(
+                res.findings, pid, exe_path, debug_image=debug_image,
+                enabled=(res.target.get("tracing_mode") == "ENABLED_SUPPORTED"),
+            )
+        except Exception:  # noqa: BLE001 - tracing is optional presentation; never breaks diagnosis
+            pass
+        # Roadmap stage 3: finding -> memory object -> variable -> thread (findings[].object_relations); presentation
+        # of the evidence above, never a status or verdict input.
+        from .object_relations import attach_object_relations
+        attach_object_relations(res.findings, report)
+
+        # Serialized once (C encoder; json.dump() runs the pure-Python one): the same text is the report file and,
+        # when asked for, the returned copy.
+        report_text = json.dumps(report, default=str)
+        try:
             rep_dir = os.path.join(engine.corpus_dir, "reports")
             os.makedirs(rep_dir, exist_ok=True)
             path = os.path.join(rep_dir, f"{session.investigation_id}.report.json")
             with open(path, "w", encoding="utf-8") as fh:
-                json.dump(report, fh, default=str)
+                fh.write(report_text)
             res.report_path = path
         except OSError as exc:
             nc.append({"kind": "report_not_saved", "item": "report", "reason": str(exc)})
         if include_report:
-            res.report = json.loads(json.dumps(report, default=str))
+            res.report = json.loads(report_text)
 
         passed = sum(1 for r in res.checks_run if r["status"] == CheckStatus.PASS)
         if res.verdict == VERDICT_HEALTHY:

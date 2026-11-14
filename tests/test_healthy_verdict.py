@@ -36,6 +36,7 @@ from extractor.target_abi import FEATURE_MUTEX_OWNER, SUPPORT_NOT_SUPPORTED_ON_T
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "benchmarks", "diagnosis_accuracy"))
 import run_benchmark as rb  # noqa: E402
+from tests.support.fixture_process import fixture_popen
 
 GENERIC = "general health check"
 
@@ -96,7 +97,7 @@ class TestHealthyVerdictRealProcesses(unittest.TestCase):
             cls.bins[name] = out
 
     def _launch(self, name):
-        proc = subprocess.Popen([self.bins[name]], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+        proc = fixture_popen([self.bins[name]], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                                 stderr=subprocess.DEVNULL)
 
         def _kill():
@@ -149,7 +150,7 @@ class TestHealthyVerdictRealProcesses(unittest.TestCase):
                 ("en", "is healthy within the checked scope", "Not checked:", "healthy = every baseline check"),
                 ("ko", "점검한 범위 안에서 정상입니다", "점검하지 못한 것:", "정상 = 모든 기본")):
             text = render_human_report(d, d.get("report"), lang=lang)
-            first = text.split("\n## ", 2)[1].split("\n\n", 1)[1].split("\n")[0]
+            first = text.split("\n## ", 2)[1].split("\n\n")[2].split("\n")[0]   # after the verdict line
             self.assertIn(healthy_txt, first, text)
             self.assertIn(nc_txt, first)
             self.assertIn("acceptor", first)
@@ -310,6 +311,67 @@ class TestHealthyRule(unittest.TestCase):
             self.assertIn(k, kinds)
         self.assertEqual(kinds.count("integrity_not_checked"), 1)
         self.assertIn("64.0 MiB", s["not_checked"][0]["label"])
+
+    def test_double_free_check_skipped_for_the_heap_cap_is_a_scope_limit(self):
+        self.assertIn("RECIPE_DOUBLE_FREE", BASELINE_RECIPE_IDS)
+        base = [_chk(r) for r in BASELINE_RECIPE_IDS if r != "RECIPE_DOUBLE_FREE"]
+        capped = {"free_list_repeats": {"status": "NOT_CHECKED", "findings": [],
+                                        "heap_not_checked_reason": "above_baseline_cap"}}
+        s = self._eval(checks=base + [_chk("RECIPE_DOUBLE_FREE", "INCONCLUSIVE", capped)])
+        self.assertTrue(s["healthy"], s["blocking"])
+        item = [x for x in s["not_checked"] if x["kind"] == "double_free_not_checked"]
+        self.assertTrue(item and "baseline walk cap" in item[0]["label"], s["not_checked"])
+        for name, obs in (("byte budget", {"free_list_repeats": {"status": "NOT_CHECKED", "findings": [],
+                                                                 "heap_not_checked_reason": "byte_budget"}}),
+                          ("lists not walked completely", {"free_list_repeats": {"status": "INCOMPLETE",
+                                                                                "findings": []}}),
+                          ("unsupported allocator", {"free_list_repeats": {"status": "UNSUPPORTED", "findings": []}})):
+            with self.subTest(name):
+                s = self._eval(checks=base + [_chk("RECIPE_DOUBLE_FREE", "INCONCLUSIVE", obs)])
+                self.assertFalse(s["healthy"])
+                self.assertEqual(s["blocking"][0]["item"], "RECIPE_DOUBLE_FREE")
+
+    def test_outside_baseline_says_what_the_heap_walk_cannot_see(self):
+        # use-after-free and double free are looked for by baseline checks now (RECIPE_FREED_MEMORY_USE,
+        # RECIPE_DOUBLE_FREE); the label must not claim they are not looked for
+        en, ko = hv.OUTSIDE_BASELINE
+        self.assertNotIn("use-after-free, double free, data races", en)
+        self.assertIn("data races and program-logic errors", en)
+        self.assertIn("re-allocated in between", en)
+        self.assertNotRegex(en, "[가-힣]")
+        self.assertIn("데이터 레이스", ko)
+
+    def test_symptom_question_needs_a_completed_check(self):
+        # stage 1 verification scope: the categories a specific symptom asks about are answered by a PASS check
+        base = [_chk(r) for r in BASELINE_RECIPE_IDS]
+
+        def ev(cats, checks=None, nc=None):
+            return hv.evaluate(verdict="INCONCLUSIVE", findings=[], checks=base if checks is None else checks,
+                               not_covered=nc or [], baseline_ids=BASELINE_RECIPE_IDS, symptom_categories=cats)
+
+        # answered by a baseline check of the category (memory growth / deadlock): unchanged
+        for cats in (["MEMORY_LEAK"], ["DEADLOCK_INDICATORS"], ["LOCK_CONTENTION", "DEADLOCK_INDICATORS"], [], None):
+            with self.subTest(cats=cats):
+                self.assertTrue(ev(cats)["healthy"], ev(cats)["blocking"])
+        # a category whose only checks reached no result: INCONCLUSIVE with the reason stated
+        s = ev(["UNEXPECTED_STATE_TRANSITIONS"],
+               checks=base + [_chk("RECIPE_STATE_TRANSITION_VIOLATIONS", "INCONCLUSIVE")])
+        self.assertFalse(s["healthy"])
+        gap = [b for b in s["blocking"] if b["kind"] == "symptom_question_unanswered"]
+        self.assertEqual([b["item"] for b in gap], ["UNEXPECTED_STATE_TRANSITIONS"])
+        self.assertIn("RECIPE_STATE_TRANSITION_VIOLATIONS INCONCLUSIVE", gap[0]["reason"])
+        # ... or that could not run in this mode
+        s = ev(["UNEXPECTED_STATE_TRANSITIONS"],
+               nc=[{"kind": "unsupported_in_mode", "item": "RECIPE_STATE_TRANSITION_VIOLATIONS",
+                    "recipe_ids": ["RECIPE_STATE_TRANSITION_VIOLATIONS"],
+                    "capability": "caller_specification", "reason": "x"}])
+        self.assertFalse(s["healthy"])
+        self.assertIn("not supported in this mode", s["blocking"][0]["reason"])
+        # the same check with a clear result answers it
+        s = ev(["UNEXPECTED_STATE_TRANSITIONS"], checks=base + [_chk("RECIPE_STATE_TRANSITION_VIOLATIONS")])
+        self.assertTrue(s["healthy"], s["blocking"])
+        # a category no recipe looks at is not a question this tool can be asked
+        self.assertTrue(ev(["NO_SUCH_CATEGORY"])["healthy"])
 
     def test_unsupported_feature_of_a_baseline_check_blocks(self):
         base = [_chk(r) for r in BASELINE_RECIPE_IDS if r != "RECIPE_POTENTIAL_DEADLOCK_PATTERNS"]

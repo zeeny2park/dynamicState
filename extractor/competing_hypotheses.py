@@ -19,6 +19,16 @@ from dataclasses import dataclass, field, asdict, fields
 import hmac
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
+from extractor.typed_evidence import (
+    INV_ADDRESS_VALID,
+    INV_NO_CIRCULAR_WAIT,
+    INV_NO_POISON,
+    POLARITY_CONTRADICTS,
+    POLARITY_SUPPORTS,
+    TYPED_EVIDENCE_KEY,
+    TypedEvidence,
+)
+from extractor.cause_predictions import OUTCOME_REFUTED, OUTCOME_SUPPORTED
 from extractor.diagnostic_rule_model import (
     VERDICT_CONFIRMED,
     VERDICT_LIKELY,
@@ -86,91 +96,217 @@ Exact Root Independence Definition (Phase 2.1.8 Part B1):
 # Primary Single-Evidence Confirmation Rules & Registry (Part A4)
 # =============================================================================
 
-def _extract_record_searchable_text(rec: Any) -> str:
-    parts: List[str] = []
-    obs = getattr(rec, "observation", "")
-    if obs:
-        parts.append(str(obs))
-    for attr in ("details", "object_observation", "field_observation", "comparison_observation"):
-        val = getattr(rec, attr, None)
-        if isinstance(val, dict):
-            for k, v in val.items():
-                parts.append(f"{k}:{v}")
-    return " ".join(parts).lower()
+# Stage 1 (zero string search in the verdict path): the executable criteria below read structured fields of the
+# EvidenceRecord only - flags in its ``details`` and the typed evidence part (``details["typed_evidence"]``, see
+# extractor.typed_evidence) that the engine records with every recipe observation.  The observation text of a
+# record is display; rewording it cannot satisfy or fail a rule.
+
+def _record_details(rec: Any) -> Dict[str, Any]:
+    d = getattr(rec, "details", None)
+    return d if isinstance(d, dict) else {}
+
+
+def _record_typed(rec: Any) -> Optional[TypedEvidence]:
+    t = _record_details(rec).get(TYPED_EVIDENCE_KEY)
+    return TypedEvidence.from_dict(t) if isinstance(t, dict) else None
 
 
 def _validate_rule_canary(rec: Any) -> Tuple[bool, str]:
-    txt = _extract_record_searchable_text(rec)
-    details = getattr(rec, "details", {}) if isinstance(getattr(rec, "details", None), dict) else {}
-    if any(neg in txt for neg in ("canary intact", "zero corrupt", "no corrupt", "headers intact")):
+    details = _record_details(rec)
+    te = _record_typed(rec)
+    if details.get("canaries_intact") is True or details.get("canary_corrupted") is False \
+            or (te is not None and te.upholds(INV_NO_POISON)):
         return False, "Observation indicates intact canary/headers rather than corruption"
-    positive_markers = (
-        "canary", "corrupt", "overflow", "guard", "magic", "deadbeef",
-        "out-of-bounds", "prev_inuse", "size_field", "header overwrite", "redzone",
-    )
-    if any(m in txt for m in positive_markers) or details.get("canary_corrupted") is True or details.get("metadata_corrupted") is True:
+    if any(details.get(k) is True for k in ("canary_corrupted", "metadata_corrupted", "magic_corrupted",
+                                            "corruption_confirmed")) \
+            or (te is not None and (te.violates(INV_NO_POISON) or te.corruption_confirmed)):
         return True, "Executable canary/metadata corruption criteria satisfied"
     return False, "Evidence record does not contain required canary or buffer/header corruption indicators"
 
 
 def _validate_rule_double_free(rec: Any) -> Tuple[bool, str]:
-    txt = _extract_record_searchable_text(rec)
-    details = getattr(rec, "details", {}) if isinstance(getattr(rec, "details", None), dict) else {}
-    if any(neg in txt for neg in ("no double free", "zero duplicate", "freelist clean")):
+    details = _record_details(rec)
+    te = _record_typed(rec)
+    if details.get("double_free_detected") is False or details.get("double_free_confirmed") is False:
         return False, "Observation indicates clean freelist rather than double free"
-    positive_markers = (
-        "double free", "double_free", "duplicate", "fastbin", "tcache",
-        "freelist", "free-list", "cycle", "already freed",
-    )
-    if any(m in txt for m in positive_markers) or details.get("double_free_detected") is True:
+    if details.get("double_free_detected") is True or details.get("double_free_confirmed") is True \
+            or (te is not None and te.rule == "RECIPE_DOUBLE_FREE" and te.polarity == POLARITY_SUPPORTS):
         return True, "Executable ptmalloc/allocator double-free criteria satisfied"
     return False, "Evidence record does not contain required duplicate free or freelist cycle indicators"
 
 
 def _validate_rule_segv_crash(rec: Any) -> Tuple[bool, str]:
-    txt = _extract_record_searchable_text(rec)
-    details = getattr(rec, "details", {}) if isinstance(getattr(rec, "details", None), dict) else {}
-    positive_markers = (
-        "sigsegv", "sigbus", "sigabrt", "segfault", "signal", "fault address",
-        "crash", "wild", "unmapped", "null pointer", "invalid memory access",
-    )
-    if any(m in txt for m in positive_markers) or details.get("signal_number") in (6, 7, 11):
+    details = _record_details(rec)
+    te = _record_typed(rec)
+    if details.get("signal_number") in (6, 7, 11) or details.get("access_fault_confirmed") is True \
+            or (te is not None and te.violates(INV_ADDRESS_VALID)):
         return True, "Executable fatal signal / fault address criteria satisfied"
     return False, "Evidence record does not contain fatal signal receipt or fault address indicators"
 
 
 def _validate_rule_deadlock_cycle(rec: Any) -> Tuple[bool, str]:
-    txt = _extract_record_searchable_text(rec)
-    details = getattr(rec, "details", {}) if isinstance(getattr(rec, "details", None), dict) else {}
-    if any(neg in txt for neg in ("no deadlock", "zero cycle", "acyclic")):
+    details = _record_details(rec)
+    te = _record_typed(rec)
+    if details.get("lock_graph_acyclic") is True or details.get("deadlock_detected") is False \
+            or (te is not None and te.upholds(INV_NO_CIRCULAR_WAIT)):
         return False, "Observation indicates acyclic lock graph rather than deadlock"
-    positive_markers = ("deadlock", "cycle", "circular", "ab-ba", "wait-for", "mutual wait")
     if (
-        any(m in txt for m in positive_markers)
-        or details.get("deadlock_detected") is True
+        details.get("deadlock_detected") is True
         or bool(details.get("deadlock_cycles"))
         or bool(details.get("deadlock_cycle"))
+        or (te is not None and te.violates(INV_NO_CIRCULAR_WAIT))
     ):
         return True, "Executable directed wait-for cycle criteria satisfied"
     return False, "Evidence record does not contain directed circular wait-for cycle indicators"
 
 
 def _validate_rule_oom_kill(rec: Any) -> Tuple[bool, str]:
-    txt = _extract_record_searchable_text(rec)
-    details = getattr(rec, "details", {}) if isinstance(getattr(rec, "details", None), dict) else {}
-    positive_markers = ("oom", "out of memory", "killed process", "exhaustion", "cgroup memory limit", "enomem")
-    if any(m in txt for m in positive_markers) or details.get("oom_killed") is True:
+    if _record_details(rec).get("oom_killed") is True:
         return True, "Executable kernel/cgroup OOM event criteria satisfied"
     return False, "Evidence record does not contain kernel/cgroup OOM or memory exhaustion indicators"
 
 
 def _validate_rule_clean_refutation(rec: Any) -> Tuple[bool, str]:
-    txt = _extract_record_searchable_text(rec)
-    details = getattr(rec, "details", {}) if isinstance(getattr(rec, "details", None), dict) else {}
-    positive_markers = ("clean", "zero", "healthy", "intact", "no violation", "passed", "normal", "acyclic", "bounded")
-    if any(m in txt for m in positive_markers) or details.get("clean_state_verified") is True:
+    te = _record_typed(rec)
+    if _record_details(rec).get("clean_state_verified") is True \
+            or (te is not None and te.polarity == POLARITY_CONTRADICTS and te.complete):
         return True, "Executable clean-state invariant verification criteria satisfied"
     return False, "Evidence record does not contain positive clean-state invariant verification indicators"
+
+
+# Verified-hypothesis status -> candidate status vocabulary
+_BOUND_STATUS = {"CONFIRMED": VERDICT_CONFIRMED, "LIKELY": VERDICT_LIKELY, "SUPPORTED": VERDICT_SUPPORTED,
+                 "PROPOSED": VERDICT_SUPPORTED, "INCONCLUSIVE": VERDICT_INCONCLUSIVE, "REFUTED": VERDICT_REFUTED,
+                 "CONTRADICTED": VERDICT_REFUTED}
+_BOUND_RANK = {VERDICT_CONFIRMED: 5, VERDICT_LIKELY: 4, VERDICT_SUPPORTED: 3, VERDICT_INCONCLUSIVE: 2,
+               VERDICT_REFUTED: 1}
+
+
+def candidate_verdict_source(candidate: Any, verified: List[Any],
+                             outcome: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """The verdict a competing candidate takes in an investigation whose hypotheses are verified (stage 1).
+
+    ``verified``: the investigation's verified hypotheses (active + rejected ExpertHypothesis).  ``outcome``: what the
+    evidence says about THIS cause (``cause_predictions.evaluate_causes``; candidates with declared predictions):
+    * supported (the evidence discriminates in its favour) -> the status of the verified hypothesis that consumed the
+      decisive evidence (at least SUPPORTED), bound to the checks that produced it;
+    * refuted (observed evidence contradicts what it predicts) -> REFUTED;
+    * undecided -> INCONCLUSIVE, with the reason (shared evidence that does not distinguish it from a rival, or
+      nothing observed that bears on it).
+    Without an outcome (a candidate with no declared predictions) the former rule applies: the candidate takes the
+    verdict of the verified hypothesis that consumed the evidence of its rules."""
+    if outcome:
+        return _verdict_source_from_outcome(candidate, verified, outcome)
+    rules = set(getattr(candidate, "applicable_diagnostic_rules", None) or [])
+    best: Optional[Tuple[int, float, Any, List[str]]] = None
+    contra_ids: List[str] = []
+    contra_by: List[str] = []
+    for h in verified:
+        supp = [e.get("evidence_id") for e in (getattr(h, "supporting_evidence", None) or [])
+                if isinstance(e, dict) and e.get("recipe_id") in rules]
+        con = [e.get("evidence_id") for e in (getattr(h, "contradicting_evidence", None) or [])
+               if isinstance(e, dict) and e.get("recipe_id") in rules]
+        contra_ids += [x for x in con if x]
+        if con:
+            contra_by.append(str(getattr(h, "hypothesis_id", "")))
+        if supp:
+            st = _BOUND_STATUS.get(str(getattr(h, "status", "")), VERDICT_INCONCLUSIVE)
+            key = (_BOUND_RANK.get(st, 0), float(getattr(h, "confidence", 0.0) or 0.0))
+            if best is None or key > best[:2]:
+                best = (key[0], key[1], h, [x for x in supp if x])
+    if best is not None:
+        h = best[2]
+        st = _BOUND_STATUS.get(str(getattr(h, "status", "")), VERDICT_INCONCLUSIVE)
+        return {"hypothesis_id": getattr(h, "hypothesis_id", None), "category": getattr(h, "category", None),
+                "rules": sorted(rules), "status": st, "confidence": round(float(getattr(h, "confidence", 0.0)), 4),
+                "supporting_evidence_ids": best[3], "contradicting_evidence_ids": contra_ids,
+                "basis": f"Verified hypothesis {getattr(h, 'hypothesis_id', '')} ({getattr(h, 'category', '')}): "
+                         + str(getattr(h, "confidence_basis", "") or "")}
+    if contra_ids:
+        return {"hypothesis_id": contra_by[0] if contra_by else None, "category": None, "rules": sorted(rules),
+                "status": VERDICT_REFUTED, "confidence": 0.10, "supporting_evidence_ids": [],
+                "contradicting_evidence_ids": contra_ids,
+                "basis": "Its discriminating checks ran and found their invariant holding (evidence "
+                         + ", ".join(contra_ids[:6]) + ")."}
+    return {"hypothesis_id": None, "category": None, "rules": sorted(rules), "status": VERDICT_INCONCLUSIVE,
+            "confidence": 0.20, "supporting_evidence_ids": [], "contradicting_evidence_ids": [],
+            "basis": "None of its discriminating checks produced evidence in this investigation."}
+
+
+def _signal_text(items: List[Dict[str, Any]]) -> str:
+    return ", ".join(f"{m.get('signal')}={m.get('observed')}" for m in items)
+
+
+def _verdict_source_from_outcome(candidate: Any, verified: List[Any], oc: Dict[str, Any]) -> Dict[str, Any]:
+    """verdict_source of a candidate from its evidence outcome (see candidate_verdict_source)."""
+    kind = oc.get("outcome")
+    decisive = list(oc.get("decisive") or [])
+    contradicted = list(oc.get("contradicted") or [])
+    matched = list(oc.get("matched") or [])
+    shown = decisive if kind == OUTCOME_SUPPORTED else contradicted if kind == OUTCOME_REFUTED else matched
+    ev_ids = [e for m in shown for e in m.get("evidence_ids") or []]
+    rules = list(dict.fromkeys(r for m in shown for r in m.get("rules") or []))
+    base = {"rules": rules, "applicable_rules": sorted(getattr(candidate, "applicable_diagnostic_rules", None) or []),
+            "outcome": kind, "reason": oc.get("reason"), "signals": shown,
+            "rivals_not_distinguished": list(oc.get("rivals_not_distinguished") or []),
+            "supporting_evidence_ids": [], "contradicting_evidence_ids": []}
+
+    def consumer(ids: List[str], lists: Tuple[str, ...]) -> Optional[Any]:
+        best = None
+        for h in verified:
+            hid = {e.get("evidence_id") for ln in lists for e in (getattr(h, ln, None) or []) if isinstance(e, dict)}
+            if not hid & set(ids):
+                continue
+            st = _BOUND_STATUS.get(str(getattr(h, "status", "")), VERDICT_INCONCLUSIVE)
+            key = (_BOUND_RANK.get(st, 0), float(getattr(h, "confidence", 0.0) or 0.0))
+            if best is None or key > best[0]:
+                best = (key, h)
+        return best[1] if best else None
+
+    if kind == OUTCOME_SUPPORTED:
+        h = consumer(ev_ids, ("supporting_evidence",))
+        st = _BOUND_STATUS.get(str(getattr(h, "status", "")), VERDICT_INCONCLUSIVE) if h is not None else None
+        if st is None or _BOUND_RANK.get(st, 0) < _BOUND_RANK[VERDICT_SUPPORTED]:
+            st, conf = VERDICT_SUPPORTED, 0.5
+        else:
+            conf = round(float(getattr(h, "confidence", 0.0) or 0.0), 4)
+        return dict(base, hypothesis_id=getattr(h, "hypothesis_id", None), category=getattr(h, "category", None),
+                    status=st, confidence=conf, supporting_evidence_ids=ev_ids,
+                    basis="The evidence discriminates in favour of this cause: " + _signal_text(decisive)
+                          + (f" (verified hypothesis {getattr(h, 'hypothesis_id', '')})." if h is not None else "."))
+    if kind == OUTCOME_REFUTED:
+        h = consumer(ev_ids, ("supporting_evidence", "contradicting_evidence"))
+        return dict(base, hypothesis_id=getattr(h, "hypothesis_id", None), category=getattr(h, "category", None),
+                    status=VERDICT_REFUTED, confidence=0.10, contradicting_evidence_ids=ev_ids,
+                    basis="Observed evidence contradicts what this cause predicts: "
+                          + "; ".join(f"{m.get('signal')}={m.get('observed')} (predicted {'/'.join(m.get('predicted') or [])})"
+                                      for m in contradicted) + ".")
+    rivals = list(oc.get("rivals_not_distinguished") or [])
+    if matched:
+        basis = ("The evidence does not distinguish this cause" + (" from " + ", ".join(rivals) if rivals else "")
+                 + ": the observations it shares (" + _signal_text(matched) + ") are predicted by the rival too, "
+                 "or its own defining observation is missing.")
+    else:
+        basis = "Nothing observed in this investigation bears on this cause."
+    return dict(base, hypothesis_id=None, category=None, status=VERDICT_INCONCLUSIVE, confidence=0.20, basis=basis)
+
+
+# Dependency-graph defects that make the graph itself invalid (not merely unverified): get_independent_root_sources
+_INVALID_GRAPH_KINDS = frozenset({"GRAPH_CYCLE", "GRAPH_SELF_DEPENDENCY", "GRAPH_MISSING_PARENT", "GRAPH_MALFORMED"})
+
+# Static storage that a use-after-free / heap corruption cannot concern (structured segment of the record).
+_STATIC_SEGMENTS = frozenset({".data", ".bss", ".rodata", ".tdata", ".tbss"})
+
+
+def _record_is_static_storage(rec: Any) -> bool:
+    details = _record_details(rec)
+    if details.get("static_lifetime") is True or details.get("storage_class") == "static":
+        return True
+    for k in ("segment", "vma_name"):
+        if details.get(k) in _STATIC_SEGMENTS:
+            return True
+    raw = details.get("raw_observation")
+    return isinstance(raw, dict) and raw.get("vma_name") in _STATIC_SEGMENTS
 
 
 @dataclass(frozen=True)
@@ -461,6 +597,11 @@ class CompetingHypothesis:
     ledger: Optional[Any] = None
     strict_ledger: bool = True
     details: Dict[str, Any] = field(default_factory=dict)
+    # Stage 1 (one hypothesis model): when an investigation has verified its hypotheses, a candidate is a view of
+    # the verified hypothesis (extractor.expert_diagnostic_engine.ExpertHypothesis) that consumed the evidence of
+    # its discriminating rules: status / confidence / basis come from there (bind_verdict).  Empty for a
+    # stand-alone candidate, which keeps its own ledger-authority evaluation.  Never restored from disk.
+    verdict_source: Dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         self._base_confidence: float = float(self.confidence)
@@ -1113,6 +1254,7 @@ class CompetingHypothesis:
         self.unresolved_dependencies = []
         valid_branches: Dict[str, List[str]] = {}
         unresolved_branches: Dict[str, str] = {}
+        invalid_kinds: Set[str] = set()   # structured reasons a branch is invalid (GRAPH_* codes)
 
         sorted_ev_ids = sorted(set(self.supporting_evidence_ids))
         if not sorted_ev_ids:
@@ -1159,12 +1301,14 @@ class CompetingHypothesis:
                 visited_edges += 1
                 if len(path) > 200 or visited_edges > 2000:
                     branch_error_reason = f"Dependency graph depth/resource limit exceeded at {curr}"
+                    invalid_kinds.add("GRAPH_DEPTH_LIMIT")
                     self._add_limitation_unique(branch_error_reason)
                     branch_invalid = True
                     break
 
                 if not isinstance(curr, str) or not curr.strip():
                     branch_error_reason = f"Malformed dependency node identifier: {curr!r}"
+                    invalid_kinds.add("GRAPH_MALFORMED")
                     self._add_limitation_unique(branch_error_reason)
                     branch_invalid = True
                     continue
@@ -1176,6 +1320,7 @@ class CompetingHypothesis:
                 raw_dep_val = self.evidence_dependencies.get(curr, [])
                 if has_explicit_deps_key and not isinstance(raw_dep_val, (list, tuple, set)):
                     branch_error_reason = f"Malformed dependency edge list on {curr}: {raw_dep_val!r}"
+                    invalid_kinds.add("GRAPH_MALFORMED")
                     self._add_limitation_unique(branch_error_reason)
                     branch_invalid = True
                     continue
@@ -1199,6 +1344,7 @@ class CompetingHypothesis:
                 for p in combined_raw_parents:
                     if not isinstance(p, str) or not p.strip():
                         branch_error_reason = f"Malformed dependency edge on {curr}: {p!r}"
+                        invalid_kinds.add("GRAPH_MALFORMED")
                         self._add_limitation_unique(branch_error_reason)
                         branch_invalid = True
                         malformed_found = True
@@ -1207,6 +1353,7 @@ class CompetingHypothesis:
 
                 if curr in combined_raw_parents:
                     branch_error_reason = f"Self-dependency detected on {curr}"
+                    invalid_kinds.add("GRAPH_SELF_DEPENDENCY")
                     self._add_limitation_unique(branch_error_reason)
                     branch_invalid = True
                     continue
@@ -1217,6 +1364,7 @@ class CompetingHypothesis:
                     # Leaf / Root node reached: must exist in authoritative ledger and pass full authority validation
                     if rec is None:
                         branch_error_reason = f"Missing root dependency {curr} in ledger"
+                        invalid_kinds.add("GRAPH_MISSING_ROOT")
                         self._add_limitation_unique(branch_error_reason)
                         branch_invalid = True
                         continue
@@ -1225,6 +1373,7 @@ class CompetingHypothesis:
                     )
                     if not auth_info["is_authoritative"]:
                         branch_error_reason = f"Root dependency {curr} failed authority validation: {auth_info['reason']}"
+                        invalid_kinds.add("GRAPH_ROOT_UNAUTHORITATIVE")
                         self._add_limitation_unique(branch_error_reason)
                         branch_invalid = True
                         continue
@@ -1237,19 +1386,23 @@ class CompetingHypothesis:
                         )
                         if not auth_info["is_authoritative"]:
                             branch_error_reason = f"Dependency node {curr} failed authority validation: {auth_info['reason']}"
+                            invalid_kinds.add("GRAPH_NODE_UNAUTHORITATIVE")
                             self._add_limitation_unique(branch_error_reason)
                             branch_invalid = True
                             continue
                     for p in unique_parents:
                         if p in path:
-                            cycle_str = " -> ".join(path[path.index(p):] + [p])
+                            first_at = next(k for k, node in enumerate(path) if node == p)
+                            cycle_str = " -> ".join(path[first_at:] + [p])
                             branch_error_reason = f"Dependency cycle detected: {cycle_str}"
+                            invalid_kinds.add("GRAPH_CYCLE")
                             self._add_limitation_unique(branch_error_reason)
                             branch_invalid = True
                             continue
                         p_rec = self._lookup_record_in_ledger(eff_ledger, p)
                         if p not in self.evidence_dependencies and p_rec is None:
                             branch_error_reason = f"Missing parent dependency {p} in ledger"
+                            invalid_kinds.add("GRAPH_MISSING_PARENT")
                             self._add_limitation_unique(branch_error_reason)
                             branch_invalid = True
                             continue
@@ -1286,6 +1439,7 @@ class CompetingHypothesis:
             "unresolved_branches": unresolved_branches,
             "independent_root_ids": sorted(independent_roots),
             "independent_capture_origins": sorted(origin_to_canonical_root.keys()),
+            "invalid_kinds": sorted(invalid_kinds),
         }
         return independent_roots
 
@@ -1495,25 +1649,15 @@ class CompetingHypothesis:
         """Evaluates deterministic rule for a decisive contradiction and checks if a documented
         structural impossibility precedence rule supersedes conflicting support (Part A3 & B2).
         """
-        obs_txt = (crec.contradiction or "") + " " + (_extract_record_searchable_text(rec) if rec else "")
-        low_txt = obs_txt.lower()
-        if not low_txt.strip():
+        if not (crec.contradiction or "").strip() and rec is None:
             return False, "Empty contradiction observation cannot satisfy decisive contradiction rule", None
 
-        # Check documented deterministic structural impossibility precedence rules
+        # Documented deterministic structural impossibility precedence rule: the contradicting record shows the
+        # address in static storage (structured segment / lifetime of the record, never the wording)
         precedence_rule = crec.precedence_rule
         if not precedence_rule:
             if category in ("USE_AFTER_FREE", "HEAP_CORRUPTION", "MEMORY_CORRUPTION", "INVALID_DOUBLE_FREE"):
-                if any(
-                    kw in low_txt
-                    for kw in (
-                        "static lifetime",
-                        "global data segment",
-                        "valid static global",
-                        "rodata",
-                        "static segment",
-                    )
-                ):
+                if rec is not None and _record_is_static_storage(rec):
                     precedence_rule = "RULE_STATIC_SEGMENT_IMPOSSIBILITY_PRECEDENCE"
 
         return True, "DECISIVE_AUTHORITATIVE_CONTRADICTION_RULE", precedence_rule
@@ -1696,9 +1840,11 @@ class CompetingHypothesis:
 
         # 5. Compute deterministic base + delta confidence (insertion-order independent!)
         support_delta = sum(w for _, w in sorted(self._support_weights.items()))
+        # weight keys of irrelevant contradictions (an evidence id, or "contra:" + the observation for one without)
+        irrelevant_keys = {ic.evidence_id for ic in irrelevant_contradictions if ic.evidence_id} | {
+            "contra:" + str(ic.contradiction) for ic in irrelevant_contradictions}
         contra_delta = sum(
-            w for k, w in sorted(self._contradiction_weights.items())
-            if not any(ic.evidence_id == k or f"contra:{ic.contradiction}" == k for ic in irrelevant_contradictions)
+            w for k, w in sorted(self._contradiction_weights.items()) if k not in irrelevant_keys
         )
         computed_conf = max(0.05, min(0.99, round(self._base_confidence + support_delta - contra_delta, 6)))
 
@@ -1755,9 +1901,8 @@ class CompetingHypothesis:
                     self.status = VERDICT_INCONCLUSIVE
                     decision_rule_applied = "RULE_INCONCLUSIVE_NO_SUPPORTING_EVIDENCE"
                     decision_explanation = "No supporting observations or evidence IDs recorded."
-            elif self.unresolved_dependencies and num_independent == 0 and any(
-                "cycle" in lim.lower() or "self-dependency" in lim.lower() or "missing parent" in lim.lower() or "malformed" in lim.lower()
-                for lim in self.integrity_limitations
+            elif self.unresolved_dependencies and num_independent == 0 and (
+                set((self.graph_validation_summary or {}).get("invalid_kinds") or []) & _INVALID_GRAPH_KINDS
             ):
                 self.status = VERDICT_INCONCLUSIVE
                 decision_rule_applied = "RULE_INCONCLUSIVE_INVALID_DEPENDENCY_GRAPH"
@@ -1835,6 +1980,17 @@ class CompetingHypothesis:
                     decision_rule_applied = "RULE_INCONCLUSIVE_FALLBACK"
                     decision_explanation = "Insufficient authoritative evidence for confirmation or refutation."
 
+        if self.verdict_source:
+            # One source of truth: the verified hypothesis decides; the ledger audit above stays as provenance data
+            decision_rule_applied = "RULE_BOUND_TO_VERIFIED_HYPOTHESIS"
+            decision_explanation = (f"Bound in the verified investigation (hypothesis "
+                                    f"{self.verdict_source.get('hypothesis_id')}, outcome "
+                                    f"{self.verdict_source.get('outcome') or 'rule-bound'}, evidence of rules "
+                                    f"{self.verdict_source.get('rules')}); ledger audit: {self.status}.")
+            self.status = str(self.verdict_source.get("status") or VERDICT_INCONCLUSIVE)
+            self.confidence = float(self.verdict_source.get("confidence") or 0.0)
+            self.confidence_basis = str(self.verdict_source.get("basis") or "")
+
         self._computed_confidence = self.confidence
         self.decision_trace = {
             "hypothesis_id": self.hypothesis_id,
@@ -1863,8 +2019,14 @@ class CompetingHypothesis:
             "integrity_limitations": list(self.integrity_limitations),
             "decision_rule_applied": decision_rule_applied,
             "decision_explanation": decision_explanation,
+            "verdict_source": dict(self.verdict_source) if self.verdict_source else None,
         }
         return self.status
+
+    def bind_verdict(self, source: Optional[Dict[str, Any]], ledger: Optional[Any] = None) -> str:
+        """Make this candidate a view of a verified hypothesis (see ``verdict_source``); None unbinds."""
+        self.verdict_source = dict(source) if source else {}
+        return self.evaluate_verdict(ledger=ledger)
 
     def to_dict(self) -> Dict[str, Any]:
         saved_ledger = self.ledger
@@ -1885,6 +2047,7 @@ class CompetingHypothesis:
     def from_dict(cls, data: Dict[str, Any], ledger: Optional[Any] = None) -> "CompetingHypothesis":
         data_copy = dict(data)
         bound_ledger = ledger or data_copy.pop("ledger", None)
+        data_copy.pop("verdict_source", None)   # re-derived by the session from its verified hypotheses
         base_conf = data_copy.pop("_base_confidence", None)
         sup_weights = data_copy.pop("_support_weights", None)
         con_weights = data_copy.pop("_contradiction_weights", None)
@@ -1916,6 +2079,30 @@ class CompetingHypothesis:
         if bound_ledger is not None or obj.supporting_evidence_ids or obj.contradicting_evidence_ids or obj.contradiction_records:
             obj.evaluate_verdict(ledger=bound_ledger)
         return obj
+
+
+# Which set of competing candidate explanations a symptom category opens (explicit table; it replaces the former
+# substring tests on the category name, tests/test_typed_evidence.py checks it against every registered category).
+# One deliberate difference from the substring rule: ABNORMAL_VARIABLE_CHANGES matched "HANG" inside "CHANGES"
+# and opened the concurrency set; it is a state-value category and opens the general set.
+CANDIDATES_LEAK = "LEAK"
+CANDIDATES_CORRUPTION = "CORRUPTION"
+CANDIDATES_CONCURRENCY = "CONCURRENCY"
+CANDIDATES_INSTABILITY = "INSTABILITY"
+CANDIDATES_GENERAL = "GENERAL"
+SYMPTOM_CANDIDATE_SET: Dict[str, str] = {
+    "MEMORY_LEAK": CANDIDATES_LEAK, "FD_LEAK": CANDIDATES_LEAK, "THREAD_LEAK": CANDIDATES_LEAK,
+    "MAPPING_GROWTH": CANDIDATES_LEAK,
+    "MEMORY_CORRUPTION": CANDIDATES_CORRUPTION, "STACK_CORRUPTION": CANDIDATES_CORRUPTION,
+    "USE_AFTER_FREE": CANDIDATES_CORRUPTION, "INVALID_DOUBLE_FREE": CANDIDATES_CORRUPTION,
+    "HEAP_CORRUPTION": CANDIDATES_CORRUPTION, "CORRUPTION": CANDIDATES_CORRUPTION,
+    "DEADLOCK_INDICATORS": CANDIDATES_CONCURRENCY, "SELF_DEADLOCK": CANDIDATES_CONCURRENCY,
+    "LOCK_CONTENTION": CANDIDATES_CONCURRENCY, "THREAD_DEADLOCK": CANDIDATES_CONCURRENCY,
+    "CONCURRENCY": CANDIDATES_CONCURRENCY,
+    "PROCESS_INSTABILITY": CANDIDATES_INSTABILITY, "RESOURCE_EXHAUSTION": CANDIDATES_INSTABILITY,
+    # GENERAL: ABNORMAL_VARIABLE_CHANGES, DATA_RACE_INDICATORS, FUNCTIONAL_STATE_INCONSISTENCY, HEAP_RETENTION,
+    # ORPHAN_LOCK, UNEXPECTED_STATE_TRANSITIONS and anything not listed
+}
 
 
 @dataclass
@@ -2032,16 +2219,10 @@ class CompetingHypothesisManager:
     ) -> List[CompetingHypothesis]:
         """Generates domain-specific competing candidate hypotheses for a reported symptom."""
         ctx = initial_context or {}
-        cat_upper = (symptom_category or "GENERAL").upper()
+        candidate_set = SYMPTOM_CANDIDATE_SET.get(str(symptom_category or "GENERAL"), CANDIDATES_GENERAL)
         hypotheses: List[CompetingHypothesis] = []
 
-        if (
-            cat_upper == "MEMORY_LEAK"
-            or "GROWTH" in cat_upper
-            or "LEAK" in cat_upper
-            or "ACCUMULATION" in cat_upper
-            or "IMBALANCE" in cat_upper
-        ):
+        if candidate_set == CANDIDATES_LEAK:
             hypotheses = [
                 CompetingHypothesis(
                     hypothesis_id="HYP_HEAP_ALLOC_LEAK",
@@ -2095,14 +2276,7 @@ class CompetingHypothesisManager:
                 ),
             ]
 
-        elif (
-            cat_upper == "CORRUPTION"
-            or "CORRUPT" in cat_upper
-            or "USE_AFTER_FREE" in cat_upper
-            or "DOUBLE_FREE" in cat_upper
-            or "INVALID_MEMORY" in cat_upper
-            or "OVERFLOW" in cat_upper
-        ):
+        elif candidate_set == CANDIDATES_CORRUPTION:
             hypotheses = [
                 CompetingHypothesis(
                     hypothesis_id="HYP_USE_AFTER_FREE",
@@ -2146,14 +2320,7 @@ class CompetingHypothesisManager:
                 ),
             ]
 
-        elif (
-            "DEADLOCK" in cat_upper
-            or "CONCURRENCY" in cat_upper
-            or "CONTENTION" in cat_upper
-            or "FREEZE" in cat_upper
-            or "HANG" in cat_upper
-            or "THREAD" in cat_upper
-        ):
+        elif candidate_set == CANDIDATES_CONCURRENCY:
             hypotheses = [
                 CompetingHypothesis(
                     hypothesis_id="HYP_CIRCULAR_WAIT_DEADLOCK",
@@ -2197,7 +2364,7 @@ class CompetingHypothesisManager:
                 ),
             ]
 
-        elif "INSTABILITY" in cat_upper or "CRASH" in cat_upper or "EXHAUSTION" in cat_upper:
+        elif candidate_set == CANDIDATES_INSTABILITY:
             hypotheses = [
                 CompetingHypothesis(
                     hypothesis_id="HYP_PROGRESSIVE_EXHAUSTION_CRASH",

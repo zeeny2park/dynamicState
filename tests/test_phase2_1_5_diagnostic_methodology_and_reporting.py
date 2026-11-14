@@ -97,6 +97,8 @@ from scripts.mcp_server import (
     runtime_get_investigation_report,
     runtime_export_incident_report,
 )
+from tests.support.fixture_process import fixture_popen
+from tests.support.tmpdirs import temp_dir
 
 
 class TestDiagnosticMethodologyAndChecks(unittest.TestCase):
@@ -205,6 +207,8 @@ class TestHypothesisEvidenceIntegrity(unittest.TestCase):
         from extractor.capture_backend import get_trusted_capture_authority_token, issue_live_capture_receipt
         ledger = EvidenceLedger(session_id="INV_T5_UAF")
         token = get_trusted_capture_authority_token()
+        # stage 1: the static-segment precedence reads the record's structured segment, not its wording
+        static = {"EV_ALLOC_ACTIVE": {"static_lifetime": True, "segment": ".data"}}
         for eid, obs_str in [
             ("EV_UAF_01", "Dangling pointer detected"),
             ("EV_ALLOC_ACTIVE", "Memory chunk is currently active in static lifetime global data segment"),
@@ -224,7 +228,8 @@ class TestHypothesisEvidenceIntegrity(unittest.TestCase):
                 evidence_type="DIAGNOSTIC",
                 nature="observation",
                 provenance={"provenance_class": PROVENANCE_CLASS_LIVE_RUNTIME_CAPTURE, "live_capture_receipt": rcpt.to_dict()},
-                details={"provenance_class": PROVENANCE_CLASS_LIVE_RUNTIME_CAPTURE, "live_capture_receipt": rcpt.to_dict(), "target_pid": 1234},
+                details={"provenance_class": PROVENANCE_CLASS_LIVE_RUNTIME_CAPTURE, "live_capture_receipt": rcpt.to_dict(), "target_pid": 1234,
+                         **static.get(eid, {})},
                 target_identity={"pid": 1234, "process_identity": "proc_1234", "executable_identity": "/proc/1234/exe", "build_id": "sha1:testbuildid12345"},
                 observation=obs_str,
             )
@@ -282,7 +287,7 @@ class TestPersistenceAndLedgerConsistency(unittest.TestCase):
     """Area 7, 8: Fail-closed persistence and full session recovery."""
 
     def test_persistence_fail_closed_raises_investigation_persistence_error(self):
-        engine = ExpertDiagnosticEngine(corpus_dir="/tmp/dynstate_test_persistence")
+        engine = ExpertDiagnosticEngine(corpus_dir=temp_dir(self, "corpus_"))
         session = engine.start_investigation("Memory leak in buffer", pid=999999)
 
         # Force a write error by patching os.replace to raise OSError
@@ -577,7 +582,7 @@ class TestRealisticCppScenarios(unittest.TestCase):
         debug_elf = "/tmp/expert_diagnostic_debug.elf"
         ensure_expert_diagnostic_fixture(need_stripped=False)
 
-        proc = subprocess.Popen([debug_elf, "leak"], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        proc = fixture_popen([debug_elf, "leak"], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         try:
             time.sleep(0.15)
             engine = ExpertDiagnosticEngine(corpus_dir=tempfile.gettempdir())

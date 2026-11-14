@@ -23,6 +23,7 @@ import time
 import unittest
 
 import scripts.mcp_server as mcp_srv
+from tests.support.fixture_process import fixture_popen
 
 
 REAL_CPP_FIXTURE = r"""
@@ -120,7 +121,7 @@ class TestMcpFirstPhase1(unittest.TestCase):
         subprocess.run(["strip", "--strip-all", cls.mismatch_stripped_bin_path], check=True)
 
         # Launch live target process using stripped binary
-        cls.proc = subprocess.Popen([cls.stripped_bin_path])
+        cls.proc = fixture_popen([cls.stripped_bin_path])
         time.sleep(0.15)
 
     @classmethod
@@ -313,9 +314,9 @@ class TestMcpFirstPhase1(unittest.TestCase):
         self.assertTrue(conn_a["success"])
 
         # Launch target B_stripped (compiled with md5 build-id, stripped of DWARF)
-        proc_b_stripped = subprocess.Popen([self.mismatch_stripped_bin_path])
+        proc_b_stripped = fixture_popen([self.mismatch_stripped_bin_path])
         # Launch target B_debug (compiled with md5 build-id, with DWARF symbols)
-        proc_b_debug = subprocess.Popen([self.mismatch_bin_path])
+        proc_b_debug = fixture_popen([self.mismatch_bin_path])
         try:
             time.sleep(0.15)
 
@@ -650,7 +651,7 @@ class TestMcpFirstPhase1(unittest.TestCase):
         self.assertEqual(res_match["pid"], self.proc.pid)
 
         # 6. Explicit PID and image differing from bound target (Target B)
-        proc_b_debug = subprocess.Popen([self.mismatch_bin_path])
+        proc_b_debug = fixture_popen([self.mismatch_bin_path])
         try:
             time.sleep(0.1)
             raw_diff = mcp_srv.runtime_golden_baseline_save(

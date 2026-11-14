@@ -10,7 +10,9 @@ Guarantees:
 - Honest limitations: graceful degradation on missing DWARF, unreadable memory, or permission denial.
 """
 
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass, field
+from .dataclass_dict import asdict
+from .corpus_retention import resolve_corpus_dir
 from datetime import datetime, timezone
 import hashlib
 import json
@@ -33,6 +35,109 @@ from .thread_sampler import (
 
 # Recipes whose inputs come from the per-thread time series (IMP-010)
 THREAD_SAMPLING_RECIPES = frozenset({"RECIPE_THREAD_STATE_ANOMALIES", "RECIPE_LONG_RUNNING_BLOCKED_THREADS"})
+
+# One lock inspection reads every mutex word first and each thread's futex wait afterwards.  A contended mutex being
+# handed on shows, for a moment, a thread still inside its futex wait while the word already reads unlocked (or
+# locked with the owner field not yet written): a waiter with no owner, i.e. an "incomplete lock graph", which makes
+# the deadlock / blocked-thread checks INCONCLUSIVE.  On a loaded host the woken waiter can sit on a run queue for
+# milliseconds, so the moment is not rare (measured: 2 of 200 inspections of a 4-thread hot mutex at load 5).
+# Before the graph is declared incomplete it is re-read after these gaps; it is incomplete only if every re-read
+# still has a waiter with no owner.  A persistent unresolved owner (undecodable layout, a real stall) is unchanged.
+UNRESOLVED_WAIT_REREAD_GAPS_S = (0.02, 0.05, 0.1)
+
+
+def unresolved_lock_waits(info: Any) -> List[Tuple[int, str]]:
+    """(tid, lock address) of every thread waiting on a lock whose owner is not resolved in this inspection."""
+    out: List[Tuple[int, str]] = []
+    for t in (info or {}).get("threads", []) if isinstance(info, dict) else []:
+        wol = t.get("waiting_on_lock") if isinstance(t, dict) else None
+        if wol and (not wol.get("held_by_tid") or wol.get("held_by_tid") <= 0):
+            out.append((int(t.get("tid") or 0), str(wol.get("lock_address"))))
+    return sorted(out)
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# Names rank candidates; they are never evidence (IMP-018 / IMP-009).
+#
+# A name is split into whole tokens (``_``, ``::``, ``.``, camelCase, digits); a role is a whole token, never a
+# substring: "silent" is not a length, "stage" is not a tag, "freelist_len" is not a free counter.  Two variables
+# are only paired (alloc/free counters, capacity/length) when the DWARF types are integers and they are
+# demonstrably related: the same scope (members of one struct, or both globals) and the same name stem once the
+# role token is removed ("g_buf_cap" / "g_buf_len", "alloc_count" / "free_count", "capacity" / "length").
+# ---------------------------------------------------------------------------------------------------------------
+_NAME_TOKEN_RE = re.compile(r"[A-Z]+(?=[A-Z][a-z])|[A-Z]?[a-z]+|[A-Z]+|[0-9]+")
+
+ROLE_ALLOC = frozenset({"alloc", "allocs", "allocated", "allocation", "allocations", "malloc", "mallocs",
+                        "malloced", "calloc", "callocs"})
+ROLE_FREE = frozenset({"free", "frees", "freed", "dealloc", "deallocs", "deallocated", "deallocation",
+                       "deallocations", "release", "releases", "released", "reclaim", "reclaims", "reclaimed"})
+ROLE_CAPACITY = frozenset({"capacity", "cap", "max", "maximum", "limit"})
+ROLE_LENGTH = frozenset({"len", "length", "size", "count", "cnt", "used"})
+ROLE_MAGIC = frozenset({"magic", "canary", "cookie", "guard"})
+ROLE_STATE = frozenset({"state", "status", "phase", "mode", "heartbeat", "step"})
+ROLE_CONTAINER = frozenset({"pool", "vector", "vec", "list", "queue", "cache", "registry", "retained", "leak",
+                            "buffer", "buffers", "map", "table", "deque"})
+
+
+def name_tokens(name: str) -> List[str]:
+    """Lower-case whole-word tokens of an identifier or a member path (``a.b``, ``ns::x``, ``fooBarLen``)."""
+    leaf = re.split(r"\.|->|::", str(name or ""))[-1]
+    return [t.lower() for t in _NAME_TOKEN_RE.findall(leaf)]
+
+
+def name_has_role(name: str, role: frozenset) -> bool:
+    return any(t in role for t in name_tokens(name))
+
+
+def name_stem(name: str, role: frozenset) -> Tuple[str, ...]:
+    """The tokens of the leaf name with the role tokens and one-letter scope prefixes (g_, s_, m_) removed: the
+    part that names WHAT is counted.  ``g_limit`` and ``g_used`` share no stem."""
+    return tuple(t for t in name_tokens(name) if t not in role and len(t) > 1)
+
+
+def is_integer_type(t: Any) -> bool:
+    """A DWARF base type holding an integer (not char / bool / floating point); typedefs must be resolved."""
+    if t is None or getattr(t, "tag", None) != "DW_TAG_base_type":
+        return False
+    n = (getattr(t, "name", "") or "").lower()
+    if any(x in n for x in ("char", "bool", "float", "double", "complex")):
+        return False
+    return any(x in n for x in ("int", "long", "short", "size", "unsigned", "signed"))
+
+
+def _as_int(v: Any) -> Optional[int]:
+    if isinstance(v, bool):
+        return None
+    if isinstance(v, int):
+        return v
+    if isinstance(v, str):
+        try:
+            return int(v, 0)
+        except ValueError:
+            return None
+    return None
+
+
+def canonical_type(idx: Any, type_offset: Any) -> Any:
+    """The canonical DWARF type (typedef / const / volatile / _Atomic removed), or None."""
+    t = idx.resolve_canonical_type(type_offset) if type_offset else None
+    seen = 0
+    while t is not None and t.tag == "DW_TAG_atomic_type" and t.target_type_offset is not None and seen < 8:
+        t = idx.resolve_canonical_type(t.target_type_offset)
+        seen += 1
+    return t
+
+
+def related_pairs(names: List[str], role_a: frozenset, role_b: frozenset) -> List[Tuple[str, str]]:
+    """(a, b) pairs of names in ONE scope whose roles are a and b and whose stems are equal."""
+    out: List[Tuple[str, str]] = []
+    a_names = [n for n in names if name_has_role(n, role_a) and not name_has_role(n, role_b)]
+    b_names = [n for n in names if name_has_role(n, role_b) and not name_has_role(n, role_a)]
+    for a in a_names:
+        for b in b_names:
+            if a != b and name_stem(a, role_a) == name_stem(b, role_b):
+                out.append((a, b))
+    return out
 
 
 # Provenance constants
@@ -131,7 +236,7 @@ class RuntimeEvidenceProvider:
         budget_tracker: Optional[Any] = None,
     ):
         self.adapter = adapter or LocalTargetAdapter()
-        self.watch_manager = watch_manager or WatchSessionManager(corpus_dir=corpus_dir or "/tmp/dynamicstate_corpus")
+        self.watch_manager = watch_manager or WatchSessionManager(corpus_dir=resolve_corpus_dir(corpus_dir))
         self.budget_tracker = budget_tracker
         self._historical_samples: Dict[str, Dict[str, Any]] = {}
         # IMP-010: overrides for ThreadSamplingConfig (thread_sample_count, thread_sample_interval_sec, ...)
@@ -560,6 +665,44 @@ class RuntimeEvidenceProvider:
         ev_records.append(rec)
         return data, method, err, ev_records
 
+    @staticmethod
+    def _pointer_value(companion_elf: str, val_item: Dict[str, Any]) -> Optional[int]:
+        """The address held by an evaluated expression, only when its DWARF type is a pointer (else None)."""
+        if not isinstance(val_item, dict) or val_item.get("status") != "OBSERVED":
+            return None
+        try:
+            from .dwarf_indexer import DwarfIndexer
+            t_off = val_item.get("type_offset")
+            t = DwarfIndexer.get_index(companion_elf).resolve_canonical_type(t_off) if t_off else None
+        except Exception:  # noqa: BLE001 - an unresolvable type is "not known to be a pointer"
+            t = None
+        if not t or t.tag != "DW_TAG_pointer_type":
+            return None
+        v = val_item.get("value")
+        try:
+            return int(v, 16) if isinstance(v, str) and v.startswith("0x") else int(v)
+        except Exception:  # noqa: BLE001
+            return None
+
+    @staticmethod
+    def _value_type_kind(companion_elf: str, val_item: Dict[str, Any]) -> str:
+        """integer / enum / pointer / other / unknown: what the DWARF type of an evaluated expression says it is."""
+        try:
+            from .dwarf_indexer import DwarfIndexer
+            t_off = val_item.get("type_offset")
+            if not t_off:
+                return "unknown"
+            t = canonical_type(DwarfIndexer.get_index(companion_elf), t_off)
+        except Exception:  # noqa: BLE001 - an unresolvable type is "unknown", never "integer"
+            return "unknown"
+        if t is None:
+            return "unknown"
+        if t.tag == "DW_TAG_enumeration_type":
+            return "enum"
+        if t.tag == "DW_TAG_pointer_type":
+            return "pointer"
+        return "integer" if is_integer_type(t) else "other"
+
     def evaluate_dwarf_expression(
         self,
         pid: int,
@@ -657,16 +800,56 @@ class RuntimeEvidenceProvider:
             if self.budget_tracker and res_id:
                 self.budget_tracker.release_reservation(res_id)
 
+    def _check_magic_siblings(self, pid: int, companion_elf: str, arrays: List[Tuple[str, int, str]],
+                              all_records: List[RuntimeEvidenceRecord]) -> Optional[Dict[str, Any]]:
+        """The one array element whose magic field disagrees with >= 3 agreeing non-zero siblings (else None).
+
+        Zero is an unused slot, not a disagreement; a value that occurs more than once is a second state (an
+        allocated / freed magic), not damage."""
+        for arr, count, member in arrays[:4]:
+            vals: List[Tuple[int, int]] = []
+            for i in range(min(int(count), 32)):
+                item, recs = self.evaluate_dwarf_expression(pid, companion_elf, f"{arr}[{i}].{member}")
+                all_records.extend(recs)
+                if item.get("status") != "OBSERVED":
+                    continue
+                iv = _as_int(item.get("value"))
+                if iv is not None and iv != 0:
+                    vals.append((i, iv))
+            if len(vals) < 4:
+                continue
+            freq: Dict[int, int] = {}
+            for _, iv in vals:
+                freq[iv] = freq.get(iv, 0) + 1
+            expected, n_exp = max(freq.items(), key=lambda kv: kv[1])
+            outliers = [(i, iv) for i, iv in vals if iv != expected]
+            if n_exp >= 3 and len(outliers) == 1:
+                i, iv = outliers[0]
+                return {"variable": f"{arr}[{i}].{member}", "observed": f"0x{iv:x}", "expected": f"0x{expected:x}",
+                        "expected_from": f"{n_exp} sibling elements of {arr} hold 0x{expected:x}"}
+        return None
+
     def _discover_dwarf_symbols(self, companion_elf: Optional[str]) -> Dict[str, Any]:
-        """Discovers product-general variables, structs, pointers, counters, and containers from DWARF."""
+        """Discovers product-general variables, structs, pointers, counters, and containers from DWARF.
+
+        The DWARF type and layout decide what a variable can be; a name only ranks candidates of the right type
+        (see ``name_tokens``).  Counter and capacity/length pairs are formed only between integer variables of one
+        scope with the same name stem (``related_pairs``); a poison-looking value in a "magic" variable is not
+        corruption (that needs an expected value: see ``_check_magic_siblings``)."""
         discovered: Dict[str, Any] = {
             "pointers": [],
             "structs": [],
             "containers": [],
             "alloc_counters": [],
             "free_counters": [],
+            # (alloc, free) counter pairs: integer, same scope, same stem
+            "alloc_free_pairs": [],
             "state_vars": [],
+            # integer members / globals whose name has a magic token (ranked candidates only, never evidence)
             "magic_canaries": [],
+            # (array variable, element count, magic member): the same magic field in sibling array elements, the
+            # only expected value available without a specification
+            "magic_sibling_arrays": [],
             "capacity_length_pairs": [],
             # IMP-018: structure-based candidates (type / layout, no names): "<var>.<count member>" of a struct
             # holding a pointer and an integer count (a pointer+length container); enum-typed state variables.
@@ -678,76 +861,92 @@ class RuntimeEvidenceProvider:
         try:
             from .dwarf_indexer import DwarfIndexer
             idx = DwarfIndexer.get_index(companion_elf)
-            cap_vars: List[str] = []
-            len_vars: List[str] = []
+            int_globals: List[str] = []
+
+            def _canon(off: Any) -> Any:
+                return canonical_type(idx, off)
 
             for v in idx.global_variables:
                 if not v.name or v.name.startswith("__"):
                     continue
-                vn_low = v.name.lower()
-                t = idx.resolve_canonical_type(v.type_offset) if v.type_offset else None
+                t = _canon(v.type_offset)
                 tname = (t.name or "").lower() if t else ""
 
                 if t and t.tag == "DW_TAG_pointer_type":
                     discovered["pointers"].append(v.name)
                 elif t and t.tag in ("DW_TAG_structure_type", "DW_TAG_class_type"):
                     discovered["structs"].append((v.name, t))
-                    if "vector" in tname or "list" in tname or "deque" in tname or any(k in vn_low for k in ("pool", "leak", "retained", "buffer")):
+                    # a decoded standard container (its type), or a name that ranks it; the collector reads only a
+                    # decoded container's size (see _obs_memory_growth)
+                    if any(k in tname for k in ("vector", "list", "deque", "map", "set")) \
+                            or name_has_role(v.name, ROLE_CONTAINER):
                         discovered["containers"].append(v.name)
 
-                    # Inspect struct members
-                    s_caps: List[str] = []
-                    s_lens: List[str] = []
+                    int_members: List[str] = []
                     for m in getattr(t, "members", []):
                         mn = m.name or ""
-                        mn_low = mn.lower()
-                        mt = idx.resolve_canonical_type(m.type_offset) if m.type_offset else None
-                        if (mt and mt.tag == "DW_TAG_pointer_type") or any(k in mn_low for k in ("ptr", "addr", "payload", "buf", "cache", "record")):
+                        if not mn:
+                            continue
+                        mt = _canon(m.type_offset)
+                        # Only the DWARF type says a member is a pointer.  A name is not evidence: an int32_t
+                        # `total_buffers` (value 32) used to be read as a pointer to 0x20 because it contains "buf".
+                        if mt and mt.tag == "DW_TAG_pointer_type":
                             discovered["pointers"].append(f"{v.name}.{mn}")
-                        if any(k in mn_low for k in ("magic", "canary", "header", "tag")):
-                            discovered["magic_canaries"].append(f"{v.name}.{mn}")
-                        if any(k in mn_low for k in ("state", "status", "phase", "mode")):
-                            discovered["state_vars"].append(f"{v.name}.{mn}")
-                        if any(k in mn_low for k in ("capacity", "max", "limit")):
-                            s_caps.append(f"{v.name}.{mn}")
-                        if any(k in mn_low for k in ("len", "length", "size", "count")) and "alloc" not in mn_low and "free" not in mn_low:
-                            s_lens.append(f"{v.name}.{mn}")
-                        if any(k in mn_low for k in ("alloc", "malloc")) and "free" not in mn_low:
-                            discovered["alloc_counters"].append(f"{v.name}.{mn}")
-                        if any(k in mn_low for k in ("free", "dealloc", "release", "reclaim")):
-                            discovered["free_counters"].append(f"{v.name}.{mn}")
-                        if any(k in mn_low for k in ("pool", "vector", "retained", "cache")):
+                        if is_integer_type(mt):
+                            int_members.append(mn)
+                            if name_has_role(mn, ROLE_MAGIC):
+                                discovered["magic_canaries"].append(f"{v.name}.{mn}")
+                            if name_has_role(mn, ROLE_STATE):
+                                discovered["state_vars"].append(f"{v.name}.{mn}")
+                        elif mt and mt.tag in ("DW_TAG_structure_type", "DW_TAG_class_type") \
+                                and (any(k in (mt.name or "").lower() for k in ("vector", "list", "deque", "map"))
+                                     or name_has_role(mn, ROLE_CONTAINER)):
                             discovered["containers"].append(f"{v.name}.{mn}")
+                    # pairs only inside this struct: the struct is the relation, the stem says which fields
+                    for a, b in related_pairs(int_members, ROLE_ALLOC, ROLE_FREE):
+                        discovered["alloc_free_pairs"].append((f"{v.name}.{a}", f"{v.name}.{b}"))
+                    cl_pairs = related_pairs(int_members, ROLE_CAPACITY, ROLE_LENGTH)
+                    caps = [m for m in int_members if name_has_role(m, ROLE_CAPACITY) and not name_has_role(m, ROLE_LENGTH)]
+                    lens = [m for m in int_members if name_has_role(m, ROLE_LENGTH) and not name_has_role(m, ROLE_CAPACITY)]
+                    if not cl_pairs and len(caps) == 1 and len(lens) == 1:
+                        # the struct's ONLY capacity field and its ONLY length field (max_capacity / payload_length):
+                        # the struct relates them; with several of either nothing says which belong together
+                        cl_pairs = [(caps[0], lens[0])]
+                    for c, ln in cl_pairs:
+                        discovered["capacity_length_pairs"].append((f"{v.name}.{c}", f"{v.name}.{ln}"))
 
-                    for c in s_caps:
-                        for l in s_lens:
-                            discovered["capacity_length_pairs"].append((c, l))
+                elif t and t.tag == "DW_TAG_array_type" and t.array_count and t.array_count >= 3:
+                    et = _canon(t.target_type_offset)
+                    if et and et.tag in ("DW_TAG_structure_type", "DW_TAG_class_type"):
+                        for m in getattr(et, "members", []) or []:
+                            if m.name and name_has_role(m.name, ROLE_MAGIC) and is_integer_type(_canon(m.type_offset)):
+                                discovered["magic_sibling_arrays"].append((v.name, int(t.array_count), m.name))
+                                break
 
-                else:
-                    if any(k in vn_low for k in ("magic", "canary", "guard")):
+                elif is_integer_type(t):
+                    int_globals.append(v.name)
+                    if name_has_role(v.name, ROLE_MAGIC):
                         discovered["magic_canaries"].append(v.name)
-                    if any(k in vn_low for k in ("state", "status", "phase", "mode", "heartbeat", "step")):
+                    if name_has_role(v.name, ROLE_STATE):
                         discovered["state_vars"].append(v.name)
-                    if any(k in vn_low for k in ("alloc", "malloc")) and "free" not in vn_low:
-                        discovered["alloc_counters"].append(v.name)
-                    if any(k in vn_low for k in ("free", "dealloc", "release", "reclaim")):
-                        discovered["free_counters"].append(v.name)
-                    if any(k in vn_low for k in ("capacity", "max", "limit")):
-                        cap_vars.append(v.name)
-                    if any(k in vn_low for k in ("len", "length", "size")) and "alloc" not in vn_low and "free" not in vn_low:
-                        len_vars.append(v.name)
 
-            for c in cap_vars:
-                for l in len_vars:
-                    discovered["capacity_length_pairs"].append((c, l))
+            # Globals are one scope only through a shared, non-empty stem ("g_buf_len" / "g_buf_cap").
+            for a, b in related_pairs(int_globals, ROLE_ALLOC, ROLE_FREE):
+                if name_stem(a, ROLE_ALLOC):
+                    discovered["alloc_free_pairs"].append((a, b))
+            for c, ln in related_pairs(int_globals, ROLE_CAPACITY, ROLE_LENGTH):
+                if name_stem(c, ROLE_CAPACITY):
+                    discovered["capacity_length_pairs"].append((c, ln))
+            for a, b in discovered["alloc_free_pairs"]:
+                discovered["alloc_counters"].append(a)
+                discovered["free_counters"].append(b)
 
             # IMP-018: structure-based selection.  Name keywords above only RANK (they come first); the type /
             # layout tells what a variable is.
-            _INT_BASES = ("int", "long", "short", "size_t", "unsigned", "uint", "int32", "int64", "uint32", "uint64")
             for v in idx.global_variables:
                 if not v.name or v.name.startswith("__") or not v.type_offset:
                     continue
-                t = idx.resolve_canonical_type(v.type_offset)
+                t = canonical_type(idx, v.type_offset)
                 if t is None:
                     continue
                 if t.tag == "DW_TAG_enumeration_type" and v.name not in discovered["state_vars"]:
@@ -758,18 +957,19 @@ class RuntimeEvidenceProvider:
                 for m in getattr(t, "members", []) or []:
                     if not m.name or not m.type_offset:
                         continue
-                    mt = idx.resolve_canonical_type(m.type_offset)
+                    mt = canonical_type(idx, m.type_offset)
                     if mt is None:
                         continue
                     if mt.tag == "DW_TAG_pointer_type":
                         has_ptr = True
-                    elif mt.tag == "DW_TAG_base_type" and any(b in (mt.name or "").lower() for b in _INT_BASES) \
-                            and "char" not in (mt.name or "").lower():
+                    elif is_integer_type(mt):
                         counts.append(f"{v.name}.{m.name}")
                     elif mt.tag == "DW_TAG_enumeration_type" and f"{v.name}.{m.name}" not in discovered["state_vars"]:
                         discovered["state_vars"].append(f"{v.name}.{m.name}")
                 if has_ptr and counts:
-                    discovered["container_counts"].append(counts[0])
+                    # rank a member whose name says it counts (len / count / size) before the first integer
+                    ranked = [c for c in counts if name_has_role(c, ROLE_LENGTH)] or counts
+                    discovered["container_counts"].append(ranked[0])
 
         except Exception:
             pass
@@ -898,47 +1098,55 @@ class RuntimeEvidenceProvider:
                 all_records.extend(v_recs)
                 if val_item.get("status") == "OBSERVED":
                     ptr_val = val_item.get("value")
-                    ptr_name = cand
-                    # Extract integer pointer address
                     if isinstance(ptr_val, dict):
-                        for k, v in ptr_val.items():
-                            if any(pk in k.lower() for pk in ("ptr", "addr", "payload", "buf", "cache", "record")):
-                                try:
-                                    observed_addr = int(v, 16) if isinstance(v, str) and v.startswith("0x") else int(v)
-                                    ptr_name = f"{cand}.{k}"
-                                    break
-                                except Exception:
-                                    pass
+                        # a struct: only its members whose DWARF type is a pointer hold an address
+                        for k in list(ptr_val)[:16]:
+                            sub_item, s_recs = self.evaluate_dwarf_expression(pid, companion_elf, f"{cand}.{k}")
+                            all_records.extend(s_recs)
+                            sub_addr = self._pointer_value(companion_elf, sub_item)
+                            if sub_addr is not None:
+                                observed_addr, ptr_name = sub_addr, f"{cand}.{k}"
+                                break
                     else:
-                        try:
-                            observed_addr = int(ptr_val, 16) if isinstance(ptr_val, str) and ptr_val.startswith("0x") else int(ptr_val)
-                        except Exception:
-                            pass
+                        # the value of a non-pointer (an integer counter, a flag) is not an address
+                        observed_addr = self._pointer_value(companion_elf, val_item)
+                        if observed_addr is not None:
+                            ptr_name = cand
                     if observed_addr is not None:
                         break
 
         # Check magic/corruption in struct if found
+        # A magic / canary value is corruption only against an expected value.  A poison-looking constant
+        # (0xDEADBEEF ...) is very often the program's VALID magic, so a value alone is a neutral note.  The
+        # expected value available without a specification is the same field in sibling array elements: when
+        # >= 3 siblings agree and one element alone differs, that element's field was overwritten.
         magic_corrupted = False
         if companion_elf and os.path.exists(companion_elf):
-            for mc in dwarf_syms.get("magic_canaries", []):
+            sib = self._check_magic_siblings(pid, companion_elf, dwarf_syms.get("magic_sibling_arrays", []),
+                                             all_records)
+            if sib is not None:
+                magic_corrupted = True
+                observation_data["chunk_state"] = "CORRUPTED"
+                observation_data["magic_corrupted"] = True
+                observation_data["observed_magic"] = sib["observed"]
+                observation_data["expected_magic"] = sib["expected"]
+                observation_data["magic_expected_from"] = sib["expected_from"]
+                # IMP-009: still a hint (the rules cap it at probable); damage is proven by the heap checks
+                observation_data["corruption_hint_source"] = "sibling_magic_disagreement"
+                observation_data["corruption_hint_variable"] = sib["variable"]
+            notes: Dict[str, str] = {}
+            for mc in dwarf_syms.get("magic_canaries", [])[:8]:
                 v_magic, m_recs = self.evaluate_dwarf_expression(pid, companion_elf, mc)
                 all_records.extend(m_recs)
                 if v_magic.get("status") == "OBSERVED":
-                    magic_val = v_magic.get("value")
-                    try:
-                        m_int = int(magic_val, 16) if isinstance(magic_val, str) and magic_val.startswith("0x") else int(magic_val)
-                        if m_int in (0xDEADBEEF, 0xBAADF00D, 0xBAADBAAD, 0xDEADDEAD):
-                            magic_corrupted = True
-                            observation_data["chunk_state"] = "CORRUPTED"
-                            observation_data["magic_corrupted"] = True
-                            observation_data["observed_magic"] = f"0x{m_int:x}"
-                            # IMP-009: a hint only (name contains magic/canary/guard + a poison constant);
-                            # the rules cap it at probable - damage is proven by heap/global/stack checks
-                            observation_data["corruption_hint_source"] = "variable_name_poison_value"
-                            observation_data["corruption_hint_variable"] = mc
-                            break
-                    except Exception:
-                        pass
+                    m_int = _as_int(v_magic.get("value"))
+                    if m_int is not None:
+                        notes[mc] = f"0x{m_int:x}"
+            if notes:
+                # neutral: without an expected value nothing is compared - evidence neither way
+                observation_data["magic_values_observed"] = notes
+                observation_data["magic_values_not_judged"] = (
+                    "no expected value (a specification or disagreeing siblings): magic values are not compared")
 
         # If an address was observed, check its VMA mapping & probe memory
         if observed_addr is not None:
@@ -957,6 +1165,8 @@ class RuntimeEvidenceProvider:
                 observation_data["faulting_address"] = f"0x{observed_addr:x}"
                 observation_data["address"] = observed_addr
                 observation_data["target_address"] = observed_addr
+                # a pointer value read from memory, not an observed free() argument (no allocation tracing)
+                observation_data["free_call_observed"] = False
                 observation_data["pointer_name"] = ptr_name
                 observation_data["pointer_value"] = f"0x{observed_addr:x}"
 
@@ -964,6 +1174,10 @@ class RuntimeEvidenceProvider:
                 if observed_addr == 0:
                     observation_data["null_pointer_value"] = True
                 elif 0 < observed_addr <= 4096:
+                    # A pointer VALUE inside the NULL page is observed; whether anything dereferenced it is not
+                    # observable from outside (no fault is caught).  Say so explicitly: the rule must not read
+                    # a missing key as "dereferenced".
+                    observation_data["dereference_attempted"] = False
                     observation_data["is_mapped"] = False
                     observation_data["vma_permissions"] = "---p"
                     observation_data["violation_type"] = "NULL_PAGE_POINTER_VALUE"
@@ -1163,9 +1377,14 @@ class RuntimeEvidenceProvider:
                 all_records.extend(pool_recs)
                 if pool_val.get("status") == "OBSERVED":
                     v = pool_val.get("value")
-                    leak_count = 0
-                    if isinstance(v, dict):
-                        leak_count = v.get("size") if v.get("size") is not None else len(v.get("elements", []))
+                    # Only a decoded standard container (the decoder marks it with "container") has an element
+                    # count.  A plain struct's member that happens to be called "size" is not one (a pool's block
+                    # size of 4096 used to be read as 4096 retained objects).
+                    if not (isinstance(v, dict) and v.get("container")):
+                        continue
+                    leak_count = v.get("size") if v.get("size") is not None else len(v.get("elements", []))
+                    if not isinstance(leak_count, int):
+                        continue
                     epoch_sample["container_sizes"][c_cand] = leak_count
                     observation_data["active_chunk_count"] = leak_count
                     observation_data["retained_objects_count"] = leak_count
@@ -1189,63 +1408,42 @@ class RuntimeEvidenceProvider:
                         observation_data["container_name"] = c_cand
                         observation_data["container_selected_by"] = "structure"
                         break
+            # The census over the window: a size alone is not accumulation, its change across epochs may be.
+            c_sel = observation_data.get("container_name")
+            if c_sel:
+                c_series = [s["container_sizes"][c_sel] for s in hist_state["samples"]
+                            if c_sel in (s.get("container_sizes") or {})]
+                observation_data["container_size_series"] = c_series
+                if len(c_series) >= 2:
+                    observation_data["container_size_delta"] = c_series[-1] - c_series[0]
 
-            # Inspect allocation & free counters dynamically + counter reset detection
-            for a_cand in dwarf_syms.get("alloc_counters", []):
+            # Allocation / free counters: only a demonstrated PAIR (integer, one scope, same stem) is read, both
+            # in the same epoch, so that the two numbers describe the same thing (+ counter reset detection).
+            for a_cand, f_cand in dwarf_syms.get("alloc_free_pairs", []):
                 alloc_v, a_recs = self.evaluate_dwarf_expression(pid, companion_elf, a_cand)
                 all_records.extend(a_recs)
-                if alloc_v.get("status") == "OBSERVED" and alloc_v.get("value") is not None:
-                    try:
-                        a_val = int(alloc_v["value"])
-                        prev_allocs = [
-                            s["alloc_count"] for s in hist_state["samples"]
-                            if s["epoch_id"] < eff_epoch_id and s.get("alloc_count") is not None
-                        ]
-                        if prev_allocs and a_val < prev_allocs[-1]:
-                            hist_state["counter_reset_detected"] = True
-                        epoch_sample["alloc_count"] = a_val
-                        epoch_sample["alloc_counter_symbol"] = a_cand
-                        observation_data["alloc_count"] = a_val
-                        observation_data["alloc_counter_name"] = a_cand
-                        # Detect counter source change across epochs
-                        prev_alloc_syms = [
-                            s.get("alloc_counter_symbol") for s in hist_state["samples"]
-                            if s["epoch_id"] < eff_epoch_id and s.get("alloc_counter_symbol") is not None
-                        ]
-                        if prev_alloc_syms and prev_alloc_syms[-1] != a_cand:
-                            hist_state["counter_source_changed"] = True
-                            hist_state["counter_reset_detected"] = True
-                        break
-                    except Exception:
-                        pass
-
-            for f_cand in dwarf_syms.get("free_counters", []):
                 free_v, f_recs = self.evaluate_dwarf_expression(pid, companion_elf, f_cand)
                 all_records.extend(f_recs)
-                if free_v.get("status") == "OBSERVED" and free_v.get("value") is not None:
-                    try:
-                        f_val = int(free_v["value"])
-                        prev_frees = [
-                            s["free_count"] for s in hist_state["samples"]
-                            if s["epoch_id"] < eff_epoch_id and s.get("free_count") is not None
-                        ]
-                        if prev_frees and f_val < prev_frees[-1]:
-                            hist_state["counter_reset_detected"] = True
-                        epoch_sample["free_count"] = f_val
-                        epoch_sample["free_counter_symbol"] = f_cand
-                        observation_data["free_count"] = f_val
-                        observation_data["free_counter_name"] = f_cand
+                a_val = _as_int(alloc_v.get("value")) if alloc_v.get("status") == "OBSERVED" else None
+                f_val = _as_int(free_v.get("value")) if free_v.get("status") == "OBSERVED" else None
+                if a_val is None or f_val is None:
+                    continue
+                for key, val, sym in (("alloc", a_val, a_cand), ("free", f_val, f_cand)):
+                    prev = [s[f"{key}_count"] for s in hist_state["samples"]
+                            if s["epoch_id"] < eff_epoch_id and s.get(f"{key}_count") is not None]
+                    if prev and val < prev[-1]:
+                        hist_state["counter_reset_detected"] = True
+                    prev_syms = [s.get(f"{key}_counter_symbol") for s in hist_state["samples"]
+                                 if s["epoch_id"] < eff_epoch_id and s.get(f"{key}_counter_symbol") is not None]
+                    if prev_syms and prev_syms[-1] != sym:
                         # Detect counter source change across epochs
-                        prev_free_syms = [
-                            s.get("free_counter_symbol") for s in hist_state["samples"]
-                            if s["epoch_id"] < eff_epoch_id and s.get("free_counter_symbol") is not None
-                        ]
-                        if prev_free_syms and prev_free_syms[-1] != f_cand:
-                            hist_state["counter_source_changed"] = True
-                            hist_state["counter_reset_detected"] = True
-                        break
-                    except Exception:
-                        pass
+                        hist_state["counter_source_changed"] = True
+                        hist_state["counter_reset_detected"] = True
+                    epoch_sample[f"{key}_count"] = val
+                    epoch_sample[f"{key}_counter_symbol"] = sym
+                    observation_data[f"{key}_count"] = val
+                    observation_data[f"{key}_counter_name"] = sym
+                break
 
         # Build MemorySample and update ObservationWindow
         obs_win = ObservationWindow(target_pid=pid, target_identity=target_key)
@@ -1351,26 +1549,30 @@ class RuntimeEvidenceProvider:
                 exprs.append(sv)
 
         observed_vals: Dict[str, Any] = {}
+        value_kinds: Dict[str, str] = {}
         if companion_elf and os.path.exists(companion_elf):
             for ex in exprs:
                 v_res, v_recs = self.evaluate_dwarf_expression(pid, companion_elf, ex)
                 all_records.extend(v_recs)
                 if v_res.get("status") == "OBSERVED":
                     observed_vals[ex] = v_res.get("value")
+                    value_kinds[ex] = self._value_type_kind(companion_elf, v_res)
 
         observation_data["observed_values"] = observed_vals
 
-        # Check primary variable
+        # Check primary variable.  The same type check applies to a name the user gave (symptom text /
+        # related_objects) as to a discovered one: only an integer or enum value is a state value.
         main_var = None
         if exprs:
             for candidate_var in exprs:
-                if candidate_var in observed_vals:
+                if candidate_var in observed_vals and value_kinds.get(candidate_var) in ("integer", "enum"):
                     main_var = candidate_var
                     break
 
         if main_var:
             val = observed_vals[main_var]
             observation_data["variable_name"] = main_var
+            observation_data["variable_type_kind"] = value_kinds.get(main_var)
             observation_data["observed_value"] = val
             observation_data["value"] = val
             # IMP-018: a value is only an observation.  A transition violation needs an observed transition
@@ -1382,28 +1584,42 @@ class RuntimeEvidenceProvider:
             except (TypeError, ValueError):
                 pass
 
-        # Inspect related fields for consistency (e.g. capacity vs length pairs)
+        # Inspect related fields for consistency (capacity vs length).  Pairs come from discovery: integer fields
+        # of one struct (or globals sharing a stem) whose roles are capacity and length - never a cross product
+        # of names.  A violation must hold over two identical reads (a pair caught mid-update is not evidence),
+        # and it is recorded for the capacity/length rule only: it is not generic "positive evidence" that any
+        # other recipe of this collector would inherit.
         if companion_elf and os.path.exists(companion_elf):
-            for cap_name, len_name in dwarf_syms.get("capacity_length_pairs", []):
-                cap_v, c_recs = self.evaluate_dwarf_expression(pid, companion_elf, cap_name)
-                len_v, l_recs = self.evaluate_dwarf_expression(pid, companion_elf, len_name)
-                all_records.extend(c_recs)
-                all_records.extend(l_recs)
-                if cap_v.get("status") == "OBSERVED" and len_v.get("status") == "OBSERVED":
-                    try:
-                        cap = int(cap_v["value"])
-                        b_len = int(len_v["value"])
-                        observation_data["capacity"] = cap
-                        observation_data["length"] = b_len
-                        observation_data["buffer_capacity"] = cap
-                        observation_data["buffer_length"] = b_len
-                        if b_len > cap:
-                            observation_data["field_inconsistency"] = True
-                            observation_data["positive_evidence_found"] = True
-                            observation_data["supporting_facts"] = [f"Length {b_len} ({len_name}) exceeds capacity {cap} ({cap_name})"]
-                            break
-                    except Exception:
-                        pass
+            for cap_name, len_name in dwarf_syms.get("capacity_length_pairs", [])[:16]:
+                reads: List[Tuple[int, int]] = []
+                for _ in range(2):
+                    cap_v, c_recs = self.evaluate_dwarf_expression(pid, companion_elf, cap_name)
+                    len_v, l_recs = self.evaluate_dwarf_expression(pid, companion_elf, len_name)
+                    all_records.extend(c_recs)
+                    all_records.extend(l_recs)
+                    cap = _as_int(cap_v.get("value")) if cap_v.get("status") == "OBSERVED" else None
+                    b_len = _as_int(len_v.get("value")) if len_v.get("status") == "OBSERVED" else None
+                    if cap is None or b_len is None:
+                        break
+                    reads.append((cap, b_len))
+                    if b_len <= cap:
+                        break           # the invariant holds on this read: nothing to confirm
+                if not reads:
+                    continue
+                cap, b_len = reads[-1]
+                if b_len > cap and not (len(reads) == 2 and reads[0] == reads[1]):
+                    observation_data["capacity_length_unstable"] = [cap_name, len_name]
+                    continue            # changed between the reads: caught mid-update, not a stable violation
+                observation_data["capacity"] = cap
+                observation_data["length"] = b_len
+                observation_data["buffer_capacity"] = cap
+                observation_data["buffer_length"] = b_len
+                observation_data["capacity_length_pair"] = [cap_name, len_name]
+                if b_len > cap:
+                    observation_data["field_inconsistency"] = True
+                    observation_data["field_inconsistency_facts"] = [
+                        f"Length {b_len} ({len_name}) exceeds capacity {cap} ({cap_name}) on two consecutive reads"]
+                    break
 
         return observation_data, all_records
         return None
@@ -1427,6 +1643,26 @@ class RuntimeEvidenceProvider:
         # Inspect thread callstacks and mutex locks using watch_manager
         try:
             callstacks_info = self._inspect_locks(pid, companion_elf)
+            transient_unresolved: List[List[Tuple[int, str]]] = []
+            if isinstance(callstacks_info, dict) and not callstacks_info.get("deadlock_detected"):
+                for gap in UNRESOLVED_WAIT_REREAD_GAPS_S:
+                    pending = unresolved_lock_waits(callstacks_info)
+                    if not pending:
+                        break
+                    transient_unresolved.append(pending)
+                    time.sleep(gap)
+                    try:
+                        again = self._inspect_locks(pid, companion_elf)
+                    except Exception:  # noqa: BLE001 - a failed re-read settles nothing: keep the last inspection
+                        break
+                    if not isinstance(again, dict) or again.get("error") or again.get("success") is False:
+                        break
+                    callstacks_info = again
+                    if again.get("deadlock_detected"):
+                        break   # a cycle goes through the persistence re-observation below like any first read
+                if transient_unresolved and not unresolved_lock_waits(callstacks_info):
+                    observation_data["transient_unresolved_lock_waits"] = [
+                        [{"tid": t, "lock_address": a} for t, a in p] for p in transient_unresolved]
             lock_series = LockObservationSeries()   # IMP-010: every successful inspection feeds a WaitForGraph
             lock_series.add_sample(1, callstacks_info)
             rec = RuntimeEvidenceRecord(

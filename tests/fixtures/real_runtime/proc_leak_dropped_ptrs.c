@@ -35,6 +35,9 @@ static void *ingest(void *arg)
         consume(r);
         g_events++;          /* r goes out of scope here: dropped pointer */
         usleep(500);
+        /* FIXTURE_CAP: ~0.36 MiB/s measured; stop leaking at ~200 MiB (~10 min), stay alive. */
+        if (g_events >= 1000000u)
+            for (;;) pause();
     }
     return NULL;
 }

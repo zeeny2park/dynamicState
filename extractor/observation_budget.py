@@ -38,7 +38,11 @@ class ObservationBudgetLimits:
     # load; the old 5 s default cut healthy investigations short with BUDGET_EXHAUSTED.  Matches diagnose()'s
     # LOCAL_DEFAULT_TIME_LIMIT_S.  Callers that want a tighter bound pass explicit limits.
     max_wall_clock_ms: float = 20000.0
-    max_bytes_read: int = 33554432  # 32 MB
+    # Default read budget of an investigation.  The memory-growth judgement needs three censuses of the in-use heap
+    # (IMP-008); at 32 MiB a heap of ~11 MiB (the leak_lru_cache benchmark target on x86-64) did not fit three walks
+    # and the leak ended INCONCLUSIVE on the slower CI runner.  Reads are zero-stop and reported in the incident
+    # report ("data read"), so the cost of a larger budget is time, not target interference.
+    max_bytes_read: int = 67108864  # 64 MiB
     min_poll_interval_ms: float = 10.0
     max_consecutive_read_failures: int = 3
     max_total_read_failures: int = 10
@@ -71,7 +75,7 @@ class ObservationBudgetLimits:
             max_wall_clock_ms=float(
                 d.get("max_wall_clock_ms", d.get("max_wall_time_ms", d.get("timeout_ms", 20000.0)))
             ),
-            max_bytes_read=int(d.get("max_bytes_read", d.get("max_bytes", 33554432))),
+            max_bytes_read=int(d.get("max_bytes_read", d.get("max_bytes", 67108864))),
             min_poll_interval_ms=float(d.get("min_poll_interval_ms", 10.0)),
             max_consecutive_read_failures=int(
                 d.get("max_consecutive_read_failures", d.get("max_consecutive_failures", 3))

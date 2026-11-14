@@ -22,6 +22,7 @@ import json
 from typing import Any, Dict, List, Optional, Set, Tuple, Union
 
 from .diagnostic_methodology import CheckStatus, DiagnosticCheck, DiagnosticMethodology
+from .reproducibility import ReproducibilitySection, render_html as _repro_html, render_markdown as _repro_md
 
 
 SCHEMA_VERSION = "2.1.5"
@@ -115,6 +116,8 @@ class TargetContextSection:
     observation_duration_sec: Optional[float] = None
     investigation_start_time: str = ""
     investigation_end_time: str = ""
+    build_id_check: Optional[Dict[str, Any]] = None  # {status, process_build_id, debug_build_id}; None = not recorded
+    target_abi: Optional[Dict[str, Any]] = None      # TargetABI.to_dict() incl. kernel_release, recorded at diagnosis time
     collection_failures: List[str] = field(default_factory=list)
     environmental_limitations: List[str] = field(default_factory=list)
 
@@ -336,6 +339,7 @@ class DiagnosticReport:
     section_g_evidence_and_provenance: Optional[EvidenceAndProvenanceSection] = None
     section_h_limitations_and_unverified: Optional[LimitationsSection] = None
     section_i_final_conclusions: Optional[FinalConclusionsSection] = None
+    section_j_reproducibility: Optional[ReproducibilitySection] = None
 
     def build_epistemic_hierarchy(self) -> Dict[str, List[Dict[str, Any]]]:
         """Explicitly separates the 5 epistemic classes required by Part E1:
@@ -504,6 +508,7 @@ class DiagnosticReport:
             "section_g_evidence_and_provenance": self.section_g_evidence_and_provenance.to_dict() if self.section_g_evidence_and_provenance else {},
             "section_h_limitations_and_unverified": self.section_h_limitations_and_unverified.to_dict() if self.section_h_limitations_and_unverified else {},
             "section_i_final_conclusions": self.section_i_final_conclusions.to_dict() if self.section_i_final_conclusions else {},
+            "section_j_reproducibility": self.section_j_reproducibility.to_dict() if self.section_j_reproducibility else {},
             "epistemic_hierarchy": self.build_epistemic_hierarchy(),
             "report_20_items": self.build_20_required_items(),
         }
@@ -525,6 +530,7 @@ class DiagnosticReport:
             section_g_evidence_and_provenance=EvidenceAndProvenanceSection.from_dict(data["section_g_evidence_and_provenance"]) if data.get("section_g_evidence_and_provenance") else None,
             section_h_limitations_and_unverified=LimitationsSection.from_dict(data["section_h_limitations_and_unverified"]) if data.get("section_h_limitations_and_unverified") else None,
             section_i_final_conclusions=FinalConclusionsSection.from_dict(data["section_i_final_conclusions"]) if data.get("section_i_final_conclusions") else None,
+            section_j_reproducibility=ReproducibilitySection.from_dict(data["section_j_reproducibility"]) if data.get("section_j_reproducibility") else None,
         )
 
     @classmethod
@@ -540,7 +546,7 @@ class DiagnosticReport:
             return str(o)
         return json.dumps(self.to_dict(), indent=indent, default=_fallback)
 
-    def to_markdown(self) -> str:
+    def to_markdown(self, language: str = "en") -> str:
         sec_a = self.section_a_executive_summary
         sec_b = self.section_b_target_context
         sec_c = self.section_c_diagnostic_strategy
@@ -883,9 +889,13 @@ class DiagnosticReport:
                 for rm in sec_i.safe_remediation_suggestions:
                     md.append(f"- 🔧 {rm}")
 
+        if self.section_j_reproducibility:
+            md.append("")
+            md.extend(_repro_md(self.section_j_reproducibility, language, heading="## J."))
+
         return "\n".join(md)
 
-    def to_html(self) -> str:
+    def to_html(self, language: str = "en") -> str:
         """Renders complete, standalone, HTML-escaped engineering diagnostic report without truncation."""
         sec_a = self.section_a_executive_summary
         sec_b = self.section_b_target_context
@@ -1183,9 +1193,308 @@ class DiagnosticReport:
                     html_out.append(f"<li>🔧 {html.escape(rem)}</li>")
                 html_out.append("</ul>")
 
+        if self.section_j_reproducibility:
+            html_out.append(_repro_html(self.section_j_reproducibility, language))
+
         html_out.extend([
             "</div>",
             "</body>",
             "</html>",
         ])
         return "\n".join(html_out)
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# Per-part detail rendering (additive).  The incident report attaches the detailed records to the part of the report
+# they belong to (a finding, a check, the conclusion, the method block) instead of one A-I dump; these functions
+# render one record or one section from the report *dict* (``DiagnosticReport.to_dict()``) with the same content and
+# wording as ``DiagnosticReport.to_html``, which is unchanged.  Every rendered record carries an ``id`` so that a
+# record shown in one place can be linked from another (``detail-chk-<check_id>``, ``detail-ev-<evidence_id>``,
+# ``detail-hyp-<hypothesis_id>``, ``detail-fnd-<finding_id>``).
+
+# status / severity -> the design system's tones (the detail records take the shared theme, no own colours)
+_DETAIL_TONE = {
+    "CONFIRMED": "fail", "CONFIRMED_FAULT": "fail", "FAULT": "fail", "FAIL": "fail", "ERROR": "fail",
+    "CRITICAL": "fail", "HIGH": "fail", "CONFIRMED_ROOT_CAUSE": "fail",
+    "DEGRADED": "warn", "LIKELY": "warn", "PROBABLE": "warn", "PROBABLE_FAULT": "warn", "INCONCLUSIVE": "warn",
+    "MEDIUM": "warn", "PROBABLE_CAUSE": "warn",
+    "PASS": "pass", "HEALTHY": "pass", "SUPPORTED": "info",
+}
+
+
+def _e(x: Any) -> str:
+    return html.escape(str(x))
+
+
+def detail_anchor(kind: str, ident: Any) -> str:
+    """The element id of a detailed record (``kind`` is chk, ev, hyp or fnd)."""
+    return f"detail-{kind}-" + "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in str(ident))
+
+
+def detail_badge(text: Any) -> str:
+    tone = _DETAIL_TONE.get(str(text).upper(), "skip")
+    return f'<span class="badge badge-tone tone-{tone} mono">{_e(text)}</span>'
+
+
+def _lines(items: Any, empty: str = "<em>None</em>") -> str:
+    items = [x for x in (items or [])]
+    return "<br>".join(_e(x) for x in items) if items else empty
+
+
+def detail_meta_html(rep: Dict[str, Any]) -> str:
+    return ('<p class="meta-bar">'
+            f"<strong>Report ID:</strong> {_e(rep.get('report_id', ''))} | "
+            f"<strong>Investigation ID:</strong> {_e(rep.get('investigation_id', ''))} | "
+            f"<strong>Schema:</strong> v{_e(rep.get('schema_version', ''))} | "
+            f"<strong>Generated:</strong> {_e(rep.get('generated_at', ''))} | "
+            f"<strong>Completeness:</strong> {_e(rep.get('report_completeness', ''))}</p>")
+
+
+def detail_section_a_html(a: Dict[str, Any]) -> str:
+    """Section A (executive summary): the verdict, its rationale and the determining checks and hypotheses."""
+    if not a:
+        return ""
+    return "\n".join([
+        "<h4>A. Executive Summary</h4>",
+        f"<p><strong>Overall Result:</strong> {detail_badge(a.get('overall_result', ''))} &nbsp;&nbsp; "
+        f"<strong>Target:</strong> {_e(a.get('target_identity', ''))}</p>",
+        f"<p><strong>Problem Statement:</strong> {_e(a.get('problem_statement', ''))}</p>",
+        f"<p><strong>Verdict Rationale:</strong> {_e(a.get('verdict_rationale', ''))}</p>",
+        '<div class="dsd-scroll"><table>', "<tr><th>Category</th><th>Details</th></tr>",
+        f"<tr><td><strong>Confirmed Problems</strong></td><td>{_lines(a.get('confirmed_problems'), '<em>None confirmed</em>')}</td></tr>",
+        f"<tr><td><strong>Probable / Suspected</strong></td><td>{_lines(a.get('probable_problems'))}</td></tr>",
+        f"<tr><td><strong>Most Important Findings</strong></td><td>{_lines(a.get('most_important_findings'))}</td></tr>",
+        f"<tr><td><strong>Contributing Factors</strong></td><td>{_lines(a.get('contributing_factors'))}</td></tr>",
+        f"<tr><td><strong>Limiting Factors</strong></td><td>{_lines(a.get('limiting_factors'))}</td></tr>",
+        f"<tr><td><strong>Critical Risks</strong></td><td>{_lines(a.get('critical_risks'))}</td></tr>",
+        f"<tr><td><strong>Unresolved Questions</strong></td><td>{_lines(a.get('unresolved_questions'))}</td></tr>",
+        f"<tr><td><strong>Recommended Next Actions</strong></td><td>{_lines(a.get('recommended_next_actions'))}</td></tr>",
+        f"<tr><td><strong>Determining Checks / Hypotheses</strong></td><td>Checks: <code>{_e(', '.join(a.get('determining_checks') or []))}</code>"
+        f" | Hypotheses: <code>{_e(', '.join(a.get('determining_hypotheses') or []))}</code> | Rule: "
+        f"<code>{_e(a.get('decision_rule_id', ''))}</code></td></tr>",
+        "</table></div>"])
+
+
+def detail_section_b_html(b: Dict[str, Any]) -> str:
+    """Section B (target and investigation context)."""
+    if not b:
+        return ""
+    stop = b.get("target_stop_duration_ms") or 0.0
+    return "\n".join([
+        "<h4>B. Target and Investigation Context</h4>", '<div class="dsd-scroll"><table>',
+        f"<tr><td><strong>Process / PID</strong></td><td><code>{_e(b.get('target_process_name', ''))}</code> (PID: {_e(b.get('pid'))}) | "
+        f"Start Identity: <code>{_e(b.get('process_start_identity') or 'N/A')}</code></td></tr>",
+        f"<tr><td><strong>Binary / Build ID</strong></td><td><code>{_e(b.get('binary_path'))}</code> | Build ID: <code>{_e(b.get('build_id'))}</code></td></tr>",
+        f"<tr><td><strong>Companion ELF</strong></td><td><code>{_e(b.get('companion_elf'))}</code></td></tr>",
+        f"<tr><td><strong>Collection Mode</strong></td><td>{_e(b.get('collection_mode', ''))} (Stop Duration: {float(stop):.2f}ms, "
+        f"Interval: {_e(b.get('observation_interval_sec'))}s, Duration: {_e(b.get('observation_duration_sec'))}s)</td></tr>",
+        f"<tr><td><strong>Execution Window</strong></td><td>Start: {_e(b.get('investigation_start_time', ''))}<br>End: {_e(b.get('investigation_end_time', ''))}</td></tr>",
+        f"<tr><td><strong>Target Capabilities</strong></td><td><code>{_e(', '.join(b.get('target_capabilities') or []))}</code></td></tr>",
+        f"<tr><td><strong>Collection Failures / Limitations</strong></td><td>"
+        f"{_e('; '.join(list(b.get('collection_failures') or []) + list(b.get('environmental_limitations') or []))) or '<em>None</em>'}</td></tr>",
+        "</table></div>"])
+
+
+def detail_section_c_html(c: Dict[str, Any], include_excluded: bool = True) -> str:
+    """Section C (diagnostic strategy).  ``include_excluded=False`` leaves out the excluded-recipe list when each
+    entry is shown at its own check instead (``detail_excluded_html``)."""
+    if not c:
+        return ""
+    out = ["<h4>C. Diagnostic Strategy</h4>",
+           f"<p><strong>Classification:</strong> <code>{_e(c.get('initial_classification', ''))}</code> "
+           f"(Confidence: {float(c.get('classification_confidence') or 0.0) * 100:.1f}%)</p>",
+           f"<p><strong>Methodology:</strong> <strong>{_e(c.get('methodology_name', ''))}</strong></p>",
+           f"<p><em>Selection Rationale:</em> {_e(c.get('methodology_selection_reason', ''))}</p>",
+           f"<p><strong>Executed Recipes:</strong> <code>{_e(', '.join(c.get('recipes_executed') or []))}</code></p>"]
+    for key, label in (("scope_narrowing_sequence", "Scope Narrowing"),
+                       ("key_observations_driving_decisions", "Key Observations Driving Decisions"),
+                       ("information_gain_prioritization", "Information Gain Prioritization")):
+        if c.get(key):
+            out.append(f"<p><strong>{label}:</strong><br>{_lines(c.get(key))}</p>")
+    if include_excluded:
+        out.append(f"<p><strong>Excluded Recipes ({len(c.get('recipes_excluded') or [])}):</strong></p>"
+                   + detail_excluded_html(c.get("recipes_excluded") or []))
+    return "\n".join(out)
+
+
+def detail_excluded_html(entries: List[Dict[str, Any]]) -> str:
+    """Excluded-recipe entries of section C (``recipe_id: reason_excluded``)."""
+    return "<p>" + ("<br>".join(f"<code>{_e(ex.get('recipe_id'))}</code>: {_e(ex.get('reason_excluded'))}" for ex in entries)
+                    or "None") + "</p>"
+
+
+def detail_section_d_summary_html(d: Dict[str, Any]) -> str:
+    """The check totals line of section D."""
+    if not d:
+        return ""
+    b = detail_badge
+    return ("<h4>D. Detailed Inspection Results (totals)</h4>"
+            f"<p>Total Checks: <strong>{_e(d.get('checks_total'))}</strong> | PASS: {b(d.get('checks_passed'))} | "
+            f"FAIL: {b(d.get('checks_failed'))} | INCONCLUSIVE: {b(d.get('checks_inconclusive'))} | "
+            f"NOT_APPLICABLE: {b(d.get('checks_not_applicable'))} | NOT_EXECUTED: {b(d.get('checks_not_executed'))} | "
+            f"ERROR: {b(d.get('checks_error'))} | SKIPPED: {b(d.get('checks_skipped', 0))} | "
+            f"UNSUPPORTED: {b(d.get('checks_unsupported', 0))} | Required Passed: "
+            f"<strong>{_e(d.get('required_checks_passed', 0))}/{_e(d.get('required_checks_count', 0))}</strong></p>"
+            + (f"<p><strong>Missing Coverage:</strong> {_lines(d.get('missing_coverage'))}</p>" if d.get("missing_coverage") else ""))
+
+
+def detail_checks_html(checks: List[Dict[str, Any]]) -> str:
+    """Rows of section D for the given checks (one table)."""
+    if not checks:
+        return ""
+    rows = []
+    for c in checks:
+        dur = c.get("duration_seconds")
+        dur_s = f"{dur:.4f}s" if isinstance(dur, (int, float)) else "UNKNOWN"
+        lim = list(c.get("limitations") or []) + list(c.get("missing_evidence") or [])
+        rows.append(
+            f'<tr id="{detail_anchor("chk", c.get("check_id", ""))}"><td>{detail_badge(c.get("status", "UNKNOWN"))}</td>'
+            f"<td><code>{_e(c.get('check_id', ''))}</code><br><code>{_e(c.get('recipe_id', ''))}</code></td>"
+            f"<td><small>{_e(c.get('decision_criteria', ''))}</small></td>"
+            f"<td><code>{_e(c.get('actual_observations', ''))}</code></td>"
+            f"<td>{_e(c.get('technical_interpretation', ''))}"
+            + (f"<br><small>Limitations: {_e('; '.join(str(x) for x in lim))}</small>" if lim else "")
+            + (f"<br><small>Error: {_e(c.get('error_details'))}</small>" if c.get("error_details") else "")
+            + (f"<br><small>Supporting evidence: <code>{_e(', '.join(c.get('supporting_evidence_ids') or []))}</code></small>"
+               if c.get("supporting_evidence_ids") else "")
+            + f"</td><td><small>{dur_s}</small></td></tr>")
+    return ('<div class="dsd-scroll"><table><tr><th>Status</th><th>Check ID / Recipe</th><th>Criteria</th>'
+            "<th>Observations</th><th>Interpretation</th><th>Duration</th></tr>" + "".join(rows) + "</table></div>")
+
+
+def detail_findings_html(records: List[Dict[str, Any]]) -> str:
+    """Finding records of section E."""
+    out = []
+    for f in records:
+        out.append(
+            f'<div class="dsd-rec" id="{detail_anchor("fnd", f.get("finding_id", ""))}">'
+            f"<p>{detail_badge(f.get('classification', ''))} {detail_badge(f.get('severity', ''))} "
+            f"<code>{_e(f.get('finding_id', ''))}</code> [{_e(f.get('epistemic_level', ''))}]: {_e(f.get('problem_description', ''))}</p>"
+            f"<p><strong>Affected Entity:</strong> <code>{_e(f.get('affected_entity'))}</code></p>"
+            f"<p><strong>Observed Behavior:</strong> {_e(f.get('observed_behavior', ''))}</p>"
+            f"<p><strong>Technical Explanation:</strong> {_e(f.get('technical_explanation', ''))}</p>"
+            f"<p><strong>Confidence Basis:</strong> {_e(f.get('confidence_basis', ''))}</p>"
+            f"<p><strong>Verification:</strong> {_e(f.get('verification_status', ''))} | <strong>Rules:</strong> "
+            f"<code>{_e(', '.join(f.get('applicable_diagnostic_rules') or []))}</code></p>"
+            f"<p><strong>Evidence IDs:</strong> <code>{_e(', '.join(f.get('supporting_evidence_ids') or []))}</code>"
+            + (f" | Contradicting: <code>{_e(', '.join(f.get('contradicting_evidence_ids') or []))}</code>"
+               if f.get("contradicting_evidence_ids") else "") + "</p>"
+            f"<p><strong>Source References:</strong> <code>{_e(', '.join(f.get('source_references') or []))}</code></p>"
+            + (f"<p><strong>Causal Relationships:</strong> {_lines(f.get('causal_relationships'))}</p>"
+               if f.get("causal_relationships") else "") + "</div>")
+    return "".join(out)
+
+
+def detail_section_f_header_html(f: Dict[str, Any]) -> str:
+    """The head of section F: the leading hypothesis and why it leads."""
+    if not f:
+        return ""
+    return ("<h4>F. Competing Hypotheses (ranking)</h4>"
+            f"<p><strong>Leading Hypothesis:</strong> <code>{_e(f.get('leading_hypothesis_id'))}</code></p>"
+            f"<p><em>Discrimination Rationale:</em> {_e(f.get('ranking_rationale', ''))}</p>"
+            + (f"<p><strong>Missing evidence preventing conclusions:</strong> {_lines(f.get('missing_evidence_preventing_conclusions'))}</p>"
+               if f.get("missing_evidence_preventing_conclusions") else ""))
+
+
+def detail_hypotheses_html(hyps: List[Dict[str, Any]]) -> str:
+    """Rows of the section F hypothesis table."""
+    if not hyps:
+        return ""
+    rows = []
+    for h in hyps:
+        supp = h.get("supporting_evidence_ids") or []
+        contra = h.get("contradicting_evidence_ids") or []
+        stmt = h.get("problem_statement") or h.get("title") or ""
+        rows.append(
+            f'<tr id="{detail_anchor("hyp", h.get("hypothesis_id", ""))}"><td>{detail_badge(h.get("status", "INCONCLUSIVE"))}</td>'
+            f"<td><strong>{_e(h.get('hypothesis_id', ''))}</strong><br><small>{_e(stmt)}</small>"
+            + (f"<br><small>Basis: {_e(h.get('confidence_basis'))}</small>" if h.get("confidence_basis") else "")
+            + f"</td><td>{float(h.get('confidence', 0.0) or 0.0) * 100:.1f}%</td>"
+            f"<td><code>{_e(', '.join(supp)) if supp else 'None'}</code></td>"
+            f"<td><code>{_e(', '.join(contra)) if contra else 'None'}</code></td></tr>")
+    return ('<div class="dsd-scroll"><table><tr><th>Status</th><th>Hypothesis ID</th><th>Confidence</th>'
+            "<th>Supporting Evidence</th><th>Contradicting Evidence</th></tr>" + "".join(rows) + "</table></div>")
+
+
+def detail_section_g_header_html(g: Dict[str, Any]) -> str:
+    if not g:
+        return ""
+    return ("<h4>G. Evidence &amp; Provenance Index (totals)</h4>"
+            f"<p>Total Registered Evidence Records: <strong>{_e(g.get('evidence_count'))}</strong> | Independent Roots: "
+            f"<code>{_e(', '.join(g.get('independent_root_sources') or []))}</code></p>"
+            + (f"<p><strong>Rejected or unverified evidence:</strong> <code>{_e(g.get('rejected_or_unverified_evidence'))}</code></p>"
+               if g.get("rejected_or_unverified_evidence") else ""))
+
+
+def detail_evidence_html(records: List[Dict[str, Any]]) -> str:
+    """Rows of the section G evidence index."""
+    if not records:
+        return ""
+    rows = []
+    for ev in records:
+        corr = ev.get("correlated_source")
+        corr_s = (f"{corr.get('demangled_symbol') or ''} ({corr.get('source_file')}:{corr.get('source_line')})"
+                  if isinstance(corr, dict) and corr else "N/A")
+        rows.append(
+            f'<tr id="{detail_anchor("ev", ev.get("evidence_id", ""))}"><td><code>{_e(ev.get("evidence_id", ""))}</code></td>'
+            f"<td><code>{_e(ev.get('epistemic_level', ''))}</code></td><td><code>{_e(ev.get('collection_method', ''))}</code></td>"
+            f"<td><small>{_e(ev.get('provenance_class', ''))} ({_e(ev.get('authority_status', ''))})</small></td>"
+            f"<td><code>{_e(ev.get('normalized_observation'))}</code></td><td><small>{_e(corr_s)}</small></td></tr>")
+    return ('<div class="dsd-scroll"><table><tr><th>Evidence ID</th><th>Epistemic Level</th><th>Method</th>'
+            "<th>Provenance / Authority</th><th>Observed Value</th><th>Source Location</th></tr>" + "".join(rows)
+            + "</table></div>")
+
+
+_H_LABELS = (("unexecuted_checks", "Unexecuted Checks"), ("unsupported_capabilities", "Unsupported Capabilities"),
+             ("collection_failures", "Failed Collections"), ("missing_symbols_or_dwarf", "Missing Symbols / DWARF"),
+             ("incomplete_temporal_observations", "Incomplete Temporal Samples"),
+             ("incomplete_lock_graphs", "Incomplete Lock Graphs"),
+             ("unavailable_allocator_metadata", "Unavailable Allocator Metadata"),
+             ("unverified_causal_relationships", "Unverified Causal Relationships"),
+             ("missing_identity_records", "Missing Identity Records"),
+             ("mismatched_identity_records", "Mismatched Identity Records"),
+             ("confidence_limiting_factors", "Confidence Limiting Factors"))
+
+
+def detail_section_h_html(h: Dict[str, Any]) -> str:
+    """Section H (limitations and unverified areas)."""
+    if not h:
+        return ""
+    items = [f"<li><strong>{label}:</strong> {_e('; '.join(str(x) for x in h.get(key)))}</li>"
+             for key, label in _H_LABELS if h.get(key)]
+    return ("<h4>H. Limitations and Unverified Areas</h4>"
+            "<p><strong>Caution:</strong> Absence of evidence is never presented as evidence of absence.</p>"
+            + (f"<ul>{''.join(items)}</ul>" if items else "<p><em>None recorded.</em></p>"))
+
+
+def detail_section_i_html(i: Dict[str, Any], a_rationale: str = "") -> str:
+    """Section I (final conclusions and recommendations)."""
+    if not i:
+        return ""
+
+    def ul(items: Any) -> str:
+        return "<ul>" + ("".join(f"<li>{_e(x)}</li>" for x in items) if items else "<li><em>None</em></li>") + "</ul>"
+    out = ["<h4>I. Final Conclusions and Recommendations</h4>",
+           f"<p><strong>Overall Verdict:</strong> {detail_badge(i.get('overall_conclusion', ''))}</p>",
+           f"<p><strong>Rationale:</strong> {_e(i.get('verdict_rationale') or a_rationale)}</p>",
+           "<p><strong>Confirmed Problems</strong></p>" + ul(i.get("confirmed_problems")),
+           "<p><strong>Probable Problems</strong></p>" + ul(i.get("probable_problems")),
+           "<p><strong>Recommended Diagnostic Actions</strong></p>" + ul(i.get("recommended_next_diagnostic_steps"))]
+    if i.get("safe_remediation_suggestions"):
+        out.append("<p><strong>Safe Remediation Suggestions</strong></p>" + ul(i.get("safe_remediation_suggestions")))
+    for key, label in (("remaining_uncertainties", "Remaining Uncertainties"),
+                       ("expected_information_value", "Expected Information Value")):
+        if i.get(key):
+            out.append(f"<p><strong>{label}</strong></p>" + ul(i.get(key)))
+    if i.get("ruled_out_hypotheses"):
+        out.append("<p><strong>Ruled-out Hypotheses</strong></p>"
+                   + ul([json.dumps(x, default=str) if isinstance(x, dict) else x for x in i["ruled_out_hypotheses"]]))
+    if i.get("decision_trace"):
+        out.append('<p><strong>Decision Trace</strong></p><pre class="dsd-pre">'
+                   + _e(json.dumps(i["decision_trace"], indent=1, default=str)) + "</pre>")
+    return "\n".join(out)
+
+
+def detail_record_markdown(title: str, record: Any) -> List[str]:
+    """One detailed record as Markdown (its fields as a fenced JSON block), for the opt-in Markdown appendix."""
+    return [f"- {title}", "", "```json", json.dumps(record, indent=1, default=str, ensure_ascii=False), "```", ""]

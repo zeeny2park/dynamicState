@@ -1,0 +1,40 @@
+{
+  "id": "ho_frame_builder",
+  "suite": "heldout",
+  "origin": "new",
+  "naming": "neutral",
+  "kind": "heap_overflow",
+  "source": "benchmarks/diagnosis_accuracy/heldout/targets/ho_frame_builder.cpp",
+  "sources": [
+    "benchmarks/diagnosis_accuracy/heldout/targets/ho_frame_builder.cpp"
+  ],
+  "language": "c++",
+  "build": {
+    "compiler": "g++",
+    "opt": "-O2",
+    "flags": [
+      "-std=c++17"
+    ]
+  },
+  "style": "C++ class with new[] buffer, append without capacity check, -O2",
+  "symptom": "this program shows occasional strange data and I suspect memory corruption",
+  "ready": {
+    "mode": "stdout_marker"
+  },
+  "causes": {
+    "variables": [
+      "g_frame"
+    ],
+    "locks": [],
+    "threads": [],
+    "functions": []
+  },
+  "locations": [
+    {
+      "file": "benchmarks/diagnosis_accuracy/heldout/targets/ho_frame_builder.cpp",
+      "line": 13,
+      "text": "std::memcpy(buf_ + used_, src, n);"
+    }
+  ],
+  "notes": "32 + 40 bytes appended into a 48-byte buffer"
+}

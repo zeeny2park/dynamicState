@@ -68,7 +68,10 @@ class TestGroundTruthFiles(unittest.TestCase):
             self.assertIs(g["scored"], False)
             self.assertTrue(g["scored_reason"].strip())
             self.assertNotEqual(g["kind"], rb.HEALTHY_KIND)
-        self.assertEqual({g["id"] for g in UNSCORED}, {"stall_pipe", "stall_sleep"})
+        # long_stall (owner decision), heap_retention and lock_contention (degradations, not defects: neither scoring fits)
+        self.assertEqual({g["id"] for g in UNSCORED},
+                         {"stall_pipe", "stall_sleep", "frag_sparse", "frag_worker", "lock_convoy", "lock_hotspot"})
+        self.assertEqual({g["kind"] for g in UNSCORED}, {"long_stall", "heap_retention", "lock_contention"})
         base = UNSCORED[0]
         self.assertTrue(rb.validate_ground_truth({k: v for k, v in base.items() if k != "scored_reason"}))
         self.assertTrue(rb.validate_ground_truth(dict(base, scored="no")))
@@ -271,6 +274,155 @@ class TestRunnerWithFakeDiagnosers(unittest.TestCase):
         seen = {}
         rb.run_all(self.targets[:1], lambda pid, img, sym, c: seen.setdefault("s", sym) and _clean_result(None))
         self.assertEqual(seen["s"], self.targets[0]["symptom"])
+
+
+class TestTimingAndRepeat(unittest.TestCase):
+    """Pure aggregation of per-check timing and repeat-verdict agreement."""
+
+    def test_check_timings_reads_checks_run(self):
+        res = {"checks_run": [{"check_id": "c1", "recipe_id": "r1", "name": "n", "status": "OK", "duration_s": 0.9},
+                              {"check_id": "c2", "duration_s": None}]}
+        t = rb.check_timings(res)
+        self.assertEqual([c["check_id"] for c in t], ["c1", "c2"])
+        self.assertEqual(t[0]["duration_s"], 0.9)
+        self.assertIsNone(t[1]["duration_s"])
+        self.assertEqual(rb.check_timings(None), [])
+
+    def test_verdict_agreement(self):
+        a = rb.verdict_agreement(["HEALTHY"] * 15 + ["INCONCLUSIVE"] * 5)
+        self.assertEqual(a["modal_verdict"], "HEALTHY")
+        self.assertEqual(a["agreement_rate"], 0.75)
+        self.assertEqual(a["distribution"], {"HEALTHY": 15, "INCONCLUSIVE": 5})
+        self.assertEqual(rb.verdict_agreement(["A", "A"])["agreement_rate"], 1.0)
+        self.assertEqual(rb.verdict_agreement(["B", "A"])["modal_verdict"], "B")  # tie: first seen
+        e = rb.verdict_agreement(["A", None, None])
+        self.assertEqual(e["distribution"], {"A": 1, "ERROR": 2})
+        self.assertIsNone(rb.verdict_agreement([])["agreement_rate"])
+
+    def test_summarize_repeat(self):
+        rows = [{"id": "a", "scored": True, "repeat": rb.verdict_agreement(["X"] * 4)},
+                {"id": "b", "repeat": rb.verdict_agreement(["X", "X", "Y", "Y"][:3])},
+                {"id": "u", "scored": False, "repeat": rb.verdict_agreement(["X", "Y"])},
+                {"id": "norepeat"}]
+        s = rb.summarize_repeat(rows)
+        self.assertEqual(s["targets"], 2)
+        self.assertEqual(s["mean_agreement_rate"], 0.8334)  # (1.0 + round(2/3, 4)) / 2
+        self.assertEqual(s["pooled_agreement_rate"], round(6 / 7, 4))
+        self.assertEqual(s["fully_agreeing_targets"], 1)
+        self.assertIn("u", s["per_target"])
+        self.assertFalse(s["per_target"]["u"]["scored"])
+        self.assertIsNone(rb.summarize_repeat([{"id": "a"}]))
+
+    def test_summarize_timing(self):
+        rows = [{"diagnose_s": 2.0, "checks": [{"check_id": "c1", "name": "one", "duration_s": 0.1},
+                                                {"check_id": "c2", "name": "two", "duration_s": 0.9}]},
+                {"diagnose_s": 4.0, "checks": [{"check_id": "c1", "name": "one", "duration_s": 0.3}]},
+                {"diagnose_s": None, "checks": []}]
+        t = rb.summarize_timing(rows)
+        self.assertEqual(t["diagnose_s"], {"mean": 3.0, "max": 4.0, "n": 2})
+        self.assertEqual(list(t["per_check"]), ["c2", "c1"])  # slowest first
+        self.assertEqual(t["per_check"]["c1"]["mean_s"], 0.2)
+        self.assertEqual(t["per_check"]["c1"]["max_s"], 0.3)
+        # with check_runs every run counts, `checks` is not double counted
+        rows = [{"checks": [{"check_id": "c", "duration_s": 9.0}],
+                 "check_runs": [[{"check_id": "c", "duration_s": 1.0}], [{"check_id": "c", "duration_s": 3.0}]]}]
+        self.assertEqual(rb.summarize_timing(rows)["per_check"]["c"], {"name": "", "mean_s": 2.0, "max_s": 3.0, "n": 2})
+
+    def test_run_target_repeat_with_fake_diagnoser(self):
+        gt = next(g for g in GT if g["kind"] == rb.HEALTHY_KIND)
+        calls = []
+
+        def fake(pid, img, sym, corpus):
+            calls.append(1)
+            r = _clean_result(None)
+            r["verdict"] = "HEALTHY" if len(calls) % 4 else "INCONCLUSIVE"
+            r["checks_run"] = [{"check_id": "c", "duration_s": 0.5}]
+            return r
+
+        tmp = rb.tempfile.mkdtemp(prefix="diagacc_test_")
+        try:
+            row = rb.run_target(gt, tmp, fake, repeat=8)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+        self.assertEqual(len(calls), 8)
+        self.assertEqual(row["repeat"]["runs"], 8)
+        self.assertEqual(row["repeat"]["agreement_rate"], 0.75)
+        self.assertEqual(len(row["check_runs"]), 8)
+        self.assertEqual(row["checks"][0]["duration_s"], 0.5)
+
+    def test_default_run_has_no_repeat_fields(self):
+        gt = next(g for g in GT if g["kind"] == rb.HEALTHY_KIND)
+        rep = rb.run_all([gt], lambda *a: _clean_result(None))
+        self.assertNotIn("repeat", rep["rows"][0])
+        self.assertNotIn("repeat_agreement", rep)
+        self.assertIn("timing", rep)
+
+
+HELDOUT = rb.load_ground_truth(rb.HELDOUT_GT_DIR)
+
+
+class TestHeldOutSuite(unittest.TestCase):
+    """The held-out suite (stage 3 validation) is a separate manifest; it never enters the main suite."""
+
+    def test_heldout_records_are_well_formed_and_separate(self):
+        self.assertGreaterEqual(len(HELDOUT), 12)
+        main_ids = {g["id"] for g in GT}
+        for g in HELDOUT:
+            with self.subTest(target=g["id"]):
+                self.assertEqual(rb.validate_ground_truth(g), [])
+                self.assertEqual(g.get("suite"), "heldout")
+                self.assertNotIn(g["id"], main_ids)
+                self.assertTrue(os.path.isfile(os.path.join(rb.HELDOUT_GT_DIR, g["id"] + ".json")))
+        self.assertFalse(any(g.get("suite") == "heldout" for g in GT))
+
+    def test_heldout_covers_every_scored_kind_and_styles(self):
+        kinds = {g["kind"] for g in SCORED_DEFECTS}
+        self.assertLessEqual(kinds, {g["kind"] for g in HELDOUT})
+        self.assertGreaterEqual(sum(1 for g in HELDOUT if (g.get("build") or {}).get("opt") == "-O2"), 4)
+        self.assertTrue(any(g["language"] == "c++" for g in HELDOUT))
+        self.assertTrue(any(len(rb.source_files(g)) > 1 for g in HELDOUT))
+
+    def test_build_command(self):
+        main = next(g for g in GT if "build" not in g)
+        self.assertEqual(rb.build_command(main, "/x/out"),
+                         ["gcc", "-g", "-O0", "-pthread", "-Wl,--build-id=sha1", main["source"], "-o", "/x/out"])
+        multi = next(g for g in HELDOUT if len(rb.source_files(g)) > 1 and g["build"]["opt"] == "-O2")
+        cmd = rb.build_command(multi, "/x/out")
+        self.assertEqual(cmd[:3], [multi["build"]["compiler"], "-g", "-O2"])
+        for s in multi["sources"]:
+            self.assertIn(s, cmd)
+
+    def test_location_in_a_second_translation_unit(self):
+        g = next(x for x in HELDOUT if any(l["file"] != x["source"] for l in x["locations"]))
+        loc = next(l for l in g["locations"] if l["file"] != g["source"])
+        cat = sorted(rb.KIND_CATEGORIES[g["kind"]])[0]
+        res = _clean_result(g)
+        res["findings"] = [{"category": cat, "subjects": [f"{os.path.basename(loc['file'])}:{loc['line']}"]}]
+        self.assertTrue(rb.score_result(g, res)["location_match"])
+        bad = dict(g, locations=[dict(loc, file="benchmarks/diagnosis_accuracy/heldout/targets/nope.c")])
+        self.assertTrue(rb.validate_ground_truth(bad))
+
+    def test_wrong_candidates_are_counted(self):
+        g = SCORED_DEFECTS[0]
+        loc = g["locations"][0]
+        cat = sorted(rb.KIND_CATEGORIES[g["kind"]])[0]
+        base = os.path.basename(loc["file"])
+
+        def res_with(cands):
+            r = _clean_result(g)
+            r["verdict"] = "CONFIRMED_FAULT"
+            r["findings"] = [{"category": cat, "subjects": [], "location_candidates": {"candidates": cands}}]
+            return r
+        right = rb.score_result(g, res_with([{"rank": 1, "location": f"{base}:{loc['line']}"}]))
+        wrong = rb.score_result(g, res_with([{"rank": 1, "location": f"{base}:{loc['line'] + 40}"}]))
+        none = rb.score_result(g, res_with([]))
+        self.assertEqual((right["location_candidates_shown"], right["location_candidate_wrong"]), (True, False))
+        self.assertEqual((wrong["location_candidates_shown"], wrong["location_candidate_wrong"]), (True, True))
+        self.assertEqual((none["location_candidates_shown"], none["location_candidate_wrong"]), (False, False))
+        totals = rb.summarize([dict(right, scored=True), dict(wrong, scored=True), dict(none, scored=True)])
+        self.assertEqual(totals["overall"]["location_candidate_wrong"], 1)
+        self.assertEqual(totals["overall"]["location_candidates_shown"], 2)
+        self.assertIn("WRONG", rb.format_table({"rows": [wrong], "totals": totals, "total_wall_s": 0}))
 
 
 if __name__ == "__main__":

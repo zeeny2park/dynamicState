@@ -19,6 +19,7 @@ import unittest
 from extractor.agent_runtime import AgentRuntime
 from extractor.web.server import WebApiAdapter
 import scripts.mcp_server as mcp_srv
+from tests.support.fixture_process import fixture_popen
 
 
 class TestPhase42IpcPipelineAndHeapScanner(unittest.TestCase):
@@ -124,8 +125,8 @@ int main(int argc, char** argv) {
             ["g++", "-g", "-O0", "-fno-omit-frame-pointer", cls.src_path, "-o", cls.bin_path],
             check=True,
         )
-        cls.producer_proc = subprocess.Popen([cls.bin_path, "producer", cls.shm_file])
-        cls.consumer_proc = subprocess.Popen([cls.bin_path, "consumer", cls.shm_file])
+        cls.producer_proc = fixture_popen([cls.bin_path, "producer", cls.shm_file])
+        cls.consumer_proc = fixture_popen([cls.bin_path, "consumer", cls.shm_file])
         time.sleep(0.35)
 
     @classmethod

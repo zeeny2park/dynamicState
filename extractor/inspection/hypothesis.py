@@ -379,6 +379,9 @@ def export_incident_report(
     ssh_proxy_jump: Optional[str] = None,
     adapter: Optional[TargetExecutionAdapter] = None,
     language: str = "en",
+    session: Any = None,
+    report_json_path: Optional[str] = None,
+    markdown_detail: bool = False,
 ) -> Dict[str, Any]:
     """1-Call Incident Report exporter (`runtime_export_incident_report`, CLI `export-report`, web).
 
@@ -389,6 +392,14 @@ def export_incident_report(
     from ..incident_report import export_incident_report as _export
     pre: List[str] = []
     build_id = None
+    if session is not None:  # a stored investigation (`investigation_id`): same generator, no target re-resolution
+        return _export(
+            title=title, hypothesis=hypothesis, assertions=assertions, output_path=output_path,
+            report_html_path=report_html_path, template_path=template_path, pid=session.pid,
+            companion_elf_path=session.companion_elf, adapter=adapter, corpus_dir=mgr.corpus_dir,
+            hypothesis_verifier=mgr.verify_runtime_hypothesis, language=language, session=session,
+            report_json_path=report_json_path, markdown_detail=markdown_detail,
+        )
     if pid is not None and (isinstance(pid, bool) or pid <= 0):
         return _export(title=title, pid=pid, language=language)
     try:
@@ -412,4 +423,5 @@ def export_incident_report(
         ssh_port=ctx_info.get("ssh_port") or 22, ssh_key=ctx_info.get("ssh_key"),
         ssh_proxy_jump=ctx_info.get("ssh_proxy_jump"), adapter=adapter, corpus_dir=mgr.corpus_dir,
         hypothesis_verifier=mgr.verify_runtime_hypothesis, pre_limitations=pre, language=language,
+        report_json_path=report_json_path, markdown_detail=markdown_detail,
     )

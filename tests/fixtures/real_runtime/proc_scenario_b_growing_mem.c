@@ -33,6 +33,12 @@ static void *leak_worker_thread(void *arg) {
             g_total_allocated += chunk_size;
         }
         usleep(30000); /* 30ms allocation cycle */
+        /* FIXTURE_CAP: ~32 MiB/s measured (975 MiB resident after 30 s, 39 GB after 20 min). Stop allocating at
+         * 1 GiB (~31 s, well above anything a test or benchmark observes: the accuracy benchmark diagnoses at
+         * 6-25 s); the leaked memory stays, the process stays alive. */
+        if (g_total_allocated >= (1024UL << 20)) {
+            while (g_running) usleep(50000);
+        }
     }
     return NULL;
 }

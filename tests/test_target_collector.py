@@ -17,6 +17,7 @@ import unittest
 
 from extractor.memory_snapshot import RawMemorySnapshot
 from extractor.memory_snapshot_summary import build_memory_snapshot_summary
+from tests.support.fixture_process import fixture_popen
 
 
 class TargetCollectorTests(unittest.TestCase):
@@ -76,7 +77,7 @@ int main() {
         self.assertEqual(comp.returncode, 0, f"Compilation failed: {comp.stderr}")
 
         # Start target app
-        proc = subprocess.Popen([target_bin])
+        proc = fixture_popen([target_bin])
         self.assertIsNotNone(proc.pid)
         time.sleep(0.1)
 
@@ -147,7 +148,7 @@ int main() {
 }
 """)
         subprocess.run(["gcc", target_src, "-o", target_bin], check=True)
-        proc = subprocess.Popen([target_bin])
+        proc = fixture_popen([target_bin])
         time.sleep(0.1)
 
         out_snap_dir = os.path.join(self.tmp_dir, "snap_json")
@@ -192,7 +193,7 @@ int main() {
 }
 """)
         subprocess.run(["gcc", target_src, "-o", target_bin], check=True)
-        proc = subprocess.Popen([target_bin])
+        proc = fixture_popen([target_bin])
         time.sleep(0.15)
 
         out_snap_dir = os.path.join(self.tmp_dir, "snap_timeout")
@@ -288,7 +289,7 @@ int main() {
 }
 """)
         subprocess.run(["gcc", target_src, "-o", target_bin], check=True)
-        proc = subprocess.Popen([target_bin])
+        proc = fixture_popen([target_bin])
         time.sleep(0.1)
 
         out_snap_dir = os.path.join(self.tmp_dir, "snap_run")
@@ -325,7 +326,7 @@ int main() {
 }
 """)
         subprocess.run(["gcc", target_src, "-o", target_bin], check=True)
-        proc = subprocess.Popen([target_bin])
+        proc = fixture_popen([target_bin])
         time.sleep(0.1)
 
         out_snap_dir = os.path.join(self.tmp_dir, "snap_verb")
@@ -365,7 +366,7 @@ int main() {
 }
 """)
         subprocess.run(["gcc", target_src, "-o", target_bin], check=True)
-        proc = subprocess.Popen([target_bin])
+        proc = fixture_popen([target_bin])
         time.sleep(0.1)
 
         try:
@@ -429,7 +430,7 @@ int main() {
 }
 """)
         subprocess.run(["gcc", target_src, "-o", target_bin], check=True)
-        proc = subprocess.Popen([target_bin])
+        proc = fixture_popen([target_bin])
         time.sleep(0.1)
 
         out_snap_dir = os.path.join(self.tmp_dir, "snap_atom")
@@ -520,7 +521,7 @@ int main() {
 }
 """)
         subprocess.run(["gcc", target_src, "-o", target_bin], check=True)
-        proc = subprocess.Popen([target_bin])
+        proc = fixture_popen([target_bin])
         time.sleep(0.1)
 
         try:
@@ -565,8 +566,8 @@ int main() {
 }
 """)
         subprocess.run(["gcc", target_src, "-o", target_bin], check=True)
-        p1 = subprocess.Popen([target_bin])
-        p2 = subprocess.Popen([target_bin])
+        p1 = fixture_popen([target_bin])
+        p2 = fixture_popen([target_bin])
         time.sleep(0.1)
 
         out_dir = os.path.join(self.tmp_dir, "snap_iso")
@@ -605,8 +606,8 @@ int main() {
             out_dir2 = os.path.join(self.tmp_dir, "snap_iso_2")
             cmd_d1 = [self.collector_bin, "-p", str(p1.pid), "-o", out_dir1, "--json"]
             cmd_d2 = [self.collector_bin, "-p", str(p2.pid), "-o", out_dir2, "--json"]
-            sub_d1 = subprocess.Popen(cmd_d1, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-            sub_d2 = subprocess.Popen(cmd_d2, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            sub_d1 = fixture_popen(cmd_d1, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            sub_d2 = fixture_popen(cmd_d2, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
             sub_d1.communicate(timeout=5)
             sub_d2.communicate(timeout=5)
             self.assertEqual(sub_d1.returncode, 0)
@@ -756,7 +757,7 @@ int main() {
         with open(target_src, "w") as f:
             f.write("int main() { while (1); return 0; }\n")
         subprocess.run(["gcc", target_src, "-o", target_bin], check=True)
-        p = subprocess.Popen([target_bin])
+        p = fixture_popen([target_bin])
         try:
             # Create a path string exceeding internal 2048-byte buffers
             huge_dir = os.path.join(self.tmp_dir, "a" * 2100)
@@ -780,7 +781,7 @@ int main() {
         with open(target_src, "w") as f:
             f.write("int main() { while (1); return 0; }\n")
         subprocess.run(["gcc", target_src, "-o", target_bin], check=True)
-        p = subprocess.Popen([target_bin])
+        p = fixture_popen([target_bin])
         try:
             read_only_dir = os.path.join(self.tmp_dir, "ro_snap_dir")
             os.makedirs(read_only_dir, exist_ok=True)
@@ -809,7 +810,7 @@ int main() {
         with open(target_src, "w") as f:
             f.write("int main() { while (1); return 0; }\n")
         subprocess.run(["gcc", target_src, "-o", target_bin], check=True)
-        p = subprocess.Popen([target_bin])
+        p = fixture_popen([target_bin])
         out_dir = os.path.join(self.tmp_dir, "stale_snap_dir")
         os.makedirs(out_dir, exist_ok=True)
         stale_meta = os.path.join(out_dir, "metadata.json")
@@ -1016,7 +1017,7 @@ with patch("os.rename", side_effect=mock_rename):
 sys.stdout.write("DONE\\n")
 sys.stdout.flush()
 """
-        proc1 = subprocess.Popen(
+        proc1 = fixture_popen(
             [sys.executable, "-c", subproc_code],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
@@ -1062,7 +1063,7 @@ sys.stdout.flush()
         lock_file = os.path.join(snap_dir, ".collector.lock")
 
         # 1. Hold lock via Python and launch C collector
-        p = subprocess.Popen(["sleep", "2"])
+        p = fixture_popen(["sleep", "2"])
         try:
             lock_fd = os.open(lock_file, os.O_CREAT | os.O_RDWR, 0o644)
             fcntl.lockf(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -1307,7 +1308,7 @@ fcntl.lockf(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
 print("LOCKED", flush=True)
 time.sleep(10)
 """
-        proc = subprocess.Popen([sys.executable, "-c", code], stdout=subprocess.PIPE, text=True)
+        proc = fixture_popen([sys.executable, "-c", code], stdout=subprocess.PIPE, text=True)
         line = proc.stdout.readline().strip()
         self.assertEqual(line, "LOCKED")
 
@@ -1476,7 +1477,7 @@ int main() {
 """)
         comp = subprocess.run(["gcc", target_src, "-o", target_bin], capture_output=True, text=True)
         self.assertEqual(comp.returncode, 0)
-        proc = subprocess.Popen([target_bin])
+        proc = fixture_popen([target_bin])
         time.sleep(0.1)
 
         # Compile a tiny LD_PRELOAD interceptor to guarantee unlink failure even when running as root
@@ -2111,7 +2112,7 @@ int main() {
 }
 """)
         subprocess.run(["gcc", target_src, "-o", target_bin], check=True)
-        proc = subprocess.Popen([target_bin])
+        proc = fixture_popen([target_bin])
         time.sleep(0.1)
         try:
             res = subprocess.run(
@@ -2164,7 +2165,7 @@ int main() {
 }
 """)
         subprocess.run(["gcc", target_src, "-o", target_bin], check=True)
-        proc = subprocess.Popen([target_bin])
+        proc = fixture_popen([target_bin])
         time.sleep(0.1)
 
         try:
@@ -2212,7 +2213,7 @@ int main() {
         )
 
         # Acquire lock in a separate process
-        lock_holder = subprocess.Popen(
+        lock_holder = fixture_popen(
             [sys.executable, "-c",
              f"import fcntl, time; f=open('{lock_file}', 'w'); fcntl.lockf(f.fileno(), fcntl.LOCK_EX); time.sleep(10)"],
         )
@@ -2223,7 +2224,7 @@ int main() {
                 raw.save()
 
             # Native collector must also fail
-            proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(10)"])
+            proc = fixture_popen([sys.executable, "-c", "import time; time.sleep(10)"])
             time.sleep(0.05)
             try:
                 res = subprocess.run(
@@ -2419,7 +2420,7 @@ int main() {
 }
 """)
         subprocess.run(["gcc", target_src, "-o", target_bin], check=True)
-        proc = subprocess.Popen([target_bin])
+        proc = fixture_popen([target_bin])
         time.sleep(0.1)
 
         so_src = os.path.join(self.tmp_dir, "fail_fsync_eacces.c")
@@ -2485,7 +2486,7 @@ int main() {
 }
 """)
         subprocess.run(["gcc", target_src, "-o", target_bin], check=True)
-        proc = subprocess.Popen([target_bin])
+        proc = fixture_popen([target_bin])
         time.sleep(0.1)
 
         so_src = os.path.join(self.tmp_dir, "fail_final_fsync_unlinkat.c")

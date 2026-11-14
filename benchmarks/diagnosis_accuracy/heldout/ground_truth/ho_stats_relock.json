@@ -1,0 +1,45 @@
+{
+  "id": "ho_stats_relock",
+  "suite": "heldout",
+  "origin": "new",
+  "naming": "neutral",
+  "kind": "self_deadlock",
+  "source": "benchmarks/diagnosis_accuracy/heldout/targets/ho_stats_relock.c",
+  "sources": [
+    "benchmarks/diagnosis_accuracy/heldout/targets/ho_stats_relock.c"
+  ],
+  "language": "c",
+  "build": {
+    "compiler": "gcc",
+    "opt": "-O2",
+    "flags": []
+  },
+  "style": "lock/unlock hidden in a statement macro, total() inlined at -O2",
+  "symptom": "the process hangs",
+  "ready": {
+    "mode": "stdout_marker"
+  },
+  "causes": {
+    "variables": [],
+    "locks": [
+      "stats_mu"
+    ],
+    "threads": [
+      "stats"
+    ],
+    "functions": []
+  },
+  "locations": [
+    {
+      "file": "benchmarks/diagnosis_accuracy/heldout/targets/ho_stats_relock.c",
+      "line": 19,
+      "text": "WITH_STATS(t = hits + misses);"
+    },
+    {
+      "file": "benchmarks/diagnosis_accuracy/heldout/targets/ho_stats_relock.c",
+      "line": 25,
+      "text": "WITH_STATS(hits++;"
+    }
+  ],
+  "notes": "record_hit calls total() inside the locked section"
+}

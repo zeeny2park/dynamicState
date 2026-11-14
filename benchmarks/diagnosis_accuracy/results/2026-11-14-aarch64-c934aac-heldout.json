@@ -1,0 +1,5571 @@
+{
+  "schema_version": 1,
+  "environment": {
+    "commit": "c934aaca5350872d7aebc44e5c390077312ce737",
+    "dirty": true,
+    "arch": "aarch64",
+    "kernel": "7.0.0-1013-oracle",
+    "glibc": "2.39",
+    "python": "3.12.3",
+    "compiler": "gcc (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0",
+    "date_utc": "2026-11-14T10:33:47Z"
+  },
+  "symptom_mode": "ground_truth",
+  "suite": "heldout",
+  "category_to_kind": {
+    "memory_leak": [
+      "MEMORY_LEAK"
+    ],
+    "heap_overflow": [
+      "MEMORY_CORRUPTION"
+    ],
+    "use_after_free": [
+      "USE_AFTER_FREE"
+    ],
+    "double_free": [
+      "INVALID_DOUBLE_FREE"
+    ],
+    "deadlock": [
+      "DEADLOCK_INDICATORS"
+    ],
+    "busy_wait": [
+      "PROCESS_INSTABILITY",
+      "RESOURCE_EXHAUSTION"
+    ],
+    "thread_growth": [
+      "THREAD_LEAK"
+    ],
+    "long_stall": [
+      "PROCESS_INSTABILITY"
+    ],
+    "mapping_growth": [
+      "MAPPING_GROWTH"
+    ],
+    "heap_retention": [
+      "HEAP_RETENTION"
+    ],
+    "lock_contention": [
+      "LOCK_CONTENTION"
+    ],
+    "orphan_lock": [
+      "ORPHAN_LOCK"
+    ],
+    "self_deadlock": [
+      "SELF_DEADLOCK"
+    ]
+  },
+  "line_tolerance": 3,
+  "totals": {
+    "overall": {
+      "defect_targets": 21,
+      "detected": 21,
+      "name_full": 18,
+      "name_partial": 3,
+      "location_match": 6,
+      "location_candidate_hit": 20,
+      "location_candidate_rank1": 18,
+      "location_candidates_shown": 20,
+      "location_candidate_wrong": 0,
+      "false_clears": 0,
+      "healthy_targets": 0,
+      "cleared": 0,
+      "not_cleared": 0,
+      "false_positives": 0,
+      "errors": 0,
+      "non_zero_stop": 0,
+      "detection_rate": 1.0,
+      "cause_name_match_rate": 0.8571
+    },
+    "unscored": {
+      "note": "informational; excluded from every total and rate in this report",
+      "targets": []
+    },
+    "per_kind": {
+      "memory_leak": {
+        "defect_targets": 4,
+        "detected": 4,
+        "name_full": 4,
+        "name_partial": 0,
+        "location_match": 0,
+        "location_candidate_hit": 3,
+        "location_candidate_rank1": 3,
+        "location_candidates_shown": 3,
+        "location_candidate_wrong": 0,
+        "false_clears": 0,
+        "healthy_targets": 0,
+        "cleared": 0,
+        "not_cleared": 0,
+        "false_positives": 0,
+        "errors": 0,
+        "non_zero_stop": 0
+      },
+      "heap_overflow": {
+        "defect_targets": 2,
+        "detected": 2,
+        "name_full": 2,
+        "name_partial": 0,
+        "location_match": 0,
+        "location_candidate_hit": 2,
+        "location_candidate_rank1": 1,
+        "location_candidates_shown": 2,
+        "location_candidate_wrong": 0,
+        "false_clears": 0,
+        "healthy_targets": 0,
+        "cleared": 0,
+        "not_cleared": 0,
+        "false_positives": 0,
+        "errors": 0,
+        "non_zero_stop": 0
+      },
+      "use_after_free": {
+        "defect_targets": 2,
+        "detected": 2,
+        "name_full": 2,
+        "name_partial": 0,
+        "location_match": 0,
+        "location_candidate_hit": 2,
+        "location_candidate_rank1": 2,
+        "location_candidates_shown": 2,
+        "location_candidate_wrong": 0,
+        "false_clears": 0,
+        "healthy_targets": 0,
+        "cleared": 0,
+        "not_cleared": 0,
+        "false_positives": 0,
+        "errors": 0,
+        "non_zero_stop": 0
+      },
+      "double_free": {
+        "defect_targets": 2,
+        "detected": 2,
+        "name_full": 2,
+        "name_partial": 0,
+        "location_match": 0,
+        "location_candidate_hit": 2,
+        "location_candidate_rank1": 1,
+        "location_candidates_shown": 2,
+        "location_candidate_wrong": 0,
+        "false_clears": 0,
+        "healthy_targets": 0,
+        "cleared": 0,
+        "not_cleared": 0,
+        "false_positives": 0,
+        "errors": 0,
+        "non_zero_stop": 0
+      },
+      "deadlock": {
+        "defect_targets": 2,
+        "detected": 2,
+        "name_full": 2,
+        "name_partial": 0,
+        "location_match": 2,
+        "location_candidate_hit": 2,
+        "location_candidate_rank1": 2,
+        "location_candidates_shown": 2,
+        "location_candidate_wrong": 0,
+        "false_clears": 0,
+        "healthy_targets": 0,
+        "cleared": 0,
+        "not_cleared": 0,
+        "false_positives": 0,
+        "errors": 0,
+        "non_zero_stop": 0
+      },
+      "busy_wait": {
+        "defect_targets": 2,
+        "detected": 2,
+        "name_full": 0,
+        "name_partial": 2,
+        "location_match": 0,
+        "location_candidate_hit": 2,
+        "location_candidate_rank1": 2,
+        "location_candidates_shown": 2,
+        "location_candidate_wrong": 0,
+        "false_clears": 0,
+        "healthy_targets": 0,
+        "cleared": 0,
+        "not_cleared": 0,
+        "false_positives": 0,
+        "errors": 0,
+        "non_zero_stop": 0
+      },
+      "thread_growth": {
+        "defect_targets": 2,
+        "detected": 2,
+        "name_full": 2,
+        "name_partial": 0,
+        "location_match": 0,
+        "location_candidate_hit": 2,
+        "location_candidate_rank1": 2,
+        "location_candidates_shown": 2,
+        "location_candidate_wrong": 0,
+        "false_clears": 0,
+        "healthy_targets": 0,
+        "cleared": 0,
+        "not_cleared": 0,
+        "false_positives": 0,
+        "errors": 0,
+        "non_zero_stop": 0
+      },
+      "mapping_growth": {
+        "defect_targets": 1,
+        "detected": 1,
+        "name_full": 0,
+        "name_partial": 1,
+        "location_match": 0,
+        "location_candidate_hit": 1,
+        "location_candidate_rank1": 1,
+        "location_candidates_shown": 1,
+        "location_candidate_wrong": 0,
+        "false_clears": 0,
+        "healthy_targets": 0,
+        "cleared": 0,
+        "not_cleared": 0,
+        "false_positives": 0,
+        "errors": 0,
+        "non_zero_stop": 0
+      },
+      "orphan_lock": {
+        "defect_targets": 2,
+        "detected": 2,
+        "name_full": 2,
+        "name_partial": 0,
+        "location_match": 2,
+        "location_candidate_hit": 2,
+        "location_candidate_rank1": 2,
+        "location_candidates_shown": 2,
+        "location_candidate_wrong": 0,
+        "false_clears": 0,
+        "healthy_targets": 0,
+        "cleared": 0,
+        "not_cleared": 0,
+        "false_positives": 0,
+        "errors": 0,
+        "non_zero_stop": 0
+      },
+      "self_deadlock": {
+        "defect_targets": 2,
+        "detected": 2,
+        "name_full": 2,
+        "name_partial": 0,
+        "location_match": 2,
+        "location_candidate_hit": 2,
+        "location_candidate_rank1": 2,
+        "location_candidates_shown": 2,
+        "location_candidate_wrong": 0,
+        "false_clears": 0,
+        "healthy_targets": 0,
+        "cleared": 0,
+        "not_cleared": 0,
+        "false_positives": 0,
+        "errors": 0,
+        "non_zero_stop": 0
+      }
+    },
+    "per_origin": {
+      "project_fixture": {
+        "defect_targets": 0,
+        "detected": 0,
+        "name_full": 0,
+        "name_partial": 0,
+        "location_match": 0,
+        "location_candidate_hit": 0,
+        "location_candidate_rank1": 0,
+        "location_candidates_shown": 0,
+        "location_candidate_wrong": 0,
+        "false_clears": 0,
+        "healthy_targets": 0,
+        "cleared": 0,
+        "not_cleared": 0,
+        "false_positives": 0,
+        "errors": 0,
+        "non_zero_stop": 0
+      },
+      "external_style": {
+        "defect_targets": 0,
+        "detected": 0,
+        "name_full": 0,
+        "name_partial": 0,
+        "location_match": 0,
+        "location_candidate_hit": 0,
+        "location_candidate_rank1": 0,
+        "location_candidates_shown": 0,
+        "location_candidate_wrong": 0,
+        "false_clears": 0,
+        "healthy_targets": 0,
+        "cleared": 0,
+        "not_cleared": 0,
+        "false_positives": 0,
+        "errors": 0,
+        "non_zero_stop": 0
+      },
+      "new": {
+        "defect_targets": 21,
+        "detected": 21,
+        "name_full": 18,
+        "name_partial": 3,
+        "location_match": 6,
+        "location_candidate_hit": 20,
+        "location_candidate_rank1": 18,
+        "location_candidates_shown": 20,
+        "location_candidate_wrong": 0,
+        "false_clears": 0,
+        "healthy_targets": 0,
+        "cleared": 0,
+        "not_cleared": 0,
+        "false_positives": 0,
+        "errors": 0,
+        "non_zero_stop": 0
+      }
+    },
+    "per_naming": {
+      "neutral": {
+        "defect_targets": 21,
+        "detected": 21,
+        "name_full": 18,
+        "name_partial": 3,
+        "location_match": 6,
+        "location_candidate_hit": 20,
+        "location_candidate_rank1": 18,
+        "location_candidates_shown": 20,
+        "location_candidate_wrong": 0,
+        "false_clears": 0,
+        "healthy_targets": 0,
+        "cleared": 0,
+        "not_cleared": 0,
+        "false_positives": 0,
+        "errors": 0,
+        "non_zero_stop": 0
+      },
+      "project": {
+        "defect_targets": 0,
+        "detected": 0,
+        "name_full": 0,
+        "name_partial": 0,
+        "location_match": 0,
+        "location_candidate_hit": 0,
+        "location_candidate_rank1": 0,
+        "location_candidates_shown": 0,
+        "location_candidate_wrong": 0,
+        "false_clears": 0,
+        "healthy_targets": 0,
+        "cleared": 0,
+        "not_cleared": 0,
+        "false_positives": 0,
+        "errors": 0,
+        "non_zero_stop": 0
+      }
+    }
+  },
+  "total_wall_s": 92.2,
+  "timing": {
+    "diagnose_s": {
+      "mean": 3.58,
+      "max": 5.11,
+      "n": 21
+    },
+    "per_check": {
+      "CHK_RECIPE_PROCESS_MEMORY_GROWTH_001": {
+        "name": "Process-Level Memory Growth & RSS Trajectory Investigation",
+        "mean_s": 1.9542,
+        "max_s": 2.0632,
+        "n": 5
+      },
+      "CHK_RECIPE_ALLOCATION_FREE_IMBALANCE_004": {
+        "name": "Allocation / Free Imbalance & Leak Detector",
+        "mean_s": 0.3559,
+        "max_s": 1.0613,
+        "n": 3
+      },
+      "CHK_RECIPE_ALLOCATION_FREE_IMBALANCE_006": {
+        "name": "Allocation / Free Imbalance & Leak Detector",
+        "mean_s": 1.0528,
+        "max_s": 1.0528,
+        "n": 1
+      },
+      "CHK_RECIPE_THREAD_LEAK_001": {
+        "name": "Thread Leak / Thread Exhaustion",
+        "mean_s": 0.9541,
+        "max_s": 1.0261,
+        "n": 2
+      },
+      "CHK_RECIPE_THREAD_STATE_ANOMALIES_001": {
+        "name": "Thread State Anomalies & Abnormal Thread Status Audit",
+        "mean_s": 0.867,
+        "max_s": 0.9975,
+        "n": 8
+      },
+      "CHK_RECIPE_MAPPING_GROWTH_016": {
+        "name": "Memory Growth Outside malloc (anonymous mappings, stacks)",
+        "mean_s": 0.9218,
+        "max_s": 0.9544,
+        "n": 6
+      },
+      "CHK_RECIPE_MAPPING_GROWTH_019": {
+        "name": "Memory Growth Outside malloc (anonymous mappings, stacks)",
+        "mean_s": 0.9349,
+        "max_s": 0.9349,
+        "n": 1
+      },
+      "CHK_RECIPE_MAPPING_GROWTH_014": {
+        "name": "Memory Growth Outside malloc (anonymous mappings, stacks)",
+        "mean_s": 0.9065,
+        "max_s": 0.907,
+        "n": 6
+      },
+      "CHK_RECIPE_MAPPING_GROWTH_018": {
+        "name": "Memory Growth Outside malloc (anonymous mappings, stacks)",
+        "mean_s": 0.9063,
+        "max_s": 0.9065,
+        "n": 4
+      },
+      "CHK_RECIPE_MAPPING_GROWTH_015": {
+        "name": "Memory Growth Outside malloc (anonymous mappings, stacks)",
+        "mean_s": 0.9057,
+        "max_s": 0.9058,
+        "n": 2
+      },
+      "CHK_RECIPE_MAPPING_GROWTH_017": {
+        "name": "Memory Growth Outside malloc (anonymous mappings, stacks)",
+        "mean_s": 0.9054,
+        "max_s": 0.9057,
+        "n": 2
+      },
+      "CHK_RECIPE_FD_LEAK_015": {
+        "name": "File Descriptor Leak / Exhaustion",
+        "mean_s": 0.8079,
+        "max_s": 0.8163,
+        "n": 6
+      },
+      "CHK_RECIPE_FD_LEAK_013": {
+        "name": "File Descriptor Leak / Exhaustion",
+        "mean_s": 0.8043,
+        "max_s": 0.8048,
+        "n": 6
+      },
+      "CHK_RECIPE_FD_LEAK_017": {
+        "name": "File Descriptor Leak / Exhaustion",
+        "mean_s": 0.804,
+        "max_s": 0.8041,
+        "n": 4
+      },
+      "CHK_RECIPE_FD_LEAK_018": {
+        "name": "File Descriptor Leak / Exhaustion",
+        "mean_s": 0.804,
+        "max_s": 0.804,
+        "n": 1
+      },
+      "CHK_RECIPE_FD_LEAK_016": {
+        "name": "File Descriptor Leak / Exhaustion",
+        "mean_s": 0.8037,
+        "max_s": 0.8038,
+        "n": 2
+      },
+      "CHK_RECIPE_FD_LEAK_014": {
+        "name": "File Descriptor Leak / Exhaustion",
+        "mean_s": 0.8037,
+        "max_s": 0.8038,
+        "n": 2
+      },
+      "CHK_RECIPE_LOCK_CONTENTION_007": {
+        "name": "Lock Contention (threads queue on a mutex whose owner keeps running)",
+        "mean_s": 0.144,
+        "max_s": 0.6228,
+        "n": 9
+      },
+      "CHK_RECIPE_LOCK_CONTENTION_006": {
+        "name": "Lock Contention (threads queue on a mutex whose owner keeps running)",
+        "mean_s": 0.6225,
+        "max_s": 0.6226,
+        "n": 2
+      },
+      "CHK_RECIPE_LOCK_CONTENTION_008": {
+        "name": "Lock Contention (threads queue on a mutex whose owner keeps running)",
+        "mean_s": 0.2094,
+        "max_s": 0.622,
+        "n": 6
+      },
+      "CHK_RECIPE_FREED_MEMORY_USE_015": {
+        "name": "Use After Free: Dangling Pointers and Writes into Freed Memory",
+        "mean_s": 0.2461,
+        "max_s": 0.4009,
+        "n": 6
+      },
+      "CHK_RECIPE_FREED_MEMORY_USE_016": {
+        "name": "Use After Free: Dangling Pointers and Writes into Freed Memory",
+        "mean_s": 0.4005,
+        "max_s": 0.4005,
+        "n": 1
+      },
+      "CHK_RECIPE_ORPHAN_LOCK_010": {
+        "name": "Orphan Lock (owner thread exited)",
+        "mean_s": 0.2256,
+        "max_s": 0.2272,
+        "n": 2
+      },
+      "CHK_RECIPE_ORPHAN_LOCK_002": {
+        "name": "Orphan Lock (owner thread exited)",
+        "mean_s": 0.2172,
+        "max_s": 0.2206,
+        "n": 2
+      },
+      "CHK_RECIPE_FREED_MEMORY_USE_013": {
+        "name": "Use After Free: Dangling Pointers and Writes into Freed Memory",
+        "mean_s": 0.1855,
+        "max_s": 0.1862,
+        "n": 2
+      },
+      "CHK_RECIPE_ORPHAN_LOCK_004": {
+        "name": "Orphan Lock (owner thread exited)",
+        "mean_s": 0.1797,
+        "max_s": 0.1799,
+        "n": 2
+      },
+      "CHK_RECIPE_ORPHAN_LOCK_005": {
+        "name": "Orphan Lock (owner thread exited)",
+        "mean_s": 0.1699,
+        "max_s": 0.1797,
+        "n": 8
+      },
+      "CHK_RECIPE_ORPHAN_LOCK_006": {
+        "name": "Orphan Lock (owner thread exited)",
+        "mean_s": 0.169,
+        "max_s": 0.1791,
+        "n": 6
+      },
+      "CHK_RECIPE_FREED_MEMORY_USE_014": {
+        "name": "Use After Free: Dangling Pointers and Writes into Freed Memory",
+        "mean_s": 0.0337,
+        "max_s": 0.1652,
+        "n": 6
+      },
+      "CHK_RECIPE_ORPHAN_LOCK_007": {
+        "name": "Orphan Lock (owner thread exited)",
+        "mean_s": 0.1635,
+        "max_s": 0.1635,
+        "n": 1
+      },
+      "CHK_RECIPE_LONG_RUNNING_BLOCKED_THREADS_004": {
+        "name": "Long-Running Blocked Thread & Worker Stall Audit",
+        "mean_s": 0.1317,
+        "max_s": 0.1451,
+        "n": 2
+      },
+      "CHK_RECIPE_HEAP_METADATA_CORRUPTION_002": {
+        "name": "Heap Metadata & Boundary Tag Integrity Audit",
+        "mean_s": 0.0496,
+        "max_s": 0.0939,
+        "n": 6
+      },
+      "CHK_RECIPE_SUSPICIOUS_LOCK_OWNERSHIP_002": {
+        "name": "Suspicious Lock Ownership & Orphaned Mutex Audit",
+        "mean_s": 0.0579,
+        "max_s": 0.0829,
+        "n": 4
+      },
+      "CHK_RECIPE_POTENTIAL_DEADLOCK_PATTERNS_003": {
+        "name": "Potential Deadlock & Wait-For Graph Cycle Detector",
+        "mean_s": 0.0323,
+        "max_s": 0.0824,
+        "n": 6
+      },
+      "CHK_RECIPE_LONG_RUNNING_BLOCKED_THREADS_013": {
+        "name": "Long-Running Blocked Thread & Worker Stall Audit",
+        "mean_s": 0.0204,
+        "max_s": 0.0711,
+        "n": 8
+      },
+      "CHK_RECIPE_INVALID_MEMORY_ACCESS_001": {
+        "name": "Invalid Memory Access & Segmentation Fault Indicator Audit",
+        "mean_s": 0.0638,
+        "max_s": 0.0701,
+        "n": 6
+      },
+      "CHK_RECIPE_THREAD_STATE_ANOMALIES_012": {
+        "name": "Thread State Anomalies & Abnormal Thread Status Audit",
+        "mean_s": 0.0199,
+        "max_s": 0.0674,
+        "n": 8
+      },
+      "CHK_RECIPE_DOUBLE_FREE_003": {
+        "name": "Double Free: A Block Listed Twice on the Allocator's Free Lists",
+        "mean_s": 0.0362,
+        "max_s": 0.0673,
+        "n": 6
+      },
+      "CHK_RECIPE_POTENTIAL_DEADLOCK_PATTERNS_009": {
+        "name": "Potential Deadlock & Wait-For Graph Cycle Detector",
+        "mean_s": 0.0309,
+        "max_s": 0.0643,
+        "n": 4
+      },
+      "CHK_RECIPE_SUSPICIOUS_LOCK_OWNERSHIP_011": {
+        "name": "Suspicious Lock Ownership & Orphaned Mutex Audit",
+        "mean_s": 0.0338,
+        "max_s": 0.0608,
+        "n": 2
+      },
+      "CHK_RECIPE_PROCESS_MEMORY_GROWTH_013": {
+        "name": "Process-Level Memory Growth & RSS Trajectory Investigation",
+        "mean_s": 0.0538,
+        "max_s": 0.0539,
+        "n": 2
+      },
+      "CHK_RECIPE_PROCESS_MEMORY_GROWTH_012": {
+        "name": "Process-Level Memory Growth & RSS Trajectory Investigation",
+        "mean_s": 0.0537,
+        "max_s": 0.0539,
+        "n": 2
+      },
+      "CHK_RECIPE_PROCESS_MEMORY_GROWTH_014": {
+        "name": "Process-Level Memory Growth & RSS Trajectory Investigation",
+        "mean_s": 0.0536,
+        "max_s": 0.0537,
+        "n": 2
+      },
+      "CHK_RECIPE_SUSPICIOUS_LOCK_OWNERSHIP_007": {
+        "name": "Suspicious Lock Ownership & Orphaned Mutex Audit",
+        "mean_s": 0.0486,
+        "max_s": 0.0486,
+        "n": 1
+      },
+      "CHK_RECIPE_LONG_RUNNING_BLOCKED_THREADS_009": {
+        "name": "Long-Running Blocked Thread & Worker Stall Audit",
+        "mean_s": 0.0423,
+        "max_s": 0.0428,
+        "n": 2
+      },
+      "CHK_RECIPE_POTENTIAL_DEADLOCK_PATTERNS_005": {
+        "name": "Potential Deadlock & Wait-For Graph Cycle Detector",
+        "mean_s": 0.0384,
+        "max_s": 0.0391,
+        "n": 2
+      },
+      "CHK_RECIPE_HEAP_METADATA_CORRUPTION_014": {
+        "name": "Heap Metadata & Boundary Tag Integrity Audit",
+        "mean_s": 0.0286,
+        "max_s": 0.0384,
+        "n": 4
+      },
+      "CHK_RECIPE_DOUBLE_FREE_005": {
+        "name": "Double Free: A Block Listed Twice on the Allocator's Free Lists",
+        "mean_s": 0.0192,
+        "max_s": 0.0356,
+        "n": 2
+      },
+      "CHK_RECIPE_HEAP_METADATA_CORRUPTION_010": {
+        "name": "Heap Metadata & Boundary Tag Integrity Audit",
+        "mean_s": 0.0192,
+        "max_s": 0.0312,
+        "n": 7
+      },
+      "CHK_RECIPE_LONG_RUNNING_BLOCKED_THREADS_002": {
+        "name": "Long-Running Blocked Thread & Worker Stall Audit",
+        "mean_s": 0.0141,
+        "max_s": 0.0193,
+        "n": 4
+      },
+      "CHK_RECIPE_SUSPICIOUS_LOCK_OWNERSHIP_004": {
+        "name": "Suspicious Lock Ownership & Orphaned Mutex Audit",
+        "mean_s": 0.0122,
+        "max_s": 0.0174,
+        "n": 4
+      },
+      "CHK_RECIPE_SELF_DEADLOCK_003": {
+        "name": "Self-Deadlock (thread waits for its own mutex)",
+        "mean_s": 0.0151,
+        "max_s": 0.0151,
+        "n": 1
+      },
+      "CHK_RECIPE_SELF_DEADLOCK_005": {
+        "name": "Self-Deadlock (thread waits for its own mutex)",
+        "mean_s": 0.0064,
+        "max_s": 0.0123,
+        "n": 3
+      },
+      "CHK_RECIPE_LOCK_CONTENTION_004": {
+        "name": "Lock Contention (threads queue on a mutex whose owner keeps running)",
+        "mean_s": 0.012,
+        "max_s": 0.012,
+        "n": 1
+      },
+      "CHK_RECIPE_PROCESS_MEMORY_GROWTH_010": {
+        "name": "Process-Level Memory Growth & RSS Trajectory Investigation",
+        "mean_s": 0.0103,
+        "max_s": 0.0103,
+        "n": 1
+      },
+      "CHK_RECIPE_HEAP_GROWTH_006": {
+        "name": "Heap Arena & Pool Expansion Investigation",
+        "mean_s": 0.0053,
+        "max_s": 0.01,
+        "n": 3
+      },
+      "CHK_RECIPE_HEAP_GROWTH_008": {
+        "name": "Heap Arena & Pool Expansion Investigation",
+        "mean_s": 0.0097,
+        "max_s": 0.0097,
+        "n": 1
+      },
+      "CHK_RECIPE_PROCESS_MEMORY_GROWTH_011": {
+        "name": "Process-Level Memory Growth & RSS Trajectory Investigation",
+        "mean_s": 0.0097,
+        "max_s": 0.0097,
+        "n": 1
+      },
+      "CHK_RECIPE_POTENTIAL_DEADLOCK_PATTERNS_011": {
+        "name": "Potential Deadlock & Wait-For Graph Cycle Detector",
+        "mean_s": 0.0062,
+        "max_s": 0.0074,
+        "n": 6
+      },
+      "CHK_RECIPE_LONG_RUNNING_BLOCKED_THREADS_014": {
+        "name": "Long-Running Blocked Thread & Worker Stall Audit",
+        "mean_s": 0.0071,
+        "max_s": 0.0071,
+        "n": 1
+      },
+      "CHK_RECIPE_THREAD_STATE_ANOMALIES_013": {
+        "name": "Thread State Anomalies & Abnormal Thread Status Audit",
+        "mean_s": 0.007,
+        "max_s": 0.007,
+        "n": 1
+      },
+      "CHK_RECIPE_SUSPICIOUS_LOCK_OWNERSHIP_010": {
+        "name": "Suspicious Lock Ownership & Orphaned Mutex Audit",
+        "mean_s": 0.0062,
+        "max_s": 0.0069,
+        "n": 6
+      },
+      "CHK_RECIPE_POTENTIAL_DEADLOCK_PATTERNS_012": {
+        "name": "Potential Deadlock & Wait-For Graph Cycle Detector",
+        "mean_s": 0.0067,
+        "max_s": 0.0067,
+        "n": 1
+      },
+      "CHK_RECIPE_SUSPICIOUS_LOCK_OWNERSHIP_009": {
+        "name": "Suspicious Lock Ownership & Orphaned Mutex Audit",
+        "mean_s": 0.0055,
+        "max_s": 0.0057,
+        "n": 2
+      },
+      "CHK_RECIPE_THREAD_STATE_ANOMALIES_010": {
+        "name": "Thread State Anomalies & Abnormal Thread Status Audit",
+        "mean_s": 0.0055,
+        "max_s": 0.0056,
+        "n": 2
+      },
+      "CHK_RECIPE_LONG_RUNNING_BLOCKED_THREADS_011": {
+        "name": "Long-Running Blocked Thread & Worker Stall Audit",
+        "mean_s": 0.0055,
+        "max_s": 0.0056,
+        "n": 2
+      },
+      "CHK_RECIPE_POTENTIAL_DEADLOCK_PATTERNS_010": {
+        "name": "Potential Deadlock & Wait-For Graph Cycle Detector",
+        "mean_s": 0.0053,
+        "max_s": 0.0055,
+        "n": 2
+      },
+      "CHK_RECIPE_THREAD_STATE_ANOMALIES_011": {
+        "name": "Thread State Anomalies & Abnormal Thread Status Audit",
+        "mean_s": 0.0054,
+        "max_s": 0.0055,
+        "n": 2
+      },
+      "CHK_RECIPE_LONG_RUNNING_BLOCKED_THREADS_012": {
+        "name": "Long-Running Blocked Thread & Worker Stall Audit",
+        "mean_s": 0.0054,
+        "max_s": 0.0055,
+        "n": 2
+      },
+      "CHK_RECIPE_SUSPICIOUS_LOCK_OWNERSHIP_008": {
+        "name": "Suspicious Lock Ownership & Orphaned Mutex Audit",
+        "mean_s": 0.0054,
+        "max_s": 0.0055,
+        "n": 2
+      },
+      "CHK_RECIPE_FREED_MEMORY_USE_011": {
+        "name": "Use After Free: Dangling Pointers and Writes into Freed Memory",
+        "mean_s": 0.0044,
+        "max_s": 0.0054,
+        "n": 6
+      },
+      "CHK_RECIPE_UNEXPECTED_NULL_OR_INVALID_POINTERS_003": {
+        "name": "Unexpected NULL & Invalid Pointer Member Audit",
+        "mean_s": 0.0026,
+        "max_s": 0.0048,
+        "n": 3
+      },
+      "CHK_RECIPE_THREAD_LEAK_008": {
+        "name": "Thread Leak / Thread Exhaustion",
+        "mean_s": 0.0038,
+        "max_s": 0.0046,
+        "n": 8
+      },
+      "CHK_RECIPE_SELF_DEADLOCK_006": {
+        "name": "Self-Deadlock (thread waits for its own mutex)",
+        "mean_s": 0.0035,
+        "max_s": 0.0044,
+        "n": 8
+      },
+      "CHK_RECIPE_HEAP_GROWTH_002": {
+        "name": "Heap Arena & Pool Expansion Investigation",
+        "mean_s": 0.0038,
+        "max_s": 0.0044,
+        "n": 5
+      },
+      "CHK_RECIPE_ALLOCATION_FREE_IMBALANCE_003": {
+        "name": "Allocation / Free Imbalance & Leak Detector",
+        "mean_s": 0.0032,
+        "max_s": 0.004,
+        "n": 5
+      },
+      "CHK_RECIPE_REPEATED_ALLOCATION_PATTERNS_004": {
+        "name": "Repeated Allocation Pattern & Growth Generator Detector",
+        "mean_s": 0.0032,
+        "max_s": 0.004,
+        "n": 5
+      },
+      "CHK_RECIPE_LONG_LIVED_OBJECT_ACCUMULATION_005": {
+        "name": "Long-Lived Object Accumulation in Containers / Caches",
+        "mean_s": 0.0034,
+        "max_s": 0.004,
+        "n": 5
+      },
+      "CHK_RECIPE_SELF_DEADLOCK_007": {
+        "name": "Self-Deadlock (thread waits for its own mutex)",
+        "mean_s": 0.0037,
+        "max_s": 0.004,
+        "n": 6
+      },
+      "CHK_RECIPE_SELF_DEADLOCK_008": {
+        "name": "Self-Deadlock (thread waits for its own mutex)",
+        "mean_s": 0.0039,
+        "max_s": 0.0039,
+        "n": 1
+      },
+      "CHK_RECIPE_SELF_DEADLOCK_011": {
+        "name": "Self-Deadlock (thread waits for its own mutex)",
+        "mean_s": 0.0039,
+        "max_s": 0.0039,
+        "n": 2
+      },
+      "CHK_RECIPE_HEAP_METADATA_CORRUPTION_015": {
+        "name": "Heap Metadata & Boundary Tag Integrity Audit",
+        "mean_s": 0.0037,
+        "max_s": 0.0037,
+        "n": 1
+      },
+      "CHK_RECIPE_DOUBLE_FREE_016": {
+        "name": "Double Free: A Block Listed Twice on the Allocator's Free Lists",
+        "mean_s": 0.0035,
+        "max_s": 0.0037,
+        "n": 4
+      },
+      "CHK_RECIPE_PROCESS_MEMORY_GROWTH_009": {
+        "name": "Process-Level Memory Growth & RSS Trajectory Investigation",
+        "mean_s": 0.0034,
+        "max_s": 0.0036,
+        "n": 6
+      },
+      "CHK_RECIPE_HEAP_RETENTION_006": {
+        "name": "Heap Retention / Fragmentation (memory held by malloc, not in use)",
+        "mean_s": 0.0035,
+        "max_s": 0.0035,
+        "n": 1
+      },
+      "CHK_RECIPE_THREAD_LEAK_010": {
+        "name": "Thread Leak / Thread Exhaustion",
+        "mean_s": 0.0034,
+        "max_s": 0.0034,
+        "n": 1
+      },
+      "CHK_RECIPE_LOCK_CONTENTION_012": {
+        "name": "Lock Contention (threads queue on a mutex whose owner keeps running)",
+        "mean_s": 0.0033,
+        "max_s": 0.0034,
+        "n": 2
+      },
+      "CHK_RECIPE_THREAD_LEAK_013": {
+        "name": "Thread Leak / Thread Exhaustion",
+        "mean_s": 0.0033,
+        "max_s": 0.0034,
+        "n": 2
+      },
+      "CHK_RECIPE_DOUBLE_FREE_012": {
+        "name": "Double Free: A Block Listed Twice on the Allocator's Free Lists",
+        "mean_s": 0.0031,
+        "max_s": 0.0033,
+        "n": 6
+      },
+      "CHK_RECIPE_THREAD_LEAK_009": {
+        "name": "Thread Leak / Thread Exhaustion",
+        "mean_s": 0.0032,
+        "max_s": 0.0033,
+        "n": 6
+      },
+      "CHK_RECIPE_LOCK_CONTENTION_009": {
+        "name": "Lock Contention (threads queue on a mutex whose owner keeps running)",
+        "mean_s": 0.0032,
+        "max_s": 0.0032,
+        "n": 1
+      },
+      "CHK_RECIPE_DOUBLE_FREE_017": {
+        "name": "Double Free: A Block Listed Twice on the Allocator's Free Lists",
+        "mean_s": 0.0031,
+        "max_s": 0.0031,
+        "n": 1
+      },
+      "CHK_RECIPE_THREAD_LEAK_007": {
+        "name": "Thread Leak / Thread Exhaustion",
+        "mean_s": 0.003,
+        "max_s": 0.003,
+        "n": 2
+      },
+      "CHK_RECIPE_DOUBLE_FREE_004": {
+        "name": "Double Free: A Block Listed Twice on the Allocator's Free Lists",
+        "mean_s": 0.0029,
+        "max_s": 0.0029,
+        "n": 2
+      },
+      "CHK_RECIPE_PROCESS_MEMORY_GROWTH_008": {
+        "name": "Process-Level Memory Growth & RSS Trajectory Investigation",
+        "mean_s": 0.0028,
+        "max_s": 0.0028,
+        "n": 2
+      },
+      "CHK_RECIPE_HEAP_METADATA_CORRUPTION_008": {
+        "name": "Heap Metadata & Boundary Tag Integrity Audit",
+        "mean_s": 0.0026,
+        "max_s": 0.0026,
+        "n": 1
+      },
+      "CHK_RECIPE_HEAP_METADATA_CORRUPTION_007": {
+        "name": "Heap Metadata & Boundary Tag Integrity Audit",
+        "mean_s": 0.0017,
+        "max_s": 0.0017,
+        "n": 2
+      },
+      "CHK_RECIPE_UNEXPECTED_NULL_OR_INVALID_POINTERS_004": {
+        "name": "Unexpected NULL & Invalid Pointer Member Audit",
+        "mean_s": 0.0016,
+        "max_s": 0.0016,
+        "n": 1
+      },
+      "CHK_RECIPE_SUSPICIOUS_BOUNDARY_VALUES_005": {
+        "name": "Suspicious Boundary Value & Sentinel Corruption Detector",
+        "mean_s": 0.0014,
+        "max_s": 0.0014,
+        "n": 1
+      },
+      "CHK_RECIPE_SUSPICIOUS_BOUNDARY_VALUES_004": {
+        "name": "Suspicious Boundary Value & Sentinel Corruption Detector",
+        "mean_s": 0.0014,
+        "max_s": 0.0014,
+        "n": 1
+      }
+    }
+  },
+  "rows": [
+    {
+      "id": "ho_accounts",
+      "kind": "deadlock",
+      "origin": "new",
+      "naming": "neutral",
+      "scored": true,
+      "verdict": "CONFIRMED_FAULT",
+      "finding_categories": [
+        "DEADLOCK_INDICATORS"
+      ],
+      "finding_status": [
+        "CONFIRMED_ROOT_CAUSE"
+      ],
+      "subjects": [
+        "1099971",
+        "teller_a",
+        "g_savings.mu",
+        "1099972",
+        "teller_b",
+        "g_checking.mu",
+        "__GI___lll_lock_wait",
+        "pthread_mutex_lock",
+        "__gthread_mutex_lock",
+        "gthr-default.h:749",
+        "lock",
+        "std_mutex.h:113",
+        "std::lock_guard<std::mutex>::lock_guard(std::mutex&)",
+        "transfer",
+        "ho_accounts.cpp:20",
+        "operator()",
+        "ho_accounts.cpp:29",
+        "__invoke_impl<void, main()::<lambda()> >",
+        "ho_accounts.cpp:61",
+        "__invoke<main()::<lambda()> >",
+        "ho_accounts.cpp:96",
+        "_M_invoke<0>",
+        "ho_accounts.cpp:292",
+        "ho_accounts.cpp:299",
+        "_M_run",
+        "ho_accounts.cpp:244",
+        "ho_accounts.cpp:33"
+      ],
+      "not_covered_kinds": [
+        "check_inconclusive",
+        "recipes_not_planned",
+        "unsupported_in_mode"
+      ],
+      "capture_mode": "ZERO_STOP_LIVE_RUNTIME",
+      "measured_stop_ms": 0.0,
+      "non_zero_stop": false,
+      "detected": true,
+      "false_clear": false,
+      "names_by_class": {
+        "variables": {
+          "expected": [],
+          "found": []
+        },
+        "locks": {
+          "expected": [
+            "g_checking.mu",
+            "g_savings.mu"
+          ],
+          "found": [
+            "g_checking.mu",
+            "g_savings.mu"
+          ]
+        },
+        "threads": {
+          "expected": [
+            "teller_a",
+            "teller_b"
+          ],
+          "found": [
+            "teller_a",
+            "teller_b"
+          ]
+        },
+        "functions": {
+          "expected": [],
+          "found": []
+        }
+      },
+      "name_match": "full",
+      "location_match": true,
+      "location_candidate_rank": 1,
+      "location_candidate_hit": true,
+      "location_candidates_shown": true,
+      "location_candidate_wrong": false,
+      "location_candidates_s": 0.008,
+      "diagnose_s": 3.94,
+      "checks": [
+        {
+          "check_id": "CHK_RECIPE_THREAD_STATE_ANOMALIES_001",
+          "recipe_id": "RECIPE_THREAD_STATE_ANOMALIES",
+          "name": "Thread State Anomalies & Abnormal Thread Status Audit",
+          "status": "INCONCLUSIVE",
+          "duration_s": 0.9252
+        },
+        {
+          "check_id": "CHK_RECIPE_SUSPICIOUS_LOCK_OWNERSHIP_002",
+          "recipe_id": "RECIPE_SUSPICIOUS_LOCK_OWNERSHIP",
+          "name": "Suspicious Lock Ownership & Orphaned Mutex Audit",
+          "status": "FAIL",
+          "duration_s": 0.0829
+        },
+        {
+          "check_id": "CHK_RECIPE_POTENTIAL_DEADLOCK_PATTERNS_003",
+          "recipe_id": "RECIPE_POTENTIAL_DEADLOCK_PATTERNS",
+          "name": "Potential Deadlock & Wait-For Graph Cycle Detector",
+          "status": "FAIL",
+          "duration_s": 0.0824
+        },
+        {
+          "check_id": "CHK_RECIPE_LONG_RUNNING_BLOCKED_THREADS_004",
+          "recipe_id": "RECIPE_LONG_RUNNING_BLOCKED_THREADS",
+          "name": "Long-Running Blocked Thread & Worker Stall Audit",
+          "status": "FAIL",
+          "duration_s": 0.1451
+        },
+        {
+          "check_id": "CHK_RECIPE_ORPHAN_LOCK_005",
+          "recipe_id": "RECIPE_ORPHAN_LOCK",
+          "name": "Orphan Lock (owner thread exited)",
+          "status": "PASS",
+          "duration_s": 0.1705
+        },
+        {
+          "check_id": "CHK_RECIPE_SELF_DEADLOCK_006",
+          "recipe_id": "RECIPE_SELF_DEADLOCK",
+          "name": "Self-Deadlock (thread waits for its own mutex)",
+          "status": "PASS",
+          "duration_s": 0.0032
+        },
+        {
+          "check_id": "CHK_RECIPE_LOCK_CONTENTION_007",
+          "recipe_id": "RECIPE_LOCK_CONTENTION",
+          "name": "Lock Contention (threads queue on a mutex whose owner keeps running)",
+          "status": "PASS",
+          "duration_s": 0.0045
+        },
+        {
+          "check_id": "CHK_RECIPE_THREAD_LEAK_008",
+          "recipe_id": "RECIPE_THREAD_LEAK",
+          "name": "Thread Leak / Thread Exhaustion",
+          "status": "PASS",
+          "duration_s": 0.0046
+        },
+        {
+          "check_id": "CHK_RECIPE_PROCESS_MEMORY_GROWTH_009",
+          "recipe_id": "RECIPE_PROCESS_MEMORY_GROWTH",
+          "name": "Process-Level Memory Growth & RSS Trajectory Investigation",
+          "status": "PASS",
+          "duration_s": 0.0035
+        },
+        {
+          "check_id": "CHK_RECIPE_HEAP_METADATA_CORRUPTION_010",
+          "recipe_id": "RECIPE_HEAP_METADATA_CORRUPTION",
+          "name": "Heap Metadata & Boundary Tag Integrity Audit",
+          "status": "PASS",
+          "duration_s": 0.0312
+        },
+        {
+          "check_id": "CHK_RECIPE_FREED_MEMORY_USE_011",
+          "recipe_id": "RECIPE_FREED_MEMORY_USE",
+          "name": "Use After Free: Dangling Pointers and Writes into Freed Memory",
+          "status": "PASS",
+          "duration_s": 0.0054
+        },
+        {
+          "check_id": "CHK_RECIPE_DOUBLE_FREE_012",
+          "recipe_id": "RECIPE_DOUBLE_FREE",
+          "name": "Double Free: A Block Listed Twice on the Allocator's Free Lists",
+          "status": "PASS",
+          "duration_s": 0.0033
+        },
+        {
+          "check_id": "CHK_RECIPE_FD_LEAK_013",
+          "recipe_id": "RECIPE_FD_LEAK",
+          "name": "File Descriptor Leak / Exhaustion",
+          "status": "PASS",
+          "duration_s": 0.8048
+        },
+        {
+          "check_id": "CHK_RECIPE_MAPPING_GROWTH_014",
+          "recipe_id": "RECIPE_MAPPING_GROWTH",
+          "name": "Memory Growth Outside malloc (anonymous mappings, stacks)",
+          "status": "PASS",
+          "duration_s": 0.907
+        }
+      ],
+      "wall_s": 5.13,
+      "symptom": "the service stopped responding"
+    },
+    {
+      "id": "ho_arena_maps",
+      "kind": "mapping_growth",
+      "origin": "new",
+      "naming": "neutral",
+      "scored": true,
+      "verdict": "PROBABLE_FAULT",
+      "finding_categories": [
+        "MAPPING_GROWTH"
+      ],
+      "finding_status": [
+        "PROBABLE_CAUSE"
+      ],
+      "subjects": [
+        "1100075",
+        "builder"
+      ],
+      "not_covered_kinds": [
+        "check_inconclusive",
+        "long_wait_not_judged",
+        "recipes_not_planned",
+        "unsupported_in_mode"
+      ],
+      "capture_mode": "ZERO_STOP_LIVE_RUNTIME",
+      "measured_stop_ms": 0.0,
+      "non_zero_stop": false,
+      "detected": true,
+      "false_clear": false,
+      "names_by_class": {
+        "variables": {
+          "expected": [
+            "g_arena"
+          ],
+          "found": []
+        },
+        "locks": {
+          "expected": [],
+          "found": []
+        },
+        "threads": {
+          "expected": [
+            "builder"
+          ],
+          "found": [
+            "builder"
+          ]
+        },
+        "functions": {
+          "expected": [],
+          "found": []
+        }
+      },
+      "name_match": "partial",
+      "location_match": false,
+      "location_candidate_rank": 1,
+      "location_candidate_hit": true,
+      "location_candidates_shown": true,
+      "location_candidate_wrong": false,
+      "location_candidates_s": 0.006,
+      "diagnose_s": 4.4,
+      "checks": [
+        {
+          "check_id": "CHK_RECIPE_PROCESS_MEMORY_GROWTH_001",
+          "recipe_id": "RECIPE_PROCESS_MEMORY_GROWTH",
+          "name": "Process-Level Memory Growth & RSS Trajectory Investigation",
+          "status": "INCONCLUSIVE",
+          "duration_s": 1.8798
+        },
+        {
+          "check_id": "CHK_RECIPE_HEAP_GROWTH_002",
+          "recipe_id": "RECIPE_HEAP_GROWTH",
+          "name": "Heap Arena & Pool Expansion Investigation",
+          "status": "INCONCLUSIVE",
+          "duration_s": 0.0033
+        },
+        {
+          "check_id": "CHK_RECIPE_ALLOCATION_FREE_IMBALANCE_003",
+          "recipe_id": "RECIPE_ALLOCATION_FREE_IMBALANCE",
+          "name": "Allocation / Free Imbalance & Leak Detector",
+          "status": "INCONCLUSIVE",
+          "duration_s": 0.0031
+        },
+        {
+          "check_id": "CHK_RECIPE_REPEATED_ALLOCATION_PATTERNS_004",
+          "recipe_id": "RECIPE_REPEATED_ALLOCATION_PATTERNS",
+          "name": "Repeated Allocation Pattern & Growth Generator Detector",
+          "status": "INCONCLUSIVE",
+          "duration_s": 0.0031
+        },
+        {
+          "check_id": "CHK_RECIPE_LONG_LIVED_OBJECT_ACCUMULATION_005",
+          "recipe_id": "RECIPE_LONG_LIVED_OBJECT_ACCUMULATION",
+          "name": "Long-Lived Object Accumulation in Containers / Caches",
+          "status": "INCONCLUSIVE",
+          "duration_s": 0.0031
+        },
+        {
+          "check_id": "CHK_RECIPE_HEAP_RETENTION_006",
+          "recipe_id": "RECIPE_HEAP_RETENTION",
+          "name": "Heap Retention / Fragmentation (memory held by malloc, not in use)",
+          "status": "PASS",
+          "duration_s": 0.0035
+        },
+        {
+          "check_id": "CHK_RECIPE_ORPHAN_LOCK_007",
+          "recipe_id": "RECIPE_ORPHAN_LOCK",
+          "name": "Orphan Lock (owner thread exited)",
+          "status": "INCONCLUSIVE",
+          "duration_s": 0.1635
+        },
+        {
+          "check_id": "CHK_RECIPE_SELF_DEADLOCK_008",
+          "recipe_id": "RECIPE_SELF_DEADLOCK",
+          "name": "Self-Deadlock (thread waits for its own mutex)",
+          "status": "INCONCLUSIVE",
+          "duration_s": 0.0039
+        },
+        {
+          "check_id": "CHK_RECIPE_LOCK_CONTENTION_009",
+          "recipe_id": "RECIPE_LOCK_CONTENTION",
+          "name": "Lock Contention (threads queue on a mutex whose owner keeps running)",
+          "status": "PASS",
+          "duration_s": 0.0032
+        },
+        {
+          "check_id": "CHK_RECIPE_THREAD_LEAK_010",
+          "recipe_id": "RECIPE_THREAD_LEAK",
+          "name": "Thread Leak / Thread Exhaustion",
+          "status": "PASS",
+          "duration_s": 0.0034
+        },
+        {
+          "check_id": "CHK_RECIPE_SUSPICIOUS_LOCK_OWNERSHIP_011",
+          "recipe_id": "RECIPE_SUSPICIOUS_LOCK_OWNERSHIP",
+          "name": "Suspicious Lock Ownership & Orphaned Mutex Audit",
+          "status": "PASS",
+          "duration_s": 0.0069
+        },
+        {
+          "check_id": "CHK_RECIPE_POTENTIAL_DEADLOCK_PATTERNS_012",
+          "recipe_id": "RECIPE_POTENTIAL_DEADLOCK_PATTERNS",
+          "name": "Potential Deadlock & Wait-For Graph Cycle Detector",
+          "status": "PASS",
+          "duration_s": 0.0067
+        },
+        {
+          "check_id": "CHK_RECIPE_THREAD_STATE_ANOMALIES_013",
+          "recipe_id": "RECIPE_THREAD_STATE_ANOMALIES",
+          "name": "Thread State Anomalies & Abnormal Thread Status Audit",
+          "status": "PASS",
+          "duration_s": 0.007
+        },
+        {
+          "check_id": "CHK_RECIPE_LONG_RUNNING_BLOCKED_THREADS_014",
+          "recipe_id": "RECIPE_LONG_RUNNING_BLOCKED_THREADS",
+          "name": "Long-Running Blocked Thread & Worker Stall Audit",
+          "status": "PASS",
+          "duration_s": 0.0071
+        },
+        {
+          "check_id": "CHK_RECIPE_HEAP_METADATA_CORRUPTION_015",
+          "recipe_id": "RECIPE_HEAP_METADATA_CORRUPTION",
+          "name": "Heap Metadata & Boundary Tag Integrity Audit",
+          "status": "PASS",
+          "duration_s": 0.0037
+        },
+        {
+          "check_id": "CHK_RECIPE_FREED_MEMORY_USE_016",
+          "recipe_id": "RECIPE_FREED_MEMORY_USE",
+          "name": "Use After Free: Dangling Pointers and Writes into Freed Memory",
+          "status": "PASS",
+          "duration_s": 0.4005
+        },
+        {
+          "check_id": "CHK_RECIPE_DOUBLE_FREE_017",
+          "recipe_id": "RECIPE_DOUBLE_FREE",
+          "name": "Double Free: A Block Listed Twice on the Allocator's Free Lists",
+          "status": "PASS",
+          "duration_s": 0.0031
+        },
+        {
+          "check_id": "CHK_RECIPE_FD_LEAK_018",
+          "recipe_id": "RECIPE_FD_LEAK",
+          "name": "File Descriptor Leak / Exhaustion",
+          "status": "PASS",
+          "duration_s": 0.804
+        },
+        {
+          "check_id": "CHK_RECIPE_MAPPING_GROWTH_019",
+          "recipe_id": "RECIPE_MAPPING_GROWTH",
+          "name": "Memory Growth Outside malloc (anonymous mappings, stacks)",
+          "status": "FAIL",
+          "duration_s": 0.9349
+        }
+      ],
+      "wall_s": 5.17,
+      "symptom": "memory usage of this process keeps growing"
+    },
+    {
+      "id": "ho_config_reload",
+      "kind": "orphan_lock",
+      "origin": "new",
+      "naming": "neutral",
+      "scored": true,
+      "verdict": "PROBABLE_FAULT",
+      "finding_categories": [
+        "ORPHAN_LOCK"
+      ],
+      "finding_status": [
+        "PROBABLE_CAUSE"
+      ],
+      "subjects": [
+        "__gthread_mutex_lock",
+        "gthr-default.h:749",
+        "lock",
+        "std_mutex.h:113",
+        "read_config",
+        "ho_config_reload.cpp:25",
+        "__invoke_impl<void, void (*)()>",
+        "ho_config_reload.cpp:61",
+        "g_cfg_mu",
+        "1100122",
+        "1100123",
+        "cfg_reader",
+        "1100124"
+      ],
+      "not_covered_kinds": [
+        "check_inconclusive",
+        "long_wait_not_judged",
+        "recipes_not_planned",
+        "unsupported_in_mode"
+      ],
+      "capture_mode": "ZERO_STOP_LIVE_RUNTIME",
+      "measured_stop_ms": 0.0,
+      "non_zero_stop": false,
+      "detected": true,
+      "false_clear": false,
+      "names_by_class": {
+        "variables": {
+          "expected": [],
+          "found": []
+        },
+        "locks": {
+          "expected": [
+            "g_cfg_mu"
+          ],
+          "found": [
+            "g_cfg_mu"
+          ]
+        },
+        "threads": {
+          "expected": [
+            "cfg_reader"
+          ],
+          "found": [
+            "cfg_reader"
+          ]
+        },
+        "functions": {
+          "expected": [],
+          "found": []
+        }
+      },
+      "name_match": "full",
+      "location_match": true,
+      "location_candidate_rank": 1,
+      "location_candidate_hit": true,
+      "location_candidates_shown": true,
+      "location_candidate_wrong": false,
+      "location_candidates_s": 0.008,
+      "diagnose_s": 3.0,
+      "checks": [
+        {
+          "check_id": "CHK_RECIPE_THREAD_STATE_ANOMALIES_001",
+          "recipe_id": "RECIPE_THREAD_STATE_ANOMALIES",
+          "name": "Thread State Anomalies & Abnormal Thread Status Audit",
+          "status": "PASS",
+          "duration_s": 0.8342
+        },
+        {
+          "check_id": "CHK_RECIPE_LONG_RUNNING_BLOCKED_THREADS_002",
+          "recipe_id": "RECIPE_LONG_RUNNING_BLOCKED_THREADS",
+          "name": "Long-Running Blocked Thread & Worker Stall Audit",
+          "status": "PASS",
+          "duration_s": 0.0193
+        },
+        {
+          "check_id": "CHK_RECIPE_POTENTIAL_DEADLOCK_PATTERNS_003",
+          "recipe_id": "RECIPE_POTENTIAL_DEADLOCK_PATTERNS",
+          "name": "Potential Deadlock & Wait-For Graph Cycle Detector",
+          "status": "PASS",
+          "duration_s": 0.0131
+        },
+        {
+          "check_id": "CHK_RECIPE_SUSPICIOUS_LOCK_OWNERSHIP_004",
+          "recipe_id": "RECIPE_SUSPICIOUS_LOCK_OWNERSHIP",
+          "name": "Suspicious Lock Ownership & Orphaned Mutex Audit",
+          "status": "PASS",
+          "duration_s": 0.0174
+        },
+        {
+          "check_id": "CHK_RECIPE_ORPHAN_LOCK_005",
+          "recipe_id": "RECIPE_ORPHAN_LOCK",
+          "name": "Orphan Lock (owner thread exited)",
+          "status": "FAIL",
+          "duration_s": 0.171
+        },
+        {
+          "check_id": "CHK_RECIPE_SELF_DEADLOCK_006",
+          "recipe_id": "RECIPE_SELF_DEADLOCK",
+          "name": "Self-Deadlock (thread waits for its own mutex)",
+          "status": "PASS",
+          "duration_s": 0.0032
+        },
+        {
+          "check_id": "CHK_RECIPE_LOCK_CONTENTION_007",
+          "recipe_id": "RECIPE_LOCK_CONTENTION",
+          "name": "Lock Contention (threads queue on a mutex whose owner keeps running)",
+          "status": "INCONCLUSIVE",
+          "duration_s": 0.0095
+        },
+        {
+          "check_id": "CHK_RECIPE_THREAD_LEAK_008",
+          "recipe_id": "RECIPE_THREAD_LEAK",
+          "name": "Thread Leak / Thread Exhaustion",
+          "status": "PASS",
+          "duration_s": 0.0043
+        },
+        {
+          "check_id": "CHK_RECIPE_PROCESS_MEMORY_GROWTH_009",
+          "recipe_id": "RECIPE_PROCESS_MEMORY_GROWTH",
+          "name": "Process-Level Memory Growth & RSS Trajectory Investigation",
+          "status": "PASS",
+          "duration_s": 0.0036
+        },
+        {
+          "check_id": "CHK_RECIPE_HEAP_METADATA_CORRUPTION_010",
+          "recipe_id": "RECIPE_HEAP_METADATA_CORRUPTION",
+          "name": "Heap Metadata & Boundary Tag Integrity Audit",
+          "status": "PASS",
+          "duration_s": 0.0215
+        },
+        {
+          "check_id": "CHK_RECIPE_FREED_MEMORY_USE_011",
+          "recipe_id": "RECIPE_FREED_MEMORY_USE",
+          "name": "Use After Free: Dangling Pointers and Writes into Freed Memory",
+          "status": "PASS",
+          "duration_s": 0.0043
+        },
+        {
+          "check_id": "CHK_RECIPE_DOUBLE_FREE_012",
+          "recipe_id": "RECIPE_DOUBLE_FREE",
+          "name": "Double Free: A Block Listed Twice on the Allocator's Free Lists",
+          "status": "PASS",
+          "duration_s": 0.0032
+        },
+        {
+          "check_id": "CHK_RECIPE_FD_LEAK_013",
+          "recipe_id": "RECIPE_FD_LEAK",
+          "name": "File Descriptor Leak / Exhaustion",
+          "status": "PASS",
+          "duration_s": 0.8043
+        },
+        {
+          "check_id": "CHK_RECIPE_MAPPING_GROWTH_014",
+          "recipe_id": "RECIPE_MAPPING_GROWTH",
+          "name": "Memory Growth Outside malloc (anonymous mappings, stacks)",
+          "status": "PASS",
+          "duration_s": 0.9068
+        }
+      ],
+      "wall_s": 3.89,
+      "symptom": "the process hangs"
+    },
+    {
+      "id": "ho_conn_close",
+      "kind": "use_after_free",
+      "origin": "new",
+      "naming": "neutral",
+      "scored": true,
+      "verdict": "PROBABLE_FAULT",
+      "finding_categories": [
+        "USE_AFTER_FREE"
+      ],
+      "finding_status": [
+        "PROBABLE_CAUSE"
+      ],
+      "subjects": [
+        "0xc21ce768a2a0",
+        "g_active"
+      ],
+      "not_covered_kinds": [
+        "check_inconclusive",
+        "long_wait_not_judged",
+        "recipes_not_planned",
+        "unsupported_in_mode"
+      ],
+      "capture_mode": "ZERO_STOP_LIVE_RUNTIME",
+      "measured_stop_ms": 0.0,
+      "non_zero_stop": false,
+      "detected": true,
+      "false_clear": false,
+      "names_by_class": {
+        "variables": {
+          "expected": [
+            "g_active"
+          ],
+          "found": [
+            "g_active"
+          ]
+        },
+        "locks": {
+          "expected": [],
+          "found": []
+        },
+        "threads": {
+          "expected": [],
+          "found": []
+        },
+        "functions": {
+          "expected": [],
+          "found": []
+        }
+      },
+      "name_match": "full",
+      "location_match": false,
+      "location_candidate_rank": 1,
+      "location_candidate_hit": true,
+      "location_candidates_shown": true,
+      "location_candidate_wrong": false,
+      "location_candidates_s": 0.005,
+      "diagnose_s": 2.95,
+      "checks": [
+        {
+          "check_id": "CHK_RECIPE_INVALID_MEMORY_ACCESS_001",
+          "recipe_id": "RECIPE_INVALID_MEMORY_ACCESS",
+          "name": "Invalid Memory Access & Segmentation Fault Indicator Audit",
+          "status": "INCONCLUSIVE",
+          "duration_s": 0.0582
+        },
+        {
+          "check_id": "CHK_RECIPE_HEAP_METADATA_CORRUPTION_002",
+          "recipe_id": "RECIPE_HEAP_METADATA_CORRUPTION",
+          "name": "Heap Metadata & Boundary Tag Integrity Audit",
+          "status": "PASS",
+          "duration_s": 0.0292
+        },
+        {
+          "check_id": "CHK_RECIPE_DOUBLE_FREE_003",
+          "recipe_id": "RECIPE_DOUBLE_FREE",
+          "name": "Double Free: A Block Listed Twice on the Allocator's Free Lists",
+          "status": "PASS",
+          "duration_s": 0.0027
+        },
+        {
+          "check_id": "CHK_RECIPE_UNEXPECTED_NULL_OR_INVALID_POINTERS_004",
+          "recipe_id": "RECIPE_UNEXPECTED_NULL_OR_INVALID_POINTERS",
+          "name": "Unexpected NULL & Invalid Pointer Member Audit",
+          "status": "INCONCLUSIVE",
+          "duration_s": 0.0016
+        },
+        {
+          "check_id": "CHK_RECIPE_SUSPICIOUS_BOUNDARY_VALUES_005",
+          "recipe_id": "RECIPE_SUSPICIOUS_BOUNDARY_VALUES",
+          "name": "Suspicious Boundary Value & Sentinel Corruption Detector",
+          "status": "INCONCLUSIVE",
+          "duration_s": 0.0014
+        },
+        {
+          "check_id": "CHK_RECIPE_ORPHAN_LOCK_006",
+          "recipe_id": "RECIPE_ORPHAN_LOCK",
+          "name": "Orphan Lock (owner thread exited)",
+          "status": "INCONCLUSIVE",
+          "duration_s": 0.1791
+        },
+        {
+          "check_id": "CHK_RECIPE_SELF_DEADLOCK_007",
+          "recipe_id": "RECIPE_SELF_DEADLOCK",
+          "name": "Self-Deadlock (thread waits for its own mutex)",
+          "status": "INCONCLUSIVE",
+          "duration_s": 0.0033
+        },
+        {
+          "check_id": "CHK_RECIPE_LOCK_CONTENTION_008",
+          "recipe_id": "RECIPE_LOCK_CONTENTION",
+          "name": "Lock Contention (threads queue on a mutex whose owner keeps running)",
+          "status": "PASS",
+          "duration_s": 0.622
+        },
+        {
+          "check_id": "CHK_RECIPE_THREAD_LEAK_009",
+          "recipe_id": "RECIPE_THREAD_LEAK",
+          "name": "Thread Leak / Thread Exhaustion",
+          "status": "PASS",
+          "duration_s": 0.003
+        },
+        {
+          "check_id": "CHK_RECIPE_SUSPICIOUS_LOCK_OWNERSHIP_010",
+          "recipe_id": "RECIPE_SUSPICIOUS_LOCK_OWNERSHIP",
+          "name": "Suspicious Lock Ownership & Orphaned Mutex Audit",
+          "status": "PASS",
+          "duration_s": 0.0056
+        },
+        {
+          "check_id": "CHK_RECIPE_POTENTIAL_DEADLOCK_PATTERNS_011",
+          "recipe_id": "RECIPE_POTENTIAL_DEADLOCK_PATTERNS",
+          "name": "Potential Deadlock & Wait-For Graph Cycle Detector",
+          "status": "PASS",
+          "duration_s": 0.0051
+        },
+        {
+          "check_id": "CHK_RECIPE_THREAD_STATE_ANOMALIES_012",
+          "recipe_id": "RECIPE_THREAD_STATE_ANOMALIES",
+          "name": "Thread State Anomalies & Abnormal Thread Status Audit",
+          "status": "PASS",
+          "duration_s": 0.0055
+        },
+        {
+          "check_id": "CHK_RECIPE_LONG_RUNNING_BLOCKED_THREADS_013",
+          "recipe_id": "RECIPE_LONG_RUNNING_BLOCKED_THREADS",
+          "name": "Long-Running Blocked Thread & Worker Stall Audit",
+          "status": "PASS",
+          "duration_s": 0.0055
+        },
+        {
+          "check_id": "CHK_RECIPE_PROCESS_MEMORY_GROWTH_014",
+          "recipe_id": "RECIPE_PROCESS_MEMORY_GROWTH",
+          "name": "Process-Level Memory Growth & RSS Trajectory Investigation",
+          "status": "PASS",
+          "duration_s": 0.0537
+        },
+        {
+          "check_id": "CHK_RECIPE_FREED_MEMORY_USE_015",
+          "recipe_id": "RECIPE_FREED_MEMORY_USE",
+          "name": "Use After Free: Dangling Pointers and Writes into Freed Memory",
+          "status": "FAIL",
+          "duration_s": 0.1672
+        },
+        {
+          "check_id": "CHK_RECIPE_FD_LEAK_016",
+          "recipe_id": "RECIPE_FD_LEAK",
+          "name": "File Descriptor Leak / Exhaustion",
+          "status": "PASS",
+          "duration_s": 0.8036
+        },
+        {
+          "check_id": "CHK_RECIPE_MAPPING_GROWTH_017",
+          "recipe_id": "RECIPE_MAPPING_GROWTH",
+          "name": "Memory Growth Outside malloc (anonymous mappings, stacks)",
+          "status": "PASS",
+          "duration_s": 0.9057
+        }
+      ],
+      "wall_s": 3.07,
+      "symptom": "this program crashes sometimes and data looks wrong"
+    },
+    {
+      "id": "ho_detached_sessions",
+      "kind": "thread_growth",
+      "origin": "new",
+      "naming": "neutral",
+      "scored": true,
+      "verdict": "CONFIRMED_FAULT",
+      "finding_categories": [
+        "THREAD_LEAK"
+      ],
+      "finding_status": [
+        "CONFIRMED_ROOT_CAUSE"
+      ],
+      "subjects": [
+        "session",
+        "serve",
+        "condition_variable:105"
+      ],
+      "not_covered_kinds": [
+        "check_inconclusive",
+        "long_wait_not_judged",
+        "recipes_not_planned",
+        "unsupported_in_mode"
+      ],
+      "capture_mode": "ZERO_STOP_LIVE_RUNTIME",
+      "measured_stop_ms": 0.0,
+      "non_zero_stop": false,
+      "detected": true,
+      "false_clear": false,
+      "names_by_class": {
+        "variables": {
+          "expected": [],
+          "found": []
+        },
+        "locks": {
+          "expected": [],
+          "found": []
+        },
+        "threads": {
+          "expected": [
+            "session"
+          ],
+          "found": [
+            "session"
+          ]
+        },
+        "functions": {
+          "expected": [
+            "serve"
+          ],
+          "found": [
+            "serve"
+          ]
+        }
+      },
+      "name_match": "full",
+      "location_match": false,
+      "location_candidate_rank": 1,
+      "location_candidate_hit": true,
+      "location_candidates_shown": true,
+      "location_candidate_wrong": false,
+      "location_candidates_s": 0.007,
+      "diagnose_s": 5.11,
+      "checks": [
+        {
+          "check_id": "CHK_RECIPE_THREAD_LEAK_001",
+          "recipe_id": "RECIPE_THREAD_LEAK",
+          "name": "Thread Leak / Thread Exhaustion",
+          "status": "FAIL",
+          "duration_s": 1.0261
+        },
+        {
+          "check_id": "CHK_RECIPE_ORPHAN_LOCK_002",
+          "recipe_id": "RECIPE_ORPHAN_LOCK",
+          "name": "Orphan Lock (owner thread exited)",
+          "status": "PASS",
+          "duration_s": 0.2206
+        },
+        {
+          "check_id": "CHK_RECIPE_DOUBLE_FREE_003",
+          "recipe_id": "RECIPE_DOUBLE_FREE",
+          "name": "Double Free: A Block Listed Twice on the Allocator's Free Lists",
+          "status": "PASS",
+          "duration_s": 0.0375
+        },
+        {
+          "check_id": "CHK_RECIPE_ALLOCATION_FREE_IMBALANCE_004",
+          "recipe_id": "RECIPE_ALLOCATION_FREE_IMBALANCE",
+          "name": "Allocation / Free Imbalance & Leak Detector",
+          "status": "INCONCLUSIVE",
+          "duration_s": 1.0613
+        },
+        {
+          "check_id": "CHK_RECIPE_SELF_DEADLOCK_005",
+          "recipe_id": "RECIPE_SELF_DEADLOCK",
+          "name": "Self-Deadlock (thread waits for its own mutex)",
+          "status": "PASS",
+          "duration_s": 0.0123
+        },
+        {
+          "check_id": "CHK_RECIPE_HEAP_GROWTH_006",
+          "recipe_id": "RECIPE_HEAP_GROWTH",
+          "name": "Heap Arena & Pool Expansion Investigation",
+          "status": "INCONCLUSIVE",
+          "duration_s": 0.01
+        },
+        {
+          "check_id": "CHK_RECIPE_LOCK_CONTENTION_007",
+          "recipe_id": "RECIPE_LOCK_CONTENTION",
+          "name": "Lock Contention (threads queue on a mutex whose owner keeps running)",
+          "status": "PASS",
+          "duration_s": 0.0166
+        },
+        {
+          "check_id": "CHK_RECIPE_HEAP_METADATA_CORRUPTION_008",
+          "recipe_id": "RECIPE_HEAP_METADATA_CORRUPTION",
+          "name": "Heap Metadata & Boundary Tag Integrity Audit",
+          "status": "PASS",
+          "duration_s": 0.0026
+        },
+        {
+          "check_id": "CHK_RECIPE_POTENTIAL_DEADLOCK_PATTERNS_009",
+          "recipe_id": "RECIPE_POTENTIAL_DEADLOCK_PATTERNS",
+          "name": "Potential Deadlock & Wait-For Graph Cycle Detector",
+          "status": "PASS",
+          "duration_s": 0.0643
+        },
+        {
+          "check_id": "CHK_RECIPE_PROCESS_MEMORY_GROWTH_010",
+          "recipe_id": "RECIPE_PROCESS_MEMORY_GROWTH",
+          "name": "Process-Level Memory Growth & RSS Trajectory Investigation",
+          "status": "INCONCLUSIVE",
+          "duration_s": 0.0103
+        },
+        {
+          "check_id": "CHK_RECIPE_SUSPICIOUS_LOCK_OWNERSHIP_011",
+          "recipe_id": "RECIPE_SUSPICIOUS_LOCK_OWNERSHIP",
+          "name": "Suspicious Lock Ownership & Orphaned Mutex Audit",
+          "status": "PASS",
+          "duration_s": 0.0608
+        },
+        {
+          "check_id": "CHK_RECIPE_THREAD_STATE_ANOMALIES_012",
+          "recipe_id": "RECIPE_THREAD_STATE_ANOMALIES",
+          "name": "Thread State Anomalies & Abnormal Thread Status Audit",
+          "status": "PASS",
+          "duration_s": 0.0674
+        },
+        {
+          "check_id": "CHK_RECIPE_LONG_RUNNING_BLOCKED_THREADS_013",
+          "recipe_id": "RECIPE_LONG_RUNNING_BLOCKED_THREADS",
+          "name": "Long-Running Blocked Thread & Worker Stall Audit",
+          "status": "PASS",
+          "duration_s": 0.0711
+        },
+        {
+          "check_id": "CHK_RECIPE_FREED_MEMORY_USE_014",
+          "recipe_id": "RECIPE_FREED_MEMORY_USE",
+          "name": "Use After Free: Dangling Pointers and Writes into Freed Memory",
+          "status": "PASS",
+          "duration_s": 0.0149
+        },
+        {
+          "check_id": "CHK_RECIPE_FD_LEAK_015",
+          "recipe_id": "RECIPE_FD_LEAK",
+          "name": "File Descriptor Leak / Exhaustion",
+          "status": "PASS",
+          "duration_s": 0.8163
+        },
+        {
+          "check_id": "CHK_RECIPE_MAPPING_GROWTH_016",
+          "recipe_id": "RECIPE_MAPPING_GROWTH",
+          "name": "Memory Growth Outside malloc (anonymous mappings, stacks)",
+          "status": "INCONCLUSIVE",
+          "duration_s": 0.9544
+        }
+      ],
+      "wall_s": 6.63,
+      "symptom": "the number of threads of this process keeps increasing"
+    },
+    {
+      "id": "ho_doc_index",
+      "kind": "memory_leak",
+      "origin": "new",
+      "naming": "neutral",
+      "scored": true,
+      "verdict": "PROBABLE_FAULT",
+      "finding_categories": [
+        "MEMORY_LEAK"
+      ],
+      "finding_status": [
+        "PROBABLE_CAUSE"
+      ],
+      "subjects": [
+        "g_index",
+        "g_index.docs_[*]",
+        "ingest",
+        "1100428"
+      ],
+      "not_covered_kinds": [
+        "check_inconclusive",
+        "long_wait_not_judged",
+        "recipes_not_planned",
+        "unsupported_in_mode"
+      ],
+      "capture_mode": "ZERO_STOP_LIVE_RUNTIME",
+      "measured_stop_ms": 0.0,
+      "non_zero_stop": false,
+      "detected": true,
+      "false_clear": false,
+      "names_by_class": {
+        "variables": {
+          "expected": [
+            "g_index"
+          ],
+          "found": [
+            "g_index"
+          ]
+        },
+        "locks": {
+          "expected": [],
+          "found": []
+        },
+        "threads": {
+          "expected": [
+            "ingest"
+          ],
+          "found": [
+            "ingest"
+          ]
+        },
+        "functions": {
+          "expected": [],
+          "found": []
+        }
+      },
+      "name_match": "full",
+      "location_match": false,
+      "location_candidate_rank": 1,
+      "location_candidate_hit": true,
+      "location_candidates_shown": true,
+      "location_candidate_wrong": false,
+      "location_candidates_s": 0.007,
+      "diagnose_s": 4.51,
+      "checks": [
+        {
+          "check_id": "CHK_RECIPE_PROCESS_MEMORY_GROWTH_001",
+          "recipe_id": "RECIPE_PROCESS_MEMORY_GROWTH",
+          "name": "Process-Level Memory Growth & RSS Trajectory Investigation",
+          "status": "FAIL",
+          "duration_s": 2.0466
+        },
+        {
+          "check_id": "CHK_RECIPE_HEAP_GROWTH_002",
+          "recipe_id": "RECIPE_HEAP_GROWTH",
+          "name": "Heap Arena & Pool Expansion Investigation",
+          "status": "FAIL",
+          "duration_s": 0.0039
+        },
+        {
+          "check_id": "CHK_RECIPE_ALLOCATION_FREE_IMBALANCE_003",
+          "recipe_id": "RECIPE_ALLOCATION_FREE_IMBALANCE",
+          "name": "Allocation / Free Imbalance & Leak Detector",
+          "status": "INCONCLUSIVE",
+          "duration_s": 0.003
+        },
+        {
+          "check_id": "CHK_RECIPE_REPEATED_ALLOCATION_PATTERNS_004",
+          "recipe_id": "RECIPE_REPEATED_ALLOCATION_PATTERNS",
+          "name": "Repeated Allocation Pattern & Growth Generator Detector",
+          "status": "INCONCLUSIVE",
+          "duration_s": 0.003
+        },
+        {
+          "check_id": "CHK_RECIPE_LONG_LIVED_OBJECT_ACCUMULATION_005",
+          "recipe_id": "RECIPE_LONG_LIVED_OBJECT_ACCUMULATION",
+          "name": "Long-Lived Object Accumulation in Containers / Caches",
+          "status": "FAIL",
+          "duration_s": 0.0039
+        },
+        {
+          "check_id": "CHK_RECIPE_ORPHAN_LOCK_006",
+          "recipe_id": "RECIPE_ORPHAN_LOCK",
+          "name": "Orphan Lock (owner thread exited)",
+          "status": "INCONCLUSIVE",
+          "duration_s": 0.165
+        },
+        {
+          "check_id": "CHK_RECIPE_SELF_DEADLOCK_007",
+          "recipe_id": "RECIPE_SELF_DEADLOCK",
+          "name": "Self-Deadlock (thread waits for its own mutex)",
+          "status": "INCONCLUSIVE",
+          "duration_s": 0.0038
+        },
+        {
+          "check_id": "CHK_RECIPE_LOCK_CONTENTION_008",
+          "recipe_id": "RECIPE_LOCK_CONTENTION",
+          "name": "Lock Contention (threads queue on a mutex whose owner keeps running)",
+          "status": "PASS",
+          "duration_s": 0.0031
+        },
+        {
+          "check_id": "CHK_RECIPE_THREAD_LEAK_009",
+          "recipe_id": "RECIPE_THREAD_LEAK",
+          "name": "Thread Leak / Thread Exhaustion",
+          "status": "PASS",
+          "duration_s": 0.0033
+        },
+        {
+          "check_id": "CHK_RECIPE_SUSPICIOUS_LOCK_OWNERSHIP_010",
+          "recipe_id": "RECIPE_SUSPICIOUS_LOCK_OWNERSHIP",
+          "name": "Suspicious Lock Ownership & Orphaned Mutex Audit",
+          "status": "PASS",
+          "duration_s": 0.0068
+        },
+        {
+          "check_id": "CHK_RECIPE_POTENTIAL_DEADLOCK_PATTERNS_011",
+          "recipe_id": "RECIPE_POTENTIAL_DEADLOCK_PATTERNS",
+          "name": "Potential Deadlock & Wait-For Graph Cycle Detector",
+          "status": "PASS",
+          "duration_s": 0.0068
+        },
+        {
+          "check_id": "CHK_RECIPE_THREAD_STATE_ANOMALIES_012",
+          "recipe_id": "RECIPE_THREAD_STATE_ANOMALIES",
+          "name": "Thread State Anomalies & Abnormal Thread Status Audit",
+          "status": "PASS",
+          "duration_s": 0.0071
+        },
+        {
+          "check_id": "CHK_RECIPE_LONG_RUNNING_BLOCKED_THREADS_013",
+          "recipe_id": "RECIPE_LONG_RUNNING_BLOCKED_THREADS",
+          "name": "Long-Running Blocked Thread & Worker Stall Audit",
+          "status": "PASS",
+          "duration_s": 0.0072
+        },
+        {
+          "check_id": "CHK_RECIPE_HEAP_METADATA_CORRUPTION_014",
+          "recipe_id": "RECIPE_HEAP_METADATA_CORRUPTION",
+          "name": "Heap Metadata & Boundary Tag Integrity Audit",
+          "status": "PASS",
+          "duration_s": 0.0366
+        },
+        {
+          "check_id": "CHK_RECIPE_FREED_MEMORY_USE_015",
+          "recipe_id": "RECIPE_FREED_MEMORY_USE",
+          "name": "Use After Free: Dangling Pointers and Writes into Freed Memory",
+          "status": "PASS",
+          "duration_s": 0.3693
+        },
+        {
+          "check_id": "CHK_RECIPE_DOUBLE_FREE_016",
+          "recipe_id": "RECIPE_DOUBLE_FREE",
+          "name": "Double Free: A Block Listed Twice on the Allocator's Free Lists",
+          "status": "PASS",
+          "duration_s": 0.0036
+        },
+        {
+          "check_id": "CHK_RECIPE_FD_LEAK_017",
+          "recipe_id": "RECIPE_FD_LEAK",
+          "name": "File Descriptor Leak / Exhaustion",
+          "status": "PASS",
+          "duration_s": 0.8039
+        },
+        {
+          "check_id": "CHK_RECIPE_MAPPING_GROWTH_018",
+          "recipe_id": "RECIPE_MAPPING_GROWTH",
+          "name": "Memory Growth Outside malloc (anonymous mappings, stacks)",
+          "status": "PASS",
+          "duration_s": 0.9065
+        }
+      ],
+      "wall_s": 5.88,
+      "symptom": "memory usage of this process keeps growing"
+    },
+    {
+      "id": "ho_frame_builder",
+      "kind": "heap_overflow",
+      "origin": "new",
+      "naming": "neutral",
+      "scored": true,
+      "verdict": "CONFIRMED_FAULT",
+      "finding_categories": [
+        "MEMORY_CORRUPTION"
+      ],
+      "finding_status": [
+        "CONFIRMED_ROOT_CAUSE"
+      ],
+      "subjects": [
+        "g_frame",
+        "g_frame->buf_"
+      ],
+      "not_covered_kinds": [
+        "check_inconclusive",
+        "long_wait_not_judged",
+        "recipes_not_planned",
+        "unsupported_in_mode"
+      ],
+      "capture_mode": "ZERO_STOP_LIVE_RUNTIME",
+      "measured_stop_ms": 0.0,
+      "non_zero_stop": false,
+      "detected": true,
+      "false_clear": false,
+      "names_by_class": {
+        "variables": {
+          "expected": [
+            "g_frame"
+          ],
+          "found": [
+            "g_frame"
+          ]
+        },
+        "locks": {
+          "expected": [],
+          "found": []
+        },
+        "threads": {
+          "expected": [],
+          "found": []
+        },
+        "functions": {
+          "expected": [],
+          "found": []
+        }
+      },
+      "name_match": "full",
+      "location_match": false,
+      "location_candidate_rank": 1,
+      "location_candidate_hit": true,
+      "location_candidates_shown": true,
+      "location_candidate_wrong": false,
+      "location_candidates_s": 0.006,
+      "diagnose_s": 3.02,
+      "checks": [
+        {
+          "check_id": "CHK_RECIPE_INVALID_MEMORY_ACCESS_001",
+          "recipe_id": "RECIPE_INVALID_MEMORY_ACCESS",
+          "name": "Invalid Memory Access & Segmentation Fault Indicator Audit",
+          "status": "INCONCLUSIVE",
+          "duration_s": 0.0701
+        },
+        {
+          "check_id": "CHK_RECIPE_HEAP_METADATA_CORRUPTION_002",
+          "recipe_id": "RECIPE_HEAP_METADATA_CORRUPTION",
+          "name": "Heap Metadata & Boundary Tag Integrity Audit",
+          "status": "FAIL",
+          "duration_s": 0.0939
+        },
+        {
+          "check_id": "CHK_RECIPE_UNEXPECTED_NULL_OR_INVALID_POINTERS_003",
+          "recipe_id": "RECIPE_UNEXPECTED_NULL_OR_INVALID_POINTERS",
+          "name": "Unexpected NULL & Invalid Pointer Member Audit",
+          "status": "INCONCLUSIVE",
+          "duration_s": 0.0015
+        },
+        {
+          "check_id": "CHK_RECIPE_DOUBLE_FREE_004",
+          "recipe_id": "RECIPE_DOUBLE_FREE",
+          "name": "Double Free: A Block Listed Twice on the Allocator's Free Lists",
+          "status": "PASS",
+          "duration_s": 0.0028
+        },
+        {
+          "check_id": "CHK_RECIPE_ORPHAN_LOCK_005",
+          "recipe_id": "RECIPE_ORPHAN_LOCK",
+          "name": "Orphan Lock (owner thread exited)",
+          "status": "INCONCLUSIVE",
+          "duration_s": 0.1797
+        },
+        {
+          "check_id": "CHK_RECIPE_SELF_DEADLOCK_006",
+          "recipe_id": "RECIPE_SELF_DEADLOCK",
+          "name": "Self-Deadlock (thread waits for its own mutex)",
+          "status": "INCONCLUSIVE",
+          "duration_s": 0.0033
+        },
+        {
+          "check_id": "CHK_RECIPE_LOCK_CONTENTION_007",
+          "recipe_id": "RECIPE_LOCK_CONTENTION",
+          "name": "Lock Contention (threads queue on a mutex whose owner keeps running)",
+          "status": "PASS",
+          "duration_s": 0.6228
+        },
+        {
+          "check_id": "CHK_RECIPE_THREAD_LEAK_008",
+          "recipe_id": "RECIPE_THREAD_LEAK",
+          "name": "Thread Leak / Thread Exhaustion",
+          "status": "PASS",
+          "duration_s": 0.003
+        },
+        {
+          "check_id": "CHK_RECIPE_SUSPICIOUS_LOCK_OWNERSHIP_009",
+          "recipe_id": "RECIPE_SUSPICIOUS_LOCK_OWNERSHIP",
+          "name": "Suspicious Lock Ownership & Orphaned Mutex Audit",
+          "status": "PASS",
+          "duration_s": 0.0057
+        },
+        {
+          "check_id": "CHK_RECIPE_POTENTIAL_DEADLOCK_PATTERNS_010",
+          "recipe_id": "RECIPE_POTENTIAL_DEADLOCK_PATTERNS",
+          "name": "Potential Deadlock & Wait-For Graph Cycle Detector",
+          "status": "PASS",
+          "duration_s": 0.0052
+        },
+        {
+          "check_id": "CHK_RECIPE_THREAD_STATE_ANOMALIES_011",
+          "recipe_id": "RECIPE_THREAD_STATE_ANOMALIES",
+          "name": "Thread State Anomalies & Abnormal Thread Status Audit",
+          "status": "PASS",
+          "duration_s": 0.0055
+        },
+        {
+          "check_id": "CHK_RECIPE_LONG_RUNNING_BLOCKED_THREADS_012",
+          "recipe_id": "RECIPE_LONG_RUNNING_BLOCKED_THREADS",
+          "name": "Long-Running Blocked Thread & Worker Stall Audit",
+          "status": "PASS",
+          "duration_s": 0.0055
+        },
+        {
+          "check_id": "CHK_RECIPE_PROCESS_MEMORY_GROWTH_013",
+          "recipe_id": "RECIPE_PROCESS_MEMORY_GROWTH",
+          "name": "Process-Level Memory Growth & RSS Trajectory Investigation",
+          "status": "PASS",
+          "duration_s": 0.0539
+        },
+        {
+          "check_id": "CHK_RECIPE_FREED_MEMORY_USE_014",
+          "recipe_id": "RECIPE_FREED_MEMORY_USE",
+          "name": "Use After Free: Dangling Pointers and Writes into Freed Memory",
+          "status": "PASS",
+          "duration_s": 0.1652
+        },
+        {
+          "check_id": "CHK_RECIPE_FD_LEAK_015",
+          "recipe_id": "RECIPE_FD_LEAK",
+          "name": "File Descriptor Leak / Exhaustion",
+          "status": "PASS",
+          "duration_s": 0.8037
+        },
+        {
+          "check_id": "CHK_RECIPE_MAPPING_GROWTH_016",
+          "recipe_id": "RECIPE_MAPPING_GROWTH",
+          "name": "Memory Growth Outside malloc (anonymous mappings, stacks)",
+          "status": "PASS",
+          "duration_s": 0.9059
+        }
+      ],
+      "wall_s": 3.15,
+      "symptom": "this program shows occasional strange data and I suspect memory corruption"
+    },
+    {
+      "id": "ho_job_queue_full",
+      "kind": "orphan_lock",
+      "origin": "new",
+      "naming": "neutral",
+      "scored": true,
+      "verdict": "PROBABLE_FAULT",
+      "finding_categories": [
+        "ORPHAN_LOCK"
+      ],
+      "finding_status": [
+        "PROBABLE_CAUSE"
+      ],
+      "subjects": [
+        "worker",
+        "ho_job_queue_full.c:38",
+        "jobs.lock",
+        "1100568",
+        "1100570",
+        "q_worker",
+        "1100571"
+      ],
+      "not_covered_kinds": [
+        "check_inconclusive",
+        "long_wait_not_judged",
+        "recipes_not_planned",
+        "unsupported_in_mode"
+      ],
+      "capture_mode": "ZERO_STOP_LIVE_RUNTIME",
+      "measured_stop_ms": 0.0,
+      "non_zero_stop": false,
+      "detected": true,
+      "false_clear": false,
+      "names_by_class": {
+        "variables": {
+          "expected": [],
+          "found": []
+        },
+        "locks": {
+          "expected": [
+            "jobs.lock"
+          ],
+          "found": [
+            "jobs.lock"
+          ]
+        },
+        "threads": {
+          "expected": [
+            "q_worker"
+          ],
+          "found": [
+            "q_worker"
+          ]
+        },
+        "functions": {
+          "expected": [],
+          "found": []
+        }
+      },
+      "name_match": "full",
+      "location_match": true,
+      "location_candidate_rank": 1,
+      "location_candidate_hit": true,
+      "location_candidates_shown": true,
+      "location_candidate_wrong": false,
+      "location_candidates_s": 0.007,
+      "diagnose_s": 2.85,
+      "checks": [
+        {
+          "check_id": "CHK_RECIPE_THREAD_STATE_ANOMALIES_001",
+          "recipe_id": "RECIPE_THREAD_STATE_ANOMALIES",
+          "name": "Thread State Anomalies & Abnormal Thread Status Audit",
+          "status": "PASS",
+          "duration_s": 0.7292
+        },
+        {
+          "check_id": "CHK_RECIPE_LONG_RUNNING_BLOCKED_THREADS_002",
+          "recipe_id": "RECIPE_LONG_RUNNING_BLOCKED_THREADS",
+          "name": "Long-Running Blocked Thread & Worker Stall Audit",
+          "status": "PASS",
+          "duration_s": 0.0135
+        },
+        {
+          "check_id": "CHK_RECIPE_POTENTIAL_DEADLOCK_PATTERNS_003",
+          "recipe_id": "RECIPE_POTENTIAL_DEADLOCK_PATTERNS",
+          "name": "Potential Deadlock & Wait-For Graph Cycle Detector",
+          "status": "PASS",
+          "duration_s": 0.009
+        },
+        {
+          "check_id": "CHK_RECIPE_SUSPICIOUS_LOCK_OWNERSHIP_004",
+          "recipe_id": "RECIPE_SUSPICIOUS_LOCK_OWNERSHIP",
+          "name": "Suspicious Lock Ownership & Orphaned Mutex Audit",
+          "status": "PASS",
+          "duration_s": 0.011
+        },
+        {
+          "check_id": "CHK_RECIPE_ORPHAN_LOCK_005",
+          "recipe_id": "RECIPE_ORPHAN_LOCK",
+          "name": "Orphan Lock (owner thread exited)",
+          "status": "FAIL",
+          "duration_s": 0.1658
+        },
+        {
+          "check_id": "CHK_RECIPE_SELF_DEADLOCK_006",
+          "recipe_id": "RECIPE_SELF_DEADLOCK",
+          "name": "Self-Deadlock (thread waits for its own mutex)",
+          "status": "PASS",
+          "duration_s": 0.0031
+        },
+        {
+          "check_id": "CHK_RECIPE_LOCK_CONTENTION_007",
+          "recipe_id": "RECIPE_LOCK_CONTENTION",
+          "name": "Lock Contention (threads queue on a mutex whose owner keeps running)",
+          "status": "INCONCLUSIVE",
+          "duration_s": 0.009
+        },
+        {
+          "check_id": "CHK_RECIPE_THREAD_LEAK_008",
+          "recipe_id": "RECIPE_THREAD_LEAK",
+          "name": "Thread Leak / Thread Exhaustion",
+          "status": "PASS",
+          "duration_s": 0.0042
+        },
+        {
+          "check_id": "CHK_RECIPE_PROCESS_MEMORY_GROWTH_009",
+          "recipe_id": "RECIPE_PROCESS_MEMORY_GROWTH",
+          "name": "Process-Level Memory Growth & RSS Trajectory Investigation",
+          "status": "PASS",
+          "duration_s": 0.0033
+        },
+        {
+          "check_id": "CHK_RECIPE_HEAP_METADATA_CORRUPTION_010",
+          "recipe_id": "RECIPE_HEAP_METADATA_CORRUPTION",
+          "name": "Heap Metadata & Boundary Tag Integrity Audit",
+          "status": "PASS",
+          "duration_s": 0.0196
+        },
+        {
+          "check_id": "CHK_RECIPE_FREED_MEMORY_USE_011",
+          "recipe_id": "RECIPE_FREED_MEMORY_USE",
+          "name": "Use After Free: Dangling Pointers and Writes into Freed Memory",
+          "status": "PASS",
+          "duration_s": 0.0042
+        },
+        {
+          "check_id": "CHK_RECIPE_DOUBLE_FREE_012",
+          "recipe_id": "RECIPE_DOUBLE_FREE",
+          "name": "Double Free: A Block Listed Twice on the Allocator's Free Lists",
+          "status": "PASS",
+          "duration_s": 0.0031
+        },
+        {
+          "check_id": "CHK_RECIPE_FD_LEAK_013",
+          "recipe_id": "RECIPE_FD_LEAK",
+          "name": "File Descriptor Leak / Exhaustion",
+          "status": "PASS",
+          "duration_s": 0.8043
+        },
+        {
+          "check_id": "CHK_RECIPE_MAPPING_GROWTH_014",
+          "recipe_id": "RECIPE_MAPPING_GROWTH",
+          "name": "Memory Growth Outside malloc (anonymous mappings, stacks)",
+          "status": "PASS",
+          "duration_s": 0.9065
+        }
+      ],
+      "wall_s": 3.64,
+      "symptom": "the process hangs"
+    },
+    {
+      "id": "ho_job_spawn",
+      "kind": "thread_growth",
+      "origin": "new",
+      "naming": "neutral",
+      "scored": true,
+      "verdict": "CONFIRMED_FAULT",
+      "finding_categories": [
+        "THREAD_LEAK"
+      ],
+      "finding_status": [
+        "CONFIRMED_ROOT_CAUSE"
+      ],
+      "subjects": [
+        "exporter",
+        "export_job",
+        "main.c:15"
+      ],
+      "not_covered_kinds": [
+        "check_inconclusive",
+        "long_wait_not_judged",
+        "recipes_not_planned",
+        "unsupported_in_mode"
+      ],
+      "capture_mode": "ZERO_STOP_LIVE_RUNTIME",
+      "measured_stop_ms": 0.0,
+      "non_zero_stop": false,
+      "detected": true,
+      "false_clear": false,
+      "names_by_class": {
+        "variables": {
+          "expected": [],
+          "found": []
+        },
+        "locks": {
+          "expected": [],
+          "found": []
+        },
+        "threads": {
+          "expected": [
+            "exporter"
+          ],
+          "found": [
+            "exporter"
+          ]
+        },
+        "functions": {
+          "expected": [
+            "export_job"
+          ],
+          "found": [
+            "export_job"
+          ]
+        }
+      },
+      "name_match": "full",
+      "location_match": false,
+      "location_candidate_rank": 1,
+      "location_candidate_hit": true,
+      "location_candidates_shown": true,
+      "location_candidate_wrong": false,
+      "location_candidates_s": 0.005,
+      "diagnose_s": 4.8,
+      "checks": [
+        {
+          "check_id": "CHK_RECIPE_THREAD_LEAK_001",
+          "recipe_id": "RECIPE_THREAD_LEAK",
+          "name": "Thread Leak / Thread Exhaustion",
+          "status": "FAIL",
+          "duration_s": 0.882
+        },
+        {
+          "check_id": "CHK_RECIPE_ORPHAN_LOCK_002",
+          "recipe_id": "RECIPE_ORPHAN_LOCK",
+          "name": "Orphan Lock (owner thread exited)",
+          "status": "INCONCLUSIVE",
+          "duration_s": 0.2139
+        },
+        {
+          "check_id": "CHK_RECIPE_SELF_DEADLOCK_003",
+          "recipe_id": "RECIPE_SELF_DEADLOCK",
+          "name": "Self-Deadlock (thread waits for its own mutex)",
+          "status": "INCONCLUSIVE",
+          "duration_s": 0.0151
+        },
+        {
+          "check_id": "CHK_RECIPE_LOCK_CONTENTION_004",
+          "recipe_id": "RECIPE_LOCK_CONTENTION",
+          "name": "Lock Contention (threads queue on a mutex whose owner keeps running)",
+          "status": "PASS",
+          "duration_s": 0.012
+        },
+        {
+          "check_id": "CHK_RECIPE_DOUBLE_FREE_005",
+          "recipe_id": "RECIPE_DOUBLE_FREE",
+          "name": "Double Free: A Block Listed Twice on the Allocator's Free Lists",
+          "status": "PASS",
+          "duration_s": 0.0356
+        },
+        {
+          "check_id": "CHK_RECIPE_ALLOCATION_FREE_IMBALANCE_006",
+          "recipe_id": "RECIPE_ALLOCATION_FREE_IMBALANCE",
+          "name": "Allocation / Free Imbalance & Leak Detector",
+          "status": "INCONCLUSIVE",
+          "duration_s": 1.0528
+        },
+        {
+          "check_id": "CHK_RECIPE_SUSPICIOUS_LOCK_OWNERSHIP_007",
+          "recipe_id": "RECIPE_SUSPICIOUS_LOCK_OWNERSHIP",
+          "name": "Suspicious Lock Ownership & Orphaned Mutex Audit",
+          "status": "PASS",
+          "duration_s": 0.0486
+        },
+        {
+          "check_id": "CHK_RECIPE_HEAP_GROWTH_008",
+          "recipe_id": "RECIPE_HEAP_GROWTH",
+          "name": "Heap Arena & Pool Expansion Investigation",
+          "status": "INCONCLUSIVE",
+          "duration_s": 0.0097
+        },
+        {
+          "check_id": "CHK_RECIPE_POTENTIAL_DEADLOCK_PATTERNS_009",
+          "recipe_id": "RECIPE_POTENTIAL_DEADLOCK_PATTERNS",
+          "name": "Potential Deadlock & Wait-For Graph Cycle Detector",
+          "status": "PASS",
+          "duration_s": 0.0484
+        },
+        {
+          "check_id": "CHK_RECIPE_HEAP_METADATA_CORRUPTION_010",
+          "recipe_id": "RECIPE_HEAP_METADATA_CORRUPTION",
+          "name": "Heap Metadata & Boundary Tag Integrity Audit",
+          "status": "PASS",
+          "duration_s": 0.0023
+        },
+        {
+          "check_id": "CHK_RECIPE_PROCESS_MEMORY_GROWTH_011",
+          "recipe_id": "RECIPE_PROCESS_MEMORY_GROWTH",
+          "name": "Process-Level Memory Growth & RSS Trajectory Investigation",
+          "status": "INCONCLUSIVE",
+          "duration_s": 0.0097
+        },
+        {
+          "check_id": "CHK_RECIPE_THREAD_STATE_ANOMALIES_012",
+          "recipe_id": "RECIPE_THREAD_STATE_ANOMALIES",
+          "name": "Thread State Anomalies & Abnormal Thread Status Audit",
+          "status": "PASS",
+          "duration_s": 0.052
+        },
+        {
+          "check_id": "CHK_RECIPE_LONG_RUNNING_BLOCKED_THREADS_013",
+          "recipe_id": "RECIPE_LONG_RUNNING_BLOCKED_THREADS",
+          "name": "Long-Running Blocked Thread & Worker Stall Audit",
+          "status": "PASS",
+          "duration_s": 0.053
+        },
+        {
+          "check_id": "CHK_RECIPE_FREED_MEMORY_USE_014",
+          "recipe_id": "RECIPE_FREED_MEMORY_USE",
+          "name": "Use After Free: Dangling Pointers and Writes into Freed Memory",
+          "status": "PASS",
+          "duration_s": 0.013
+        },
+        {
+          "check_id": "CHK_RECIPE_FD_LEAK_015",
+          "recipe_id": "RECIPE_FD_LEAK",
+          "name": "File Descriptor Leak / Exhaustion",
+          "status": "PASS",
+          "duration_s": 0.8157
+        },
+        {
+          "check_id": "CHK_RECIPE_MAPPING_GROWTH_016",
+          "recipe_id": "RECIPE_MAPPING_GROWTH",
+          "name": "Memory Growth Outside malloc (anonymous mappings, stacks)",
+          "status": "INCONCLUSIVE",
+          "duration_s": 0.9526
+        }
+      ],
+      "wall_s": 6.0,
+      "symptom": "the number of threads of this process keeps increasing"
+    },
+    {
+      "id": "ho_journal",
+      "kind": "memory_leak",
+      "origin": "new",
+      "naming": "neutral",
+      "scored": true,
+      "verdict": "PROBABLE_FAULT",
+      "finding_categories": [
+        "MEMORY_LEAK"
+      ],
+      "finding_status": [
+        "PROBABLE_CAUSE"
+      ],
+      "subjects": [
+        "journal",
+        "journal.first(->link)*",
+        "appender",
+        "1100779"
+      ],
+      "not_covered_kinds": [
+        "check_inconclusive",
+        "long_wait_not_judged",
+        "recipes_not_planned",
+        "unsupported_in_mode"
+      ],
+      "capture_mode": "ZERO_STOP_LIVE_RUNTIME",
+      "measured_stop_ms": 0.0,
+      "non_zero_stop": false,
+      "detected": true,
+      "false_clear": false,
+      "names_by_class": {
+        "variables": {
+          "expected": [
+            "journal"
+          ],
+          "found": [
+            "journal"
+          ]
+        },
+        "locks": {
+          "expected": [],
+          "found": []
+        },
+        "threads": {
+          "expected": [
+            "appender"
+          ],
+          "found": [
+            "appender"
+          ]
+        },
+        "functions": {
+          "expected": [],
+          "found": []
+        }
+      },
+      "name_match": "full",
+      "location_match": false,
+      "location_candidate_rank": 1,
+      "location_candidate_hit": true,
+      "location_candidates_shown": true,
+      "location_candidate_wrong": false,
+      "location_candidates_s": 0.006,
+      "diagnose_s": 4.07,
+      "checks": [
+        {
+          "check_id": "CHK_RECIPE_PROCESS_MEMORY_GROWTH_001",
+          "recipe_id": "RECIPE_PROCESS_MEMORY_GROWTH",
+          "name": "Process-Level Memory Growth & RSS Trajectory Investigation",
+          "status": "FAIL",
+          "duration_s": 1.9625
+        },
+        {
+          "check_id": "CHK_RECIPE_HEAP_GROWTH_002",
+          "recipe_id": "RECIPE_HEAP_GROWTH",
+          "name": "Heap Arena & Pool Expansion Investigation",
+          "status": "FAIL",
+          "duration_s": 0.0044
+        },
+        {
+          "check_id": "CHK_RECIPE_ALLOCATION_FREE_IMBALANCE_003",
+          "recipe_id": "RECIPE_ALLOCATION_FREE_IMBALANCE",
+          "name": "Allocation / Free Imbalance & Leak Detector",
+          "status": "INCONCLUSIVE",
+          "duration_s": 0.004
+        },
+        {
+          "check_id": "CHK_RECIPE_REPEATED_ALLOCATION_PATTERNS_004",
+          "recipe_id": "RECIPE_REPEATED_ALLOCATION_PATTERNS",
+          "name": "Repeated Allocation Pattern & Growth Generator Detector",
+          "status": "INCONCLUSIVE",
+          "duration_s": 0.004
+        },
+        {
+          "check_id": "CHK_RECIPE_LONG_LIVED_OBJECT_ACCUMULATION_005",
+          "recipe_id": "RECIPE_LONG_LIVED_OBJECT_ACCUMULATION",
+          "name": "Long-Lived Object Accumulation in Containers / Caches",
+          "status": "FAIL",
+          "duration_s": 0.004
+        },
+        {
+          "check_id": "CHK_RECIPE_ORPHAN_LOCK_006",
+          "recipe_id": "RECIPE_ORPHAN_LOCK",
+          "name": "Orphan Lock (owner thread exited)",
+          "status": "INCONCLUSIVE",
+          "duration_s": 0.1637
+        },
+        {
+          "check_id": "CHK_RECIPE_SELF_DEADLOCK_007",
+          "recipe_id": "RECIPE_SELF_DEADLOCK",
+          "name": "Self-Deadlock (thread waits for its own mutex)",
+          "status": "INCONCLUSIVE",
+          "duration_s": 0.0039
+        },
+        {
+          "check_id": "CHK_RECIPE_LOCK_CONTENTION_008",
+          "recipe_id": "RECIPE_LOCK_CONTENTION",
+          "name": "Lock Contention (threads queue on a mutex whose owner keeps running)",
+          "status": "PASS",
+          "duration_s": 0.0032
+        },
+        {
+          "check_id": "CHK_RECIPE_THREAD_LEAK_009",
+          "recipe_id": "RECIPE_THREAD_LEAK",
+          "name": "Thread Leak / Thread Exhaustion",
+          "status": "PASS",
+          "duration_s": 0.0033
+        },
+        {
+          "check_id": "CHK_RECIPE_SUSPICIOUS_LOCK_OWNERSHIP_010",
+          "recipe_id": "RECIPE_SUSPICIOUS_LOCK_OWNERSHIP",
+          "name": "Suspicious Lock Ownership & Orphaned Mutex Audit",
+          "status": "PASS",
+          "duration_s": 0.0066
+        },
+        {
+          "check_id": "CHK_RECIPE_POTENTIAL_DEADLOCK_PATTERNS_011",
+          "recipe_id": "RECIPE_POTENTIAL_DEADLOCK_PATTERNS",
+          "name": "Potential Deadlock & Wait-For Graph Cycle Detector",
+          "status": "PASS",
+          "duration_s": 0.0066
+        },
+        {
+          "check_id": "CHK_RECIPE_THREAD_STATE_ANOMALIES_012",
+          "recipe_id": "RECIPE_THREAD_STATE_ANOMALIES",
+          "name": "Thread State Anomalies & Abnormal Thread Status Audit",
+          "status": "PASS",
+          "duration_s": 0.0075
+        },
+        {
+          "check_id": "CHK_RECIPE_LONG_RUNNING_BLOCKED_THREADS_013",
+          "recipe_id": "RECIPE_LONG_RUNNING_BLOCKED_THREADS",
+          "name": "Long-Running Blocked Thread & Worker Stall Audit",
+          "status": "PASS",
+          "duration_s": 0.007
+        },
+        {
+          "check_id": "CHK_RECIPE_HEAP_METADATA_CORRUPTION_014",
+          "recipe_id": "RECIPE_HEAP_METADATA_CORRUPTION",
+          "name": "Heap Metadata & Boundary Tag Integrity Audit",
+          "status": "PASS",
+          "duration_s": 0.0384
+        },
+        {
+          "check_id": "CHK_RECIPE_FREED_MEMORY_USE_015",
+          "recipe_id": "RECIPE_FREED_MEMORY_USE",
+          "name": "Use After Free: Dangling Pointers and Writes into Freed Memory",
+          "status": "PASS",
+          "duration_s": 0.0037
+        },
+        {
+          "check_id": "CHK_RECIPE_DOUBLE_FREE_016",
+          "recipe_id": "RECIPE_DOUBLE_FREE",
+          "name": "Double Free: A Block Listed Twice on the Allocator's Free Lists",
+          "status": "PASS",
+          "duration_s": 0.0034
+        },
+        {
+          "check_id": "CHK_RECIPE_FD_LEAK_017",
+          "recipe_id": "RECIPE_FD_LEAK",
+          "name": "File Descriptor Leak / Exhaustion",
+          "status": "PASS",
+          "duration_s": 0.8041
+        },
+        {
+          "check_id": "CHK_RECIPE_MAPPING_GROWTH_018",
+          "recipe_id": "RECIPE_MAPPING_GROWTH",
+          "name": "Memory Growth Outside malloc (anonymous mappings, stacks)",
+          "status": "PASS",
+          "duration_s": 0.9064
+        }
+      ],
+      "wall_s": 5.35,
+      "symptom": "memory usage of this process keeps growing"
+    },
+    {
+      "id": "ho_kv_names",
+      "kind": "heap_overflow",
+      "origin": "new",
+      "naming": "neutral",
+      "scored": true,
+      "verdict": "CONFIRMED_FAULT",
+      "finding_categories": [
+        "MEMORY_CORRUPTION"
+      ],
+      "finding_status": [
+        "CONFIRMED_ROOT_CAUSE"
+      ],
+      "subjects": [
+        "kv_slots",
+        "kv_slots[1]->name",
+        "kv_slots[2]"
+      ],
+      "not_covered_kinds": [
+        "check_inconclusive",
+        "long_wait_not_judged",
+        "recipes_not_planned",
+        "unsupported_in_mode"
+      ],
+      "capture_mode": "ZERO_STOP_LIVE_RUNTIME",
+      "measured_stop_ms": 0.0,
+      "non_zero_stop": false,
+      "detected": true,
+      "false_clear": false,
+      "names_by_class": {
+        "variables": {
+          "expected": [
+            "kv_slots"
+          ],
+          "found": [
+            "kv_slots"
+          ]
+        },
+        "locks": {
+          "expected": [],
+          "found": []
+        },
+        "threads": {
+          "expected": [],
+          "found": []
+        },
+        "functions": {
+          "expected": [],
+          "found": []
+        }
+      },
+      "name_match": "full",
+      "location_match": false,
+      "location_candidate_rank": 2,
+      "location_candidate_hit": true,
+      "location_candidates_shown": true,
+      "location_candidate_wrong": false,
+      "location_candidates_s": 0.005,
+      "diagnose_s": 2.85,
+      "checks": [
+        {
+          "check_id": "CHK_RECIPE_INVALID_MEMORY_ACCESS_001",
+          "recipe_id": "RECIPE_INVALID_MEMORY_ACCESS",
+          "name": "Invalid Memory Access & Segmentation Fault Indicator Audit",
+          "status": "INCONCLUSIVE",
+          "duration_s": 0.0633
+        },
+        {
+          "check_id": "CHK_RECIPE_HEAP_METADATA_CORRUPTION_002",
+          "recipe_id": "RECIPE_HEAP_METADATA_CORRUPTION",
+          "name": "Heap Metadata & Boundary Tag Integrity Audit",
+          "status": "FAIL",
+          "duration_s": 0.0896
+        },
+        {
+          "check_id": "CHK_RECIPE_UNEXPECTED_NULL_OR_INVALID_POINTERS_003",
+          "recipe_id": "RECIPE_UNEXPECTED_NULL_OR_INVALID_POINTERS",
+          "name": "Unexpected NULL & Invalid Pointer Member Audit",
+          "status": "INCONCLUSIVE",
+          "duration_s": 0.0015
+        },
+        {
+          "check_id": "CHK_RECIPE_DOUBLE_FREE_004",
+          "recipe_id": "RECIPE_DOUBLE_FREE",
+          "name": "Double Free: A Block Listed Twice on the Allocator's Free Lists",
+          "status": "PASS",
+          "duration_s": 0.0029
+        },
+        {
+          "check_id": "CHK_RECIPE_ORPHAN_LOCK_005",
+          "recipe_id": "RECIPE_ORPHAN_LOCK",
+          "name": "Orphan Lock (owner thread exited)",
+          "status": "INCONCLUSIVE",
+          "duration_s": 0.1792
+        },
+        {
+          "check_id": "CHK_RECIPE_SELF_DEADLOCK_006",
+          "recipe_id": "RECIPE_SELF_DEADLOCK",
+          "name": "Self-Deadlock (thread waits for its own mutex)",
+          "status": "INCONCLUSIVE",
+          "duration_s": 0.0035
+        },
+        {
+          "check_id": "CHK_RECIPE_LOCK_CONTENTION_007",
+          "recipe_id": "RECIPE_LOCK_CONTENTION",
+          "name": "Lock Contention (threads queue on a mutex whose owner keeps running)",
+          "status": "PASS",
+          "duration_s": 0.6222
+        },
+        {
+          "check_id": "CHK_RECIPE_THREAD_LEAK_008",
+          "recipe_id": "RECIPE_THREAD_LEAK",
+          "name": "Thread Leak / Thread Exhaustion",
+          "status": "PASS",
+          "duration_s": 0.0031
+        },
+        {
+          "check_id": "CHK_RECIPE_SUSPICIOUS_LOCK_OWNERSHIP_009",
+          "recipe_id": "RECIPE_SUSPICIOUS_LOCK_OWNERSHIP",
+          "name": "Suspicious Lock Ownership & Orphaned Mutex Audit",
+          "status": "PASS",
+          "duration_s": 0.0053
+        },
+        {
+          "check_id": "CHK_RECIPE_POTENTIAL_DEADLOCK_PATTERNS_010",
+          "recipe_id": "RECIPE_POTENTIAL_DEADLOCK_PATTERNS",
+          "name": "Potential Deadlock & Wait-For Graph Cycle Detector",
+          "status": "PASS",
+          "duration_s": 0.0055
+        },
+        {
+          "check_id": "CHK_RECIPE_THREAD_STATE_ANOMALIES_011",
+          "recipe_id": "RECIPE_THREAD_STATE_ANOMALIES",
+          "name": "Thread State Anomalies & Abnormal Thread Status Audit",
+          "status": "PASS",
+          "duration_s": 0.0054
+        },
+        {
+          "check_id": "CHK_RECIPE_LONG_RUNNING_BLOCKED_THREADS_012",
+          "recipe_id": "RECIPE_LONG_RUNNING_BLOCKED_THREADS",
+          "name": "Long-Running Blocked Thread & Worker Stall Audit",
+          "status": "PASS",
+          "duration_s": 0.0054
+        },
+        {
+          "check_id": "CHK_RECIPE_PROCESS_MEMORY_GROWTH_013",
+          "recipe_id": "RECIPE_PROCESS_MEMORY_GROWTH",
+          "name": "Process-Level Memory Growth & RSS Trajectory Investigation",
+          "status": "PASS",
+          "duration_s": 0.0537
+        },
+        {
+          "check_id": "CHK_RECIPE_FREED_MEMORY_USE_014",
+          "recipe_id": "RECIPE_FREED_MEMORY_USE",
+          "name": "Use After Free: Dangling Pointers and Writes into Freed Memory",
+          "status": "PASS",
+          "duration_s": 0.0028
+        },
+        {
+          "check_id": "CHK_RECIPE_FD_LEAK_015",
+          "recipe_id": "RECIPE_FD_LEAK",
+          "name": "File Descriptor Leak / Exhaustion",
+          "status": "PASS",
+          "duration_s": 0.8037
+        },
+        {
+          "check_id": "CHK_RECIPE_MAPPING_GROWTH_016",
+          "recipe_id": "RECIPE_MAPPING_GROWTH",
+          "name": "Memory Growth Outside malloc (anonymous mappings, stacks)",
+          "status": "PASS",
+          "duration_s": 0.9055
+        }
+      ],
+      "wall_s": 2.94,
+      "symptom": "this program shows occasional strange data and I suspect memory corruption"
+    },
+    {
+      "id": "ho_outbox_flush",
+      "kind": "double_free",
+      "origin": "new",
+      "naming": "neutral",
+      "scored": true,
+      "verdict": "CONFIRMED_FAULT",
+      "finding_categories": [
+        "INVALID_DOUBLE_FREE",
+        "USE_AFTER_FREE"
+      ],
+      "finding_status": [
+        "CONFIRMED_ROOT_CAUSE",
+        "PROBABLE_CAUSE"
+      ],
+      "subjects": [
+        "0xb92ea63f52a0",
+        "outbox",
+        "outbox[0]",
+        "0xb92ea63f5510",
+        "batch",
+        "batch[6]",
+        "0xb92ea63f54c0",
+        "batch[5]",
+        "0xb92ea63f5470",
+        "batch[4]",
+        "0xb92ea63f5420",
+        "batch[3]",
+        "0xb92ea63f53d0",
+        "batch[2]",
+        "0xb92ea63f5380",
+        "batch[1]",
+        "0xb92ea63f5330",
+        "batch[0]"
+      ],
+      "not_covered_kinds": [
+        "check_inconclusive",
+        "long_wait_not_judged",
+        "recipes_not_planned",
+        "unsupported_in_mode"
+      ],
+      "capture_mode": "ZERO_STOP_LIVE_RUNTIME",
+      "measured_stop_ms": 0.0,
+      "non_zero_stop": false,
+      "detected": true,
+      "false_clear": false,
+      "names_by_class": {
+        "variables": {
+          "expected": [
+            "outbox"
+          ],
+          "found": [
+            "outbox"
+          ]
+        },
+        "locks": {
+          "expected": [],
+          "found": []
+        },
+        "threads": {
+          "expected": [],
+          "found": []
+        },
+        "functions": {
+          "expected": [],
+          "found": []
+        }
+      },
+      "name_match": "full",
+      "location_match": false,
+      "location_candidate_rank": 2,
+      "location_candidate_hit": true,
+      "location_candidates_shown": true,
+      "location_candidate_wrong": false,
+      "location_candidates_s": 0.006,
+      "diagnose_s": 3.12,
+      "checks": [
+        {
+          "check_id": "CHK_RECIPE_INVALID_MEMORY_ACCESS_001",
+          "recipe_id": "RECIPE_INVALID_MEMORY_ACCESS",
+          "name": "Invalid Memory Access & Segmentation Fault Indicator Audit",
+          "status": "INCONCLUSIVE",
+          "duration_s": 0.0648
+        },
+        {
+          "check_id": "CHK_RECIPE_HEAP_METADATA_CORRUPTION_002",
+          "recipe_id": "RECIPE_HEAP_METADATA_CORRUPTION",
+          "name": "Heap Metadata & Boundary Tag Integrity Audit",
+          "status": "PASS",
+          "duration_s": 0.0259
+        },
+        {
+          "check_id": "CHK_RECIPE_DOUBLE_FREE_003",
+          "recipe_id": "RECIPE_DOUBLE_FREE",
+          "name": "Double Free: A Block Listed Twice on the Allocator's Free Lists",
+          "status": "FAIL",
+          "duration_s": 0.0673
+        },
+        {
+          "check_id": "CHK_RECIPE_ORPHAN_LOCK_004",
+          "recipe_id": "RECIPE_ORPHAN_LOCK",
+          "name": "Orphan Lock (owner thread exited)",
+          "status": "INCONCLUSIVE",
+          "duration_s": 0.1799
+        },
+        {
+          "check_id": "CHK_RECIPE_SELF_DEADLOCK_005",
+          "recipe_id": "RECIPE_SELF_DEADLOCK",
+          "name": "Self-Deadlock (thread waits for its own mutex)",
+          "status": "INCONCLUSIVE",
+          "duration_s": 0.0036
+        },
+        {
+          "check_id": "CHK_RECIPE_LOCK_CONTENTION_006",
+          "recipe_id": "RECIPE_LOCK_CONTENTION",
+          "name": "Lock Contention (threads queue on a mutex whose owner keeps running)",
+          "status": "PASS",
+          "duration_s": 0.6224
+        },
+        {
+          "check_id": "CHK_RECIPE_THREAD_LEAK_007",
+          "recipe_id": "RECIPE_THREAD_LEAK",
+          "name": "Thread Leak / Thread Exhaustion",
+          "status": "PASS",
+          "duration_s": 0.003
+        },
+        {
+          "check_id": "CHK_RECIPE_SUSPICIOUS_LOCK_OWNERSHIP_008",
+          "recipe_id": "RECIPE_SUSPICIOUS_LOCK_OWNERSHIP",
+          "name": "Suspicious Lock Ownership & Orphaned Mutex Audit",
+          "status": "PASS",
+          "duration_s": 0.0053
+        },
+        {
+          "check_id": "CHK_RECIPE_POTENTIAL_DEADLOCK_PATTERNS_009",
+          "recipe_id": "RECIPE_POTENTIAL_DEADLOCK_PATTERNS",
+          "name": "Potential Deadlock & Wait-For Graph Cycle Detector",
+          "status": "PASS",
+          "duration_s": 0.0058
+        },
+        {
+          "check_id": "CHK_RECIPE_THREAD_STATE_ANOMALIES_010",
+          "recipe_id": "RECIPE_THREAD_STATE_ANOMALIES",
+          "name": "Thread State Anomalies & Abnormal Thread Status Audit",
+          "status": "PASS",
+          "duration_s": 0.0056
+        },
+        {
+          "check_id": "CHK_RECIPE_LONG_RUNNING_BLOCKED_THREADS_011",
+          "recipe_id": "RECIPE_LONG_RUNNING_BLOCKED_THREADS",
+          "name": "Long-Running Blocked Thread & Worker Stall Audit",
+          "status": "PASS",
+          "duration_s": 0.0055
+        },
+        {
+          "check_id": "CHK_RECIPE_PROCESS_MEMORY_GROWTH_012",
+          "recipe_id": "RECIPE_PROCESS_MEMORY_GROWTH",
+          "name": "Process-Level Memory Growth & RSS Trajectory Investigation",
+          "status": "PASS",
+          "duration_s": 0.0535
+        },
+        {
+          "check_id": "CHK_RECIPE_FREED_MEMORY_USE_013",
+          "recipe_id": "RECIPE_FREED_MEMORY_USE",
+          "name": "Use After Free: Dangling Pointers and Writes into Freed Memory",
+          "status": "FAIL",
+          "duration_s": 0.1849
+        },
+        {
+          "check_id": "CHK_RECIPE_FD_LEAK_014",
+          "recipe_id": "RECIPE_FD_LEAK",
+          "name": "File Descriptor Leak / Exhaustion",
+          "status": "PASS",
+          "duration_s": 0.8037
+        },
+        {
+          "check_id": "CHK_RECIPE_MAPPING_GROWTH_015",
+          "recipe_id": "RECIPE_MAPPING_GROWTH",
+          "name": "Memory Growth Outside malloc (anonymous mappings, stacks)",
+          "status": "PASS",
+          "duration_s": 0.9056
+        }
+      ],
+      "wall_s": 3.23,
+      "symptom": "this program crashes sometimes and data looks wrong"
+    },
+    {
+      "id": "ho_packet_dispatch",
+      "kind": "memory_leak",
+      "origin": "new",
+      "naming": "neutral",
+      "scored": true,
+      "verdict": "CONFIRMED_FAULT",
+      "finding_categories": [
+        "MEMORY_LEAK"
+      ],
+      "finding_status": [
+        "CONFIRMED_ROOT_CAUSE"
+      ],
+      "subjects": [
+        "rx",
+        "1100970"
+      ],
+      "not_covered_kinds": [
+        "check_inconclusive",
+        "check_not_applicable",
+        "long_wait_not_judged",
+        "recipes_not_planned",
+        "unsupported_in_mode"
+      ],
+      "capture_mode": "ZERO_STOP_LIVE_RUNTIME",
+      "measured_stop_ms": 0.0,
+      "non_zero_stop": false,
+      "detected": true,
+      "false_clear": false,
+      "names_by_class": {
+        "variables": {
+          "expected": [],
+          "found": []
+        },
+        "locks": {
+          "expected": [],
+          "found": []
+        },
+        "threads": {
+          "expected": [
+            "rx"
+          ],
+          "found": [
+            "rx"
+          ]
+        },
+        "functions": {
+          "expected": [
+            "dispatch"
+          ],
+          "found": []
+        }
+      },
+      "name_match": "full",
+      "location_match": false,
+      "location_candidate_rank": null,
+      "location_candidate_hit": false,
+      "location_candidates_shown": false,
+      "location_candidate_wrong": false,
+      "location_candidates_s": 0.006,
+      "diagnose_s": 4.28,
+      "checks": [
+        {
+          "check_id": "CHK_RECIPE_PROCESS_MEMORY_GROWTH_001",
+          "recipe_id": "RECIPE_PROCESS_MEMORY_GROWTH",
+          "name": "Process-Level Memory Growth & RSS Trajectory Investigation",
+          "status": "FAIL",
+          "duration_s": 1.8189
+        },
+        {
+          "check_id": "CHK_RECIPE_HEAP_GROWTH_002",
+          "recipe_id": "RECIPE_HEAP_GROWTH",
+          "name": "Heap Arena & Pool Expansion Investigation",
+          "status": "FAIL",
+          "duration_s": 0.0037
+        },
+        {
+          "check_id": "CHK_RECIPE_ALLOCATION_FREE_IMBALANCE_003",
+          "recipe_id": "RECIPE_ALLOCATION_FREE_IMBALANCE",
+          "name": "Allocation / Free Imbalance & Leak Detector",
+          "status": "INCONCLUSIVE",
+          "duration_s": 0.0029
+        },
+        {
+          "check_id": "CHK_RECIPE_REPEATED_ALLOCATION_PATTERNS_004",
+          "recipe_id": "RECIPE_REPEATED_ALLOCATION_PATTERNS",
+          "name": "Repeated Allocation Pattern & Growth Generator Detector",
+          "status": "INCONCLUSIVE",
+          "duration_s": 0.0029
+        },
+        {
+          "check_id": "CHK_RECIPE_LONG_LIVED_OBJECT_ACCUMULATION_005",
+          "recipe_id": "RECIPE_LONG_LIVED_OBJECT_ACCUMULATION",
+          "name": "Long-Lived Object Accumulation in Containers / Caches",
+          "status": "NOT_APPLICABLE",
+          "duration_s": 0.0028
+        },
+        {
+          "check_id": "CHK_RECIPE_ORPHAN_LOCK_006",
+          "recipe_id": "RECIPE_ORPHAN_LOCK",
+          "name": "Orphan Lock (owner thread exited)",
+          "status": "INCONCLUSIVE",
+          "duration_s": 0.1625
+        },
+        {
+          "check_id": "CHK_RECIPE_SELF_DEADLOCK_007",
+          "recipe_id": "RECIPE_SELF_DEADLOCK",
+          "name": "Self-Deadlock (thread waits for its own mutex)",
+          "status": "INCONCLUSIVE",
+          "duration_s": 0.004
+        },
+        {
+          "check_id": "CHK_RECIPE_LOCK_CONTENTION_008",
+          "recipe_id": "RECIPE_LOCK_CONTENTION",
+          "name": "Lock Contention (threads queue on a mutex whose owner keeps running)",
+          "status": "PASS",
+          "duration_s": 0.0031
+        },
+        {
+          "check_id": "CHK_RECIPE_THREAD_LEAK_009",
+          "recipe_id": "RECIPE_THREAD_LEAK",
+          "name": "Thread Leak / Thread Exhaustion",
+          "status": "PASS",
+          "duration_s": 0.0032
+        },
+        {
+          "check_id": "CHK_RECIPE_SUSPICIOUS_LOCK_OWNERSHIP_010",
+          "recipe_id": "RECIPE_SUSPICIOUS_LOCK_OWNERSHIP",
+          "name": "Suspicious Lock Ownership & Orphaned Mutex Audit",
+          "status": "PASS",
+          "duration_s": 0.0064
+        },
+        {
+          "check_id": "CHK_RECIPE_POTENTIAL_DEADLOCK_PATTERNS_011",
+          "recipe_id": "RECIPE_POTENTIAL_DEADLOCK_PATTERNS",
+          "name": "Potential Deadlock & Wait-For Graph Cycle Detector",
+          "status": "PASS",
+          "duration_s": 0.0063
+        },
+        {
+          "check_id": "CHK_RECIPE_THREAD_STATE_ANOMALIES_012",
+          "recipe_id": "RECIPE_THREAD_STATE_ANOMALIES",
+          "name": "Thread State Anomalies & Abnormal Thread Status Audit",
+          "status": "PASS",
+          "duration_s": 0.0069
+        },
+        {
+          "check_id": "CHK_RECIPE_LONG_RUNNING_BLOCKED_THREADS_013",
+          "recipe_id": "RECIPE_LONG_RUNNING_BLOCKED_THREADS",
+          "name": "Long-Running Blocked Thread & Worker Stall Audit",
+          "status": "PASS",
+          "duration_s": 0.0067
+        },
+        {
+          "check_id": "CHK_RECIPE_HEAP_METADATA_CORRUPTION_014",
+          "recipe_id": "RECIPE_HEAP_METADATA_CORRUPTION",
+          "name": "Heap Metadata & Boundary Tag Integrity Audit",
+          "status": "PASS",
+          "duration_s": 0.0035
+        },
+        {
+          "check_id": "CHK_RECIPE_FREED_MEMORY_USE_015",
+          "recipe_id": "RECIPE_FREED_MEMORY_USE",
+          "name": "Use After Free: Dangling Pointers and Writes into Freed Memory",
+          "status": "PASS",
+          "duration_s": 0.4009
+        },
+        {
+          "check_id": "CHK_RECIPE_DOUBLE_FREE_016",
+          "recipe_id": "RECIPE_DOUBLE_FREE",
+          "name": "Double Free: A Block Listed Twice on the Allocator's Free Lists",
+          "status": "PASS",
+          "duration_s": 0.0034
+        },
+        {
+          "check_id": "CHK_RECIPE_FD_LEAK_017",
+          "recipe_id": "RECIPE_FD_LEAK",
+          "name": "File Descriptor Leak / Exhaustion",
+          "status": "PASS",
+          "duration_s": 0.8039
+        },
+        {
+          "check_id": "CHK_RECIPE_MAPPING_GROWTH_018",
+          "recipe_id": "RECIPE_MAPPING_GROWTH",
+          "name": "Memory Growth Outside malloc (anonymous mappings, stacks)",
+          "status": "PASS",
+          "duration_s": 0.906
+        }
+      ],
+      "wall_s": 6.21,
+      "symptom": "memory usage of this process keeps growing"
+    },
+    {
+      "id": "ho_plugin_registry",
+      "kind": "self_deadlock",
+      "origin": "new",
+      "naming": "neutral",
+      "scored": true,
+      "verdict": "CONFIRMED_FAULT",
+      "finding_categories": [
+        "SELF_DEADLOCK"
+      ],
+      "finding_status": [
+        "CONFIRMED_ROOT_CAUSE"
+      ],
+      "subjects": [
+        "__gthread_mutex_lock",
+        "gthr-default.h:749",
+        "lock",
+        "std_mutex.h:113",
+        "count",
+        "stl_tree.h:14",
+        "add",
+        "ho_plugin_registry.cpp:21",
+        "g_registry.mu_",
+        "1101036",
+        "plugin_loader"
+      ],
+      "not_covered_kinds": [
+        "long_wait_not_judged",
+        "recipes_not_planned",
+        "unsupported_in_mode"
+      ],
+      "capture_mode": "ZERO_STOP_LIVE_RUNTIME",
+      "measured_stop_ms": 0.0,
+      "non_zero_stop": false,
+      "detected": true,
+      "false_clear": false,
+      "names_by_class": {
+        "variables": {
+          "expected": [],
+          "found": []
+        },
+        "locks": {
+          "expected": [
+            "g_registry.mu_"
+          ],
+          "found": [
+            "g_registry.mu_"
+          ]
+        },
+        "threads": {
+          "expected": [
+            "plugin_loader"
+          ],
+          "found": [
+            "plugin_loader"
+          ]
+        },
+        "functions": {
+          "expected": [],
+          "found": []
+        }
+      },
+      "name_match": "full",
+      "location_match": true,
+      "location_candidate_rank": 1,
+      "location_candidate_hit": true,
+      "location_candidates_shown": true,
+      "location_candidate_wrong": false,
+      "location_candidates_s": 0.011,
+      "diagnose_s": 3.08,
+      "checks": [
+        {
+          "check_id": "CHK_RECIPE_THREAD_STATE_ANOMALIES_001",
+          "recipe_id": "RECIPE_THREAD_STATE_ANOMALIES",
+          "name": "Thread State Anomalies & Abnormal Thread Status Audit",
+          "status": "PASS",
+          "duration_s": 0.9867
+        },
+        {
+          "check_id": "CHK_RECIPE_LONG_RUNNING_BLOCKED_THREADS_002",
+          "recipe_id": "RECIPE_LONG_RUNNING_BLOCKED_THREADS",
+          "name": "Long-Running Blocked Thread & Worker Stall Audit",
+          "status": "PASS",
+          "duration_s": 0.0133
+        },
+        {
+          "check_id": "CHK_RECIPE_POTENTIAL_DEADLOCK_PATTERNS_003",
+          "recipe_id": "RECIPE_POTENTIAL_DEADLOCK_PATTERNS",
+          "name": "Potential Deadlock & Wait-For Graph Cycle Detector",
+          "status": "PASS",
+          "duration_s": 0.0096
+        },
+        {
+          "check_id": "CHK_RECIPE_SUSPICIOUS_LOCK_OWNERSHIP_004",
+          "recipe_id": "RECIPE_SUSPICIOUS_LOCK_OWNERSHIP",
+          "name": "Suspicious Lock Ownership & Orphaned Mutex Audit",
+          "status": "PASS",
+          "duration_s": 0.0117
+        },
+        {
+          "check_id": "CHK_RECIPE_ORPHAN_LOCK_005",
+          "recipe_id": "RECIPE_ORPHAN_LOCK",
+          "name": "Orphan Lock (owner thread exited)",
+          "status": "PASS",
+          "duration_s": 0.1652
+        },
+        {
+          "check_id": "CHK_RECIPE_SELF_DEADLOCK_006",
+          "recipe_id": "RECIPE_SELF_DEADLOCK",
+          "name": "Self-Deadlock (thread waits for its own mutex)",
+          "status": "FAIL",
+          "duration_s": 0.0043
+        },
+        {
+          "check_id": "CHK_RECIPE_LOCK_CONTENTION_007",
+          "recipe_id": "RECIPE_LOCK_CONTENTION",
+          "name": "Lock Contention (threads queue on a mutex whose owner keeps running)",
+          "status": "PASS",
+          "duration_s": 0.0036
+        },
+        {
+          "check_id": "CHK_RECIPE_THREAD_LEAK_008",
+          "recipe_id": "RECIPE_THREAD_LEAK",
+          "name": "Thread Leak / Thread Exhaustion",
+          "status": "PASS",
+          "duration_s": 0.0035
+        },
+        {
+          "check_id": "CHK_RECIPE_PROCESS_MEMORY_GROWTH_009",
+          "recipe_id": "RECIPE_PROCESS_MEMORY_GROWTH",
+          "name": "Process-Level Memory Growth & RSS Trajectory Investigation",
+          "status": "PASS",
+          "duration_s": 0.0031
+        },
+        {
+          "check_id": "CHK_RECIPE_HEAP_METADATA_CORRUPTION_010",
+          "recipe_id": "RECIPE_HEAP_METADATA_CORRUPTION",
+          "name": "Heap Metadata & Boundary Tag Integrity Audit",
+          "status": "PASS",
+          "duration_s": 0.0199
+        },
+        {
+          "check_id": "CHK_RECIPE_FREED_MEMORY_USE_011",
+          "recipe_id": "RECIPE_FREED_MEMORY_USE",
+          "name": "Use After Free: Dangling Pointers and Writes into Freed Memory",
+          "status": "PASS",
+          "duration_s": 0.004
+        },
+        {
+          "check_id": "CHK_RECIPE_DOUBLE_FREE_012",
+          "recipe_id": "RECIPE_DOUBLE_FREE",
+          "name": "Double Free: A Block Listed Twice on the Allocator's Free Lists",
+          "status": "PASS",
+          "duration_s": 0.0028
+        },
+        {
+          "check_id": "CHK_RECIPE_FD_LEAK_013",
+          "recipe_id": "RECIPE_FD_LEAK",
+          "name": "File Descriptor Leak / Exhaustion",
+          "status": "PASS",
+          "duration_s": 0.8039
+        },
+        {
+          "check_id": "CHK_RECIPE_MAPPING_GROWTH_014",
+          "recipe_id": "RECIPE_MAPPING_GROWTH",
+          "name": "Memory Growth Outside malloc (anonymous mappings, stacks)",
+          "status": "PASS",
+          "duration_s": 0.9061
+        }
+      ],
+      "wall_s": 4.13,
+      "symptom": "the process hangs"
+    },
+    {
+      "id": "ho_ready_flag",
+      "kind": "busy_wait",
+      "origin": "new",
+      "naming": "neutral",
+      "scored": true,
+      "verdict": "PROBABLE_FAULT",
+      "finding_categories": [
+        "PROCESS_INSTABILITY"
+      ],
+      "finding_status": [
+        "PROBABLE_CAUSE"
+      ],
+      "subjects": [
+        "1101126",
+        "watcher",
+        "_M_run"
+      ],
+      "not_covered_kinds": [
+        "check_inconclusive",
+        "recipes_not_planned",
+        "unsupported_in_mode"
+      ],
+      "capture_mode": "ZERO_STOP_LIVE_RUNTIME",
+      "measured_stop_ms": 0.0,
+      "non_zero_stop": false,
+      "detected": true,
+      "false_clear": false,
+      "names_by_class": {
+        "variables": {
+          "expected": [
+            "g_ready"
+          ],
+          "found": []
+        },
+        "locks": {
+          "expected": [],
+          "found": []
+        },
+        "threads": {
+          "expected": [
+            "watcher"
+          ],
+          "found": [
+            "watcher"
+          ]
+        },
+        "functions": {
+          "expected": [
+            "wait_until_ready"
+          ],
+          "found": []
+        }
+      },
+      "name_match": "partial",
+      "location_match": false,
+      "location_candidate_rank": 1,
+      "location_candidate_hit": true,
+      "location_candidates_shown": true,
+      "location_candidate_wrong": false,
+      "location_candidates_s": 0.007,
+      "diagnose_s": 3.25,
+      "checks": [
+        {
+          "check_id": "CHK_RECIPE_THREAD_STATE_ANOMALIES_001",
+          "recipe_id": "RECIPE_THREAD_STATE_ANOMALIES",
+          "name": "Thread State Anomalies & Abnormal Thread Status Audit",
+          "status": "FAIL",
+          "duration_s": 0.9975
+        },
+        {
+          "check_id": "CHK_RECIPE_SUSPICIOUS_LOCK_OWNERSHIP_002",
+          "recipe_id": "RECIPE_SUSPICIOUS_LOCK_OWNERSHIP",
+          "name": "Suspicious Lock Ownership & Orphaned Mutex Audit",
+          "status": "PASS",
+          "duration_s": 0.0391
+        },
+        {
+          "check_id": "CHK_RECIPE_DOUBLE_FREE_003",
+          "recipe_id": "RECIPE_DOUBLE_FREE",
+          "name": "Double Free: A Block Listed Twice on the Allocator's Free Lists",
+          "status": "PASS",
+          "duration_s": 0.0219
+        },
+        {
+          "check_id": "CHK_RECIPE_ALLOCATION_FREE_IMBALANCE_004",
+          "recipe_id": "RECIPE_ALLOCATION_FREE_IMBALANCE",
+          "name": "Allocation / Free Imbalance & Leak Detector",
+          "status": "INCONCLUSIVE",
+          "duration_s": 0.0031
+        },
+        {
+          "check_id": "CHK_RECIPE_POTENTIAL_DEADLOCK_PATTERNS_005",
+          "recipe_id": "RECIPE_POTENTIAL_DEADLOCK_PATTERNS",
+          "name": "Potential Deadlock & Wait-For Graph Cycle Detector",
+          "status": "PASS",
+          "duration_s": 0.0391
+        },
+        {
+          "check_id": "CHK_RECIPE_HEAP_GROWTH_006",
+          "recipe_id": "RECIPE_HEAP_GROWTH",
+          "name": "Heap Arena & Pool Expansion Investigation",
+          "status": "PASS",
+          "duration_s": 0.003
+        },
+        {
+          "check_id": "CHK_RECIPE_HEAP_METADATA_CORRUPTION_007",
+          "recipe_id": "RECIPE_HEAP_METADATA_CORRUPTION",
+          "name": "Heap Metadata & Boundary Tag Integrity Audit",
+          "status": "PASS",
+          "duration_s": 0.0017
+        },
+        {
+          "check_id": "CHK_RECIPE_PROCESS_MEMORY_GROWTH_008",
+          "recipe_id": "RECIPE_PROCESS_MEMORY_GROWTH",
+          "name": "Process-Level Memory Growth & RSS Trajectory Investigation",
+          "status": "PASS",
+          "duration_s": 0.0028
+        },
+        {
+          "check_id": "CHK_RECIPE_LONG_RUNNING_BLOCKED_THREADS_009",
+          "recipe_id": "RECIPE_LONG_RUNNING_BLOCKED_THREADS",
+          "name": "Long-Running Blocked Thread & Worker Stall Audit",
+          "status": "INCONCLUSIVE",
+          "duration_s": 0.0428
+        },
+        {
+          "check_id": "CHK_RECIPE_ORPHAN_LOCK_010",
+          "recipe_id": "RECIPE_ORPHAN_LOCK",
+          "name": "Orphan Lock (owner thread exited)",
+          "status": "INCONCLUSIVE",
+          "duration_s": 0.2272
+        },
+        {
+          "check_id": "CHK_RECIPE_SELF_DEADLOCK_011",
+          "recipe_id": "RECIPE_SELF_DEADLOCK",
+          "name": "Self-Deadlock (thread waits for its own mutex)",
+          "status": "INCONCLUSIVE",
+          "duration_s": 0.0039
+        },
+        {
+          "check_id": "CHK_RECIPE_LOCK_CONTENTION_012",
+          "recipe_id": "RECIPE_LOCK_CONTENTION",
+          "name": "Lock Contention (threads queue on a mutex whose owner keeps running)",
+          "status": "PASS",
+          "duration_s": 0.0034
+        },
+        {
+          "check_id": "CHK_RECIPE_THREAD_LEAK_013",
+          "recipe_id": "RECIPE_THREAD_LEAK",
+          "name": "Thread Leak / Thread Exhaustion",
+          "status": "PASS",
+          "duration_s": 0.0034
+        },
+        {
+          "check_id": "CHK_RECIPE_FREED_MEMORY_USE_014",
+          "recipe_id": "RECIPE_FREED_MEMORY_USE",
+          "name": "Use After Free: Dangling Pointers and Writes into Freed Memory",
+          "status": "PASS",
+          "duration_s": 0.0033
+        },
+        {
+          "check_id": "CHK_RECIPE_FD_LEAK_015",
+          "recipe_id": "RECIPE_FD_LEAK",
+          "name": "File Descriptor Leak / Exhaustion",
+          "status": "PASS",
+          "duration_s": 0.8041
+        },
+        {
+          "check_id": "CHK_RECIPE_MAPPING_GROWTH_016",
+          "recipe_id": "RECIPE_MAPPING_GROWTH",
+          "name": "Memory Growth Outside malloc (anonymous mappings, stacks)",
+          "status": "PASS",
+          "duration_s": 0.9065
+        }
+      ],
+      "wall_s": 4.05,
+      "symptom": "this process uses a full CPU core while doing nothing useful"
+    },
+    {
+      "id": "ho_release_cb",
+      "kind": "use_after_free",
+      "origin": "new",
+      "naming": "neutral",
+      "scored": true,
+      "verdict": "PROBABLE_FAULT",
+      "finding_categories": [
+        "USE_AFTER_FREE"
+      ],
+      "finding_status": [
+        "PROBABLE_CAUSE"
+      ],
+      "subjects": [
+        "0xabdfc0a59290",
+        "pending"
+      ],
+      "not_covered_kinds": [
+        "check_inconclusive",
+        "long_wait_not_judged",
+        "recipes_not_planned",
+        "unsupported_in_mode"
+      ],
+      "capture_mode": "ZERO_STOP_LIVE_RUNTIME",
+      "measured_stop_ms": 0.0,
+      "non_zero_stop": false,
+      "detected": true,
+      "false_clear": false,
+      "names_by_class": {
+        "variables": {
+          "expected": [
+            "pending"
+          ],
+          "found": [
+            "pending"
+          ]
+        },
+        "locks": {
+          "expected": [],
+          "found": []
+        },
+        "threads": {
+          "expected": [],
+          "found": []
+        },
+        "functions": {
+          "expected": [],
+          "found": []
+        }
+      },
+      "name_match": "full",
+      "location_match": false,
+      "location_candidate_rank": 1,
+      "location_candidate_hit": true,
+      "location_candidates_shown": true,
+      "location_candidate_wrong": false,
+      "location_candidates_s": 0.006,
+      "diagnose_s": 2.96,
+      "checks": [
+        {
+          "check_id": "CHK_RECIPE_INVALID_MEMORY_ACCESS_001",
+          "recipe_id": "RECIPE_INVALID_MEMORY_ACCESS",
+          "name": "Invalid Memory Access & Segmentation Fault Indicator Audit",
+          "status": "PASS",
+          "duration_s": 0.0647
+        },
+        {
+          "check_id": "CHK_RECIPE_HEAP_METADATA_CORRUPTION_002",
+          "recipe_id": "RECIPE_HEAP_METADATA_CORRUPTION",
+          "name": "Heap Metadata & Boundary Tag Integrity Audit",
+          "status": "PASS",
+          "duration_s": 0.029
+        },
+        {
+          "check_id": "CHK_RECIPE_UNEXPECTED_NULL_OR_INVALID_POINTERS_003",
+          "recipe_id": "RECIPE_UNEXPECTED_NULL_OR_INVALID_POINTERS",
+          "name": "Unexpected NULL & Invalid Pointer Member Audit",
+          "status": "PASS",
+          "duration_s": 0.0048
+        },
+        {
+          "check_id": "CHK_RECIPE_SUSPICIOUS_BOUNDARY_VALUES_004",
+          "recipe_id": "RECIPE_SUSPICIOUS_BOUNDARY_VALUES",
+          "name": "Suspicious Boundary Value & Sentinel Corruption Detector",
+          "status": "INCONCLUSIVE",
+          "duration_s": 0.0014
+        },
+        {
+          "check_id": "CHK_RECIPE_DOUBLE_FREE_005",
+          "recipe_id": "RECIPE_DOUBLE_FREE",
+          "name": "Double Free: A Block Listed Twice on the Allocator's Free Lists",
+          "status": "PASS",
+          "duration_s": 0.0027
+        },
+        {
+          "check_id": "CHK_RECIPE_ORPHAN_LOCK_006",
+          "recipe_id": "RECIPE_ORPHAN_LOCK",
+          "name": "Orphan Lock (owner thread exited)",
+          "status": "INCONCLUSIVE",
+          "duration_s": 0.179
+        },
+        {
+          "check_id": "CHK_RECIPE_SELF_DEADLOCK_007",
+          "recipe_id": "RECIPE_SELF_DEADLOCK",
+          "name": "Self-Deadlock (thread waits for its own mutex)",
+          "status": "INCONCLUSIVE",
+          "duration_s": 0.0034
+        },
+        {
+          "check_id": "CHK_RECIPE_LOCK_CONTENTION_008",
+          "recipe_id": "RECIPE_LOCK_CONTENTION",
+          "name": "Lock Contention (threads queue on a mutex whose owner keeps running)",
+          "status": "PASS",
+          "duration_s": 0.6216
+        },
+        {
+          "check_id": "CHK_RECIPE_THREAD_LEAK_009",
+          "recipe_id": "RECIPE_THREAD_LEAK",
+          "name": "Thread Leak / Thread Exhaustion",
+          "status": "PASS",
+          "duration_s": 0.0029
+        },
+        {
+          "check_id": "CHK_RECIPE_SUSPICIOUS_LOCK_OWNERSHIP_010",
+          "recipe_id": "RECIPE_SUSPICIOUS_LOCK_OWNERSHIP",
+          "name": "Suspicious Lock Ownership & Orphaned Mutex Audit",
+          "status": "PASS",
+          "duration_s": 0.0049
+        },
+        {
+          "check_id": "CHK_RECIPE_POTENTIAL_DEADLOCK_PATTERNS_011",
+          "recipe_id": "RECIPE_POTENTIAL_DEADLOCK_PATTERNS",
+          "name": "Potential Deadlock & Wait-For Graph Cycle Detector",
+          "status": "PASS",
+          "duration_s": 0.0049
+        },
+        {
+          "check_id": "CHK_RECIPE_THREAD_STATE_ANOMALIES_012",
+          "recipe_id": "RECIPE_THREAD_STATE_ANOMALIES",
+          "name": "Thread State Anomalies & Abnormal Thread Status Audit",
+          "status": "PASS",
+          "duration_s": 0.0053
+        },
+        {
+          "check_id": "CHK_RECIPE_LONG_RUNNING_BLOCKED_THREADS_013",
+          "recipe_id": "RECIPE_LONG_RUNNING_BLOCKED_THREADS",
+          "name": "Long-Running Blocked Thread & Worker Stall Audit",
+          "status": "PASS",
+          "duration_s": 0.0052
+        },
+        {
+          "check_id": "CHK_RECIPE_PROCESS_MEMORY_GROWTH_014",
+          "recipe_id": "RECIPE_PROCESS_MEMORY_GROWTH",
+          "name": "Process-Level Memory Growth & RSS Trajectory Investigation",
+          "status": "PASS",
+          "duration_s": 0.0535
+        },
+        {
+          "check_id": "CHK_RECIPE_FREED_MEMORY_USE_015",
+          "recipe_id": "RECIPE_FREED_MEMORY_USE",
+          "name": "Use After Free: Dangling Pointers and Writes into Freed Memory",
+          "status": "FAIL",
+          "duration_s": 0.1668
+        },
+        {
+          "check_id": "CHK_RECIPE_FD_LEAK_016",
+          "recipe_id": "RECIPE_FD_LEAK",
+          "name": "File Descriptor Leak / Exhaustion",
+          "status": "PASS",
+          "duration_s": 0.8038
+        },
+        {
+          "check_id": "CHK_RECIPE_MAPPING_GROWTH_017",
+          "recipe_id": "RECIPE_MAPPING_GROWTH",
+          "name": "Memory Growth Outside malloc (anonymous mappings, stacks)",
+          "status": "PASS",
+          "duration_s": 0.9051
+        }
+      ],
+      "wall_s": 3.07,
+      "symptom": "this program crashes sometimes and data looks wrong"
+    },
+    {
+      "id": "ho_ring_poll",
+      "kind": "busy_wait",
+      "origin": "new",
+      "naming": "neutral",
+      "scored": true,
+      "verdict": "PROBABLE_FAULT",
+      "finding_categories": [
+        "PROCESS_INSTABILITY"
+      ],
+      "finding_status": [
+        "PROBABLE_CAUSE"
+      ],
+      "subjects": [
+        "1101222",
+        "consumer",
+        "consume"
+      ],
+      "not_covered_kinds": [
+        "check_inconclusive",
+        "recipes_not_planned",
+        "unsupported_in_mode"
+      ],
+      "capture_mode": "ZERO_STOP_LIVE_RUNTIME",
+      "measured_stop_ms": 0.0,
+      "non_zero_stop": false,
+      "detected": true,
+      "false_clear": false,
+      "names_by_class": {
+        "variables": {
+          "expected": [
+            "inbox"
+          ],
+          "found": []
+        },
+        "locks": {
+          "expected": [],
+          "found": []
+        },
+        "threads": {
+          "expected": [
+            "consumer"
+          ],
+          "found": [
+            "consumer"
+          ]
+        },
+        "functions": {
+          "expected": [
+            "consume"
+          ],
+          "found": [
+            "consume"
+          ]
+        }
+      },
+      "name_match": "partial",
+      "location_match": false,
+      "location_candidate_rank": 1,
+      "location_candidate_hit": true,
+      "location_candidates_shown": true,
+      "location_candidate_wrong": false,
+      "location_candidates_s": 0.005,
+      "diagnose_s": 3.18,
+      "checks": [
+        {
+          "check_id": "CHK_RECIPE_THREAD_STATE_ANOMALIES_001",
+          "recipe_id": "RECIPE_THREAD_STATE_ANOMALIES",
+          "name": "Thread State Anomalies & Abnormal Thread Status Audit",
+          "status": "FAIL",
+          "duration_s": 0.9414
+        },
+        {
+          "check_id": "CHK_RECIPE_SUSPICIOUS_LOCK_OWNERSHIP_002",
+          "recipe_id": "RECIPE_SUSPICIOUS_LOCK_OWNERSHIP",
+          "name": "Suspicious Lock Ownership & Orphaned Mutex Audit",
+          "status": "PASS",
+          "duration_s": 0.0371
+        },
+        {
+          "check_id": "CHK_RECIPE_DOUBLE_FREE_003",
+          "recipe_id": "RECIPE_DOUBLE_FREE",
+          "name": "Double Free: A Block Listed Twice on the Allocator's Free Lists",
+          "status": "PASS",
+          "duration_s": 0.0209
+        },
+        {
+          "check_id": "CHK_RECIPE_ALLOCATION_FREE_IMBALANCE_004",
+          "recipe_id": "RECIPE_ALLOCATION_FREE_IMBALANCE",
+          "name": "Allocation / Free Imbalance & Leak Detector",
+          "status": "INCONCLUSIVE",
+          "duration_s": 0.0032
+        },
+        {
+          "check_id": "CHK_RECIPE_POTENTIAL_DEADLOCK_PATTERNS_005",
+          "recipe_id": "RECIPE_POTENTIAL_DEADLOCK_PATTERNS",
+          "name": "Potential Deadlock & Wait-For Graph Cycle Detector",
+          "status": "PASS",
+          "duration_s": 0.0377
+        },
+        {
+          "check_id": "CHK_RECIPE_HEAP_GROWTH_006",
+          "recipe_id": "RECIPE_HEAP_GROWTH",
+          "name": "Heap Arena & Pool Expansion Investigation",
+          "status": "PASS",
+          "duration_s": 0.003
+        },
+        {
+          "check_id": "CHK_RECIPE_HEAP_METADATA_CORRUPTION_007",
+          "recipe_id": "RECIPE_HEAP_METADATA_CORRUPTION",
+          "name": "Heap Metadata & Boundary Tag Integrity Audit",
+          "status": "PASS",
+          "duration_s": 0.0017
+        },
+        {
+          "check_id": "CHK_RECIPE_PROCESS_MEMORY_GROWTH_008",
+          "recipe_id": "RECIPE_PROCESS_MEMORY_GROWTH",
+          "name": "Process-Level Memory Growth & RSS Trajectory Investigation",
+          "status": "PASS",
+          "duration_s": 0.0028
+        },
+        {
+          "check_id": "CHK_RECIPE_LONG_RUNNING_BLOCKED_THREADS_009",
+          "recipe_id": "RECIPE_LONG_RUNNING_BLOCKED_THREADS",
+          "name": "Long-Running Blocked Thread & Worker Stall Audit",
+          "status": "INCONCLUSIVE",
+          "duration_s": 0.0418
+        },
+        {
+          "check_id": "CHK_RECIPE_ORPHAN_LOCK_010",
+          "recipe_id": "RECIPE_ORPHAN_LOCK",
+          "name": "Orphan Lock (owner thread exited)",
+          "status": "INCONCLUSIVE",
+          "duration_s": 0.2239
+        },
+        {
+          "check_id": "CHK_RECIPE_SELF_DEADLOCK_011",
+          "recipe_id": "RECIPE_SELF_DEADLOCK",
+          "name": "Self-Deadlock (thread waits for its own mutex)",
+          "status": "INCONCLUSIVE",
+          "duration_s": 0.0038
+        },
+        {
+          "check_id": "CHK_RECIPE_LOCK_CONTENTION_012",
+          "recipe_id": "RECIPE_LOCK_CONTENTION",
+          "name": "Lock Contention (threads queue on a mutex whose owner keeps running)",
+          "status": "PASS",
+          "duration_s": 0.0032
+        },
+        {
+          "check_id": "CHK_RECIPE_THREAD_LEAK_013",
+          "recipe_id": "RECIPE_THREAD_LEAK",
+          "name": "Thread Leak / Thread Exhaustion",
+          "status": "PASS",
+          "duration_s": 0.0033
+        },
+        {
+          "check_id": "CHK_RECIPE_FREED_MEMORY_USE_014",
+          "recipe_id": "RECIPE_FREED_MEMORY_USE",
+          "name": "Use After Free: Dangling Pointers and Writes into Freed Memory",
+          "status": "PASS",
+          "duration_s": 0.0032
+        },
+        {
+          "check_id": "CHK_RECIPE_FD_LEAK_015",
+          "recipe_id": "RECIPE_FD_LEAK",
+          "name": "File Descriptor Leak / Exhaustion",
+          "status": "PASS",
+          "duration_s": 0.8041
+        },
+        {
+          "check_id": "CHK_RECIPE_MAPPING_GROWTH_016",
+          "recipe_id": "RECIPE_MAPPING_GROWTH",
+          "name": "Memory Growth Outside malloc (anonymous mappings, stacks)",
+          "status": "PASS",
+          "duration_s": 0.9061
+        }
+      ],
+      "wall_s": 3.76,
+      "symptom": "this process uses a full CPU core while doing nothing useful"
+    },
+    {
+      "id": "ho_session_table",
+      "kind": "memory_leak",
+      "origin": "new",
+      "naming": "neutral",
+      "scored": true,
+      "verdict": "CONFIRMED_FAULT",
+      "finding_categories": [
+        "MEMORY_LEAK"
+      ],
+      "finding_status": [
+        "CONFIRMED_ROOT_CAUSE"
+      ],
+      "subjects": [
+        "sessions",
+        "1101308"
+      ],
+      "not_covered_kinds": [
+        "check_inconclusive",
+        "check_not_applicable",
+        "long_wait_not_judged",
+        "recipes_not_planned",
+        "unsupported_in_mode"
+      ],
+      "capture_mode": "ZERO_STOP_LIVE_RUNTIME",
+      "measured_stop_ms": 0.0,
+      "non_zero_stop": false,
+      "detected": true,
+      "false_clear": false,
+      "names_by_class": {
+        "variables": {
+          "expected": [],
+          "found": []
+        },
+        "locks": {
+          "expected": [],
+          "found": []
+        },
+        "threads": {
+          "expected": [
+            "sessions"
+          ],
+          "found": [
+            "sessions"
+          ]
+        },
+        "functions": {
+          "expected": [
+            "retire_oldest"
+          ],
+          "found": []
+        }
+      },
+      "name_match": "full",
+      "location_match": false,
+      "location_candidate_rank": 1,
+      "location_candidate_hit": true,
+      "location_candidates_shown": true,
+      "location_candidate_wrong": false,
+      "location_candidates_s": 0.01,
+      "diagnose_s": 4.56,
+      "checks": [
+        {
+          "check_id": "CHK_RECIPE_PROCESS_MEMORY_GROWTH_001",
+          "recipe_id": "RECIPE_PROCESS_MEMORY_GROWTH",
+          "name": "Process-Level Memory Growth & RSS Trajectory Investigation",
+          "status": "FAIL",
+          "duration_s": 2.0632
+        },
+        {
+          "check_id": "CHK_RECIPE_HEAP_GROWTH_002",
+          "recipe_id": "RECIPE_HEAP_GROWTH",
+          "name": "Heap Arena & Pool Expansion Investigation",
+          "status": "FAIL",
+          "duration_s": 0.0039
+        },
+        {
+          "check_id": "CHK_RECIPE_ALLOCATION_FREE_IMBALANCE_003",
+          "recipe_id": "RECIPE_ALLOCATION_FREE_IMBALANCE",
+          "name": "Allocation / Free Imbalance & Leak Detector",
+          "status": "INCONCLUSIVE",
+          "duration_s": 0.0031
+        },
+        {
+          "check_id": "CHK_RECIPE_REPEATED_ALLOCATION_PATTERNS_004",
+          "recipe_id": "RECIPE_REPEATED_ALLOCATION_PATTERNS",
+          "name": "Repeated Allocation Pattern & Growth Generator Detector",
+          "status": "INCONCLUSIVE",
+          "duration_s": 0.003
+        },
+        {
+          "check_id": "CHK_RECIPE_LONG_LIVED_OBJECT_ACCUMULATION_005",
+          "recipe_id": "RECIPE_LONG_LIVED_OBJECT_ACCUMULATION",
+          "name": "Long-Lived Object Accumulation in Containers / Caches",
+          "status": "NOT_APPLICABLE",
+          "duration_s": 0.003
+        },
+        {
+          "check_id": "CHK_RECIPE_ORPHAN_LOCK_006",
+          "recipe_id": "RECIPE_ORPHAN_LOCK",
+          "name": "Orphan Lock (owner thread exited)",
+          "status": "INCONCLUSIVE",
+          "duration_s": 0.1644
+        },
+        {
+          "check_id": "CHK_RECIPE_SELF_DEADLOCK_007",
+          "recipe_id": "RECIPE_SELF_DEADLOCK",
+          "name": "Self-Deadlock (thread waits for its own mutex)",
+          "status": "INCONCLUSIVE",
+          "duration_s": 0.0038
+        },
+        {
+          "check_id": "CHK_RECIPE_LOCK_CONTENTION_008",
+          "recipe_id": "RECIPE_LOCK_CONTENTION",
+          "name": "Lock Contention (threads queue on a mutex whose owner keeps running)",
+          "status": "PASS",
+          "duration_s": 0.0032
+        },
+        {
+          "check_id": "CHK_RECIPE_THREAD_LEAK_009",
+          "recipe_id": "RECIPE_THREAD_LEAK",
+          "name": "Thread Leak / Thread Exhaustion",
+          "status": "PASS",
+          "duration_s": 0.0033
+        },
+        {
+          "check_id": "CHK_RECIPE_SUSPICIOUS_LOCK_OWNERSHIP_010",
+          "recipe_id": "RECIPE_SUSPICIOUS_LOCK_OWNERSHIP",
+          "name": "Suspicious Lock Ownership & Orphaned Mutex Audit",
+          "status": "PASS",
+          "duration_s": 0.0069
+        },
+        {
+          "check_id": "CHK_RECIPE_POTENTIAL_DEADLOCK_PATTERNS_011",
+          "recipe_id": "RECIPE_POTENTIAL_DEADLOCK_PATTERNS",
+          "name": "Potential Deadlock & Wait-For Graph Cycle Detector",
+          "status": "PASS",
+          "duration_s": 0.0074
+        },
+        {
+          "check_id": "CHK_RECIPE_THREAD_STATE_ANOMALIES_012",
+          "recipe_id": "RECIPE_THREAD_STATE_ANOMALIES",
+          "name": "Thread State Anomalies & Abnormal Thread Status Audit",
+          "status": "PASS",
+          "duration_s": 0.0075
+        },
+        {
+          "check_id": "CHK_RECIPE_LONG_RUNNING_BLOCKED_THREADS_013",
+          "recipe_id": "RECIPE_LONG_RUNNING_BLOCKED_THREADS",
+          "name": "Long-Running Blocked Thread & Worker Stall Audit",
+          "status": "PASS",
+          "duration_s": 0.0075
+        },
+        {
+          "check_id": "CHK_RECIPE_HEAP_METADATA_CORRUPTION_014",
+          "recipe_id": "RECIPE_HEAP_METADATA_CORRUPTION",
+          "name": "Heap Metadata & Boundary Tag Integrity Audit",
+          "status": "PASS",
+          "duration_s": 0.0358
+        },
+        {
+          "check_id": "CHK_RECIPE_FREED_MEMORY_USE_015",
+          "recipe_id": "RECIPE_FREED_MEMORY_USE",
+          "name": "Use After Free: Dangling Pointers and Writes into Freed Memory",
+          "status": "PASS",
+          "duration_s": 0.3688
+        },
+        {
+          "check_id": "CHK_RECIPE_DOUBLE_FREE_016",
+          "recipe_id": "RECIPE_DOUBLE_FREE",
+          "name": "Double Free: A Block Listed Twice on the Allocator's Free Lists",
+          "status": "PASS",
+          "duration_s": 0.0037
+        },
+        {
+          "check_id": "CHK_RECIPE_FD_LEAK_017",
+          "recipe_id": "RECIPE_FD_LEAK",
+          "name": "File Descriptor Leak / Exhaustion",
+          "status": "PASS",
+          "duration_s": 0.804
+        },
+        {
+          "check_id": "CHK_RECIPE_MAPPING_GROWTH_018",
+          "recipe_id": "RECIPE_MAPPING_GROWTH",
+          "name": "Memory Growth Outside malloc (anonymous mappings, stacks)",
+          "status": "PASS",
+          "duration_s": 0.9063
+        }
+      ],
+      "wall_s": 6.18,
+      "symptom": "memory usage of this process keeps growing"
+    },
+    {
+      "id": "ho_stats_relock",
+      "kind": "self_deadlock",
+      "origin": "new",
+      "naming": "neutral",
+      "scored": true,
+      "verdict": "CONFIRMED_FAULT",
+      "finding_categories": [
+        "SELF_DEADLOCK"
+      ],
+      "finding_status": [
+        "CONFIRMED_ROOT_CAUSE"
+      ],
+      "subjects": [
+        "stats_thread",
+        "ho_stats_relock.c:19",
+        "stats_mu",
+        "1101376",
+        "stats"
+      ],
+      "not_covered_kinds": [
+        "long_wait_not_judged",
+        "recipes_not_planned",
+        "unsupported_in_mode"
+      ],
+      "capture_mode": "ZERO_STOP_LIVE_RUNTIME",
+      "measured_stop_ms": 0.0,
+      "non_zero_stop": false,
+      "detected": true,
+      "false_clear": false,
+      "names_by_class": {
+        "variables": {
+          "expected": [],
+          "found": []
+        },
+        "locks": {
+          "expected": [
+            "stats_mu"
+          ],
+          "found": [
+            "stats_mu"
+          ]
+        },
+        "threads": {
+          "expected": [
+            "stats"
+          ],
+          "found": [
+            "stats"
+          ]
+        },
+        "functions": {
+          "expected": [],
+          "found": []
+        }
+      },
+      "name_match": "full",
+      "location_match": true,
+      "location_candidate_rank": 1,
+      "location_candidate_hit": true,
+      "location_candidates_shown": true,
+      "location_candidate_wrong": false,
+      "location_candidates_s": 0.007,
+      "diagnose_s": 2.8,
+      "checks": [
+        {
+          "check_id": "CHK_RECIPE_THREAD_STATE_ANOMALIES_001",
+          "recipe_id": "RECIPE_THREAD_STATE_ANOMALIES",
+          "name": "Thread State Anomalies & Abnormal Thread Status Audit",
+          "status": "PASS",
+          "duration_s": 0.7184
+        },
+        {
+          "check_id": "CHK_RECIPE_LONG_RUNNING_BLOCKED_THREADS_002",
+          "recipe_id": "RECIPE_LONG_RUNNING_BLOCKED_THREADS",
+          "name": "Long-Running Blocked Thread & Worker Stall Audit",
+          "status": "PASS",
+          "duration_s": 0.0105
+        },
+        {
+          "check_id": "CHK_RECIPE_POTENTIAL_DEADLOCK_PATTERNS_003",
+          "recipe_id": "RECIPE_POTENTIAL_DEADLOCK_PATTERNS",
+          "name": "Potential Deadlock & Wait-For Graph Cycle Detector",
+          "status": "PASS",
+          "duration_s": 0.0074
+        },
+        {
+          "check_id": "CHK_RECIPE_SUSPICIOUS_LOCK_OWNERSHIP_004",
+          "recipe_id": "RECIPE_SUSPICIOUS_LOCK_OWNERSHIP",
+          "name": "Suspicious Lock Ownership & Orphaned Mutex Audit",
+          "status": "PASS",
+          "duration_s": 0.0086
+        },
+        {
+          "check_id": "CHK_RECIPE_ORPHAN_LOCK_005",
+          "recipe_id": "RECIPE_ORPHAN_LOCK",
+          "name": "Orphan Lock (owner thread exited)",
+          "status": "PASS",
+          "duration_s": 0.1619
+        },
+        {
+          "check_id": "CHK_RECIPE_SELF_DEADLOCK_006",
+          "recipe_id": "RECIPE_SELF_DEADLOCK",
+          "name": "Self-Deadlock (thread waits for its own mutex)",
+          "status": "FAIL",
+          "duration_s": 0.0044
+        },
+        {
+          "check_id": "CHK_RECIPE_LOCK_CONTENTION_007",
+          "recipe_id": "RECIPE_LOCK_CONTENTION",
+          "name": "Lock Contention (threads queue on a mutex whose owner keeps running)",
+          "status": "PASS",
+          "duration_s": 0.0036
+        },
+        {
+          "check_id": "CHK_RECIPE_THREAD_LEAK_008",
+          "recipe_id": "RECIPE_THREAD_LEAK",
+          "name": "Thread Leak / Thread Exhaustion",
+          "status": "PASS",
+          "duration_s": 0.0036
+        },
+        {
+          "check_id": "CHK_RECIPE_PROCESS_MEMORY_GROWTH_009",
+          "recipe_id": "RECIPE_PROCESS_MEMORY_GROWTH",
+          "name": "Process-Level Memory Growth & RSS Trajectory Investigation",
+          "status": "PASS",
+          "duration_s": 0.0032
+        },
+        {
+          "check_id": "CHK_RECIPE_HEAP_METADATA_CORRUPTION_010",
+          "recipe_id": "RECIPE_HEAP_METADATA_CORRUPTION",
+          "name": "Heap Metadata & Boundary Tag Integrity Audit",
+          "status": "PASS",
+          "duration_s": 0.0191
+        },
+        {
+          "check_id": "CHK_RECIPE_FREED_MEMORY_USE_011",
+          "recipe_id": "RECIPE_FREED_MEMORY_USE",
+          "name": "Use After Free: Dangling Pointers and Writes into Freed Memory",
+          "status": "PASS",
+          "duration_s": 0.0038
+        },
+        {
+          "check_id": "CHK_RECIPE_DOUBLE_FREE_012",
+          "recipe_id": "RECIPE_DOUBLE_FREE",
+          "name": "Double Free: A Block Listed Twice on the Allocator's Free Lists",
+          "status": "PASS",
+          "duration_s": 0.0028
+        },
+        {
+          "check_id": "CHK_RECIPE_FD_LEAK_013",
+          "recipe_id": "RECIPE_FD_LEAK",
+          "name": "File Descriptor Leak / Exhaustion",
+          "status": "PASS",
+          "duration_s": 0.8039
+        },
+        {
+          "check_id": "CHK_RECIPE_MAPPING_GROWTH_014",
+          "recipe_id": "RECIPE_MAPPING_GROWTH",
+          "name": "Memory Growth Outside malloc (anonymous mappings, stacks)",
+          "status": "PASS",
+          "duration_s": 0.9059
+        }
+      ],
+      "wall_s": 3.38,
+      "symptom": "the process hangs"
+    },
+    {
+      "id": "ho_token_holders",
+      "kind": "double_free",
+      "origin": "new",
+      "naming": "neutral",
+      "scored": true,
+      "verdict": "CONFIRMED_FAULT",
+      "finding_categories": [
+        "INVALID_DOUBLE_FREE",
+        "USE_AFTER_FREE"
+      ],
+      "finding_status": [
+        "CONFIRMED_ROOT_CAUSE",
+        "PROBABLE_CAUSE"
+      ],
+      "subjects": [
+        "0xb6c0485722b0",
+        "g_primary",
+        "g_primary.tok",
+        "g_backup",
+        "g_backup.tok",
+        "0xb6c0485724a0",
+        "g_scratch",
+        "g_scratch[6]",
+        "0xb6c048572460",
+        "g_scratch[5]",
+        "0xb6c048572420",
+        "g_scratch[4]",
+        "0xb6c0485723e0",
+        "g_scratch[3]",
+        "0xb6c0485723a0",
+        "g_scratch[2]",
+        "0xb6c048572360",
+        "g_scratch[1]",
+        "0xb6c048572320",
+        "g_scratch[0]"
+      ],
+      "not_covered_kinds": [
+        "check_inconclusive",
+        "long_wait_not_judged",
+        "recipes_not_planned",
+        "unsupported_in_mode"
+      ],
+      "capture_mode": "ZERO_STOP_LIVE_RUNTIME",
+      "measured_stop_ms": 0.0,
+      "non_zero_stop": false,
+      "detected": true,
+      "false_clear": false,
+      "names_by_class": {
+        "variables": {
+          "expected": [
+            "g_primary",
+            "g_backup"
+          ],
+          "found": [
+            "g_primary",
+            "g_backup"
+          ]
+        },
+        "locks": {
+          "expected": [],
+          "found": []
+        },
+        "threads": {
+          "expected": [],
+          "found": []
+        },
+        "functions": {
+          "expected": [],
+          "found": []
+        }
+      },
+      "name_match": "full",
+      "location_match": false,
+      "location_candidate_rank": 1,
+      "location_candidate_hit": true,
+      "location_candidates_shown": true,
+      "location_candidate_wrong": false,
+      "location_candidates_s": 0.007,
+      "diagnose_s": 3.08,
+      "checks": [
+        {
+          "check_id": "CHK_RECIPE_INVALID_MEMORY_ACCESS_001",
+          "recipe_id": "RECIPE_INVALID_MEMORY_ACCESS",
+          "name": "Invalid Memory Access & Segmentation Fault Indicator Audit",
+          "status": "INCONCLUSIVE",
+          "duration_s": 0.0619
+        },
+        {
+          "check_id": "CHK_RECIPE_HEAP_METADATA_CORRUPTION_002",
+          "recipe_id": "RECIPE_HEAP_METADATA_CORRUPTION",
+          "name": "Heap Metadata & Boundary Tag Integrity Audit",
+          "status": "PASS",
+          "duration_s": 0.0298
+        },
+        {
+          "check_id": "CHK_RECIPE_DOUBLE_FREE_003",
+          "recipe_id": "RECIPE_DOUBLE_FREE",
+          "name": "Double Free: A Block Listed Twice on the Allocator's Free Lists",
+          "status": "FAIL",
+          "duration_s": 0.0671
+        },
+        {
+          "check_id": "CHK_RECIPE_ORPHAN_LOCK_004",
+          "recipe_id": "RECIPE_ORPHAN_LOCK",
+          "name": "Orphan Lock (owner thread exited)",
+          "status": "INCONCLUSIVE",
+          "duration_s": 0.1794
+        },
+        {
+          "check_id": "CHK_RECIPE_SELF_DEADLOCK_005",
+          "recipe_id": "RECIPE_SELF_DEADLOCK",
+          "name": "Self-Deadlock (thread waits for its own mutex)",
+          "status": "INCONCLUSIVE",
+          "duration_s": 0.0033
+        },
+        {
+          "check_id": "CHK_RECIPE_LOCK_CONTENTION_006",
+          "recipe_id": "RECIPE_LOCK_CONTENTION",
+          "name": "Lock Contention (threads queue on a mutex whose owner keeps running)",
+          "status": "PASS",
+          "duration_s": 0.6226
+        },
+        {
+          "check_id": "CHK_RECIPE_THREAD_LEAK_007",
+          "recipe_id": "RECIPE_THREAD_LEAK",
+          "name": "Thread Leak / Thread Exhaustion",
+          "status": "PASS",
+          "duration_s": 0.003
+        },
+        {
+          "check_id": "CHK_RECIPE_SUSPICIOUS_LOCK_OWNERSHIP_008",
+          "recipe_id": "RECIPE_SUSPICIOUS_LOCK_OWNERSHIP",
+          "name": "Suspicious Lock Ownership & Orphaned Mutex Audit",
+          "status": "PASS",
+          "duration_s": 0.0055
+        },
+        {
+          "check_id": "CHK_RECIPE_POTENTIAL_DEADLOCK_PATTERNS_009",
+          "recipe_id": "RECIPE_POTENTIAL_DEADLOCK_PATTERNS",
+          "name": "Potential Deadlock & Wait-For Graph Cycle Detector",
+          "status": "PASS",
+          "duration_s": 0.0053
+        },
+        {
+          "check_id": "CHK_RECIPE_THREAD_STATE_ANOMALIES_010",
+          "recipe_id": "RECIPE_THREAD_STATE_ANOMALIES",
+          "name": "Thread State Anomalies & Abnormal Thread Status Audit",
+          "status": "PASS",
+          "duration_s": 0.0055
+        },
+        {
+          "check_id": "CHK_RECIPE_LONG_RUNNING_BLOCKED_THREADS_011",
+          "recipe_id": "RECIPE_LONG_RUNNING_BLOCKED_THREADS",
+          "name": "Long-Running Blocked Thread & Worker Stall Audit",
+          "status": "PASS",
+          "duration_s": 0.0056
+        },
+        {
+          "check_id": "CHK_RECIPE_PROCESS_MEMORY_GROWTH_012",
+          "recipe_id": "RECIPE_PROCESS_MEMORY_GROWTH",
+          "name": "Process-Level Memory Growth & RSS Trajectory Investigation",
+          "status": "PASS",
+          "duration_s": 0.0539
+        },
+        {
+          "check_id": "CHK_RECIPE_FREED_MEMORY_USE_013",
+          "recipe_id": "RECIPE_FREED_MEMORY_USE",
+          "name": "Use After Free: Dangling Pointers and Writes into Freed Memory",
+          "status": "FAIL",
+          "duration_s": 0.1862
+        },
+        {
+          "check_id": "CHK_RECIPE_FD_LEAK_014",
+          "recipe_id": "RECIPE_FD_LEAK",
+          "name": "File Descriptor Leak / Exhaustion",
+          "status": "PASS",
+          "duration_s": 0.8038
+        },
+        {
+          "check_id": "CHK_RECIPE_MAPPING_GROWTH_015",
+          "recipe_id": "RECIPE_MAPPING_GROWTH",
+          "name": "Memory Growth Outside malloc (anonymous mappings, stacks)",
+          "status": "PASS",
+          "duration_s": 0.9058
+        }
+      ],
+      "wall_s": 3.2,
+      "symptom": "this program crashes sometimes and data looks wrong"
+    },
+    {
+      "id": "ho_wrapped_locks",
+      "kind": "deadlock",
+      "origin": "new",
+      "naming": "neutral",
+      "scored": true,
+      "verdict": "CONFIRMED_FAULT",
+      "finding_categories": [
+        "DEADLOCK_INDICATORS"
+      ],
+      "finding_status": [
+        "CONFIRMED_ROOT_CAUSE"
+      ],
+      "subjects": [
+        "1101495",
+        "evictor",
+        "disk_mu",
+        "1101496",
+        "loader",
+        "cache_mu",
+        "__GI___lll_lock_wait",
+        "pthread_mutex_lock",
+        "take",
+        "sync.h:7",
+        "evictor",
+        "main.c:18",
+        "start_thread",
+        "thread_start",
+        "loader",
+        "main.c:32"
+      ],
+      "not_covered_kinds": [
+        "check_inconclusive",
+        "recipes_not_planned",
+        "unsupported_in_mode"
+      ],
+      "capture_mode": "ZERO_STOP_LIVE_RUNTIME",
+      "measured_stop_ms": 0.0,
+      "non_zero_stop": false,
+      "detected": true,
+      "false_clear": false,
+      "names_by_class": {
+        "variables": {
+          "expected": [],
+          "found": []
+        },
+        "locks": {
+          "expected": [
+            "cache_mu",
+            "disk_mu"
+          ],
+          "found": [
+            "cache_mu",
+            "disk_mu"
+          ]
+        },
+        "threads": {
+          "expected": [
+            "evictor",
+            "loader"
+          ],
+          "found": [
+            "evictor",
+            "loader"
+          ]
+        },
+        "functions": {
+          "expected": [],
+          "found": []
+        }
+      },
+      "name_match": "full",
+      "location_match": true,
+      "location_candidate_rank": 1,
+      "location_candidate_hit": true,
+      "location_candidates_shown": true,
+      "location_candidate_wrong": false,
+      "location_candidates_s": 0.009,
+      "diagnose_s": 3.37,
+      "checks": [
+        {
+          "check_id": "CHK_RECIPE_THREAD_STATE_ANOMALIES_001",
+          "recipe_id": "RECIPE_THREAD_STATE_ANOMALIES",
+          "name": "Thread State Anomalies & Abnormal Thread Status Audit",
+          "status": "INCONCLUSIVE",
+          "duration_s": 0.8031
+        },
+        {
+          "check_id": "CHK_RECIPE_SUSPICIOUS_LOCK_OWNERSHIP_002",
+          "recipe_id": "RECIPE_SUSPICIOUS_LOCK_OWNERSHIP",
+          "name": "Suspicious Lock Ownership & Orphaned Mutex Audit",
+          "status": "FAIL",
+          "duration_s": 0.0724
+        },
+        {
+          "check_id": "CHK_RECIPE_POTENTIAL_DEADLOCK_PATTERNS_003",
+          "recipe_id": "RECIPE_POTENTIAL_DEADLOCK_PATTERNS",
+          "name": "Potential Deadlock & Wait-For Graph Cycle Detector",
+          "status": "FAIL",
+          "duration_s": 0.0722
+        },
+        {
+          "check_id": "CHK_RECIPE_LONG_RUNNING_BLOCKED_THREADS_004",
+          "recipe_id": "RECIPE_LONG_RUNNING_BLOCKED_THREADS",
+          "name": "Long-Running Blocked Thread & Worker Stall Audit",
+          "status": "FAIL",
+          "duration_s": 0.1183
+        },
+        {
+          "check_id": "CHK_RECIPE_ORPHAN_LOCK_005",
+          "recipe_id": "RECIPE_ORPHAN_LOCK",
+          "name": "Orphan Lock (owner thread exited)",
+          "status": "PASS",
+          "duration_s": 0.1656
+        },
+        {
+          "check_id": "CHK_RECIPE_SELF_DEADLOCK_006",
+          "recipe_id": "RECIPE_SELF_DEADLOCK",
+          "name": "Self-Deadlock (thread waits for its own mutex)",
+          "status": "PASS",
+          "duration_s": 0.0032
+        },
+        {
+          "check_id": "CHK_RECIPE_LOCK_CONTENTION_007",
+          "recipe_id": "RECIPE_LOCK_CONTENTION",
+          "name": "Lock Contention (threads queue on a mutex whose owner keeps running)",
+          "status": "PASS",
+          "duration_s": 0.0046
+        },
+        {
+          "check_id": "CHK_RECIPE_THREAD_LEAK_008",
+          "recipe_id": "RECIPE_THREAD_LEAK",
+          "name": "Thread Leak / Thread Exhaustion",
+          "status": "PASS",
+          "duration_s": 0.0043
+        },
+        {
+          "check_id": "CHK_RECIPE_PROCESS_MEMORY_GROWTH_009",
+          "recipe_id": "RECIPE_PROCESS_MEMORY_GROWTH",
+          "name": "Process-Level Memory Growth & RSS Trajectory Investigation",
+          "status": "PASS",
+          "duration_s": 0.0035
+        },
+        {
+          "check_id": "CHK_RECIPE_HEAP_METADATA_CORRUPTION_010",
+          "recipe_id": "RECIPE_HEAP_METADATA_CORRUPTION",
+          "name": "Heap Metadata & Boundary Tag Integrity Audit",
+          "status": "PASS",
+          "duration_s": 0.0208
+        },
+        {
+          "check_id": "CHK_RECIPE_FREED_MEMORY_USE_011",
+          "recipe_id": "RECIPE_FREED_MEMORY_USE",
+          "name": "Use After Free: Dangling Pointers and Writes into Freed Memory",
+          "status": "PASS",
+          "duration_s": 0.0046
+        },
+        {
+          "check_id": "CHK_RECIPE_DOUBLE_FREE_012",
+          "recipe_id": "RECIPE_DOUBLE_FREE",
+          "name": "Double Free: A Block Listed Twice on the Allocator's Free Lists",
+          "status": "PASS",
+          "duration_s": 0.0032
+        },
+        {
+          "check_id": "CHK_RECIPE_FD_LEAK_013",
+          "recipe_id": "RECIPE_FD_LEAK",
+          "name": "File Descriptor Leak / Exhaustion",
+          "status": "PASS",
+          "duration_s": 0.8044
+        },
+        {
+          "check_id": "CHK_RECIPE_MAPPING_GROWTH_014",
+          "recipe_id": "RECIPE_MAPPING_GROWTH",
+          "name": "Memory Growth Outside malloc (anonymous mappings, stacks)",
+          "status": "PASS",
+          "duration_s": 0.9067
+        }
+      ],
+      "wall_s": 4.08,
+      "symptom": "the service stopped responding"
+    }
+  ],
+  "host_loadavg": [
+    0.42724609375,
+    0.44873046875,
+    0.3798828125
+  ],
+  "adversarial_healthy": {
+    "programs": [
+      "caplen",
+      "containers",
+      "counters",
+      "cpp_containers_steady",
+      "cpp_magic_objects",
+      "cpp_pool_stats",
+      "int_named_pointers",
+      "lockish_types",
+      "locks",
+      "magic",
+      "progress_names",
+      "ring_counters",
+      "sentinels",
+      "siblings",
+      "state"
+    ],
+    "runs": 90,
+    "false_positives": 0,
+    "fault_verdicts": 0,
+    "errors": 0,
+    "verdicts": {
+      "HEALTHY": 69,
+      "INCONCLUSIVE": 21
+    },
+    "wall_s": 297.6,
+    "rows": [
+      {
+        "program": "caplen",
+        "symptom_kind": null,
+        "diagnose_s": 2.77,
+        "verdict": "HEALTHY",
+        "violations": [],
+        "false_positive": false
+      },
+      {
+        "program": "caplen",
+        "symptom_kind": "crash_corruption",
+        "diagnose_s": 2.69,
+        "verdict": "HEALTHY",
+        "violations": [],
+        "false_positive": false
+      },
+      {
+        "program": "caplen",
+        "symptom_kind": "memory_growth",
+        "diagnose_s": 3.76,
+        "verdict": "HEALTHY",
+        "violations": [],
+        "false_positive": false
+      },
+      {
+        "program": "caplen",
+        "symptom_kind": "hang_deadlock",
+        "diagnose_s": 2.64,
+        "verdict": "HEALTHY",
+        "violations": [],
+        "false_positive": false
+      },
+      {
+        "program": "caplen",
+        "symptom_kind": "state_inconsistency",
+        "diagnose_s": 2.69,
+        "verdict": "INCONCLUSIVE",
+        "violations": [],
+        "false_positive": false
+      },
+      {
+        "program": "caplen",
+        "symptom_kind": "variable_anomaly",
+        "diagnose_s": 2.69,
+        "verdict": "INCONCLUSIVE",
+        "violations": [],
+        "false_positive": false
+      },
+      {
+        "program": "containers",
+        "symptom_kind": null,
+        "diagnose_s": 2.79,
+        "verdict": "HEALTHY",
+        "violations": [],
+        "false_positive": false
+      },
+      {
+        "program": "containers",
+        "symptom_kind": "crash_corruption",
+        "diagnose_s": 2.72,
+        "verdict": "HEALTHY",
+        "violations": [],
+        "false_positive": false
+      },
+      {
+        "program": "containers",
+        "symptom_kind": "memory_growth",
+        "diagnose_s": 3.78,
+        "verdict": "HEALTHY",
+        "violations": [],
+        "false_positive": false
+      },
+      {
+        "program": "containers",
+        "symptom_kind": "hang_deadlock",
+        "diagnose_s": 2.65,
+        "verdict": "HEALTHY",
+        "violations": [],
+        "false_positive": false
+      },
+      {
+        "program": "containers",
+        "symptom_kind": "state_inconsistency",
+        "diagnose_s": 2.7,
+        "verdict": "INCONCLUSIVE",
+        "violations": [],
+        "false_positive": false
+      },
+      {
+        "program": "containers",
+        "symptom_kind": "variable_anomaly",
+        "diagnose_s": 2.7,
+        "verdict": "HEALTHY",
+        "violations": [],
+        "false_positive": false
+      },
+      {
+        "program": "counters",
+        "symptom_kind": null,
+        "diagnose_s": 3.08,
+        "verdict": "HEALTHY",
+        "violations": [],
+        "false_positive": false
+      },
+      {
+        "program": "counters",
+        "symptom_kind": "crash_corruption",
+        "diagnose_s": 2.89,
+        "verdict": "HEALTHY",
+        "violations": [],
+        "false_positive": false
+      },
+      {
+        "program": "counters",
+        "symptom_kind": "memory_growth",
+        "diagnose_s": 4.12,
+        "verdict": "HEALTHY",
+        "violations": [],
+        "false_positive": false
+      },
+      {
+        "program": "counters",
+        "symptom_kind": "hang_deadlock",
+        "diagnose_s": 3.04,
+        "verdict": "HEALTHY",
+        "violations": [],
+        "false_positive": false
+      },
+      {
+        "program": "counters",
+        "symptom_kind": "state_inconsistency",
+        "diagnose_s": 3.06,
+        "verdict": "INCONCLUSIVE",
+        "violations": [],
+        "false_positive": false
+      },
+      {
+        "program": "counters",
+        "symptom_kind": "variable_anomaly",
+        "diagnose_s": 3.07,
+        "verdict": "INCONCLUSIVE",
+        "violations": [],
+        "false_positive": false
+      },
+      {
+        "program": "cpp_containers_steady",
+        "symptom_kind": null,
+        "diagnose_s": 3.33,
+        "verdict": "HEALTHY",
+        "violations": [],
+        "false_positive": false
+      },
+      {
+        "program": "cpp_containers_steady",
+        "symptom_kind": "crash_corruption",
+        "diagnose_s": 2.72,
+        "verdict": "HEALTHY",
+        "violations": [],
+        "false_positive": false
+      },
+      {
+        "program": "cpp_containers_steady",
+        "symptom_kind": "memory_growth",
+        "diagnose_s": 3.89,
+        "verdict": "HEALTHY",
+        "violations": [],
+        "false_positive": false
+      },
+      {
+        "program": "cpp_containers_steady",
+        "symptom_kind": "hang_deadlock",
+        "diagnose_s": 2.69,
+        "verdict": "HEALTHY",
+        "violations": [],
+        "false_positive": false
+      },
+      {
+        "program": "cpp_containers_steady",
+        "symptom_kind": "state_inconsistency",
+        "diagnose_s": 2.8,
+        "verdict": "INCONCLUSIVE",
+        "violations": [],
+        "false_positive": false
+      },
+      {
+        "program": "cpp_containers_steady",
+        "symptom_kind": "variable_anomaly",
+        "diagnose_s": 2.78,
+        "verdict": "HEALTHY",
+        "violations": [],
+        "false_positive": false
+      },
+      {
+        "program": "cpp_magic_objects",
+        "symptom_kind": null,
+        "diagnose_s": 2.8,
+        "verdict": "HEALTHY",
+        "violations": [],
+        "false_positive": false
+      },
+      {
+        "program": "cpp_magic_objects",
+        "symptom_kind": "crash_corruption",
+        "diagnose_s": 2.73,
+        "verdict": "HEALTHY",
+        "violations": [],
+        "false_positive": false
+      },
+      {
+        "program": "cpp_magic_objects",
+        "symptom_kind": "memory_growth",
+        "diagnose_s": 3.74,
+        "verdict": "HEALTHY",
+        "violations": [],
+        "false_positive": false
+      },
+      {
+        "program": "cpp_magic_objects",
+        "symptom_kind": "hang_deadlock",
+        "diagnose_s": 2.69,
+        "verdict": "HEALTHY",
+        "violations": [],
+        "false_positive": false
+      },
+      {
+        "program": "cpp_magic_objects",
+        "symptom_kind": "state_inconsistency",
+        "diagnose_s": 2.7,
+        "verdict": "INCONCLUSIVE",
+        "violations": [],
+        "false_positive": false
+      },
+      {
+        "program": "cpp_magic_objects",
+        "symptom_kind": "variable_anomaly",
+        "diagnose_s": 2.72,
+        "verdict": "HEALTHY",
+        "violations": [],
+        "false_positive": false
+      },
+      {
+        "program": "cpp_pool_stats",
+        "symptom_kind": null,
+        "diagnose_s": 3.27,
+        "verdict": "HEALTHY",
+        "violations": [],
+        "false_positive": false
+      },
+      {
+        "program": "cpp_pool_stats",
+        "symptom_kind": "crash_corruption",
+        "diagnose_s": 2.89,
+        "verdict": "HEALTHY",
+        "violations": [],
+        "false_positive": false
+      },
+      {
+        "program": "cpp_pool_stats",
+        "symptom_kind": "memory_growth",
+        "diagnose_s": 4.26,
+        "verdict": "HEALTHY",
+        "violations": [],
+        "false_positive": false
+      },
+      {
+        "program": "cpp_pool_stats",
+        "symptom_kind": "hang_deadlock",
+        "diagnose_s": 3.07,
+        "verdict": "HEALTHY",
+        "violations": [],
+        "false_positive": false
+      },
+      {
+        "program": "cpp_pool_stats",
+        "symptom_kind": "state_inconsistency",
+        "diagnose_s": 3.09,
+        "verdict": "HEALTHY",
+        "violations": [],
+        "false_positive": false
+      },
+      {
+        "program": "cpp_pool_stats",
+        "symptom_kind": "variable_anomaly",
+        "diagnose_s": 3.1,
+        "verdict": "INCONCLUSIVE",
+        "violations": [],
+        "false_positive": false
+      },
+      {
+        "program": "int_named_pointers",
+        "symptom_kind": null,
+        "diagnose_s": 2.83,
+        "verdict": "HEALTHY",
+        "violations": [],
+        "false_positive": false
+      },
+      {
+        "program": "int_named_pointers",
+        "symptom_kind": "crash_corruption",
+        "diagnose_s": 2.72,
+        "verdict": "HEALTHY",
+        "violations": [],
+        "false_positive": false
+      },
+      {
+        "program": "int_named_pointers",
+        "symptom_kind": "memory_growth",
+        "diagnose_s": 3.74,
+        "verdict": "HEALTHY",
+        "violations": [],
+        "false_positive": false
+      },
+      {
+        "program": "int_named_pointers",
+        "symptom_kind": "hang_deadlock",
+        "diagnose_s": 2.65,
+        "verdict": "HEALTHY",
+        "violations": [],
+        "false_positive": false
+      },
+      {
+        "program": "int_named_pointers",
+        "symptom_kind": "state_inconsistency",
+        "diagnose_s": 2.7,
+        "verdict": "INCONCLUSIVE",
+        "violations": [],
+        "false_positive": false
+      },
+      {
+        "program": "int_named_pointers",
+        "symptom_kind": "variable_anomaly",
+        "diagnose_s": 2.75,
+        "verdict": "HEALTHY",
+        "violations": [],
+        "false_positive": false
+      },
+      {
+        "program": "lockish_types",
+        "symptom_kind": null,
+        "diagnose_s": 2.89,
+        "verdict": "HEALTHY",
+        "violations": [],
+        "false_positive": false
+      },
+      {
+        "program": "lockish_types",
+        "symptom_kind": "crash_corruption",
+        "diagnose_s": 2.75,
+        "verdict": "HEALTHY",
+        "violations": [],
+        "false_positive": false
+      },
+      {
+        "program": "lockish_types",
+        "symptom_kind": "memory_growth",
+        "diagnose_s": 3.87,
+        "verdict": "HEALTHY",
+        "violations": [],
+        "false_positive": false
+      },
+      {
+        "program": "lockish_types",
+        "symptom_kind": "hang_deadlock",
+        "diagnose_s": 2.74,
+        "verdict": "HEALTHY",
+        "violations": [],
+        "false_positive": false
+      },
+      {
+        "program": "lockish_types",
+        "symptom_kind": "state_inconsistency",
+        "diagnose_s": 2.79,
+        "verdict": "INCONCLUSIVE",
+        "violations": [],
+        "false_positive": false
+      },
+      {
+        "program": "lockish_types",
+        "symptom_kind": "variable_anomaly",
+        "diagnose_s": 2.8,
+        "verdict": "INCONCLUSIVE",
+        "violations": [],
+        "false_positive": false
+      },
+      {
+        "program": "locks",
+        "symptom_kind": null,
+        "diagnose_s": 2.85,
+        "verdict": "HEALTHY",
+        "violations": [],
+        "false_positive": false
+      },
+      {
+        "program": "locks",
+        "symptom_kind": "crash_corruption",
+        "diagnose_s": 2.72,
+        "verdict": "HEALTHY",
+        "violations": [],
+        "false_positive": false
+      },
+      {
+        "program": "locks",
+        "symptom_kind": "memory_growth",
+        "diagnose_s": 3.76,
+        "verdict": "HEALTHY",
+        "violations": [],
+        "false_positive": false
+      },
+      {
+        "program": "locks",
+        "symptom_kind": "hang_deadlock",
+        "diagnose_s": 2.68,
+        "verdict": "HEALTHY",
+        "violations": [],
+        "false_positive": false
+      },
+      {
+        "program": "locks",
+        "symptom_kind": "state_inconsistency",
+        "diagnose_s": 2.72,
+        "verdict": "INCONCLUSIVE",
+        "violations": [],
+        "false_positive": false
+      },
+      {
+        "program": "locks",
+        "symptom_kind": "variable_anomaly",
+        "diagnose_s": 2.76,
+        "verdict": "INCONCLUSIVE",
+        "violations": [],
+        "false_positive": false
+      },
+      {
+        "program": "magic",
+        "symptom_kind": null,
+        "diagnose_s": 2.79,
+        "verdict": "HEALTHY",
+        "violations": [],
+        "false_positive": false
+      },
+      {
+        "program": "magic",
+        "symptom_kind": "crash_corruption",
+        "diagnose_s": 2.72,
+        "verdict": "HEALTHY",
+        "violations": [],
+        "false_positive": false
+      },
+      {
+        "program": "magic",
+        "symptom_kind": "memory_growth",
+        "diagnose_s": 3.73,
+        "verdict": "HEALTHY",
+        "violations": [],
+        "false_positive": false
+      },
+      {
+        "program": "magic",
+        "symptom_kind": "hang_deadlock",
+        "diagnose_s": 2.64,
+        "verdict": "HEALTHY",
+        "violations": [],
+        "false_positive": false
+      },
+      {
+        "program": "magic",
+        "symptom_kind": "state_inconsistency",
+        "diagnose_s": 2.74,
+        "verdict": "INCONCLUSIVE",
+        "violations": [],
+        "false_positive": false
+      },
+      {
+        "program": "magic",
+        "symptom_kind": "variable_anomaly",
+        "diagnose_s": 2.71,
+        "verdict": "HEALTHY",
+        "violations": [],
+        "false_positive": false
+      },
+      {
+        "program": "progress_names",
+        "symptom_kind": null,
+        "diagnose_s": 2.84,
+        "verdict": "HEALTHY",
+        "violations": [],
+        "false_positive": false
+      },
+      {
+        "program": "progress_names",
+        "symptom_kind": "crash_corruption",
+        "diagnose_s": 2.7,
+        "verdict": "HEALTHY",
+        "violations": [],
+        "false_positive": false
+      },
+      {
+        "program": "progress_names",
+        "symptom_kind": "memory_growth",
+        "diagnose_s": 3.79,
+        "verdict": "HEALTHY",
+        "violations": [],
+        "false_positive": false
+      },
+      {
+        "program": "progress_names",
+        "symptom_kind": "hang_deadlock",
+        "diagnose_s": 2.74,
+        "verdict": "HEALTHY",
+        "violations": [],
+        "false_positive": false
+      },
+      {
+        "program": "progress_names",
+        "symptom_kind": "state_inconsistency",
+        "diagnose_s": 2.74,
+        "verdict": "INCONCLUSIVE",
+        "violations": [],
+        "false_positive": false
+      },
+      {
+        "program": "progress_names",
+        "symptom_kind": "variable_anomaly",
+        "diagnose_s": 2.75,
+        "verdict": "HEALTHY",
+        "violations": [],
+        "false_positive": false
+      },
+      {
+        "program": "ring_counters",
+        "symptom_kind": null,
+        "diagnose_s": 2.79,
+        "verdict": "HEALTHY",
+        "violations": [],
+        "false_positive": false
+      },
+      {
+        "program": "ring_counters",
+        "symptom_kind": "crash_corruption",
+        "diagnose_s": 2.76,
+        "verdict": "HEALTHY",
+        "violations": [],
+        "false_positive": false
+      },
+      {
+        "program": "ring_counters",
+        "symptom_kind": "memory_growth",
+        "diagnose_s": 3.74,
+        "verdict": "HEALTHY",
+        "violations": [],
+        "false_positive": false
+      },
+      {
+        "program": "ring_counters",
+        "symptom_kind": "hang_deadlock",
+        "diagnose_s": 2.65,
+        "verdict": "HEALTHY",
+        "violations": [],
+        "false_positive": false
+      },
+      {
+        "program": "ring_counters",
+        "symptom_kind": "state_inconsistency",
+        "diagnose_s": 2.7,
+        "verdict": "INCONCLUSIVE",
+        "violations": [],
+        "false_positive": false
+      },
+      {
+        "program": "ring_counters",
+        "symptom_kind": "variable_anomaly",
+        "diagnose_s": 2.71,
+        "verdict": "HEALTHY",
+        "violations": [],
+        "false_positive": false
+      },
+      {
+        "program": "sentinels",
+        "symptom_kind": null,
+        "diagnose_s": 2.79,
+        "verdict": "HEALTHY",
+        "violations": [],
+        "false_positive": false
+      },
+      {
+        "program": "sentinels",
+        "symptom_kind": "crash_corruption",
+        "diagnose_s": 2.74,
+        "verdict": "HEALTHY",
+        "violations": [],
+        "false_positive": false
+      },
+      {
+        "program": "sentinels",
+        "symptom_kind": "memory_growth",
+        "diagnose_s": 3.72,
+        "verdict": "HEALTHY",
+        "violations": [],
+        "false_positive": false
+      },
+      {
+        "program": "sentinels",
+        "symptom_kind": "hang_deadlock",
+        "diagnose_s": 2.64,
+        "verdict": "HEALTHY",
+        "violations": [],
+        "false_positive": false
+      },
+      {
+        "program": "sentinels",
+        "symptom_kind": "state_inconsistency",
+        "diagnose_s": 2.7,
+        "verdict": "INCONCLUSIVE",
+        "violations": [],
+        "false_positive": false
+      },
+      {
+        "program": "sentinels",
+        "symptom_kind": "variable_anomaly",
+        "diagnose_s": 2.7,
+        "verdict": "INCONCLUSIVE",
+        "violations": [],
+        "false_positive": false
+      },
+      {
+        "program": "siblings",
+        "symptom_kind": null,
+        "diagnose_s": 2.85,
+        "verdict": "HEALTHY",
+        "violations": [],
+        "false_positive": false
+      },
+      {
+        "program": "siblings",
+        "symptom_kind": "crash_corruption",
+        "diagnose_s": 2.74,
+        "verdict": "HEALTHY",
+        "violations": [],
+        "false_positive": false
+      },
+      {
+        "program": "siblings",
+        "symptom_kind": "memory_growth",
+        "diagnose_s": 3.73,
+        "verdict": "HEALTHY",
+        "violations": [],
+        "false_positive": false
+      },
+      {
+        "program": "siblings",
+        "symptom_kind": "hang_deadlock",
+        "diagnose_s": 2.65,
+        "verdict": "HEALTHY",
+        "violations": [],
+        "false_positive": false
+      },
+      {
+        "program": "siblings",
+        "symptom_kind": "state_inconsistency",
+        "diagnose_s": 2.7,
+        "verdict": "INCONCLUSIVE",
+        "violations": [],
+        "false_positive": false
+      },
+      {
+        "program": "siblings",
+        "symptom_kind": "variable_anomaly",
+        "diagnose_s": 2.72,
+        "verdict": "INCONCLUSIVE",
+        "violations": [],
+        "false_positive": false
+      },
+      {
+        "program": "state",
+        "symptom_kind": null,
+        "diagnose_s": 2.81,
+        "verdict": "HEALTHY",
+        "violations": [],
+        "false_positive": false
+      },
+      {
+        "program": "state",
+        "symptom_kind": "crash_corruption",
+        "diagnose_s": 2.7,
+        "verdict": "HEALTHY",
+        "violations": [],
+        "false_positive": false
+      },
+      {
+        "program": "state",
+        "symptom_kind": "memory_growth",
+        "diagnose_s": 3.72,
+        "verdict": "HEALTHY",
+        "violations": [],
+        "false_positive": false
+      },
+      {
+        "program": "state",
+        "symptom_kind": "hang_deadlock",
+        "diagnose_s": 2.65,
+        "verdict": "HEALTHY",
+        "violations": [],
+        "false_positive": false
+      },
+      {
+        "program": "state",
+        "symptom_kind": "state_inconsistency",
+        "diagnose_s": 2.7,
+        "verdict": "INCONCLUSIVE",
+        "violations": [],
+        "false_positive": false
+      },
+      {
+        "program": "state",
+        "symptom_kind": "variable_anomaly",
+        "diagnose_s": 2.7,
+        "verdict": "HEALTHY",
+        "violations": [],
+        "false_positive": false
+      }
+    ]
+  }
+}

@@ -23,6 +23,7 @@ from extractor.target_adapter import LocalTargetAdapter, RemoteSshTargetAdapter
 from extractor.watch_session import WatchSessionManager
 from extractor.web.server import WebApiAdapter
 import scripts.mcp_server as mcp_srv
+from tests.support.fixture_process import fixture_popen
 
 
 class TestPhase32RemoteAndMcpImprovements(unittest.TestCase):
@@ -71,7 +72,7 @@ class TestPhase32RemoteAndMcpImprovements(unittest.TestCase):
                         pass
 
     def _start_target(self, bin_path: str) -> subprocess.Popen:
-        p = subprocess.Popen(
+        p = fixture_popen(
             [bin_path],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
@@ -255,24 +256,6 @@ class TestPhase32RemoteAndMcpImprovements(unittest.TestCase):
             self.assertEqual(unchanged_paths.get("g_heap_state->counter"), 99)
         finally:
             mcp_srv.runtime = old_runtime
-
-    def test_04_web_ui_html_and_api_routes(self):
-        """Verify index.html exposes remote SSH / process discovery inputs and symbol path evaluator."""
-        html_path = os.path.join(PROJECT_ROOT, "extractor", "web", "static", "index.html")
-        with open(html_path, "r", encoding="utf-8") as f:
-            html = f.read()
-        for required_id in (
-            "te-remote-host",
-            "te-remote-user",
-            "te-remote-port",
-            "te-remote-jump",
-            "te-process-name",
-            "btn-find-target-pid",
-            "te-eval-expr-input",
-            "btn-te-eval-expr",
-            "btn-te-diff-expr",
-        ):
-            self.assertIn(f'id="{required_id}"', html, f"Missing UI element #{required_id} in index.html")
 
 
 if __name__ == "__main__":

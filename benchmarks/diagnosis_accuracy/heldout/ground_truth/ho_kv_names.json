@@ -1,0 +1,39 @@
+{
+  "id": "ho_kv_names",
+  "suite": "heldout",
+  "origin": "new",
+  "naming": "neutral",
+  "kind": "heap_overflow",
+  "source": "benchmarks/diagnosis_accuracy/heldout/targets/ho_kv_names/main.c",
+  "sources": [
+    "benchmarks/diagnosis_accuracy/heldout/targets/ho_kv_names/main.c",
+    "benchmarks/diagnosis_accuracy/heldout/targets/ho_kv_names/kv.c"
+  ],
+  "language": "c",
+  "build": {
+    "compiler": "gcc",
+    "opt": "-O0",
+    "flags": []
+  },
+  "style": "multi-file, the copy is hidden in a macro from a header",
+  "symptom": "this program shows occasional strange data and I suspect memory corruption",
+  "ready": {
+    "mode": "stdout_marker"
+  },
+  "causes": {
+    "variables": [
+      "kv_slots"
+    ],
+    "locks": [],
+    "threads": [],
+    "functions": []
+  },
+  "locations": [
+    {
+      "file": "benchmarks/diagnosis_accuracy/heldout/targets/ho_kv_names/kv.c",
+      "line": 18,
+      "text": "KV_SET_NAME(e, name);"
+    }
+  ],
+  "notes": "a 32-character name is strcpy'd (via KV_SET_NAME) into a 16-byte name buffer in kv_rename"
+}

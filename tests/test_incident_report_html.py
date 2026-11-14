@@ -13,6 +13,7 @@ import unittest
 import scripts.mcp_server as mcp_srv
 from extractor.human_report import conclusion_sentence, markdown_to_html
 from extractor.incident_report import export_incident_report
+from tests.support.fixture_process import fixture_popen
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SRC = os.path.join(ROOT, "tests", "fixtures", "real_runtime", "proc_thread_circular_deadlock.c")
@@ -45,7 +46,7 @@ class TestIncidentHtml(unittest.TestCase):
         cls.binary = os.path.join(cls.tmp, "dl")
         subprocess.run(["gcc", "-g", "-O0", "-pthread", "-Wl,--build-id=sha1", SRC, "-o", cls.binary],
                        check=True, capture_output=True, timeout=120)
-        cls.proc = subprocess.Popen([cls.binary], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        cls.proc = fixture_popen([cls.binary], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                                     stdin=subprocess.DEVNULL)
         cls.addClassCleanup(cls._kill)
         time.sleep(0.7)
@@ -59,9 +60,10 @@ class TestIncidentHtml(unittest.TestCase):
 
     def _check_html(self, h, lang):
         self.assertNotRegex(h, r"""(?:src|href)\s*=\s*["']?https?://""")
-        a = h.index("A. Executive Summary")
-        pre = h[:a]
-        self.assertIn('id="human-summary"', pre)
+        self.assertIn("A. Executive Summary", h)                       # the detailed records are attached ...
+        pre = re.sub(r'(?s)<div class="dsv-detail-body[^"]*"[^>]*>.*?</div><!--/dsv-detail-body-->', "", h)
+        self.assertNotIn("A. Executive Summary", pre)                  # ... in collapsed blocks, not in the reading part
+        self.assertIn('id="sec-conclusion"', pre)
         self.assertIn('lang="%s"' % lang, pre)
         for name in ("g_mutex_a", "g_mutex_b"):
             self.assertIn(name, pre)
@@ -95,7 +97,7 @@ class TestIncidentHtml(unittest.TestCase):
     def test_en_html_is_english(self):
         out = export_incident_report(pid=self.proc.pid, companion_elf_path=self.binary, corpus_dir=self.corpus)
         pre = self._check_html(out["report_html"], "en")
-        self.assertIn("1. Conclusion", pre)
+        self.assertIn(">Conclusion</h2>", pre)                         # the banner's title (the cards carry no numbers)
         self.assertNotRegex(pre, "[가-힣]")
         self.assertEqual(out["language"], "en")
         with self.assertRaises(ValueError):

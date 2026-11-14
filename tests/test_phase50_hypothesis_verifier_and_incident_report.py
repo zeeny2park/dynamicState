@@ -1,4 +1,5 @@
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -8,6 +9,7 @@ import unittest
 from extractor.agent_runtime import AgentRuntime
 from extractor.watch_session import WatchSessionManager
 from extractor.web.server import WebApiAdapter
+from tests.support.fixture_process import fixture_popen
 
 
 PHASE50_CPP_SOURCE = r"""
@@ -108,7 +110,7 @@ class TestPhase50HypothesisVerifierAndIncidentReport(unittest.TestCase):
             check=True,
         )
 
-        cls.proc = subprocess.Popen(
+        cls.proc = fixture_popen(
             [cls.bin_path],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -209,10 +211,20 @@ class TestPhase50HypothesisVerifierAndIncidentReport(unittest.TestCase):
         rep_data = er_resp["data"]
         self.assertEqual(rep_data["stop_duration_ms"], 0.0)
         self.assertTrue(os.path.isfile(report_file))
-        self.assertIn("## 1. Target Identity & Zero-Stop Telemetry", rep_data["report_markdown"])
-        self.assertIn("## 2. Root-Cause Findings", rep_data["report_markdown"])
-        self.assertIn("## 3. Hypothesis Verification (`CONFIRMED`", rep_data["report_markdown"])
-        self.assertIn("## 5. Remediation Checklist", rep_data["report_markdown"])
+        md = rep_data["report_markdown"]
+        # the common outline: conclusion first, the requested hypothesis check in its own section, next steps,
+        # and the target identity / zero-stop statement in the method section
+        self.assertIn("## 1. Conclusion", md)
+        hyp = re.search(r"^## \d+\. The hypothesis you asked to check\n(.*?)(?=^## )", md, re.S | re.M)
+        self.assertTrue(hyp, md)
+        self.assertIn("`CONFIRMED`", hyp.group(1))
+        self.assertRegex(md, r"(?m)^## \d+\. What to do next$")
+        method = re.search(r"^## \d+\. How the diagnosis was done and what it cost the target\n(.*?)(?=^## )", md,
+                           re.S | re.M).group(1)
+        self.assertIn("ZERO_STOP", method)                              # the zero-stop statement
+        target = re.search(r"^## \d+\. Target\n(.*?)(?=^## )", md, re.S | re.M).group(1)
+        self.assertIn("pid %d" % self.proc.pid, target)                # the identity, stated once in the target card
+        self.assertIn("never paused", md.split("\n## ", 2)[1])        # the four figures close the conclusion
 
 
 if __name__ == "__main__":

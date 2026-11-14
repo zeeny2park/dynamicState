@@ -120,6 +120,7 @@ from extractor.investigation import (
 from extractor.raw_snapshot import RawRuntimeSnapshot
 from extractor.state_diff import StateDiffEngine
 from extractor.web.server import WebApiAdapter
+from tests.support.fixture_process import fixture_popen
 
 
 def _approved_full_plan():
@@ -170,7 +171,7 @@ class BasePhase13ProcessTestCase(unittest.TestCase):
         shutil.rmtree(cls.work_dir, ignore_errors=True)
 
     def _start_process(self, bin_path: str) -> subprocess.Popen:
-        proc = subprocess.Popen(
+        proc = fixture_popen(
             [bin_path],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,

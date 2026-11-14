@@ -10,10 +10,11 @@ and analysis procedures for embedded Linux and C/C++ runtime investigations acro
 Every recipe is fully deterministic, self-contained, and testable without LLM dependencies.
 """
 
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 import hashlib
-from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Union
+from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple, Union
 
 from .allocator_inspector import FreeValidationOutcome, AllocatorType, FreeValidationResult
 from .temporal_observation_window import MemoryBehaviorClassification, TemporalAnalysisResult
@@ -106,6 +107,47 @@ OBS_RUNTIME_STATE = "runtime_state"           # DWARF globals: observed values a
 OBS_THREADS_AND_LOCKS = "threads_and_locks"   # thread states/samples, mutex owners, wait-for graph
 OBS_PROCESS_INFO = "process_info"             # /proc/<pid>/status (always collected last)
 
+# Capabilities a recipe may require beyond what a zero-stop, read-only diagnosis has.  ``AVAILABLE_CAPABILITIES`` is
+# what the current mode provides (none of these); an optional tracing mode would add its capabilities there.
+CAP_ALLOCATION_TRACING = "allocation_tracing"      # a record of every malloc/free (a tracer attached to the target)
+CAP_STOPPED_SNAPSHOT = "stopped_snapshot"          # a consistent snapshot of running threads (needs a stop)
+CAP_CALLER_SPECIFICATION = "caller_specification"  # a value domain / state machine the caller supplies
+CAPABILITY_DESCRIPTIONS: Dict[str, Tuple[str, str]] = {
+    CAP_ALLOCATION_TRACING: ("allocation tracing (a record of every allocation and free)",
+                             "할당 추적 (모든 할당·해제 기록)"),
+    CAP_STOPPED_SNAPSHOT: ("a stopped, consistent snapshot of the running threads",
+                           "실행 중인 스레드의 정지된 일관 스냅샷"),
+    CAP_CALLER_SPECIFICATION: ("a value range or state machine supplied by the caller",
+                               "호출자가 지정하는 값 범위 또는 상태 전이 명세"),
+}
+AVAILABLE_CAPABILITIES: frozenset = frozenset()
+_ACTIVE_CAPABILITIES: Optional[frozenset] = None
+
+
+def get_available_capabilities() -> frozenset:
+    """Return the set of currently active capabilities (defaults to AVAILABLE_CAPABILITIES)."""
+    if _ACTIVE_CAPABILITIES is not None:
+        return _ACTIVE_CAPABILITIES
+    return AVAILABLE_CAPABILITIES
+
+
+def set_active_capabilities(caps: Optional[Iterable[str]]) -> None:
+    """Set the currently active capabilities globally (or None to reset to default)."""
+    global _ACTIVE_CAPABILITIES
+    _ACTIVE_CAPABILITIES = frozenset(caps) if caps is not None else None
+
+
+@contextmanager
+def temporary_capabilities(caps: Iterable[str]):
+    """Context manager to activate capabilities (such as CAP_ALLOCATION_TRACING in selective tracing mode)."""
+    global _ACTIVE_CAPABILITIES
+    prev = _ACTIVE_CAPABILITIES
+    _ACTIVE_CAPABILITIES = frozenset(caps)
+    try:
+        yield
+    finally:
+        _ACTIVE_CAPABILITIES = prev
+
 # Baseline checks: planned and executed for EVERY investigation, whatever the symptom wording says.  They are the
 # cheap, read-only, zero-stop checks; the symptom text only orders them and adds more specific / costlier recipes.
 # Order = execution order when the symptom gives no preference (cheapest first).
@@ -171,6 +213,18 @@ class DiagnosticRecipe:
     requires_lock_owner: bool = False          # "nothing found" is only meaningful when mutex owners decode
     lock_owner_required_for_support: bool = False  # ... and so is "found" (a stall without owners is not attributable)
     risk_level: str = "READ_ONLY"
+    # Capabilities the recipe's verdict rule needs that a zero-stop diagnosis does not have (CAP_* above).  A recipe
+    # that declares one is not planned while the capability is absent (``DiagnosticRecipeRegistry.is_plannable``):
+    # it is neither executed nor counted as an open check, and the report lists its question as "not examined".
+    # ``unsupported_question`` is that question in plain words.  A baseline recipe must not declare any.
+    requires_capabilities: Tuple[str, ...] = ()
+    unsupported_question: str = ""
+    # Declared wall-clock cost on a quiet host (extractor.check_budget): base seconds + seconds per target thread, plus
+    # the shared collection named by ``shared_cost`` (check_budget.SHARED_COSTS) when no earlier check of the run
+    # collected it.  Used to decide whether a default (baseline, not symptom-requested) check fits the time budget.
+    expected_cost_s: float = 0.05
+    cost_per_thread_s: float = 0.0
+    shared_cost: str = ""
 
     @property
     def problem_category(self) -> str:
@@ -180,6 +234,7 @@ class DiagnosticRecipe:
         d = asdict(self)
         d.pop("rule", None)
         d["observations"] = list(self.observations)
+        d["requires_capabilities"] = list(self.requires_capabilities)
         return d
 
     @classmethod
@@ -188,6 +243,8 @@ class DiagnosticRecipe:
         filtered = {k: v for k, v in data.items() if k in valid_fields and k != "rule"}
         if "observations" in filtered:
             filtered["observations"] = tuple(filtered["observations"] or ())
+        if "requires_capabilities" in filtered:
+            filtered["requires_capabilities"] = tuple(filtered["requires_capabilities"] or ())
         return cls(**filtered)
 
 
@@ -243,9 +300,20 @@ def _register(recipe: DiagnosticRecipe) -> None:
     _RECIPES[recipe.recipe_id] = recipe
 
 
+def declare_cost(recipe_id: str, expected_cost_s: float, cost_per_thread_s: float = 0.0, shared_cost: str = "") -> None:
+    """Declare a registered recipe's cost metadata (see DiagnosticRecipe.expected_cost_s)."""
+    r = _RECIPES[recipe_id]
+    r.expected_cost_s = float(expected_cost_s)
+    r.cost_per_thread_s = float(cost_per_thread_s)
+    r.shared_cost = str(shared_cost or "")
+
+
 def register_recipe(recipe: DiagnosticRecipe, baseline: bool = False, category: Optional[str] = None) -> DiagnosticRecipe:
     """Register a recipe from its definition file (IMP-018).  ``baseline``: also plan and run it in every
     investigation (it must be cheap, read-only and zero-stop).  ``category``: a new problem category it reports."""
+    if baseline and recipe.requires_capabilities:
+        raise ValueError(f"{recipe.recipe_id}: a baseline check runs in every diagnosis and cannot require "
+                         f"{recipe.requires_capabilities}")
     if category:
         ALL_PROBLEM_CATEGORIES.add(category)
     _register(recipe)
@@ -294,45 +362,17 @@ _register(DiagnosticRecipe(
     output_structure={"faulting_address": "str", "vma_match": "bool", "violation_type": "str", "permissions": "str"},
 ))
 
-_register(DiagnosticRecipe(
-    recipe_id="RECIPE_DOUBLE_FREE",
-    version="1.0.0",
-    name="Double Free & Corrupted Freelist Audit",
-    domain=DOMAIN_MEMORY_INTEGRITY,
-    observations=(OBS_MEMORY_INTEGRITY, OBS_PROCESS_INFO,),
-    applicable_problem_categories=[CATEGORY_INVALID_DOUBLE_FREE, CATEGORY_MEMORY_CORRUPTION],
-    required_prerequisites=["memory_read_available", "heap_inspection_available"],
-    evidence_sources=["heap_metadata", "freelist", "allocator_bins"],
-    collection_steps=[
-        {"step": 1, "action": "inspect_chunk_header", "purpose": "Inspect PREV_INUSE bit and size fields of chunk"},
-        {"step": 2, "action": "traverse_freelist", "purpose": "Check if target chunk pointer already exists in bin/freelist"},
-        {"step": 3, "action": "verify_neighbour_chunks", "purpose": "Verify next chunk's prev_size and prev_inuse consistency"},
-    ],
-    analysis_rules=[
-        "Chunk with PREV_INUSE==0 while being deallocated indicates double free.",
-        "Finding the same chunk pointer multiple times in a freelist confirms double free corruption.",
-        "Fastbin/tcache double free detected if chunk->next equals chunk or matches top of bin.",
-    ],
-    thresholds_and_conditions={"max_freelist_depth": 1024},
-    supporting_evidence_criteria=[
-        "Chunk address is already present in allocator freelist / fastbin / tcache",
-        "Chunk header prev_inuse flag is 0 when deallocation was requested",
-    ],
-    contradicting_evidence_criteria=[
-        "Chunk is in active allocated state (prev_inuse==1, not present in any freelist)",
-        "Freelist traversal completes without finding chunk pointer",
-    ],
-    verification_procedure="Traverse fastbins, tcache bins, and smallbins to confirm whether chunk pointer is already enqueued.",
-    stop_conditions=["Duplicate chunk found in freelist", "All freelists traversed without duplicate"],
-    limitations=["Requires glibc/musl or pool-specific allocator metadata layout."],
-    output_structure={"chunk_address": "str", "freelist_occurrences": "int", "is_double_free": "bool"},
-))
+# RECIPE_DOUBLE_FREE is defined (recipe, free-list observation and rule) in recipe_plugins/double_free.py.
 
 _register(DiagnosticRecipe(
     recipe_id="RECIPE_INVALID_FREE",
     version="1.0.0",
     name="Invalid Free & Non-Heap Pointer Deallocation Audit",
     domain=DOMAIN_MEMORY_INTEGRITY,
+    # A pointer VALUE read from memory is not a free() argument: which pointer is passed to free() is only known
+    # from a free() history.  Without it the rule can only say "not observed" (free_call_observed False).
+    requires_capabilities=(CAP_ALLOCATION_TRACING,),
+    unsupported_question="Was free() called on a pointer that is not a heap block (stack / global / interior)?",
     observations=(OBS_MEMORY_INTEGRITY, OBS_PROCESS_INFO,),
     applicable_problem_categories=[CATEGORY_INVALID_DOUBLE_FREE, CATEGORY_MEMORY_CORRUPTION],
     required_prerequisites=["memory_read_available", "memory_maps_available"],
@@ -367,6 +407,9 @@ _register(DiagnosticRecipe(
     version="1.0.0",
     name="Use-After-Free & Dangling Pointer Access Investigation",
     domain=DOMAIN_MEMORY_INTEGRITY,
+    requires_capabilities=(CAP_ALLOCATION_TRACING,),
+    unsupported_question=("Was a block used after it was freed, proven from the free() history? (a heap walk looks "
+                          "for typed pointers into free blocks instead: RECIPE_FREED_MEMORY_USE)"),
     observations=(OBS_MEMORY_INTEGRITY, OBS_PROCESS_INFO,),
     applicable_problem_categories=[CATEGORY_USE_AFTER_FREE, CATEGORY_MEMORY_CORRUPTION],
     required_prerequisites=["memory_read_available", "heap_inspection_available"],
@@ -437,6 +480,9 @@ _register(DiagnosticRecipe(
     version="1.0.0",
     name="Suspicious Allocation / Deallocation Pattern Detector",
     domain=DOMAIN_MEMORY_INTEGRITY,
+    requires_capabilities=(CAP_ALLOCATION_TRACING,),
+    unsupported_question=("Is an allocation unusually large or repeated? (needs the sizes of the allocation calls, "
+                          "which one point-in-time read does not give)"),
     observations=(OBS_MEMORY_INTEGRITY, OBS_PROCESS_INFO,),
     applicable_problem_categories=[CATEGORY_MEMORY_CORRUPTION, CATEGORY_MEMORY_LEAK],
     required_prerequisites=["memory_read_available"],
@@ -577,6 +623,9 @@ _register(DiagnosticRecipe(
     version="1.0.0",
     name="Object Lifetime & Premature / Prolonged Retention Anomaly Detector",
     domain=DOMAIN_MEMORY_GROWTH,
+    requires_capabilities=(CAP_ALLOCATION_TRACING,),
+    unsupported_question=("Does a live reference point to an object whose lifetime ended? (needs the allocation and "
+                          "free history, which one point-in-time read does not give)"),
     observations=(OBS_MEMORY_INTEGRITY, OBS_MEMORY_GROWTH, OBS_PROCESS_INFO,),
     applicable_problem_categories=[CATEGORY_MEMORY_LEAK, CATEGORY_FUNCTIONAL_STATE_INCONSISTENCY],
     required_prerequisites=["memory_read_available", "dwarf_symbols_available"],
@@ -679,6 +728,9 @@ _register(DiagnosticRecipe(
     version="1.0.0",
     name="Unexpected Variable Mutation & Range Violation Investigation",
     domain=DOMAIN_ABNORMAL_STATE,
+    requires_capabilities=(CAP_CALLER_SPECIFICATION,),
+    unsupported_question=("Did a variable leave its expected value range? (needs the range from the caller; the "
+                          "target does not contain it)"),
     observations=(OBS_RUNTIME_STATE, OBS_PROCESS_INFO,),
     applicable_problem_categories=[CATEGORY_ABNORMAL_VARIABLE_CHANGES, CATEGORY_FUNCTIONAL_STATE_INCONSISTENCY],
     required_prerequisites=["memory_read_available", "dwarf_symbols_available"],
@@ -713,6 +765,9 @@ _register(DiagnosticRecipe(
     version="1.0.0",
     name="State Machine Transition Invariant Violation Audit",
     domain=DOMAIN_ABNORMAL_STATE,
+    requires_capabilities=(CAP_CALLER_SPECIFICATION,),
+    unsupported_question=("Did a state variable make a transition its state machine forbids? (needs the allowed "
+                          "states from the caller; the target does not contain them)"),
     observations=(OBS_RUNTIME_STATE, OBS_PROCESS_INFO,),
     applicable_problem_categories=[CATEGORY_UNEXPECTED_STATE_TRANSITIONS, CATEGORY_FUNCTIONAL_STATE_INCONSISTENCY],
     required_prerequisites=["memory_read_available", "dwarf_symbols_available"],
@@ -989,6 +1044,9 @@ _register(DiagnosticRecipe(
     version="1.0.0",
     name="Shared State Inconsistency & Data Race Indicator Audit",
     domain=DOMAIN_CONCURRENCY,
+    requires_capabilities=(CAP_STOPPED_SNAPSHOT,),
+    unsupported_question=("Is multi-field state shared by threads torn or inconsistent? (needs one consistent "
+                          "snapshot of running threads; reading them one at a time races with their updates)"),
     observations=(OBS_RUNTIME_STATE, OBS_THREADS_AND_LOCKS, OBS_PROCESS_INFO,),
     applicable_problem_categories=[CATEGORY_DATA_RACE_INDICATORS, CATEGORY_FUNCTIONAL_STATE_INCONSISTENCY],
     required_prerequisites=["memory_read_available", "dwarf_symbols_available"],
@@ -1030,24 +1088,58 @@ class DiagnosticRecipeRegistry:
         return _RECIPES.get(recipe_id)
 
     @classmethod
-    def list_recipes(cls, domain: Optional[str] = None) -> List[DiagnosticRecipe]:
-        if domain:
-            return [r for r in _RECIPES.values() if r.domain == domain]
-        return list(_RECIPES.values())
+    def missing_capabilities(cls, recipe_or_id: Union[str, DiagnosticRecipe], *,
+                             active_caps: Optional[frozenset] = None) -> Tuple[str, ...]:
+        """Capabilities the recipe declares that the current mode does not provide (empty: it can be planned)."""
+        r = recipe_or_id if isinstance(recipe_or_id, DiagnosticRecipe) else _RECIPES.get(str(recipe_or_id))
+        if r is None:
+            return ()
+        caps = active_caps if active_caps is not None else get_available_capabilities()
+        return tuple(c for c in r.requires_capabilities if c not in caps)
+
+    @classmethod
+    def is_plannable(cls, recipe_or_id: Union[str, DiagnosticRecipe], *,
+                     active_caps: Optional[frozenset] = None) -> bool:
+        return not cls.missing_capabilities(recipe_or_id, active_caps=active_caps)
+
+    @classmethod
+    def get_plannable_recipe(cls, recipe_id: str, *,
+                             active_caps: Optional[frozenset] = None) -> Optional[DiagnosticRecipe]:
+        """``get_recipe``, but None for a recipe the current mode cannot execute (plan construction uses this)."""
+        r = _RECIPES.get(recipe_id)
+        return r if r is not None and cls.is_plannable(r, active_caps=active_caps) else None
+
+    @classmethod
+    def unsupported_recipes(cls) -> Dict[str, List[DiagnosticRecipe]]:
+        """Recipes left out of every plan, grouped by the (first) missing capability."""
+        out: Dict[str, List[DiagnosticRecipe]] = {}
+        for r in _RECIPES.values():
+            miss = cls.missing_capabilities(r)
+            if miss:
+                out.setdefault(miss[0], []).append(r)
+        return out
+
+    @classmethod
+    def list_recipes(cls, domain: Optional[str] = None, plannable_only: bool = False) -> List[DiagnosticRecipe]:
+        rs = [r for r in _RECIPES.values() if (not domain or r.domain == domain)
+              and (not plannable_only or cls.is_plannable(r))]
+        return rs
 
     @classmethod
     def list_recipe_ids(cls, domain: Optional[str] = None) -> List[str]:
         return [r.recipe_id for r in cls.list_recipes(domain=domain)]
 
     @classmethod
-    def get_recipes_for_category(cls, category: str) -> List[DiagnosticRecipe]:
-        return cls.find_recipes_for_categories([category])
+    def get_recipes_for_category(cls, category: str, plannable_only: bool = False) -> List[DiagnosticRecipe]:
+        return cls.find_recipes_for_categories([category], plannable_only=plannable_only)
 
     @classmethod
-    def find_recipes_for_categories(cls, categories: List[str]) -> List[DiagnosticRecipe]:
+    def find_recipes_for_categories(cls, categories: List[str], plannable_only: bool = False) -> List[DiagnosticRecipe]:
         matched: List[DiagnosticRecipe] = []
         cat_set = set(categories)
         for r in _RECIPES.values():
+            if plannable_only and not cls.is_plannable(r):
+                continue
             if any(c in cat_set for c in r.applicable_problem_categories):
                 matched.append(r)
         return matched
@@ -1158,9 +1250,16 @@ def _evaluate_leak_investigation(recipe: "DiagnosticRecipe", data: Dict[str, Any
                                            "retained_count": o.get("blocks_delta"), "is_unbounded": True}),
             )
         if rid == "RECIPE_HEAP_GROWTH":
-            fact = ("in-use heap grew +%d KB (+%d blocks) across %d heap walks over %.2f s, without a drop"
-                    % (int(li.get("in_use_growth_bytes") or 0) // 1024, int(li.get("in_use_growth_blocks") or 0),
-                       walks, float(li.get("window_s") or 0.0)))
+            if li.get("in_use_monotonic_growth") is False:
+                rows = list(li.get("unreachable_growth") or []) + list(li.get("growth_owners") or [])
+                fact = ("in-use heap rose and fell across %d heap walks over %.2f s, but +%d KB of blocks under it "
+                        "grew across every walk"
+                        % (walks, float(li.get("window_s") or 0.0),
+                           sum(int(r.get("bytes_delta") or 0) for r in rows) // 1024))
+            else:
+                fact = ("in-use heap grew +%d KB (+%d blocks) across %d heap walks over %.2f s, without a drop"
+                        % (int(li.get("in_use_growth_bytes") or 0) // 1024, int(li.get("in_use_growth_blocks") or 0),
+                           walks, float(li.get("window_s") or 0.0)))
             return RecipeEvaluationResult(
                 recipe_id=rid, status=RECIPE_STATUS_SUPPORTED, confidence=0.9, confidence_basis=fact,
                 supporting_facts=[fact],
@@ -1535,7 +1634,9 @@ def _rule_invalid_memory_access(recipe: DiagnosticRecipe, data: Dict[str, Any]) 
             or data.get("chunk_state") == "CORRUPTED"
             or data.get("magic_corrupted")
         )
-        if not is_dereferenced and data.get("dereference_attempted") is False:
+        # Only positive evidence of a dereference confirms a fault.  A zero-stop observation carries no
+        # "dereference_attempted" key at all; a missing key is "not observed", never "dereferenced".
+        if not is_dereferenced and data.get("dereference_attempted") is not True:
             return RecipeEvaluationResult(
                 recipe_id=rid,
                 status=RECIPE_STATUS_INSUFFICIENT_EVIDENCE,
@@ -1597,75 +1698,25 @@ def _rule_invalid_memory_access(recipe: DiagnosticRecipe, data: Dict[str, Any]) 
     return None
 
 
-def _rule_double_free(recipe: DiagnosticRecipe, data: Dict[str, Any]) -> Optional[RecipeEvaluationResult]:
-    """Verdict rule of RECIPE_DOUBLE_FREE (None: no rule matched; the generic rule decides)."""
-    rid = recipe.recipe_id
-    in_freelist = data.get("in_freelist", False)
-    freelist_occ = data.get("freelist_occurrences", 0)
-    double_free_recorded = data.get("double_free_recorded", False) or data.get("duplicate_free_event", False)
-    alloc_events = data.get("allocation_event_history", [])
-    prev_inuse = data.get("prev_inuse")
-    if data.get("slot_status") == "IN_USE":
-        freelist_occ = 0
-        prev_inuse = 1
-
-    is_double_free = (
-        double_free_recorded
-        or freelist_occ > 1
-        or (in_freelist and data.get("operation") == "FREE")
-        or (data.get("slot_status") == "FREE" and data.get("operation") == "FREE")
-        or bool(data.get("freed_epoch") and data.get("current_epoch") and data.get("operation") == "FREE")
-    )
-
-    # Case D: A single free-list observation must not confirm double free
-    if not is_double_free and (freelist_occ == 1 or in_freelist):
-        return RecipeEvaluationResult(
-            recipe_id=rid,
-            status=RECIPE_STATUS_INSUFFICIENT_EVIDENCE,
-            confidence=0.35,
-            confidence_basis="Chunk appears once in freelist, which represents normal single deallocation. A single freelist observation cannot prove double free without repeated deallocation evidence.",
-            missing_evidence=["second_deallocation_event", "duplicate_freelist_entry"],
-            limitations=recipe.limitations,
-            details={"double_free_confirmed": False, "single_freelist_occurrence": True, "single_freelist_observation": True},
-        )
-
-    if is_double_free:
-        return RecipeEvaluationResult(
-            recipe_id=rid,
-            status=RECIPE_STATUS_SUPPORTED,
-            confidence=0.96,
-            confidence_basis="Chunk deallocation was observed twice in event history or chunk appears multiple times in freelist. Double free confirmed.",
-            supporting_facts=["Double free observed on chunk/slot"],
-            recommended_action="Audit object destruction lifecycle to ensure single ownership.",
-            details={"double_free_confirmed": True},
-        )
-    elif freelist_occ == 0 and prev_inuse == 1 and not double_free_recorded:
-        return RecipeEvaluationResult(
-            recipe_id=rid,
-            status=RECIPE_STATUS_CONTRADICTED,
-            confidence=0.92,
-            confidence_basis="Chunk is in active state (prev_inuse==1) and absent from freelist with zero duplicate free events.",
-            contradicting_facts=["Chunk not present in freelist", "prev_inuse is 1"],
-            recommended_action="Refute double free hypothesis for this chunk.",
-            details={"double_free_confirmed": False},
-        )
-    return RecipeEvaluationResult(
-        recipe_id=rid,
-        status=RECIPE_STATUS_INSUFFICIENT_EVIDENCE,
-        confidence=0.20,
-        confidence_basis="A single snapshot cannot prove that a free operation occurred twice. Allocation/free event history or allocator metadata required.",
-        missing_evidence=["allocation_free_event_history", "freelist_traversal_data"],
-        limitations=recipe.limitations,
-    )
-    return None
-
-
 def _rule_invalid_free(recipe: DiagnosticRecipe, data: Dict[str, Any]) -> Optional[RecipeEvaluationResult]:
     """Verdict rule of RECIPE_INVALID_FREE (None: no rule matched; the generic rule decides)."""
     rid = recipe.recipe_id
     alloc_insp = data.get("allocator_inspector") or data.get("allocator")
     ptr_addr = data.get("pointer_address") if "pointer_address" in data else (data.get("target_address") if "target_address" in data else data.get("address"))
     maps = data.get("maps") or data.get("proc_maps") or []
+    if data.get("free_call_observed") is False:
+        # The live observation holds a pointer VALUE; nobody was seen passing it to free().  A pointer to a global
+        # or into an object is valid as a pointer, and "would be an invalid free target" is not an invalid free.
+        return RecipeEvaluationResult(
+            recipe_id=rid,
+            status=RECIPE_STATUS_INSUFFICIENT_EVIDENCE,
+            confidence=0.20,
+            confidence_basis="A pointer value was observed, but no free() of it was observed (zero-stop, no "
+                             "allocation tracing): whether it is ever freed cannot be decided.",
+            missing_evidence=["observed_free_call"],
+            limitations=recipe.limitations,
+            details={"is_invalid_free": False, "free_call_observed": False},
+        )
     if alloc_insp and ptr_addr is not None:
         val_res = alloc_insp.validate_free_target(ptr_addr, maps=maps)
         if not val_res.is_valid:
@@ -1779,7 +1830,8 @@ def _rule_use_after_free(recipe: DiagnosticRecipe, data: Dict[str, Any]) -> Opti
             confidence_basis="Pointer dereferences a memory block currently on freelist, tracked as freed, or containing deallocation poison markers.",
             supporting_facts=[f"in_freelist={in_free}", f"poison_detected={poison}"],
             recommended_action="Locate dangling reference holders and nullify upon deallocation.",
-            details={"uaf_confirmed": True, "chain": ["FREED_ALLOCATION", "STALE_POINTER_CANDIDATE", "CONFIRMED_USE_AFTER_FREE"]},
+            details={"uaf_confirmed": True, "in_freelist": bool(in_free), "poison_detected": bool(poison),
+                     "chain": ["FREED_ALLOCATION", "STALE_POINTER_CANDIDATE", "CONFIRMED_USE_AFTER_FREE"]},
         )
     if active and not in_free and not poison:
         return RecipeEvaluationResult(
@@ -1980,7 +2032,7 @@ def _rule_potential_deadlock_patterns(recipe: DiagnosticRecipe, data: Dict[str, 
                 confidence_basis=f"Complete lock graph verified acyclic with zero circular wait cycles ({analysis.summary}).",
                 contradicting_facts=["Complete lock graph verified acyclic (DAG)"],
                 recommended_action="Refute deadlock; inspect thread worker contention or external I/O stall.",
-                details={"deadlock_confirmed": False, "state": "NO_DEADLOCK_ACYCLIC"},
+                details={"deadlock_confirmed": False, "state": "NO_DEADLOCK_ACYCLIC", "lock_graph_acyclic": True},
             )
 
     thread_locks = data.get("thread_locks") or data.get("lock_graph") or data.get("callstacks_info")
@@ -2054,7 +2106,7 @@ def _rule_potential_deadlock_patterns(recipe: DiagnosticRecipe, data: Dict[str, 
             confidence_basis="Wait-for graph is a verified complete acyclic directed graph with no wait cycles.",
             contradicting_facts=["Wait-for graph is complete and acyclic"],
             recommended_action="Refute deadlock hypothesis; inspect thread contention and lock holding durations.",
-            details={"deadlock_confirmed": False, "thread_contention": bool(blocked_threads)},
+            details={"deadlock_confirmed": False, "thread_contention": bool(blocked_threads), "lock_graph_acyclic": True},
         )
     return RecipeEvaluationResult(
         recipe_id=rid,
@@ -2138,7 +2190,7 @@ def _rule_heap_growth(recipe: DiagnosticRecipe, data: Dict[str, Any]) -> Optiona
             confidence_basis=f"Heap footprint is stable (delta={heap_delta} bytes). Unmanaged heap expansion refuted.",
             contradicting_facts=[f"Heap stable (delta={heap_delta} bytes)"],
             recommended_action="Refute heap growth hypothesis.",
-            details={"heap_growth_confirmed": False},
+            details={"heap_growth_confirmed": False, "heap_stable": True},
         )
     return RecipeEvaluationResult(
         recipe_id=rid,
@@ -2151,18 +2203,42 @@ def _rule_heap_growth(recipe: DiagnosticRecipe, data: Dict[str, Any]) -> Optiona
     return None
 
 
+def memory_grew_in_window(data: Dict[str, Any]) -> Optional[bool]:
+    """Did memory (heap walk / heap VMA / RSS) grow over the same observation window?  True / False when measured,
+    None when nothing was measured.  Used to decide whether a growing count is backed by memory."""
+    li = data.get("leak_investigation") if isinstance(data.get("leak_investigation"), dict) else {}
+    trend = data.get("memory_trend") if isinstance(data.get("memory_trend"), dict) else {}
+    measured = False
+    if li.get("verdict") in _LEAK_VERDICTS or trend.get("indicates_growth"):
+        return True
+    if li.get("verdict") in _NO_LEAK_VERDICTS:
+        measured = True
+    hg = data.get("heap_growth_bytes")
+    if isinstance(hg, (int, float)) and not isinstance(hg, bool):
+        if hg > 64 * 1024:
+            return True
+        measured = True
+    rss = [x for x in (data.get("rss_history_kb") or []) if isinstance(x, (int, float))]
+    if len(rss) >= 2:
+        if rss[-1] - rss[0] > 100:
+            return True
+        measured = True
+    return False if measured else None
+
+
 def _rule_long_lived_object_accumulation(recipe: DiagnosticRecipe, data: Dict[str, Any]) -> Optional[RecipeEvaluationResult]:
     """Verdict rule of RECIPE_LONG_LIVED_OBJECT_ACCUMULATION (None: no rule matched; the generic rule decides)."""
     rid = recipe.recipe_id
-    obj_delta = data.get("object_count_delta")
-    if obj_delta is None:
-        obj_delta = data.get("container_size_delta")
-    if obj_delta is None:
-        obj_delta = data.get("container_size")
-    if obj_delta is None:
-        obj_delta = data.get("active_chunk_count")
-    if obj_delta is None:
-        obj_delta = data.get("retained_objects_count")
+    # Accumulation is a CHANGE over the window.  An object census delta counts as it is; an integer read from the
+    # target (a container's size / count member) counts only together with memory growth in the same window.  A
+    # size read once is not a delta: a pool's block size of 4096 is not 4096 retained objects.
+    census_delta = data.get("object_count_delta")
+    count_delta = data.get("container_size_delta")
+    if count_delta is None:
+        count_delta = data.get("container_delta")
+    obj_delta = census_delta if census_delta is not None else count_delta
+    absolute = next((data.get(k) for k in ("container_size", "active_chunk_count", "retained_objects_count")
+                     if data.get(k) is not None), None)
 
     # Case G: A large but stable container must not be called accumulating memory!
     if (
@@ -2176,13 +2252,49 @@ def _rule_long_lived_object_accumulation(recipe: DiagnosticRecipe, data: Dict[st
             recipe_id=rid,
             status=RECIPE_STATUS_NOT_APPLICABLE,
             confidence=0.91,
-            confidence_basis=f"Container holds populated elements ({obj_delta}) but population delta across observation epochs is zero. Bounded static cache refuted as accumulating leak.",
+            confidence_basis=f"Container holds populated elements ({absolute if obj_delta is None else obj_delta}) but population delta across observation epochs is zero. Bounded static cache refuted as accumulating leak.",
             contradicting_facts=["Container element delta is zero across observation window"],
             not_applicable_reason="Container delta is zero across observation epochs",
             recommended_action="Refute object accumulation leak; container operates as stable bounded cache.",
             details={"object_accumulation_confirmed": False, "stable_container": True},
         )
 
+    if census_delta is None and count_delta is not None and count_delta > 50:
+        grew = memory_grew_in_window(data)
+        if grew is False:
+            return RecipeEvaluationResult(
+                recipe_id=rid,
+                status=RECIPE_STATUS_CONTRADICTED,
+                confidence=0.80,
+                confidence_basis=f"{data.get('container_name') or 'a count'} rose by {count_delta} over the "
+                                 f"observation window while heap / RSS stayed flat: a count without memory behind it "
+                                 f"is not retained objects.",
+                contradicting_facts=[f"count +{count_delta} with no memory growth in the same window"],
+                recommended_action="Refute object accumulation; the growing integer is not backed by memory.",
+                details={"object_accumulation_confirmed": False, "count_without_memory_growth": True},
+            )
+        if grew is None:
+            return RecipeEvaluationResult(
+                recipe_id=rid,
+                status=RECIPE_STATUS_INSUFFICIENT_EVIDENCE,
+                confidence=0.30,
+                confidence_basis=f"{data.get('container_name') or 'a count'} rose by {count_delta}, but memory "
+                                 f"growth in the same window was not measured.",
+                missing_evidence=["heap_or_rss_growth_in_the_same_window"],
+                limitations=recipe.limitations,
+            )
+    if obj_delta is None and absolute is not None and absolute <= 5:
+        obj_delta = absolute            # a near-empty container: bounded at this moment (not a fault either way)
+    if obj_delta is None and absolute is not None:
+        return RecipeEvaluationResult(
+            recipe_id=rid,
+            status=RECIPE_STATUS_INSUFFICIENT_EVIDENCE,
+            confidence=0.25,
+            confidence_basis=f"One reading of {data.get('container_name') or 'the container'} ({absolute}); a size "
+                             f"at one moment is not accumulation.",
+            missing_evidence=["container_size_across_epochs"],
+            limitations=recipe.limitations,
+        )
     if obj_delta is not None and obj_delta > 50:
         return RecipeEvaluationResult(
             recipe_id=rid,
@@ -2201,7 +2313,7 @@ def _rule_long_lived_object_accumulation(recipe: DiagnosticRecipe, data: Dict[st
             confidence_basis=f"Object population remains stable without unbounded accumulation (count={obj_delta}).",
             contradicting_facts=["Object population stable"],
             recommended_action="Refute object accumulation hypothesis.",
-            details={"object_accumulation_confirmed": False},
+            details={"object_accumulation_confirmed": False, "population_stable": True},
         )
     return RecipeEvaluationResult(
         recipe_id=rid,
@@ -2390,7 +2502,7 @@ def _rule_heap_metadata_corruption(recipe: DiagnosticRecipe, data: Dict[str, Any
             confidence_basis="Heap chunk canaries intact across audited chunks.",
             contradicting_facts=["Canaries valid"],
             recommended_action="Refute heap metadata corruption for this region.",
-            details={"corruption_confirmed": False},
+            details={"corruption_confirmed": False, "canaries_intact": True},
         )
     return None
 
@@ -2478,14 +2590,17 @@ def _rule_allocation_free_imbalance(recipe: DiagnosticRecipe, data: Dict[str, An
     free_count = data.get("free_count") if data.get("free_count") is not None else data.get("cumulative_frees")
     if alloc_count is not None and free_count is not None:
         if alloc_count >= 5 * max(1, free_count):
+            # A static ratio is not a leak (a pool allocated once and never freed by design has the same ratio);
+            # an imbalance needs the gap to GROW over the window - the delta branch above.
             return RecipeEvaluationResult(
                 recipe_id=rid,
-                status=RECIPE_STATUS_SUPPORTED,
-                confidence=0.92,
-                confidence_basis=f"Severe allocation/free imbalance: {alloc_count} allocations vs {free_count} frees.",
-                supporting_facts=[f"Allocs: {alloc_count}, Frees: {free_count}"],
-                recommended_action="Audit object lifetime and ensure symmetrical free() in destructors.",
-                details={"imbalance_confirmed": True},
+                status=RECIPE_STATUS_INSUFFICIENT_EVIDENCE,
+                confidence=0.30,
+                confidence_basis=f"Allocation/free counters read {alloc_count} vs {free_count} at one moment; a "
+                                 f"static ratio is not an imbalance until the gap is seen to grow over the window.",
+                missing_evidence=["alloc_free_gap_growth_over_window"],
+                limitations=recipe.limitations,
+                details={"imbalance_confirmed": False, "static_ratio_only": True},
             )
         elif abs(alloc_count - free_count) <= max(10, int(0.05 * alloc_count)):
             return RecipeEvaluationResult(
@@ -2523,6 +2638,20 @@ def _rule_suspicious_boundary_values(recipe: DiagnosticRecipe, data: Dict[str, A
     rid = recipe.recipe_id
     val = data.get("value") or data.get("observed_value")
     if val in (0xFFFFFFFF, 0x7FFFFFFF, 0xFFFFFFFFFFFFFFFF, -1):
+        # -1 / all-ones / INT_MAX are very often VALID sentinels ("not configured", "no limit", an unopened fd).
+        # The value is an anomaly only against an expected range that excludes it.
+        rng = data.get("valid_range") or data.get("expected_bounds")
+        if not (isinstance(rng, (list, tuple)) and len(rng) == 2 and not (rng[0] <= val <= rng[1])):
+            return RecipeEvaluationResult(
+                recipe_id=rid,
+                status=RECIPE_STATUS_INSUFFICIENT_EVIDENCE,
+                confidence=0.20,
+                confidence_basis=f"{data.get('variable_name') or 'a variable'} holds the sentinel-like value {val}; "
+                                 f"without an expected range it is not judged (a sentinel is often valid).",
+                missing_evidence=["expected_value_range"],
+                limitations=recipe.limitations,
+                details={"boundary_violation": False, "sentinel_value_not_judged": val},
+            )
         return RecipeEvaluationResult(
             recipe_id=rid,
             status=RECIPE_STATUS_SUPPORTED,
@@ -2531,6 +2660,17 @@ def _rule_suspicious_boundary_values(recipe: DiagnosticRecipe, data: Dict[str, A
             supporting_facts=[f"Value {val} matches known sentinel/extreme"],
             recommended_action="Verify arithmetic underflow protection.",
             details={"boundary_violation": True},
+        )
+    if isinstance(val, int) and not isinstance(val, bool) and data.get("variable_type_kind", "integer") in ("integer", "enum"):
+        # the recipe's contradicting criterion: an integer state value that is no boundary / sentinel value
+        return RecipeEvaluationResult(
+            recipe_id=rid,
+            status=RECIPE_STATUS_CONTRADICTED,
+            confidence=0.70,
+            confidence_basis=f"{data.get('variable_name') or 'the state variable'} holds {val}, not a boundary or "
+                             f"sentinel value.",
+            contradicting_facts=[f"value {val} is no boundary / sentinel value"],
+            details={"boundary_violation": False},
         )
     return None
 
@@ -2557,7 +2697,7 @@ def _rule_inconsistent_related_variables(recipe: DiagnosticRecipe, data: Dict[st
             status=RECIPE_STATUS_SUPPORTED,
             confidence=0.95,
             confidence_basis=f"Coupled variable invariant violation detected: length ({length}) exceeds capacity ({cap}).",
-            supporting_facts=[f"Length {length} exceeds capacity {cap}"],
+            supporting_facts=list(data.get("field_inconsistency_facts") or [f"Length {length} exceeds capacity {cap}"]),
             recommended_action="Audit bounds checking on buffer write routines.",
             details={"invariant_violation_confirmed": True, "field_inconsistency": True, "capacity": cap, "length": length},
         )
@@ -2771,7 +2911,9 @@ def _rule_repeated_allocation_patterns(recipe: DiagnosticRecipe, data: Dict[str,
     rid = recipe.recipe_id
     if not (not ("positive_evidence_found" in data or "negative_evidence_found" in data)):
         return None
-    if data.get("unreclaimed_site_growth") is True or (data.get("alloc_delta", 0) > 100 and data.get("free_delta", 0) == 0):
+    # alloc_delta / free_delta are None when the counter source changed between epochs: not comparable
+    a_d, f_d = data.get("alloc_delta"), data.get("free_delta")
+    if data.get("unreclaimed_site_growth") is True or (a_d is not None and f_d is not None and a_d > 100 and f_d == 0):
         return RecipeEvaluationResult(
             recipe_id=rid,
             status=RECIPE_STATUS_SUPPORTED,
@@ -2824,7 +2966,6 @@ def _rule_shared_state_inconsistencies(recipe: DiagnosticRecipe, data: Dict[str,
 
 _RULES: Dict[str, Callable[[DiagnosticRecipe, Dict[str, Any]], Optional[RecipeEvaluationResult]]] = {
     "RECIPE_INVALID_MEMORY_ACCESS": _rule_invalid_memory_access,
-    "RECIPE_DOUBLE_FREE": _rule_double_free,
     "RECIPE_INVALID_FREE": _rule_invalid_free,
     "RECIPE_USE_AFTER_FREE": _rule_use_after_free,
     "RECIPE_PROCESS_MEMORY_GROWTH": _rule_process_memory_growth,
@@ -2848,8 +2989,9 @@ _RULES: Dict[str, Callable[[DiagnosticRecipe, Dict[str, Any]], Optional[RecipeEv
 }
 
 
-# The 22 built-in recipes defined in this module (recipe definition files add more; see below).
-BUILTIN_RECIPE_IDS: Tuple[str, ...] = tuple(_RECIPES)
+# The 22 built-in recipes: those defined in this module plus RECIPE_DOUBLE_FREE, whose definition moved to its
+# recipe definition file (recipe_plugins/double_free.py) under its built-in id.  Other definition files add more.
+BUILTIN_RECIPE_IDS: Tuple[str, ...] = tuple(_RECIPES) + (RECIPE_DOUBLE_FREE,)
 
 # IMP-018: recipe definition files (extractor/recipe_plugins/*.py) register themselves here.
 def _load_recipe_plugins() -> None:
@@ -2861,3 +3003,31 @@ def _load_recipe_plugins() -> None:
 
 
 _load_recipe_plugins()
+
+
+# Declared cost of the baseline recipes (extractor.check_budget), measured on a quiet 4-core aarch64 host
+# (2026-11-14): a 2-thread idle server and a 301-thread target, per-check wall time from ``checks_run[].duration_s``.
+# (recipe, base seconds, seconds per target thread, shared collection paid by the first check that needs it)
+_WINDOW, _LOCK_WAIT = "observation_window", "lock_wait_samples"
+_DECLARED_COSTS = (
+    ("RECIPE_THREAD_STATE_ANOMALIES", 0.02, 0.002, _WINDOW),      # 0.014 s (2 thr, window paid) / 0.61 s (301 thr)
+    ("RECIPE_LONG_RUNNING_BLOCKED_THREADS", 0.02, 0.002, _WINDOW),  # 0.014 s / 0.60 s
+    ("RECIPE_SUSPICIOUS_LOCK_OWNERSHIP", 0.02, 0.0017, ""),       # 0.013 s / 0.50 s
+    ("RECIPE_POTENTIAL_DEADLOCK_PATTERNS", 0.02, 0.0018, ""),     # 0.013 s / 0.54 s
+    ("RECIPE_PROCESS_MEMORY_GROWTH", 0.05, 0.0, _WINDOW),         # 0.76 s / 2.85 s when it pays the window, else 0.07 s
+    ("RECIPE_HEAP_METADATA_CORRUPTION", 0.05, 0.0, ""),           # 0.004-0.01 s (heap walk capped at 8 MiB)
+    ("RECIPE_DOUBLE_FREE", 0.1, 0.001, ""),                       # 0.11 s / 0.29 s
+    ("RECIPE_FD_LEAK", 0.8, 0.0003, ""),                          # 0.81 s / 0.89 s (own fd sampling series)
+    ("RECIPE_LOCK_CONTENTION", 0.01, 0.0005, ""),                 # 0.007 s / 0.15 s
+    ("RECIPE_ORPHAN_LOCK", 0.01, 0.0002, _LOCK_WAIT),             # 0.17 s / 1.03 s when it pays the lock-wait samples
+    ("RECIPE_SELF_DEADLOCK", 0.01, 0.0002, _LOCK_WAIT),           # 0.006 s / 0.09 s after them, 1.08 s when it pays
+    ("RECIPE_MAPPING_GROWTH", 0.9, 0.0003, ""),                   # 0.91 s / 1.00 s (own maps series)
+    ("RECIPE_THREAD_LEAK", 0.02, 0.0, _WINDOW),                   # 0.0075 s / 2.96 s when it pays the window
+    ("RECIPE_FREED_MEMORY_USE", 0.05, 0.0004, ""),                # 0.006 s / 0.13 s (reuses the integrity heap walk)
+    # not baseline (never budgeted), declared so a run knows they collected the shared window (memory trend)
+    ("RECIPE_ALLOCATION_FREE_IMBALANCE", 0.05, 0.0, _WINDOW),
+    ("RECIPE_HEAP_GROWTH", 0.05, 0.0, _WINDOW),
+)
+for _rid, _base, _per_thread, _shared in _DECLARED_COSTS:
+    if _rid in _RECIPES:
+        declare_cost(_rid, _base, _per_thread, _shared)

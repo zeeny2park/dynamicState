@@ -11,6 +11,7 @@ Validates:
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -19,6 +20,7 @@ import time
 import unittest
 
 from tests.fixture_builds import ensure_real_runtime_app_debug
+from tests.support.fixture_process import fixture_popen
 
 
 class TestCliAdaptiveReportIntegration(unittest.TestCase):
@@ -29,7 +31,7 @@ class TestCliAdaptiveReportIntegration(unittest.TestCase):
         cls.tmp_dir = tempfile.mkdtemp(prefix="ds_cli_test_")
         cls.target_bin = ensure_real_runtime_app_debug()
 
-        cls.proc = subprocess.Popen(
+        cls.proc = fixture_popen(
             [cls.target_bin],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
@@ -126,7 +128,8 @@ class TestCliAdaptiveReportIntegration(unittest.TestCase):
             md_text = f.read()
 
         self.assertIn("# dynamicState Zero-Stop Runtime Incident Report", md_text)
-        self.assertIn("## 1. Target Identity", md_text)
+        self.assertIn("## 1. Conclusion", md_text)
+        self.assertRegex(md_text, r"(?m)^## \d+\. How the diagnosis was done and what it cost the target$")
 
         data = json.loads(res.stdout)
         self.assertEqual(data.get("saved_path"), os.path.abspath(md_out))
@@ -393,7 +396,8 @@ class TestCliAdaptiveReportIntegration(unittest.TestCase):
         with open(html_out, "r", encoding="utf-8") as f:
             html_content = f.read()
         self.assertIn(data["verdict"], html_content)
-        self.assertNotIn("CONFIRMED_FAULT", html_content)
+        # the shared theme's stylesheet names every verdict tone (.tone-CONFIRMED_FAULT); the report itself must not
+        self.assertNotIn("CONFIRMED_FAULT", re.sub(r"(?is)<style\b.*?</style>", "", html_content))
 
 
 if __name__ == "__main__":

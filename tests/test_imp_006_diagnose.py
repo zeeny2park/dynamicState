@@ -17,6 +17,7 @@ import unittest
 import scripts.mcp_server as mcp_srv
 from extractor.expert_diagnostic_engine import DiagnoseResult, ExpertDiagnosticEngine, diagnose
 from extractor.diagnostic_verdict_aggregator import ALL_OVERALL_VERDICTS
+from tests.support.fixture_process import fixture_popen
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 FIXTURES = os.path.join(ROOT, "tests", "fixtures", "real_runtime")
@@ -25,7 +26,7 @@ SETTLE_S = 0.5
 RESULT_KEYS = {
     "schema_version", "verdict", "confidence", "confidence_basis", "summary", "findings", "checks_run",
     "not_covered", "collection_impact", "report_path", "report", "investigation_id", "target", "state",
-    "stop_reason", "duration_s", "healthy_scope",
+    "stop_reason", "duration_s", "healthy_scope", "symptom_interpretation", "process_profile",
 }
 
 
@@ -44,7 +45,7 @@ class TestDiagnoseEntryPoint(unittest.TestCase):
         cls.corpus = os.path.join(cls.tmp, "corpus")
 
     def _launch(self, name):
-        proc = subprocess.Popen([self.bins[name]], stdin=subprocess.DEVNULL,
+        proc = fixture_popen([self.bins[name]], stdin=subprocess.DEVNULL,
                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
         def _kill():

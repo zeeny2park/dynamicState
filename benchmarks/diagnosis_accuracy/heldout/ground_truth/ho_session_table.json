@@ -1,0 +1,42 @@
+{
+  "id": "ho_session_table",
+  "suite": "heldout",
+  "origin": "new",
+  "naming": "neutral",
+  "kind": "memory_leak",
+  "source": "benchmarks/diagnosis_accuracy/heldout/targets/ho_session_table.cpp",
+  "sources": [
+    "benchmarks/diagnosis_accuracy/heldout/targets/ho_session_table.cpp"
+  ],
+  "language": "c++",
+  "build": {
+    "compiler": "g++",
+    "opt": "-O2",
+    "flags": [
+      "-std=c++17"
+    ]
+  },
+  "style": "C++ std::vector<T*>::erase without delete, std::thread, -O2",
+  "symptom": "memory usage of this process keeps growing",
+  "ready": {
+    "mode": "stdout_marker"
+  },
+  "causes": {
+    "variables": [],
+    "locks": [],
+    "threads": [
+      "sessions"
+    ],
+    "functions": [
+      "retire_oldest"
+    ]
+  },
+  "locations": [
+    {
+      "file": "benchmarks/diagnosis_accuracy/heldout/targets/ho_session_table.cpp",
+      "line": 29,
+      "text": "live_.erase(live_.begin());"
+    }
+  ],
+  "notes": "leak without owner: the oldest session pointer is erased from the vector and never deleted"
+}

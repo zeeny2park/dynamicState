@@ -18,6 +18,7 @@ import unittest
 from extractor.agent_runtime import AgentRuntime
 from extractor.watch_session import WatchSessionManager
 from extractor.web.server import WebApiAdapter
+from tests.support.fixture_process import fixture_popen
 
 
 class TestPhase38PoolScannerAndThreadOwnerLookup(unittest.TestCase):
@@ -128,7 +129,7 @@ int main() {
             ["g++", "-g", "-O0", "-pthread", cls.src_path, "-o", cls.bin_path],
             check=True,
         )
-        cls.proc = subprocess.Popen([cls.bin_path])
+        cls.proc = fixture_popen([cls.bin_path])
         # Wait until worker thread has initialized its stack frame and set g_ready
         time.sleep(0.25)
 
