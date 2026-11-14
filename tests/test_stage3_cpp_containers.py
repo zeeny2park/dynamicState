@@ -327,5 +327,37 @@ class TestLeakFinding(_Base):
         self.assertGreaterEqual(o["capacity"], o["size_last"])
 
 
+@unittest.skipUnless(shutil.which("make") and shutil.which("gcc"), "make/gcc needed for the native collector")
+class TestRemoteTarget(_Base):
+    """The same decode through the remote adapter (native collector behind a local ``sh`` transport, as in
+    tests/test_imp006_remote_diagnose.py): no local /proc read of the target is needed for it."""
+
+    def test_d_remote_vector_owner_is_decoded(self):
+        from extractor.expert_diagnostic_engine import TargetSpec, diagnose
+        from tests.test_imp006_remote_diagnose import COLLECTOR_SRC, local_sh_runner, local_sh_stream
+        build = os.path.join(self.tmp, "collector")
+        if not os.path.isdir(build):
+            shutil.copytree(COLLECTOR_SRC, build,
+                            ignore=shutil.ignore_patterns("*.o", "dist", "dynamicstate-collector", "test_crypto"))
+        r = subprocess.run(["make", "-C", build, "dynamicstate-collector"], capture_output=True, text=True)
+        if r.returncode != 0:
+            self.skipTest("native collector build failed: " + r.stderr[-300:])
+        spec = TargetSpec(remote_host="board.example", ssh_user="root",
+                          collector_path=os.path.join(build, "dynamicstate-collector"),
+                          command_runner=local_sh_runner, stream_opener=local_sh_stream)
+        proc, gt = self.launch("vector")
+        res = diagnose(proc.pid, self.binary, MEMORY_SYMPTOM, corpus_dir=os.path.join(self.tmp, "corpus_r"),
+                       include_report=True, target=spec).to_dict()
+        leaks = [f for f in res["findings"] if f["category"] == "MEMORY_LEAK"]
+        self.assertEqual(len(leaks), 1, res["findings"])
+        self.assertIn("g_registry[*]", leaks[0]["subjects"])
+        li = next((c.get("actual_observations") or {}).get("leak_investigation")
+                  for c in res["report"]["section_d_detailed_inspection_results"]["checks"]
+                  if c["recipe_id"] == "RECIPE_PROCESS_MEMORY_GROWTH")
+        c = next(o for o in li["growth_owners"] if o["variable"] == "g_registry")["container"]
+        self.assertTrue(c["decoded"], c)
+        self.assertGreater(c["size_last"], 300)
+
+
 if __name__ == "__main__":
     unittest.main()
