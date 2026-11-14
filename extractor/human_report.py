@@ -427,6 +427,10 @@ T: Dict[str, Tuple[str, str]] = {
     "f_cands": ("**Location candidates** (static analysis, not observed): {locs}.",
                 "**위치 후보**(정적 분석, 관측 아님): {locs}."),
     "f_cands_head": ("Location candidates (static analysis, not observed)", "위치 후보 (정적 분석, 관측 아님)"),
+    # selective tracing mode (extractor.tracing_mode): observed at runtime via eBPF/uprobe
+    "f_traced": ("**Traced locations** (observed at runtime via eBPF/uprobe): {locs}.",
+                 "**추적 관측 위치**(eBPF/uprobe 런타임 관측): {locs}."),
+    "f_traced_head": ("Traced locations (observed at runtime via eBPF/uprobe)", "추적 관측 위치 (eBPF/uprobe 런타임 관측)"),
     # object relations (extractor.object_relations): memory object <- owning variable <- thread, each link with how
     "f_rel": ("**Relation**: {chain}.", "**관계**: {chain}."),
     "rel_arrow": (" ← ({how}) ", " ← ({how}) "),
@@ -476,6 +480,11 @@ T: Dict[str, Tuple[str, str]] = {
                      "디버그 정보와 소스 코드로 고른 후보이며 실행 중에 본 위치가 아닙니다. 결함이 생긴 위치를 확인한 "
                      "것도 아닙니다. 발견과 얼마나 직접 이어지는지에 따라 순위를 매겼습니다."),
     "f_cand_item": ("`{loc}` in `{fn}`: `{stmt}`. Why: {why}.", "`{loc}`(`{fn}`): `{stmt}`. 고른 이유: {why}."),
+    "f_traced_note": ("Directly observed at runtime using Linux eBPF uprobe/uretprobe dynamic event tracing. "
+                      "These locations represent actual execution call sites during the observation window.",
+                      "Linux eBPF uprobe/uretprobe 동적 이벤트 추적으로 런타임에 직접 관측한 위치입니다. "
+                      "관측 구간 동안 실행된 실제 호출 지점입니다."),
+    "f_traced_item": ("`{loc}` in `{fn}()`: {why}.", "`{loc}`(`{fn}()`): {why}."),
     "sev_CRITICAL": ("critical", "치명적"), "sev_HIGH": ("high", "높음"), "sev_MEDIUM": ("medium", "중간"),
     "sev_WARNING": ("warning", "경고"), "sev_LOW": ("low", "낮음"), "sev_INFO": ("informational", "참고"),
     # next steps
@@ -1370,12 +1379,16 @@ def _finding_blocks(ctx: _Ctx, res: Dict[str, Any], renders: List[Dict[str, Any]
         if cands:
             facts.append(ctx.t("f_cands", locs=_join([f"`{c['location']}`" for c in
                                                       (f.get("location_candidates") or {}).get("candidates")])))
+        traced = traced_location_lines(ctx, f)
+        if traced:
+            facts.append(ctx.t("f_traced", locs=_join([f"`{c['location']}`" for c in
+                                                       (f.get("traced_locations") or {}).get("locations")])))
         diagram = []
         if r.get("diagram"):
             diagram = [f"**{ctx.t('h2_wait')}**", "```", ctx.t("d_hdr")] + list(r["diagram"]) + ["```"]
         out.append({"i": i, "heading": ctx.t("f_head", i=i, label=_cat_label(ctx, str(f.get("category")))),
                     "facts": facts, "body": body, "diagram": diagram, "why": _finding_why(ctx, f, r),
-                    "cands": cands})
+                    "cands": cands, "traced": traced})
     return out
 
 
@@ -1455,6 +1468,21 @@ def location_candidate_lines(ctx: _Ctx, f: Dict[str, Any]) -> List[str]:
     return out
 
 
+def traced_location_lines(ctx: _Ctx, f: Dict[str, Any]) -> List[str]:
+    """The finding's runtime traced locations as list items (Markdown, report language); [] when none observed."""
+    tl = f.get("traced_locations") if isinstance(f.get("traced_locations"), dict) else {}
+    if not tl.get("observed") or not tl.get("locations"):
+        return []
+    out = []
+    for c in tl.get("locations") or []:
+        if not isinstance(c, dict) or not c.get("location"):
+            continue
+        why = c.get("reason_ko") if ctx.i == 1 and c.get("reason_ko") else c.get("reason")
+        fn = c.get("function") or "?"
+        out.append(ctx.t("f_traced_item", loc=c["location"], fn=fn, why=why or "-"))
+    return out
+
+
 def _finding_why(ctx: _Ctx, f: Dict[str, Any], r: Dict[str, Any]) -> List[str]:
     """What was observed and what was inferred from it, for the categories the frame knows (else nothing: a
     registered text already says it)."""
@@ -1491,6 +1519,9 @@ def _section2(ctx: _Ctx, blocks: List[Dict[str, Any]]) -> List[str]:
             out += b["diagram"] + [""]
         if b["why"]:
             out += [ctx.t("f_why"), ""] + [f"{n}. {x}" for n, x in enumerate(b["why"], 1)] + [""]
+        if b.get("traced"):
+            out += [f"**{ctx.t('f_traced_head')}**", "", ctx.t("f_traced_note"), ""] + [
+                f"{n}. {x}" for n, x in enumerate(b["traced"], 1)] + [""]
         if b.get("cands"):
             out += [f"**{ctx.t('f_cands_head')}**", "", ctx.t("f_cands_note"), ""] + [
                 f"{n}. {x}" for n, x in enumerate(b["cands"], 1)] + [""]
@@ -2056,7 +2087,8 @@ def diagnose_with_summary(pid: int, debug_image: Optional[str] = None, symptom: 
                           corpus_dir: Optional[str] = None, target: Any = None,
                           adapter: Any = None, symptom_fields: Any = None,
                           keep_report: bool = False, default_check_budget_s: Optional[float] = None,
-                          default_check_max_s: Optional[float] = None) -> Tuple[Dict[str, Any], str]:
+                          default_check_max_s: Optional[float] = None,
+                          enable_tracing: Optional[bool] = None) -> Tuple[Dict[str, Any], str]:
     """Run ``diagnose`` once and return ``(result_dict_without_inline_report, human_summary_markdown)``.
 
     The inline full report is requested only to give the summary its names and numbers; it is dropped from the
@@ -2074,6 +2106,8 @@ def diagnose_with_summary(pid: int, debug_image: Optional[str] = None, symptom: 
         kw["default_check_budget_s"] = default_check_budget_s
     if default_check_max_s is not None:
         kw["default_check_max_s"] = default_check_max_s
+    if enable_tracing is not None:
+        kw["enable_tracing"] = enable_tracing
     res = diagnose(pid, debug_image=debug_image, symptom=symptom, time_limit_s=time_limit_s,
                    include_report=True, **kw)
     d = res.to_dict()

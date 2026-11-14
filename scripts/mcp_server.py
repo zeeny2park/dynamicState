@@ -774,6 +774,7 @@ def runtime_diagnose_process(
     related_objects: Optional[List[str]] = None,
     default_check_budget_s: Optional[float] = None,
     default_check_max_s: Optional[float] = None,
+    enable_tracing: Optional[bool] = None,
 ) -> str:
     """Diagnose a live Linux process end to end in ONE call and return the final verdict.
 
@@ -847,7 +848,7 @@ def runtime_diagnose_process(
             pid, debug_image=debug_image, symptom=symptom, time_limit_s=time_limit_s,
             engine=runtime.expert_diagnostic_engine, lang=lang, target=remote_target,
             symptom_fields=symptom_fields, default_check_budget_s=default_check_budget_s,
-            default_check_max_s=default_check_max_s,
+            default_check_max_s=default_check_max_s, enable_tracing=enable_tracing,
         )
         out["human_summary"] = summary
         return _format_watch_result(out)

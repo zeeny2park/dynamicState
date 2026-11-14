@@ -4430,6 +4430,7 @@ def diagnose(
     symptom_fields: Any = None,
     default_check_budget_s: Optional[float] = None,
     default_check_max_s: Optional[float] = None,
+    enable_tracing: Optional[bool] = None,
 ) -> DiagnoseResult:
     """Diagnose live process ``pid`` end to end in one call and return a :class:`DiagnoseResult`.
 
@@ -4540,7 +4541,7 @@ def diagnose(
                              time_limit_s=time_limit_s, max_steps=max_steps, include_report=include_report,
                              engine=engine, extra_target=extra_target, pre_nc=pre_nc, t0=t0, remote=remote,
                              symptom_fields=symptom_fields, default_check_budget_s=default_check_budget_s,
-                             default_check_max_s=default_check_max_s)
+                             default_check_max_s=default_check_max_s, enable_tracing=enable_tracing)
     finally:
         if own_adapter is not None:
             try:
@@ -4596,6 +4597,7 @@ def _diagnose_run(
     symptom_fields: Any = None,
     default_check_budget_s: Optional[float] = None,
     default_check_max_s: Optional[float] = None,
+    enable_tracing: Optional[bool] = None,
 ) -> DiagnoseResult:
     res = _new_diagnose_result(pid, debug_image)
     res.target.update(extra_target)
@@ -4650,27 +4652,52 @@ def _diagnose_run(
         # IMP-020: bracket the whole collection with the target-load meter (never raises; unmeasured -> None).
         from .collection_impact import CollectionImpactMeter, impact_summary_for_report
         meter = CollectionImpactMeter(adapter, pid).start()
+
+        # Roadmap stage 3: selective tracing mode configuration
+        from .tracing_mode import is_tracing_enabled, check_tracing_support
+        from .diagnostic_recipes import CAP_ALLOCATION_TRACING, temporary_capabilities
+        from contextlib import nullcontext
+
+        tracing_on = is_tracing_enabled(enable_tracing)
+        if tracing_on:
+            supported, reason, prereqs = check_tracing_support()
+            if supported:
+                res.target["tracing_mode"] = "ENABLED_SUPPORTED"
+                caps_ctx = temporary_capabilities([CAP_ALLOCATION_TRACING])
+            else:
+                res.target["tracing_mode"] = "ENABLED_UNSUPPORTED"
+                nc.append({
+                    "kind": "tracing_limitation",
+                    "item": "ebpf_dynamic_tracing",
+                    "reason": f"tracing requested but unsupported: {reason}",
+                })
+                caps_ctx = nullcontext()
+        else:
+            res.target["tracing_mode"] = "DISABLED"
+            caps_ctx = nullcontext()
+
         session = None
         stage = "start_investigation"
-        try:
-            session = engine.start_investigation(
-                problem_statement=symptom or ("" if symptom_fields else DIAGNOSE_DEFAULT_SYMPTOM),
-                pid=pid, companion_elf=debug_image, adapter=adapter, budget_limits=limits,
-                symptom_fields=symptom_fields,
-                default_check_budget=DefaultCheckBudget.resolve(default_check_budget_s, default_check_max_s),
-            )
-            res.investigation_id = session.investigation_id
-            if getattr(session, "budget_tracker", None) is not None:
-                session.budget_tracker.attach_target_cpu_probe(meter.attributable_cpu_ms)
-            stage = "run_to_completion"
-            conclusion = session.run_to_completion(max_steps=max_steps)
-        except Exception as exc:  # noqa: BLE001
-            nc.append({"kind": "stage_failed", "item": stage, "reason": f"{type(exc).__name__}: {exc}"})
-            if session is not None:
-                res.state = session.state
-                res.checks_run = [_diagnose_check_row(c) for c in session.checks
-                                  if c.status not in (CheckStatus.NOT_EXECUTED, CheckStatus.SKIPPED)]
-            return _finish(f"The diagnosis failed during '{stage}' ({type(exc).__name__}). No conclusion was reached.")
+        with caps_ctx:
+            try:
+                session = engine.start_investigation(
+                    problem_statement=symptom or ("" if symptom_fields else DIAGNOSE_DEFAULT_SYMPTOM),
+                    pid=pid, companion_elf=debug_image, adapter=adapter, budget_limits=limits,
+                    symptom_fields=symptom_fields,
+                    default_check_budget=DefaultCheckBudget.resolve(default_check_budget_s, default_check_max_s),
+                )
+                res.investigation_id = session.investigation_id
+                if getattr(session, "budget_tracker", None) is not None:
+                    session.budget_tracker.attach_target_cpu_probe(meter.attributable_cpu_ms)
+                stage = "run_to_completion"
+                conclusion = session.run_to_completion(max_steps=max_steps)
+            except Exception as exc:  # noqa: BLE001
+                nc.append({"kind": "stage_failed", "item": stage, "reason": f"{type(exc).__name__}: {exc}"})
+                if session is not None:
+                    res.state = session.state
+                    res.checks_run = [_diagnose_check_row(c) for c in session.checks
+                                      if c.status not in (CheckStatus.NOT_EXECUTED, CheckStatus.SKIPPED)]
+                return _finish(f"The diagnosis failed during '{stage}' ({type(exc).__name__}). No conclusion was reached.")
 
         res.state = session.state
         if session.classification_result is not None and session.classification_result.interpretation:
@@ -4873,6 +4900,17 @@ def _diagnose_run(
         # Never subjects, never a status or verdict input; debug image + source text only (no target access).
         from .static_location_candidates import attach_location_candidates
         attach_location_candidates(res.findings, debug_image, report=report, profile=res.process_profile)
+        # Roadmap stage 3: selective tracing mode (findings[].traced_locations).
+        # When enable_tracing=True and supported, extracts runtime observed call sites.
+        try:
+            from .tracing_mode import attach_traced_locations
+            exe_path = debug_image if debug_image and os.path.exists(debug_image) else f"/proc/{pid}/exe"
+            attach_traced_locations(
+                res.findings, pid, exe_path, debug_image=debug_image,
+                enabled=(res.target.get("tracing_mode") == "ENABLED_SUPPORTED"),
+            )
+        except Exception:  # noqa: BLE001 - tracing is optional presentation; never breaks diagnosis
+            pass
         # Roadmap stage 3: finding -> memory object -> variable -> thread (findings[].object_relations); presentation
         # of the evidence above, never a status or verdict input.
         from .object_relations import attach_object_relations

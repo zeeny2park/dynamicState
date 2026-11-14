@@ -10,10 +10,11 @@ and analysis procedures for embedded Linux and C/C++ runtime investigations acro
 Every recipe is fully deterministic, self-contained, and testable without LLM dependencies.
 """
 
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 import hashlib
-from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Union
+from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple, Union
 
 from .allocator_inspector import FreeValidationOutcome, AllocatorType, FreeValidationResult
 from .temporal_observation_window import MemoryBehaviorClassification, TemporalAnalysisResult
@@ -120,6 +121,32 @@ CAPABILITY_DESCRIPTIONS: Dict[str, Tuple[str, str]] = {
                                "호출자가 지정하는 값 범위 또는 상태 전이 명세"),
 }
 AVAILABLE_CAPABILITIES: frozenset = frozenset()
+_ACTIVE_CAPABILITIES: Optional[frozenset] = None
+
+
+def get_available_capabilities() -> frozenset:
+    """Return the set of currently active capabilities (defaults to AVAILABLE_CAPABILITIES)."""
+    if _ACTIVE_CAPABILITIES is not None:
+        return _ACTIVE_CAPABILITIES
+    return AVAILABLE_CAPABILITIES
+
+
+def set_active_capabilities(caps: Optional[Iterable[str]]) -> None:
+    """Set the currently active capabilities globally (or None to reset to default)."""
+    global _ACTIVE_CAPABILITIES
+    _ACTIVE_CAPABILITIES = frozenset(caps) if caps is not None else None
+
+
+@contextmanager
+def temporary_capabilities(caps: Iterable[str]):
+    """Context manager to activate capabilities (such as CAP_ALLOCATION_TRACING in selective tracing mode)."""
+    global _ACTIVE_CAPABILITIES
+    prev = _ACTIVE_CAPABILITIES
+    _ACTIVE_CAPABILITIES = frozenset(caps)
+    try:
+        yield
+    finally:
+        _ACTIVE_CAPABILITIES = prev
 
 # Baseline checks: planned and executed for EVERY investigation, whatever the symptom wording says.  They are the
 # cheap, read-only, zero-stop checks; the symptom text only orders them and adds more specific / costlier recipes.
@@ -1061,22 +1088,26 @@ class DiagnosticRecipeRegistry:
         return _RECIPES.get(recipe_id)
 
     @classmethod
-    def missing_capabilities(cls, recipe_or_id: Union[str, DiagnosticRecipe]) -> Tuple[str, ...]:
+    def missing_capabilities(cls, recipe_or_id: Union[str, DiagnosticRecipe], *,
+                             active_caps: Optional[frozenset] = None) -> Tuple[str, ...]:
         """Capabilities the recipe declares that the current mode does not provide (empty: it can be planned)."""
         r = recipe_or_id if isinstance(recipe_or_id, DiagnosticRecipe) else _RECIPES.get(str(recipe_or_id))
         if r is None:
             return ()
-        return tuple(c for c in r.requires_capabilities if c not in AVAILABLE_CAPABILITIES)
+        caps = active_caps if active_caps is not None else get_available_capabilities()
+        return tuple(c for c in r.requires_capabilities if c not in caps)
 
     @classmethod
-    def is_plannable(cls, recipe_or_id: Union[str, DiagnosticRecipe]) -> bool:
-        return not cls.missing_capabilities(recipe_or_id)
+    def is_plannable(cls, recipe_or_id: Union[str, DiagnosticRecipe], *,
+                     active_caps: Optional[frozenset] = None) -> bool:
+        return not cls.missing_capabilities(recipe_or_id, active_caps=active_caps)
 
     @classmethod
-    def get_plannable_recipe(cls, recipe_id: str) -> Optional[DiagnosticRecipe]:
+    def get_plannable_recipe(cls, recipe_id: str, *,
+                             active_caps: Optional[frozenset] = None) -> Optional[DiagnosticRecipe]:
         """``get_recipe``, but None for a recipe the current mode cannot execute (plan construction uses this)."""
         r = _RECIPES.get(recipe_id)
-        return r if r is not None and cls.is_plannable(r) else None
+        return r if r is not None and cls.is_plannable(r, active_caps=active_caps) else None
 
     @classmethod
     def unsupported_recipes(cls) -> Dict[str, List[DiagnosticRecipe]]:

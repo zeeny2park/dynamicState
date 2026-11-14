@@ -534,6 +534,8 @@ def main():
     dx_p.add_argument("--default-check-max", dest="default_check_max_s", type=float, default=None,
                       help="Per-check limit in seconds for a default check (env DYNAMICSTATE_DEFAULT_CHECK_MAX_S, "
                            "default 2.5; <= 0: no limit)")
+    dx_p.add_argument("--enable-tracing", "--tracing", dest="enable_tracing", action="store_true", default=None,
+                      help="Enable selective eBPF/uprobe dynamic event tracing mode (default: disabled, zero-stop read-only)")
     dx_p.add_argument("--corpus", type=str, default="corpus", help="State Corpus directory (reports are written under <corpus>/reports)")
     dx_p.add_argument("--json", action="store_true", default=False,
                       help="Print the full result as JSON (the readable summary is under 'human_summary')")
@@ -1816,6 +1818,7 @@ def main():
             engine=ExpertDiagnosticEngine(corpus_dir=os.path.abspath(args.corpus)), lang=args.lang,
             target=remote_target, symptom_fields=symptom_fields,
             default_check_budget_s=args.default_check_budget_s, default_check_max_s=args.default_check_max_s,
+            enable_tracing=args.enable_tracing,
         )
         if args.json:
             result["human_summary"] = summary
