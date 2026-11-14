@@ -306,6 +306,7 @@ class TestPhase242TemporalIdentityAndClockSemantics(unittest.TestCase):
         res_normal = registry.evaluate_recipe(RECIPE_ALLOCATION_FREE_IMBALANCE, {
             "alloc_count": 5000,
             "free_count": 100,
+            "alloc_delta": 4000, "free_delta": 50,  # static ratio is not a leak: the gap grew over the window
         })
         self.assertEqual(res_normal.status, RECIPE_STATUS_SUPPORTED)
 

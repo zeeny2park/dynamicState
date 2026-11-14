@@ -198,6 +198,7 @@ class TestPhase21DeterministicRecipes(unittest.TestCase):
         pos = self.registry.evaluate_recipe(RECIPE_ALLOCATION_FREE_IMBALANCE, {
             "alloc_count": 1000,
             "free_count": 20,
+            "alloc_delta": 900, "free_delta": 10,  # static ratio is not a leak: the gap grew over the window
         })
         self.assertEqual(pos.status, RECIPE_STATUS_SUPPORTED)
 
@@ -237,6 +238,7 @@ class TestPhase21DeterministicRecipes(unittest.TestCase):
             "variable_name": "buffer_len",
             "value": 0xFFFFFFFF,
             "type": "uint32_t",
+            "valid_range": (0, 4096),  # a sentinel is an anomaly only against an expected range
         })
         self.assertEqual(pos.status, RECIPE_STATUS_SUPPORTED)
 

@@ -37,6 +37,15 @@ from ..target_adapter import TargetExecutionAdapter
 # ------------------------------------------------------------------------------------------
 # IMP-011: CFI unwinding helpers shared by the call-stack and frame-locals inspectors
 # ------------------------------------------------------------------------------------------
+_LOCK_TOKEN_RE = re.compile(r"[A-Z]+(?=[A-Z][a-z])|[A-Z]?[a-z]+|[A-Z]+|[0-9]+")
+_LOCK_TYPE_TOKENS = frozenset({"mutex", "lock", "rwlock", "spinlock", "sem"})
+
+
+def _lock_tokens(text: str) -> Set[str]:
+    """Whole-word tokens of a type or variable name: "clock_t" / "block_hdr" are not locks, "pthread_mutex_t" is."""
+    return {t.lower() for t in _LOCK_TOKEN_RE.findall(text or "")}
+
+
 def _imp011_prepare_unwinder(
     target_adapter: TargetExecutionAdapter, pid: int, target_abi: TargetABI,
     map_data: Dict[str, Any], endian: str,
@@ -339,8 +348,9 @@ def inspect_thread_callstacks_and_locks(
             tl = t_name.lower()
             is_explicit = bool(lock_expressions and var.name in lock_expressions)
             # IMP-018: a lock is selected by its TYPE; the name is used only when the type name is unknown
-            is_lock_like = any(k in tl for k in ("mutex", "lock", "rwlock", "spinlock", "sem_t")) or (
-                not tl.strip() and any(k in nl for k in ("mutex", "lock", "rwlock", "spinlock")))
+            # whole tokens, not substrings: a clock_t / struct block_hdr is not a lock
+            is_lock_like = bool(_lock_tokens(t_name) & _LOCK_TYPE_TOKENS) or (
+                not tl.strip() and bool(_lock_tokens(var.name) & (_LOCK_TYPE_TOKENS - {"sem"})))
             if (is_explicit or is_lock_like) and var.name not in seen_lock_names:
                 seen_lock_names.add(var.name)
                 rt_addr = (m_bias + var.link_time_address) if m_dyn else var.link_time_address
@@ -396,12 +406,12 @@ def inspect_thread_callstacks_and_locks(
             for m in canon_l.members:
                 if not m.name:
                     continue
-                mnl = m.name.lower()
-                if ("owner" in mnl or "tid" in mnl) and m.offset + 4 <= len(raw_lock):
+                mtok = _lock_tokens(m.name)
+                if mtok & {"owner", "tid"} and m.offset + 4 <= len(raw_lock):
                     custom_tid = struct.unpack("<i" if endian == "little" else ">i", raw_lock[m.offset:m.offset + 4])[0]
                     if custom_tid > 0:
                         owner_tid = custom_tid
-                elif ("lock" in mnl or "held" in mnl) and m.offset + 4 <= len(raw_lock):
+                elif mtok & {"lock", "locked", "held"} and m.offset + 4 <= len(raw_lock):
                     custom_lk = struct.unpack("<i" if endian == "little" else ">i", raw_lock[m.offset:m.offset + 4])[0]
                     if custom_lk != 0:
                         lock_word = custom_lk

@@ -330,7 +330,8 @@ class TestPhase241RecipeAccuracyAndEvidencePath(unittest.TestCase):
             },
             "RECIPE_ALLOCATION_FREE_IMBALANCE": {
                 "healthy": {"alloc_count": 100, "free_count": 100, "cumulative_allocations": 100, "cumulative_frees": 100},
-                "defect": {"alloc_count": 10000, "free_count": 10, "cumulative_allocations": 10000, "cumulative_frees": 10},
+                "defect": {"alloc_count": 10000, "free_count": 10, "cumulative_allocations": 10000, "cumulative_frees": 10,
+                           "alloc_delta": 9000, "free_delta": 5},  # static ratio is not a leak: the gap grew over the window
             },
             "RECIPE_OBJECT_LIFETIME_ANOMALIES": {
                 "healthy": {"lifetime_valid": True},
@@ -372,7 +373,7 @@ class TestPhase241RecipeAccuracyAndEvidencePath(unittest.TestCase):
             },
             "RECIPE_SUSPICIOUS_BOUNDARY_VALUES": {
                 "healthy": {"value": 50},
-                "defect": {"observed_value": -1},
+                "defect": {"observed_value": -1, "valid_range": (0, 100)},  # a sentinel is an anomaly only against an expected range
             },
             # Concurrency Domain
             "RECIPE_THREAD_STATE_ANOMALIES": {

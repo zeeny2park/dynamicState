@@ -129,7 +129,7 @@ class TestPhase23RecipeDiagnosticQuality(unittest.TestCase):
         # Defect: 1000 allocs vs 2 frees (>= 5x)
         res_fail = self.reg.evaluate_recipe(
             RECIPE_ALLOCATION_FREE_IMBALANCE,
-            {"alloc_count": 1000, "free_count": 2}
+            {"alloc_count": 1000, "free_count": 2, "alloc_delta": 900, "free_delta": 2}  # static ratio is not a leak: the gap grew over the window
         )
         self.assertEqual(res_fail.status, RECIPE_STATUS_SUPPORTED)
 

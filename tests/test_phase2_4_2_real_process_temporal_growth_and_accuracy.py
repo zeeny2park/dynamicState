@@ -256,6 +256,7 @@ class TestPhase242RealProcessTemporalGrowthAndAccuracy(unittest.TestCase):
         res_imbal = DiagnosticRecipeRegistry.evaluate_recipe(RECIPE_ALLOCATION_FREE_IMBALANCE, {
             "alloc_count": 1000,
             "free_count": 10,
+            "alloc_delta": 900, "free_delta": 0,  # static ratio is not a leak: the gap grew over the window
         })
         self.assertEqual(res_imbal.status, RECIPE_STATUS_SUPPORTED)
 
@@ -317,7 +318,7 @@ class TestPhase242RealProcessTemporalGrowthAndAccuracy(unittest.TestCase):
             },
             "RECIPE_ALLOCATION_FREE_IMBALANCE": {
                 "healthy": {"alloc_count": 100, "free_count": 100},
-                "defect": {"alloc_count": 10000, "free_count": 10},
+                "defect": {"alloc_count": 10000, "free_count": 10, "alloc_delta": 9000, "free_delta": 5},
             },
             "RECIPE_OBJECT_LIFETIME_ANOMALIES": {
                 "healthy": {"lifetime_valid": True},
@@ -357,7 +358,7 @@ class TestPhase242RealProcessTemporalGrowthAndAccuracy(unittest.TestCase):
             },
             "RECIPE_SUSPICIOUS_BOUNDARY_VALUES": {
                 "healthy": {"value": 42, "negative_evidence_found": True},
-                "defect": {"value": 0x7FFFFFFF},
+                "defect": {"value": 0x7FFFFFFF, "valid_range": (0, 1000)},  # a sentinel is an anomaly only against an expected range
             },
             "RECIPE_THREAD_STATE_ANOMALIES": {
                 "healthy": {"threads_healthy": True},
