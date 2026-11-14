@@ -77,6 +77,10 @@ W: Dict[str, Tuple[str, str]] = {
     "m_walk_n": (" ({n} blocks)", "(블록 {n}개)"),
     "m_classes": ("growing size classes: {x}", "늘어나는 크기 등급: {x}"),
     "m_class": ("{c} B blocks x {n}", "{c} B 블록 {n}개"),
+    "m_conts": ("C++ containers: {x}", "C++ 컨테이너: {x}"),
+    "m_cont": ("{v} ({t}) {n} elements{cap}{g}", "{v}({t}) 원소 {n}개{cap}{g}"),
+    "m_cont_cap": (", capacity {n}", ", 용량 {n}"),
+    "m_cont_g": (", {a} → {b} across the walks", ", 힙 조사 동안 {a} → {b}"),
     "m_integ": ("integrity check: heap walk {w}, {c} chunks, {d} damaged; {k} thread stacks checked{u}",
                 "무결성 점검: 힙 순회 {w}, 덩어리 {c}개, 손상 {d}건, 스레드 스택 {k}개 확인{u}"),
     "m_integ_nc": ("integrity check: heap {s}", "무결성 점검: 힙 {s}"),
@@ -311,6 +315,13 @@ def memory_lines(lx: Lx, mem: Dict[str, Any]) -> List[str]:
             hb.append(lx.t("m_walk_use", u=_size(walk["in_use_kb"]), n=n, basis=basis))
     if heap.get("growing_classes"):
         hb.append(lx.t("m_classes", x=", ".join(lx.t("m_class", c=c["chunk_b"], n=c["blocks"]) for c in heap["growing_classes"])))
+    if heap.get("containers"):
+        def _cont(c: Dict[str, Any]) -> str:
+            ser = [x for x in (c.get("size_series") or []) if x is not None]
+            g = lx.t("m_cont_g", a=ser[0], b=ser[-1]) if len(ser) >= 2 and ser[0] != ser[-1] else ""
+            cap = lx.t("m_cont_cap", n=c["capacity"]) if c.get("capacity") is not None else ""
+            return lx.t("m_cont", v=c.get("variable"), t=c.get("type"), n=c.get("size"), cap=cap, g=g)
+        hb.append(lx.t("m_conts", x="; ".join(_cont(c) for c in heap["containers"])))
     ig = mem.get("integrity")
     if ig:
         if ig.get("chunks") is not None:

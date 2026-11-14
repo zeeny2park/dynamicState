@@ -538,13 +538,45 @@ class JobExplorer:
 
         def read() -> Any:
             self._need_dwarf()                      # after the liveness check of ``run``: a gone target is 410 first
-            return t.mgr.evaluate_symbol_paths(pid=t.pid, companion_elf_path=elf, expressions=[expr], **t.remote_kw())
+            out = t.mgr.evaluate_symbol_paths(pid=t.pid, companion_elf_path=elf, expressions=[expr], **t.remote_kw())
+            r0 = (out.get("results") or [{}])[0]
+            if r0.get("status") == "OBSERVED":
+                cont = self._container(expr, r0.get("runtime_address"))
+                if cont:
+                    out["container"] = cont
+            return out
 
         raw, cost = t.run(read)
         r = (raw.get("results") or [{}])[0]
-        return {"expr": expr, "status": r.get("status"), "error": r.get("error"), "type": r.get("type_name"), "size": r.get("size"),
-                "addr": r.get("runtime_address"), "value": r.get("value"), "decl": r.get("source_location"),
-                "pointer": _is_pointer_type(r.get("type_name")), "cost": cost}
+        out = {"expr": expr, "status": r.get("status"), "error": r.get("error"), "type": r.get("type_name"), "size": r.get("size"),
+               "addr": r.get("runtime_address"), "value": r.get("value"), "decl": r.get("source_location"),
+               "pointer": _is_pointer_type(r.get("type_name")), "cost": cost}
+        if raw.get("container"):
+            out["container"] = raw["container"]
+        return out
+
+    def _container(self, expr: str, addr: Any) -> Optional[Dict[str, Any]]:
+        """Stage 3: a variable (``g_map`` / ``g_state.items``) that is a C++ standard container, decoded and validated
+        through the job's adapter (extractor.cpp_containers): size / capacity / counts, or why it could not be
+        decoded.  Only when the address agrees with the one the evaluation read.  Never raises."""
+        try:
+            from extractor.cpp_containers import ContainerMemory, ContainerPaths, decode, summary, text
+            idx = self._index()
+            bias = self._load_bias() if idx.elf_type == "ET_DYN" else 0
+            if bias is None:
+                return None
+            ref = ContainerPaths([(os.path.basename(self._need_elf()), idx, bias, idx.elf_type == "ET_DYN")]) \
+                .at_variable(None, expr)
+            a = addr if isinstance(addr, int) else (int(str(addr), 16) if addr is not None else None)
+            if ref is None or ref.address is None or a != ref.address:
+                return None
+            t = self.target
+            d = decode(ref.layout, ref.address, ContainerMemory.from_adapter(t.adapter, t.pid, max_bytes=16 * 1024))
+            out = summary(d)
+            out["text"] = text(d)
+            return out
+        except Exception:  # noqa: BLE001
+            return None
 
     def lock(self, name: str) -> Dict[str, Any]:
         """A mutex: owner and waiters with where each one is (one stack read of every thread) and the mutex words."""

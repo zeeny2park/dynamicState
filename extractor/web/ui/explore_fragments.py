@@ -67,6 +67,16 @@ F: Dict[str, Tuple[str, str]] = {
     "v_none": ("This executable has no globals or statics with that name.", "이 실행 파일에는 그런 이름의 전역·정적 변수가 없습니다."),
     "val_h": ("Value", "값"), "val_read": ("read {t} · {s} B once · {c}", "읽음 {t} · {s} B 1회 · {c}"),
     "val_follow": ("follow →", "따라가기 →"),
+    # stage 3: a C++ standard container decoded from its library fields and checked (extractor.cpp_containers)
+    "val_cont": ("{ty}: {n} {u}{cap} (decoded from the library's fields and checked)",
+                 "{ty}: {u} {n}개{cap} (라이브러리 필드에서 해독하고 검증함)"),
+    "val_cont_cap": (", capacity {n}", ", 용량 {n}"),
+    "val_cont_el": ("elements", "원소"), "val_cont_ch": ("characters", "문자"),
+    "val_cont_ptr": ("{ty}: points to {a}, use_count {u}, weak references {w}", "{ty}: {a}을(를) 가리킴, use_count {u}, 약한 참조 {w}개"),
+    "val_cont_uptr": ("{ty}: points to {a}", "{ty}: {a}을(를) 가리킴"),
+    "val_cont_null": ("{ty}: null", "{ty}: 널"),
+    "val_cont_fail": ("{ty}: contents not decoded ({m}); the fields above are the raw ones",
+                      "{ty}: 내용을 해독하지 못함({m}). 위 값은 원래 필드입니다"),
     "val_fail": ("Could not read {e}: {m}", "{e} 을(를) 읽지 못했습니다: {m}"),
     "val_more": ("… {n} more elements", "… {n}개 더"),
     "err_TARGET_EXITED": ("The target is gone: {m}. Values read before stay on screen.",
@@ -392,9 +402,30 @@ def value_fragment(lang: str, d: Dict[str, Any]) -> str:
             body += _follow(lang, expr, v)
         body += f'   <span class="c">{E(ty)}</span>'
     note = t(lang, "val_read", t=clock((d.get("cost") or {}).get("at")), s=d.get("size") or "?", c=cost_text(lang, d.get("cost")))
+    cont = container_note(lang, d.get("container"))
     return (f'<div><h4>{E(t(lang, "val_h"))} · <span class="mono">{E(expr)}</span> @ {E(str(d.get("addr") or "?"))}</h4>'
+            + (f'<p class="dt-note">{E(cont)}</p>' if cont else "") +
             f'<pre class="valbox">{body}</pre><div class="dt-actions" style="margin-top:6px"><span class="dt-note">{E(note)}</span>'
             f'<button type="button" class="btn btn-outline btn-sm" data-act="track" data-expr="{E(expr)}">{E(t(lang, "v_track"))}</button></div></div>')
+
+
+def container_note(lang: str, c: Any) -> str:
+    """One line for a decoded C++ container value (size / capacity / counts), or why it could not be decoded."""
+    if not isinstance(c, dict) or not c.get("type"):
+        return ""
+    ty = str(c["type"])
+    if not c.get("decoded"):
+        return t(lang, "val_cont_fail", ty=ty, m=str(c.get("reason") or "-"))
+    if c.get("kind") in ("std::shared_ptr", "std::weak_ptr", "std::unique_ptr"):
+        if c.get("null"):
+            return t(lang, "val_cont_null", ty=ty)
+        a = str((c.get("pointee") or {}).get("address") or "?")
+        if c.get("kind") == "std::unique_ptr":
+            return t(lang, "val_cont_uptr", ty=ty, a=a)
+        return t(lang, "val_cont_ptr", ty=ty, a=a, u=c.get("use_count"), w=c.get("weak_count"))
+    cap = t(lang, "val_cont_cap", n=c["capacity"]) if c.get("capacity") is not None else ""
+    return t(lang, "val_cont", ty=ty, n=c.get("size"), u=t(lang, "val_cont_ch" if c.get("kind") == "std::string" else "val_cont_el"),
+             cap=cap)
 
 
 # ------------------------------------------------------------------------------------------------ chips

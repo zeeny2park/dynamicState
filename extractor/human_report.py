@@ -114,6 +114,21 @@ T: Dict[str, Tuple[str, str]] = {
                    "이 블록들은 변수 {var}에서 계속 참조되고 있어 포인터를 잃어버린 것이 아니라, "
                    "항목이 계속 추가되기만 하고 제거되지 않는 상태입니다."),
     "w_leak_thread": ("The growing blocks are allocated by thread {thr}.", "증가하는 블록은 스레드 {thr}이(가) 할당합니다."),
+    # stage 3: the owner is a C++ container decoded from its library fields (extractor.cpp_containers), validated
+    "w_cont": ("{var} is a {type}: {size} {unit}{cap} at the last heap walk{grow}.",
+               "{var}은(는) {type}입니다: 마지막 힙 조사에서 {unit} {size}개{cap}{grow}."),
+    "w_cont_cap": (" (capacity {n})", "(용량 {n})"),
+    "w_cont_buckets": (" in {n} buckets", ", 버킷 {n}개"),
+    "w_cont_grow": ("; {first} → {last} across {n} heap walks", ", 힙 조사 {n}회 동안 {first} → {last}"),
+    "w_cont_unit_el": ("elements", "원소"),
+    "w_cont_unit_ch": ("characters", "문자"),
+    "w_cont_partial": ("Only {k} of {n} heap walks could decode it ({why}).",
+                       "힙 조사 {n}회 중 {k}회만 해독했습니다({why})."),
+    "w_cont_fail": ("{var} is a {type}, but its contents could not be decoded ({why}); the owner is shown by its raw "
+                    "path only.",
+                    "{var}은(는) {type}이지만 내용을 해독하지 못했습니다({why}). 소유자는 원래 경로로만 표시합니다."),
+    "w_cont_ptr": ("{var} is a {type}: it points to {addr}, use_count {use}, weak references {weak}.",
+                   "{var}은(는) {type}입니다: {addr}을(를) 가리키며 use_count {use}, 약한 참조 {weak}개."),
     "w_spin": ("Thread {thr} (tid {tid}) was runnable in {frac}% of the samples and used {cpu}% of a CPU while "
                "running in {fn} (defined at {loc}).",
                "스레드 {thr} (tid {tid})은(는) 샘플의 {frac}%에서 실행 가능 상태였고 CPU를 {cpu}% 사용하며 "
@@ -702,7 +717,7 @@ def _growth(f: Dict[str, Any], report: Optional[Dict[str, Any]]) -> Optional[Dic
                         "kb": round(float(g.get("bytes_delta") or 0) / 1024.0),
                         "win": li.get("window_s"), "rate": g.get("rate_kb_per_s"),
                         "thr": g.get("allocating_thread_name"), "tid": g.get("allocating_thread_tid"),
-                        "walks": li.get("walks"), "still_ref": True}
+                        "walks": li.get("walks"), "still_ref": True, "container": g.get("container")}
     m = re.search(r"under (\S+): \+(\d+) blocks / \+(\d+(?:\.\d+)?) KB in use over ([\d.]+) s \(([\d.]+) KB/s\)",
                   f.get("description") or "")
     kinds = _by_kind(f)
@@ -812,7 +827,34 @@ def _render_leak(ctx: _Ctx, f: Dict[str, Any], report: Optional[Dict[str, Any]])
         lines.append(ctx.t("w_leak_ref", var=_c(g["var"])))
     if g.get("thr"):
         lines.append(ctx.t("w_leak_thread", thr=_c(g["thr"]) + (f" (tid {g['tid']})" if g.get("tid") else "")))
+    lines.extend(container_lines(ctx, g.get("container")))
     return {"lines": lines, "g": g}
+
+
+def container_lines(ctx: "_Ctx", c: Any) -> List[str]:
+    """The decoded C++ container under a growing owner (leak_attribution growth row ``container``): its size (and
+    capacity) and the change across the walks; a container that could not be decoded says so and why."""
+    if not isinstance(c, dict) or not c.get("type"):
+        return []
+    var, typ = _c(c.get("path") or "?"), _c(c["type"])
+    if not c.get("decoded"):
+        return [ctx.t("w_cont_fail", var=var, type=typ, why=_c(c.get("reason") or "-"))]
+    out: List[str] = []
+    if c.get("kind") in ("std::shared_ptr", "std::weak_ptr") and c.get("use_count") is not None:
+        out.append(ctx.t("w_cont_ptr", var=var, type=typ, addr=_c((c.get("pointee") or {}).get("address") or "null"),
+                         use=c.get("use_count"), weak=c.get("weak_count")))
+    elif c.get("size_last") is not None:
+        cap = ctx.t("w_cont_cap", n=_num(c["capacity"])) if c.get("capacity") is not None else (
+            ctx.t("w_cont_buckets", n=_num(c["buckets"])) if c.get("buckets") is not None else "")
+        decoded = [x for x in (c.get("size_series") or []) if x is not None]
+        grow = ctx.t("w_cont_grow", first=_num(c["size_first"]), last=_num(c["size_last"]), n=len(decoded)) \
+            if len(decoded) >= 2 and c.get("size_first") != c.get("size_last") else ""
+        unit = ctx.t("w_cont_unit_ch" if c.get("kind") == "std::string" else "w_cont_unit_el")
+        out.append(ctx.t("w_cont", var=var, type=typ, size=_num(c["size_last"]), unit=unit, cap=cap, grow=grow))
+    if c.get("walks") and c.get("walks_decoded") is not None and c["walks_decoded"] < c["walks"]:
+        out.append(ctx.t("w_cont_partial", k=c["walks_decoded"], n=c["walks"],
+                         why=_c(str(c.get("partial_reason") or "-").split(": ", 1)[-1])))
+    return out
 
 
 def _render_thread(ctx: _Ctx, f: Dict[str, Any], report: Optional[Dict[str, Any]]) -> Dict[str, Any]:

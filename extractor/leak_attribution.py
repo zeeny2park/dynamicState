@@ -276,6 +276,8 @@ def census(analysis: Any) -> Dict[str, Any]:
     norm = _NormPaths(an)
     owners: Dict[str, Dict[str, Any]] = {}
     unreach: Dict[int, Dict[str, Any]] = {}
+    cpaths = _container_paths(an)
+    crefs: Dict[str, Any] = {}
     for ci in range(len(ct)):
         st = ct.states[ci]
         if st != ST_IN_USE and st != ST_MMAPPED:
@@ -302,6 +304,13 @@ def census(analysis: Any) -> Dict[str, Any]:
         else:
             node, suffix, root, _slot, _interior = lst[0]
             key, kind, label, rname, path = _owner_of(an, norm, node, suffix, root)
+            if cpaths is not None and path and kind in OWNED_KINDS:
+                # stage 3: a path through a C++ container's private members names the container instead
+                hit = cpaths.resolve(key.split(":", 2)[1] or None, path)
+                if hit is not None:
+                    path = hit[1]
+                    if key not in crefs:
+                        crefs[key] = hit[0]
         o = owners.get(key)
         if o is None:
             o = owners[key] = {"kind": kind, "label": label, "root": rname, "count": 0, "bytes": 0, "paths": Counter(),
@@ -311,9 +320,103 @@ def census(analysis: Any) -> Dict[str, Any]:
         o["bytes"] += sz
         if path:
             o["paths"][path] += 1
+    for key, ref in crefs.items():
+        owners[key]["container"] = {"path": ref.path, "kind": ref.layout.kind, "type": ref.layout.type_name}
     out["owners"] = owners
     out["unreachable"] = unreach
+    out["_container_refs"] = crefs
     return out
+
+
+# --------------------------------------------------------------------------------------------- C++ containers (stage 3)
+MAX_CONTAINER_DECODES_PER_WALK = 16
+CONTAINER_DECODE_BYTES_PER_WALK = 64 * 1024
+
+
+def _container_paths(an: Any) -> Any:
+    try:
+        from .cpp_containers import ContainerPaths
+        return ContainerPaths(an.modules) if getattr(an, "modules", None) else None
+    except Exception:  # noqa: BLE001 - the container view is an addition; the raw paths stay without it
+        return None
+
+
+def decode_owner_containers(analysis: Any, c: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+    """Validated decode (extractor.cpp_containers) of the C++ containers the census found under global/static owners,
+    read through the walk's budgeted reader right after the walk: {owner key: summary}.  Pops the census's
+    internal references.  At most ``MAX_CONTAINER_DECODES_PER_WALK`` owners (largest first), a few small reads each."""
+    refs = c.pop("_container_refs", None) or {}
+    if not refs or analysis is None or analysis.analyzer is None:
+        return {}
+    from .cpp_containers import ContainerMemory, decode, summary
+    mem = ContainerMemory.from_analysis(analysis, max_bytes=CONTAINER_DECODE_BYTES_PER_WALK)
+    out: Dict[str, Dict[str, Any]] = {}
+    order = sorted(refs, key=lambda k: -int((c.get("owners") or {}).get(k, {}).get("bytes") or 0))
+    for k in order[:MAX_CONTAINER_DECODES_PER_WALK]:
+        ref = refs[k]
+        d = summary(decode(ref.layout, ref.address, mem))
+        d["path"] = ref.path
+        out[k] = d
+    c["container_decode_bytes"] = mem.bytes_read
+    return out
+
+
+def _container_row(ok: List[Dict[str, Any]], key: str) -> Optional[Dict[str, Any]]:
+    """The container under an owner across the walks: size series (None where a walk's decode failed), the last
+    decode, and the reason when no walk could be decoded (the raw path then stands alone)."""
+    decs = [(w.get("containers") or {}).get(key) for w in ok]
+    if not any(decs):
+        return None
+    good = [d for d in decs if d and d.get("decoded")]
+    last = next((d for d in reversed(decs) if d), {})
+    row: Dict[str, Any] = {"path": last.get("path"), "kind": last.get("kind"), "type": last.get("type"),
+                           "walks_decoded": len(good), "walks": len(decs)}
+    if last.get("element_type"):
+        row["element_type"] = last["element_type"]
+    if not good:
+        row["decoded"] = False
+        row["reason"] = last.get("reason")
+        row["limitation"] = ("the owner %s is a %s, but its contents could not be decoded (%s): reported by its raw "
+                             "path only" % (last.get("path"), last.get("type"), last.get("reason")))
+        return row
+    row["decoded"] = True
+    if any("size" in d for d in good):
+        row["size_series"] = [d.get("size") if d and d.get("decoded") else None for d in decs]
+        sizes = [d["size"] for d in good if "size" in d]
+        row["size_first"], row["size_last"] = sizes[0], sizes[-1]
+        row["size_delta"] = sizes[-1] - sizes[0]
+    lg = good[-1]
+    row["last"] = lg
+    for k in ("capacity", "buckets", "use_count", "weak_count", "pointee", "null"):
+        if k in lg:
+            row[k] = lg[k]
+    bad = [d for d in decs if d and not d.get("decoded")]
+    if len(good) < len(decs):
+        row["partial_reason"] = "%d of %d walks decoded%s" % (
+            len(good), len(decs), (": " + str(bad[0].get("reason"))) if bad else "")
+    return row
+
+
+def container_observations(walks: List[Dict[str, Any]], skip_roots: Sequence[str] = ()) -> List[Dict[str, Any]]:
+    """Containers under global/static owners whose decoded size changed across the walks without making the owner a
+    growth owner (e.g. one std::string whose single block grows): an observation, never a verdict input."""
+    ok = [w for w in walks if w.get("ok")]
+    keys: List[str] = []
+    for w in ok:
+        for k in (w.get("containers") or {}):
+            if k not in keys:
+                keys.append(k)
+    out = []
+    for k in keys:
+        root = k.split(":", 2)[-1]
+        if root in skip_roots:
+            continue
+        row = _container_row(ok, k)
+        if row and row.get("decoded") and row.get("size_delta"):
+            row["variable"] = root
+            out.append(row)
+    out.sort(key=lambda r: -abs(int(r.get("size_delta") or 0)))
+    return out[:8]
 
 
 # --------------------------------------------------------------------------------------------- corroboration
@@ -495,6 +598,9 @@ def judge(walks: List[Dict[str, Any]], cfg: MemoryObservationConfig) -> Dict[str
                        growing_paths={p: pdelta[p] for p in top},
                        arena_index=(ar.most_common(1)[0][0] if ar else None),
                        mmapped=bool(ar) and ar.most_common(1)[0][0] == -1)
+            cont = _container_row(ok, k)
+            if cont is not None:
+                row["container"] = cont
             res["growth_owners"].append(row)
             res["facts"].append(
                 "unbounded growth under %s: +%d blocks / +%d KB in use over %.2f s (%.1f KB/s), still referenced "
@@ -641,13 +747,20 @@ def run_walk_series(adapter: Any, pid: int, companion_elf: Optional[str], cfg: M
             break
         we = time.monotonic()
         last_wall = we - ws
-        out["bytes_read"] += int(an.reader.bytes_read)
         if an.walk.status in _WALK_STATUS_UNSUPPORTED:
+            out["bytes_read"] += int(an.reader.bytes_read)
             out["status"] = INV_UNSUPPORTED
             out["unsupported_status"] = an.walk.status
             out["unsupported_reason"] = an.walk.message
             return out
         c = census(an)
+        try:
+            c["containers"] = decode_owner_containers(an, c)
+        except Exception as exc:  # noqa: BLE001 - never lose the walk over the container view
+            c.pop("_container_refs", None)
+            c["containers"] = {}
+            c["container_decode_error"] = "%s: %s" % (type(exc).__name__, exc)
+        out["bytes_read"] += int(an.reader.bytes_read)
         c["t"] = (ws + we) / 2.0
         c["ok"] = an.ok and an.walk.status in ("OK", "PARTIAL") and not an.info.get("reachability_error")
         c["wall_ms"] = round(last_wall * 1000.0, 1)
@@ -698,6 +811,9 @@ def investigate(adapter: Any, pid: int, companion_elf: Optional[str], cfg: Memor
             inv["limitations"].extend(v)
         else:
             inv[k] = v
+    cobs = container_observations(series["walks"], [str(r.get("variable")) for r in j.get("growth_owners") or []])
+    if cobs:
+        inv["container_observations"] = cobs
     an = series.get("last_analysis")
     # IMP-009: the last walk (object, not plain data) is handed to the session state by attach_memory_observation
     # so the integrity check can re-use it instead of walking again; never part of the recorded investigation

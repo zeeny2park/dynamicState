@@ -916,6 +916,9 @@ class HeapOwnershipAnalysis:
         res["reachability"] = an.reach_of(ci) if st in IN_USE_STATES else None
         res["referrers"] = an.referrers(ci)
         res["referrer_count"] = an.ref_counts.get(ci, 0)
+        oc = self._owner_container(res["referrers"])
+        if oc:
+            res["owner_container"] = oc
         res["leak_candidate"] = st in (ST_IN_USE, ST_MMAPPED) and an.reach[ci] == 0
         if res["leak_candidate"]:
             res["classification"] = "no reachable path (leak candidate)"
@@ -928,6 +931,25 @@ class HeapOwnershipAnalysis:
         else:
             res["classification"] = "reachable only through untyped / conservative references"
         return res
+
+    def _owner_container(self, referrers: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        """Stage 3: when the first typed global/static referrer path runs through a C++ container's private members,
+        the container (validated decode, extractor.cpp_containers) and the readable path; never raises."""
+        try:
+            from .cpp_containers import ContainerMemory, ContainerPaths, decode, summary
+            for r in referrers:
+                if r.get("kind") not in (KIND_GLOBAL, KIND_STATIC) or not r.get("path"):
+                    continue
+                hit = ContainerPaths(self.analyzer.modules).resolve(r.get("module"), r["path"])
+                if hit is None:
+                    return None
+                ref, readable = hit
+                d = summary(decode(ref.layout, ref.address, ContainerMemory.from_analysis(self)))
+                d.update(path=ref.path, readable_path=readable)
+                return d
+        except Exception:  # noqa: BLE001 - an addition to the raw referrers, never a failure of the lookup
+            return None
+        return None
 
     def leak_report(self, max_examples_per_class: int = 8, max_classes: int = 64) -> Dict[str, Any]:
         if not self.ok:
