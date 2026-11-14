@@ -1,0 +1,43 @@
+{
+  "id": "ho_ring_poll",
+  "suite": "heldout",
+  "origin": "new",
+  "naming": "neutral",
+  "kind": "busy_wait",
+  "source": "benchmarks/diagnosis_accuracy/heldout/targets/ho_ring_poll/main.c",
+  "sources": [
+    "benchmarks/diagnosis_accuracy/heldout/targets/ho_ring_poll/main.c",
+    "benchmarks/diagnosis_accuracy/heldout/targets/ho_ring_poll/ring.c"
+  ],
+  "language": "c",
+  "build": {
+    "compiler": "gcc",
+    "opt": "-O0",
+    "flags": []
+  },
+  "style": "multi-file, the loop calls a non-blocking pop in another file",
+  "symptom": "this process uses a full CPU core while doing nothing useful",
+  "ready": {
+    "mode": "stdout_marker"
+  },
+  "causes": {
+    "variables": [
+      "inbox"
+    ],
+    "locks": [],
+    "threads": [
+      "consumer"
+    ],
+    "functions": [
+      "consume"
+    ]
+  },
+  "locations": [
+    {
+      "file": "benchmarks/diagnosis_accuracy/heldout/targets/ho_ring_poll/main.c",
+      "line": 13,
+      "text": "if (ring_try_pop(&inbox, &v))"
+    }
+  ],
+  "notes": "retry loop around a pop that never waits"
+}

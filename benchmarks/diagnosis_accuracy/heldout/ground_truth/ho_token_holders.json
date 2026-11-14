@@ -1,0 +1,46 @@
+{
+  "id": "ho_token_holders",
+  "suite": "heldout",
+  "origin": "new",
+  "naming": "neutral",
+  "kind": "double_free",
+  "source": "benchmarks/diagnosis_accuracy/heldout/targets/ho_token_holders.cpp",
+  "sources": [
+    "benchmarks/diagnosis_accuracy/heldout/targets/ho_token_holders.cpp"
+  ],
+  "language": "c++",
+  "build": {
+    "compiler": "g++",
+    "opt": "-O0",
+    "flags": [
+      "-std=c++17"
+    ]
+  },
+  "style": "C++ two holder objects sharing one raw pointer, delete in a member function",
+  "symptom": "this program crashes sometimes and data looks wrong",
+  "ready": {
+    "mode": "stdout_marker"
+  },
+  "causes": {
+    "variables": [
+      "g_primary",
+      "g_backup"
+    ],
+    "locks": [],
+    "threads": [],
+    "functions": []
+  },
+  "locations": [
+    {
+      "file": "benchmarks/diagnosis_accuracy/heldout/targets/ho_token_holders.cpp",
+      "line": 14,
+      "text": "void release() { delete tok; }"
+    },
+    {
+      "file": "benchmarks/diagnosis_accuracy/heldout/targets/ho_token_holders.cpp",
+      "line": 42,
+      "text": "g_backup.release();"
+    }
+  ],
+  "notes": "fastbin cycle (tcache full): shared, other, shared"
+}

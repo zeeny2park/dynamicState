@@ -1,0 +1,47 @@
+target               kind            origin          verdict          det   names loc  cand  categories
+ho_accounts          deadlock        new             CONFIRMED_FAULT  yes    full yes     -  DEADLOCK_INDICATORS
+ho_arena_maps        mapping_growth  new             PROBABLE_FAULT   yes partial  no     -  MAPPING_GROWTH
+ho_config_reload     orphan_lock     new             INCONCLUSIVE      no    none  no     -  -
+ho_conn_close        use_after_free  new             PROBABLE_FAULT   yes    full  no    #1  USE_AFTER_FREE
+ho_detached_sessions thread_growth   new             CONFIRMED_FAULT  yes    full  no    #1  THREAD_LEAK
+ho_doc_index         memory_leak     new             CONFIRMED_FAULT  yes partial  no    #1  MEMORY_LEAK
+ho_frame_builder     heap_overflow   new             CONFIRMED_FAULT  yes    full  no     -  MEMORY_CORRUPTION
+ho_job_queue_full    orphan_lock     new             PROBABLE_FAULT   yes    full yes     -  ORPHAN_LOCK
+ho_job_spawn         thread_growth   new             CONFIRMED_FAULT  yes    full  no     -  THREAD_LEAK
+ho_journal           memory_leak     new             PROBABLE_FAULT   yes    full  no     -  MEMORY_LEAK
+ho_kv_names          heap_overflow   new             CONFIRMED_FAULT  yes    full  no     -  MEMORY_CORRUPTION
+ho_outbox_flush      double_free     new             CONFIRMED_FAULT  yes    full  no    #2  INVALID_DOUBLE_FREE,USE_AFTER_FREE
+ho_packet_dispatch   memory_leak     new             CONFIRMED_FAULT  yes    full  no     -  MEMORY_LEAK
+ho_plugin_registry   self_deadlock   new             CONFIRMED_FAULT  yes    full yes     -  SELF_DEADLOCK
+ho_ready_flag        busy_wait       new             PROBABLE_FAULT   yes partial  no     -  PROCESS_INSTABILITY
+ho_release_cb        use_after_free  new             PROBABLE_FAULT   yes    full  no    #1  USE_AFTER_FREE
+ho_ring_poll         busy_wait       new             PROBABLE_FAULT   yes partial yes     -  PROCESS_INSTABILITY
+ho_session_table     memory_leak     new             CONFIRMED_FAULT  yes    full  no WRONG  MEMORY_LEAK
+ho_stats_relock      self_deadlock   new             CONFIRMED_FAULT  yes    full yes     -  SELF_DEADLOCK
+ho_token_holders     double_free     new             CONFIRMED_FAULT  yes    full  no     -  INVALID_DOUBLE_FREE,USE_AFTER_FREE
+ho_wrapped_locks     deadlock        new             CONFIRMED_FAULT  yes    full yes     -  DEADLOCK_INDICATORS
+
+scored defects: detected 20/21, cause names full 16 partial 4, location 6
+static location candidates (not observed; not in 'location'): contain the true location 5/21, at rank 1 4; shown 6, wrong (shown, true location not among them) 1
+healthy: cleared 0, not cleared 0, false positives 0 (of 0), false clears 0 (of 21 defects); errors 0; non-zero-stop collections 0
+  memory_leak     detected 4/4  names 3/4  false clears 0
+  heap_overflow   detected 2/2  names 2/2  false clears 0
+  use_after_free  detected 2/2  names 2/2  false clears 0
+  double_free     detected 2/2  names 2/2  false clears 0
+  deadlock        detected 2/2  names 2/2  false clears 0
+  busy_wait       detected 2/2  names 0/2  false clears 0
+  thread_growth   detected 2/2  names 2/2  false clears 0
+  mapping_growth  detected 1/1  names 0/1  false clears 0
+  orphan_lock     detected 1/2  names 1/2  false clears 0
+  self_deadlock   detected 2/2  names 2/2  false clears 0
+  origin new             detected 20/21  names 16/21  healthy FP 0/0 nc 0
+
+diagnose time per target (first run): mean 4.615s max 9.85s; slowest checks (mean/max s over targets):
+  CHK_RECIPE_PROCESS_MEMORY_GROWTH_001   1.948   2.099  n=5  Process-Level Memory Growth & RSS Trajectory Investigation
+  CHK_RECIPE_ALLOCATION_FREE_IMBALANCE_004   0.530   1.062  n=4  Allocation / Free Imbalance & Leak Detector
+  CHK_RECIPE_THREAD_STATE_ANOMALIES_001   0.888   1.016  n=8  Thread State Anomalies & Abnormal Thread Status Audit
+  CHK_RECIPE_THREAD_LEAK_001     0.967   1.014  n=2  Thread Leak / Thread Exhaustion
+  CHK_RECIPE_MAPPING_GROWTH_015   0.938   0.974  n=4  Memory Growth Outside malloc (anonymous mappings, stacks)
+host loadavg at end of run: 1.51 1.30 2.17
+total wall time 114.1s
+results written to /tmp/ho_a4f_scripts/first_run.json

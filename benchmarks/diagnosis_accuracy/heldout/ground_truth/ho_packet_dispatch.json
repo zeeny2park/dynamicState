@@ -1,0 +1,45 @@
+{
+  "id": "ho_packet_dispatch",
+  "suite": "heldout",
+  "origin": "new",
+  "naming": "neutral",
+  "kind": "memory_leak",
+  "source": "benchmarks/diagnosis_accuracy/heldout/targets/ho_packet_dispatch.c",
+  "sources": [
+    "benchmarks/diagnosis_accuracy/heldout/targets/ho_packet_dispatch.c"
+  ],
+  "language": "c",
+  "build": {
+    "compiler": "gcc",
+    "opt": "-O2",
+    "flags": []
+  },
+  "style": "allocation macro, handlers called through a function-pointer table, prctl thread name, -O2",
+  "symptom": "memory usage of this process keeps growing",
+  "ready": {
+    "mode": "stdout_marker"
+  },
+  "causes": {
+    "variables": [],
+    "locks": [],
+    "threads": [
+      "rx"
+    ],
+    "functions": [
+      "dispatch"
+    ]
+  },
+  "locations": [
+    {
+      "file": "benchmarks/diagnosis_accuracy/heldout/targets/ho_packet_dispatch.c",
+      "line": 37,
+      "text": "struct packet *p = NEW(struct packet);"
+    },
+    {
+      "file": "benchmarks/diagnosis_accuracy/heldout/targets/ho_packet_dispatch.c",
+      "line": 44,
+      "text": "return;"
+    }
+  ],
+  "notes": "leak without owner: a data packet is dropped on the early return after its handler returns 0"
+}

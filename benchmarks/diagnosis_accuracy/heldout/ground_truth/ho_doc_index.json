@@ -1,0 +1,42 @@
+{
+  "id": "ho_doc_index",
+  "suite": "heldout",
+  "origin": "new",
+  "naming": "neutral",
+  "kind": "memory_leak",
+  "source": "benchmarks/diagnosis_accuracy/heldout/targets/ho_doc_index.cpp",
+  "sources": [
+    "benchmarks/diagnosis_accuracy/heldout/targets/ho_doc_index.cpp"
+  ],
+  "language": "c++",
+  "build": {
+    "compiler": "g++",
+    "opt": "-O0",
+    "flags": [
+      "-std=c++17"
+    ]
+  },
+  "style": "C++ class owning a std::vector of new'd objects",
+  "symptom": "memory usage of this process keeps growing",
+  "ready": {
+    "mode": "stdout_marker"
+  },
+  "causes": {
+    "variables": [
+      "g_index"
+    ],
+    "locks": [],
+    "threads": [
+      "ingest"
+    ],
+    "functions": []
+  },
+  "locations": [
+    {
+      "file": "benchmarks/diagnosis_accuracy/heldout/targets/ho_doc_index.cpp",
+      "line": 18,
+      "text": "Doc *d = new Doc;"
+    }
+  ],
+  "notes": "leak with owner: the index keeps every document (still referenced, unbounded)"
+}

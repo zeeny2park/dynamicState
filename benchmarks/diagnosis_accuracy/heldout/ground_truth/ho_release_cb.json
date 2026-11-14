@@ -1,0 +1,44 @@
+{
+  "id": "ho_release_cb",
+  "suite": "heldout",
+  "origin": "new",
+  "naming": "neutral",
+  "kind": "use_after_free",
+  "source": "benchmarks/diagnosis_accuracy/heldout/targets/ho_release_cb/main.c",
+  "sources": [
+    "benchmarks/diagnosis_accuracy/heldout/targets/ho_release_cb/main.c",
+    "benchmarks/diagnosis_accuracy/heldout/targets/ho_release_cb/buf.c"
+  ],
+  "language": "c",
+  "build": {
+    "compiler": "gcc",
+    "opt": "-O2",
+    "flags": []
+  },
+  "style": "multi-file, the free happens in a release callback called through a function pointer, -O2",
+  "symptom": "this program crashes sometimes and data looks wrong",
+  "ready": {
+    "mode": "stdout_marker"
+  },
+  "causes": {
+    "variables": [
+      "pending"
+    ],
+    "locks": [],
+    "threads": [],
+    "functions": []
+  },
+  "locations": [
+    {
+      "file": "benchmarks/diagnosis_accuracy/heldout/targets/ho_release_cb/main.c",
+      "line": 12,
+      "text": "pending->len += 64;"
+    },
+    {
+      "file": "benchmarks/diagnosis_accuracy/heldout/targets/ho_release_cb/buf.c",
+      "line": 8,
+      "text": "free(b);"
+    }
+  ],
+  "notes": "buf_put drops the last reference (release callback frees), then the caller writes into it"
+}

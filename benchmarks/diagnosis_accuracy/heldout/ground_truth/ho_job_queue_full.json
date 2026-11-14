@@ -1,0 +1,45 @@
+{
+  "id": "ho_job_queue_full",
+  "suite": "heldout",
+  "origin": "new",
+  "naming": "neutral",
+  "kind": "orphan_lock",
+  "source": "benchmarks/diagnosis_accuracy/heldout/targets/ho_job_queue_full.c",
+  "sources": [
+    "benchmarks/diagnosis_accuracy/heldout/targets/ho_job_queue_full.c"
+  ],
+  "language": "c",
+  "build": {
+    "compiler": "gcc",
+    "opt": "-O2",
+    "flags": []
+  },
+  "style": "lock embedded in a struct, macro lock calls, -O2",
+  "symptom": "the process hangs",
+  "ready": {
+    "mode": "stdout_marker"
+  },
+  "causes": {
+    "variables": [],
+    "locks": [
+      "jobs.lock"
+    ],
+    "threads": [
+      "q_worker"
+    ],
+    "functions": []
+  },
+  "locations": [
+    {
+      "file": "benchmarks/diagnosis_accuracy/heldout/targets/ho_job_queue_full.c",
+      "line": 24,
+      "text": "Q_LOCK(&jobs);"
+    },
+    {
+      "file": "benchmarks/diagnosis_accuracy/heldout/targets/ho_job_queue_full.c",
+      "line": 38,
+      "text": "Q_LOCK(&jobs);"
+    }
+  ],
+  "notes": "the producer thread returns with jobs.lock held when the queue is full"
+}

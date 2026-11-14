@@ -131,6 +131,98 @@ def _call_args(text: str, open_paren: int) -> List[str]:
     return out
 
 
+def _call_span(text: str, open_paren: int) -> Tuple[List[str], Optional[int]]:
+    """Arguments of the call whose ``(`` is at ``open_paren`` and the index of its closing ``)`` (None if the
+    call is not closed on this text)."""
+    depth, cur, out = 0, [], []
+    for i in range(open_paren, len(text)):
+        ch = text[i]
+        if ch in "([{":
+            depth += 1
+            if depth == 1:
+                continue
+        elif ch in ")]}":
+            depth -= 1
+            if depth == 0:
+                out.append("".join(cur).strip())
+                return out, i
+        elif ch == "," and depth == 1:
+            out.append("".join(cur).strip())
+            cur = []
+            continue
+        cur.append(ch)
+    return out, None
+
+
+# ---- preprocessor macros (the program's own #defines; the line structure of the source is kept)
+_DEFINE_RE = re.compile(r"^\s*#\s*define\s+([A-Za-z_]\w*)(\(([^)]*)\))?(.*)$")
+_INCLUDE_RE = re.compile(r'^\s*#\s*include\s+"([^"]+)"')
+_MACRO_PASSES = 4
+
+
+def _parse_macros(clean: List[str]) -> Dict[str, Tuple[Optional[List[str]], str]]:
+    """name -> (parameters or None for an object-like macro, body) of the #defines in comment-free lines."""
+    out: Dict[str, Tuple[Optional[List[str]], str]] = {}
+    i, n = 0, len(clean)
+    while i < n:
+        text = clean[i]
+        if _DEFINE_RE.match(text):
+            while text.rstrip().endswith("\\") and i + 1 < n:
+                i += 1
+                text = text.rstrip()[:-1] + " " + clean[i]
+            m = _DEFINE_RE.match(text)
+            body = re.sub(r"\s+", " ", m.group(4)).strip() if m else ""
+            if m and body and m.group(1) not in out:
+                params = [p.strip() for p in m.group(3).split(",") if p.strip()] if m.group(2) is not None else None
+                out[m.group(1)] = (params, body)
+        i += 1
+    return out
+
+
+def _expand_macros(code: str, macros: Dict[str, Tuple[Optional[List[str]], str]]) -> str:
+    """``code`` (one comment-free source line) with the program's own macros expanded, so a call written through
+    a macro (``NEW(T)``, ``Q_LOCK(q)``, ``WITH_STATS(...)``) is seen as the call it expands to."""
+    if not macros or code.lstrip().startswith("#"):
+        return code
+    for _ in range(_MACRO_PASSES):
+        pos, changed = 0, False
+        while True:
+            m = _IDENT_RE.search(code, pos)
+            if not m:
+                break
+            mac = macros.get(m.group(0))
+            if mac is None or (m.start() and code[m.start() - 1] in ".>"):
+                pos = m.end()
+                continue
+            params, body = mac
+            if params is None:
+                code = code[:m.start()] + body + code[m.end():]
+                pos, changed = m.start() + len(body), True
+                continue
+            j = m.end()
+            while j < len(code) and code[j] in " \t":
+                j += 1
+            if j >= len(code) or code[j] != "(":
+                pos = m.end()
+                continue
+            args, end = _call_span(code, j)
+            if end is None:
+                pos = m.end()
+                continue
+            named = params[:-1] if params and params[-1] == "..." else params
+            rep = body
+            if len(named) < len(params):
+                rep = rep.replace("__VA_ARGS__", ", ".join(args[len(named):]))
+            for p, a in zip(named, args):
+                rep = re.sub(r"#?(?<![\w])" + re.escape(p) + r"(?![\w])", lambda _m, a=a: a, rep)
+            rep = rep.replace("##", "")
+            code = code[:m.start()] + rep + code[end + 1:]
+            pos, changed = m.start() + len(rep), True
+        if not changed:
+            break
+    return code
+
+
 _ASSIGN_RE = re.compile(r"^(?P<lhs>[^=]*?[^=!<>+\-*/%&|^])(?P<op>[+\-*/%&|^]?=)(?!=)(?P<rhs>.*)$")
 
 
@@ -278,6 +370,34 @@ def _strip_code(lines: List[str]) -> List[str]:
             res.append(ch)
             i += 1
         out.append("".join(res).rstrip("\n"))
+    return out
+
+
+def _file_macros(path: str, raw: List[str], image_mtime: float, depth: int = 0,
+                 seen: Optional[Set[str]] = None) -> Dict[str, Tuple[Optional[List[str]], str]]:
+    """Macros defined in ``path`` (raw lines ``raw``) and in the headers it includes with ``#include "..."`` (next
+    to it, not system headers, not edited after the binary was built), the file's own definitions first."""
+    seen = seen if seen is not None else set()
+    seen.add(os.path.abspath(path))
+    out = dict(_parse_macros(_strip_code(raw)))
+    if depth >= 3:
+        return out
+    for line in raw:
+        m = _INCLUDE_RE.match(line)
+        if not m:
+            continue
+        inc = os.path.abspath(os.path.join(os.path.dirname(path), m.group(1)))
+        if inc in seen or _is_system(inc) or not os.path.isfile(inc):
+            continue
+        try:
+            if os.stat(inc).st_size > (1 << 20) or os.stat(inc).st_mtime > image_mtime + 1.0:
+                continue
+            with open(inc, encoding="utf-8", errors="replace") as fh:
+                hdr = fh.read().split("\n")
+        except OSError:
+            continue
+        for k, v in _file_macros(inc, hdr, image_mtime, depth + 1, seen).items():
+            out.setdefault(k, v)
     return out
 
 
@@ -458,6 +578,12 @@ def _build_program(path: str, image_mtime: float, deadline: float) -> _Program:
                 if v.name:
                     f.locals[v.name] = _Var(v.name, v.type_offset, bool(v.is_parameter))
             prog.funcs[sp.name] = f
+    # The program's own macros (this file's and its locally included headers'), so that a call hidden in a macro
+    # is seen; raw text (shown to the reader) is unchanged.
+    for src in list(prog.clean):
+        macros = _file_macros(src, prog.source[src], image_mtime)
+        if macros:
+            prog.clean[src] = [_expand_macros(c, macros) for c in prog.clean[src]]
     for v in list(idx.global_variables or []) + list(idx.static_variables or []):
         if v.name and v.name not in prog.globals and not v.is_declaration:
             prog.globals[v.name] = v
@@ -582,6 +708,40 @@ class _Ctx:
             return _pointee(self.idx, v.type_offset)
         g = self.prog.globals.get(name)
         return _pointee(self.idx, g.type_offset) if g is not None else None
+
+    def root_type_keys(self, root: str) -> Set[Tuple[str, str, int]]:
+        """Type keys a value "of the type of ``root``" can have: the root's own type and, for a pointer or an
+        array (of pointers), the type it points to / its element type."""
+        out: Set[Tuple[str, str, int]] = set()
+        g = self.prog.globals.get(root)
+        t = _canon(self.idx, g.type_offset) if g is not None else None
+        for x in (t, _pointee(self.idx, g.type_offset) if g is not None else None,
+                  _canon(self.idx, t.target_type_offset) if t is not None and _tag(t) == "array_type" else None):
+            k = _type_key(x)
+            if k is not None:
+                out.add(k)
+        return out
+
+    def this_type(self, f: _Func) -> Any:
+        """The class of a member function (the type its ``this`` parameter points to), else None."""
+        v = f.locals.get("this")
+        return _pointee(self.idx, v.type_offset) if v is not None and v.is_parameter else None
+
+    def member_of_root(self, f: _Func, root: str) -> bool:
+        """``f`` is a member function of the type of ``root`` (so a bare member name in it is a member of an
+        object like ``root``)."""
+        t = self.this_type(f)
+        return t is not None and _type_key(t) in self.root_type_keys(root)
+
+    def root_members(self, root: str) -> List[str]:
+        """First-level member names the variable subjects give for ``root`` (``g_primary.tok`` -> ``tok``,
+        ``kv_slots[1]->name`` -> ``name``)."""
+        out: List[str] = []
+        for v in self.variables:
+            m = re.match(r"^\s*\(?\*?" + re.escape(root) + r"(?:\s*\[[^\]]*\])*\s*(?:\.|->)\s*([A-Za-z_]\w*)", v)
+            if m and m.group(1) not in out:
+                out.append(m.group(1))
+        return out
 
     def shadowed(self, f: _Func, root: str) -> bool:
         return root in f.locals and root in self.prog.globals
@@ -737,6 +897,24 @@ def _writes_root(ctx: _Ctx, f: _Func, root: str) -> List[int]:
     return out
 
 
+def _alloc_wrappers(ctx: _Ctx, alloc_re: "re.Pattern[str]") -> Dict[str, int]:
+    """User functions that return the result of their own allocation (``void *mem_get(n) { p = malloc(n); ...;
+    return p; }``): name -> line of the allocation inside."""
+    out: Dict[str, int] = {}
+    for n, f in ctx.prog.funcs.items():
+        allocs = [(ln, c) for ln, c in ctx.prog.body(f) if alloc_re.search(c)]
+        if not allocs:
+            continue
+        held = {_lhs_name(lhs) for _ln, c in allocs for lhs, rhs in _assigns(c) if alloc_re.search(rhs)} - {None}
+        for _ln, c in ctx.prog.body(f):
+            r = re.search(r"\breturn\b(.*)", c)
+            if r and (alloc_re.search(r.group(1)) or any(
+                    re.match(r"\s*(\([^()]*\)\s*)?\(?\s*" + re.escape(v) + r"\s*\)?\s*;?\s*$", r.group(1)) for v in held)):
+                out[n] = allocs[0][0]
+                break
+    return out
+
+
 def _growth_candidates(ctx: _Ctx, alloc_re: "re.Pattern[str]", what_en: str, what_ko: str) -> List[_Cand]:
     """Owner known (leak owner / mapping owner): allocation sites in the functions that store into the owner, and in
     the functions they call; then the stores themselves."""
@@ -746,9 +924,22 @@ def _growth_candidates(ctx: _Ctx, alloc_re: "re.Pattern[str]", what_en: str, wha
     for root in ctx.roots():
         writers = {n: _writes_root(ctx, f, root) for n, f in ctx.prog.funcs.items()}
         writers = {n: ls for n, ls in writers.items() if ls}
+        wrappers = _alloc_wrappers(ctx, alloc_re)
         for n, wlines in writers.items():
             f = ctx.prog.funcs[n]
             for ln, code in ctx.prog.body(f):
+                w = next((w for w in wrappers if w != n and re.search(r"(?<![\w.])" + re.escape(w) + r"\s*\(", code)),
+                         None)
+                if w and not alloc_re.search(code):
+                    a = _assignment(code)
+                    c = _Cand(f, ln, "allocation", 3, [(
+                        f"{what_en} through `{w}()` (which returns the result of its own {what_en}, line "
+                        f"{wrappers[w]}) in `{n}`, which stores into `{root}` (line {wlines[0]})",
+                        f"`{root}`에 저장하는 `{n}` 안에서 `{w}()`를 통한 {what_ko} ({wrappers[w]}행에서 할당해 반환)")])
+                    _size_reason(ctx, _alloc_type(ctx, f, code, _lhs_name(a[0]) if a else None), classes, c)
+                    if n in observed:
+                        c.add(1, f"`{n}` was on a live thread's stack", f"`{n}`가 살아 있는 스레드의 스택에서 관측됨")
+                    out.append(c)
                 if alloc_re.search(code):
                     a = _assignment(code)
                     c = _Cand(f, ln, "allocation", 3, [(
@@ -777,8 +968,19 @@ def _growth_candidates(ctx: _Ctx, alloc_re: "re.Pattern[str]", what_en: str, wha
     return out
 
 
+# Calls that read or write through a pointer argument but never keep it (libc string / memory / output functions,
+# allocation, and the language keywords the call pattern also matches).
+_NON_RETAINING = frozenset("""memset memcpy memmove memcmp memchr bzero strcpy strncpy stpcpy strcat strncat strlen strnlen
+strcmp strncmp strcasecmp strchr strrchr strstr strspn strcspn strtol strtoul strtoll strtoull strtod atoi atol printf
+fprintf sprintf snprintf vsnprintf vsprintf vprintf puts fputs fwrite fread write read pread pwrite send recv
+assert malloc calloc strdup strndup aligned_alloc memalign valloc pvalloc sizeof alignof
+offsetof typeof decltype if while for switch return""".split())
+
+
 def _escapes(ctx: _Ctx, f: _Func, p: str, after: int) -> bool:
-    """``p`` (a local pointer) is freed, returned, stored or handed to a user function that stores its parameter."""
+    """``p`` (a local pointer) is freed, returned, stored, handed to a user function that stores its parameter, or
+    handed to code that is not analysed (a library function other than the known non-retaining ones, a method of
+    a library container, a call through a function pointer)."""
     pid = _ident(p)
     for ln, code in ctx.prog.body(f):
         if ln < after or not pid.search(code):
@@ -788,6 +990,16 @@ def _escapes(ctx: _Ctx, f: _Func, p: str, after: int) -> bool:
         if any(not pid.search(lhs) and re.fullmatch(r"\s*(\([^()]*\)\s*)?&?\s*" + re.escape(p) + r"\s*", rhs)
                for lhs, rhs in _assigns(code)):
             return True
+        # Handed to code this analysis does not see (a library call, a container method such as push_back, a
+        # function pointer): it may keep the pointer, so "never stored" cannot be claimed.
+        for m in re.finditer(r"([A-Za-z_]\w*)\s*\(", code):
+            if (m.group(1) not in ctx.prog.funcs and m.group(1) not in _NON_RETAINING
+                    and any(pid.search(a) for a in _call_args(code, m.end() - 1))):
+                return True
+        # a call through a function pointer (``table[k](p)``, ``obj->cb(p)`` is matched above as ``cb``)
+        for m in re.finditer(r"\]\s*\(", code):
+            if any(pid.search(a) for a in _call_args(code, m.end() - 1)):
+                return True
         for m in re.finditer(r"([A-Za-z_]\w*)\s*\(", code):
             g = ctx.prog.funcs.get(m.group(1))
             if g is None:
@@ -811,6 +1023,11 @@ def _stores_param(ctx: _Ctx, g: _Func, pname: str) -> bool:
         if re.search(r"\breturn\s+" + re.escape(pname) + r"\b", code) or (
                 (_FREE_RE.search(code) or _DELETE_RE.search(code)) and _ident(pname).search(code)):
             return True
+        pid = _ident(pname)
+        if any(m.group(1) not in ctx.prog.funcs and m.group(1) not in _NON_RETAINING
+               and any(pid.search(a) for a in _call_args(code, m.end() - 1))
+               for m in re.finditer(r"([A-Za-z_]\w*)\s*\(", code)):
+            return True
     return False
 
 
@@ -823,9 +1040,14 @@ def _unreachable_leak_candidates(ctx: _Ctx) -> List[_Cand]:
     workers = ctx.reachable(ctx.thread_starts())
     observed = ctx.observed_functions()
     classes = ctx.leak_size_classes()
+    containers = _pointer_containers(ctx)
+    wrappers = _alloc_wrappers(ctx, _ALLOC_RE)
+    wrap_re = (re.compile(r"(?<![\w.])(" + "|".join(re.escape(w) for w in wrappers) + r")\s*\(")
+               if wrappers else None)
     out: List[_Cand] = []
     for n in sorted(scope):
         f = funcs[n]
+        found: List[_Cand] = []
         for p, var in f.locals.items():
             if var.is_parameter or _pointee(ctx.idx, var.type_offset) is None:
                 continue
@@ -834,7 +1056,7 @@ def _unreachable_leak_candidates(ctx: _Ctx) -> List[_Cand]:
                 a = next(((lhs, rhs) for lhs, rhs in _assigns(code) if _lhs_name(lhs) == p), None)
                 if a is None:
                     continue
-                if _ALLOC_RE.search(a[1]):
+                if _ALLOC_RE.search(a[1]) or (wrap_re is not None and wrap_re.search(a[1])):
                     if _escapes(ctx, f, p, ln):
                         continue
                     c = _Cand(f, ln, "allocation", 3, [(
@@ -856,15 +1078,56 @@ def _unreachable_leak_candidates(ctx: _Ctx) -> List[_Cand]:
                     _size_reason(ctx, t, classes, c)
                 else:
                     continue
-                if named and n in scope:
-                    who = ", ".join(f"`{k}`" for k in sorted(named))
-                    c.add(1, f"reached from the start function of thread {who}, which the leak was attributed to",
-                          f"누수가 귀속된 스레드 {who}의 시작 함수에서 도달함")
-                elif n in workers and n != "main":
-                    c.add(1, f"`{n}` runs on a thread started by pthread_create", f"`{n}`는 pthread_create로 시작한 스레드에서 실행됨")
-                if n in observed:
-                    c.add(1, f"`{n}` was on a live thread's stack", f"`{n}`가 살아 있는 스레드의 스택에서 관측됨")
-                out.append(c)
+                found.append(c)
+        found.extend(_container_drop_candidates(ctx, f, containers, classes))
+        for c in found:
+            if named and n in scope:
+                who = ", ".join(f"`{k}`" for k in sorted(named))
+                c.add(1, f"reached from the start function of thread {who}, which the leak was attributed to",
+                      f"누수가 귀속된 스레드 {who}의 시작 함수에서 도달함")
+            elif n in workers and n != "main":
+                c.add(1, f"`{n}` runs on a thread started by pthread_create", f"`{n}`는 pthread_create로 시작한 스레드에서 실행됨")
+            if n in observed:
+                c.add(1, f"`{n}` was on a live thread's stack", f"`{n}`가 살아 있는 스레드의 스택에서 관측됨")
+            out.append(c)
+    return out
+
+
+_PTR_CONTAINER_RE = re.compile(
+    r"\b(?:std\s*::\s*)?(?:vector|deque|list|forward_list|set|unordered_set|multiset)\s*<\s*(?:const\s+)?"
+    r"(?:struct\s+|class\s+)?([A-Za-z_][\w:]*)\s*\*\s*>\s*([A-Za-z_]\w*)\s*[;{=(]")
+_CONTAINER_DROP_RE = re.compile(r"(?<![\w.])([A-Za-z_]\w*)\s*(?:\.|->)\s*(erase|pop_front|pop_back|clear|resize)\s*\(")
+
+
+def _pointer_containers(ctx: _Ctx) -> Dict[str, str]:
+    """Variables / members declared as a standard container of raw pointers (``std::vector<Session *> live_``):
+    name -> element type name (from the analysed source text)."""
+    out: Dict[str, str] = {}
+    for lines in ctx.prog.clean.values():
+        for code in lines:
+            for m in _PTR_CONTAINER_RE.finditer(code):
+                out.setdefault(m.group(2), m.group(1).split("::")[-1])
+    return out
+
+
+def _container_drop_candidates(ctx: _Ctx, f: _Func, containers: Dict[str, str], classes: Set[int]) -> List[_Cand]:
+    """A function that removes elements from a container of raw pointers (erase / pop / clear / resize) and frees
+    or deletes nothing: the removed pointers were the last references."""
+    if not containers or any(_FREE_RE.search(c) or _DELETE_RE.search(c) for _l, c in ctx.prog.body(f)):
+        return []
+    out: List[_Cand] = []
+    for ln, code in ctx.prog.body(f):
+        m = _CONTAINER_DROP_RE.search(code)
+        if not m or m.group(1) not in containers:
+            continue
+        tname = containers[m.group(1)]
+        c = _Cand(f, ln, "unlink", 3, [(
+            f"removes `{tname} *` pointers from `{m.group(1)}` ({m.group(2)}); `{f.name}` deletes or frees none of them",
+            f"`{m.group(1)}`에서 `{tname} *` 포인터를 제거하지만({m.group(2)}) `{f.name}`에서 해제하지 않음")])
+        t = next((x for x in ctx.idx.types_by_name.get(tname, []) or []
+                  if _tag(x) in ("structure_type", "class_type", "union_type") and x.byte_size), None)
+        _size_reason(ctx, t, classes, c)
+        out.append(c)
     return out
 
 
@@ -873,21 +1136,59 @@ def _leak(ctx: _Ctx) -> List[_Cand]:
 
 
 def _mapping(ctx: _Ctx) -> List[_Cand]:
-    return _growth_candidates(ctx, _MMAP_RE, "mmap call", "mmap 호출") if ctx.roots() else []
+    if ctx.roots():
+        return _growth_candidates(ctx, _MMAP_RE, "mmap call", "mmap 호출")
+    return _mapping_without_owner(ctx)
+
+
+def _mapping_without_owner(ctx: _Ctx) -> List[_Cand]:
+    """Owner not named: the program's own mmap call sites reached from the thread the growth was attributed to;
+    if none is reached (e.g. called through a function pointer) and the program has no more mmap call sites than
+    candidates are shown, all of them, labelled as such.  More sites than that and none reached: nothing."""
+    sites = [(f, ln) for f in ctx.prog.funcs.values() for ln, code in ctx.prog.body(f) if _MMAP_RE.search(code)]
+    if not sites:
+        return []
+    named = ctx.named_thread_funcs()
+    reach = ctx.reachable(named.values()) if named else set()
+    who = ", ".join(f"`{k}`" for k in sorted(named))
+    hit = [(f, ln) for f, ln in sites if f.name in reach]
+    if hit:
+        return [_Cand(f, ln, "mapping", 3, [(f"mmap call in `{f.name}`, reached from the function of thread {who}, "
+                                             f"which the growth was attributed to",
+                                             f"증가가 귀속된 스레드 {who}의 함수에서 도달하는 `{f.name}` 안의 mmap 호출")])
+                for f, ln in hit]
+    if len(sites) > CANDIDATE_CAP:
+        return []
+    return [_Cand(f, ln, "mapping", 2, [(f"one of the {len(sites)} mmap call site(s) in the program's own code; the "
+                                         f"owner of the growing mappings was not named",
+                                         f"프로그램 코드의 mmap 호출 {len(sites)}곳 중 하나이며, 늘어나는 매핑의 소유자는 "
+                                         f"특정되지 않음")])
+            for f, ln in sites]
 
 
 def _same_type_base(ctx: _Ctx, f: _Func, expr: str, root: str) -> Optional[str]:
     """The local/parameter in ``expr`` (``r->buf``) whose type is the type of ``root`` or a pointer to it."""
-    rt = ctx.root_type(root)
-    rk = _type_key(rt)
-    if rk is None:
+    keys = ctx.root_type_keys(root)
+    if not keys:
         return None
+    expr = re.sub(r"\(\s*([A-Za-z_]\w*)\s*\)", r"\1", expr)   # `(e)->name` (macro arguments) -> `e->name`
     for m in re.finditer(r"(?<![\w.])(?<!->)([A-Za-z_]\w*)\s*(->|\.|\[)", expr):
         b = m.group(1)
         if b == root or b not in f.locals:
             continue
-        if _type_key(ctx.var_pointee(f, b)) == rk or _type_key(ctx.var_type(f, b)) == rk:
+        if _type_key(ctx.var_pointee(f, b)) in keys or _type_key(ctx.var_type(f, b)) in keys:
             return b
+    return None
+
+
+def _this_member(ctx: _Ctx, f: _Func, expr: str, root: str) -> Optional[str]:
+    """In a member function of the type of ``root``, the member of ``root`` named by the subjects that ``expr``
+    uses bare (``buf_ + used_``) or as ``this->m``; else None."""
+    if not ctx.member_of_root(f, root):
+        return None
+    for mm in ctx.root_members(root):
+        if re.search(r"(?<![\w.>])(?:this\s*->\s*)?" + re.escape(mm) + r"\b", expr) and mm not in f.locals:
+            return mm
     return None
 
 
@@ -911,9 +1212,17 @@ def _corruption(ctx: _Ctx) -> List[_Cand]:
                         break
                     b = _same_type_base(ctx, f, dest, root)
                     if b:
+                        tl = _type_label(ctx.var_pointee(f, b) or ctx.var_type(f, b))
                         c = _Cand(f, ln, "copy", 3, [(
-                            f"`{fn}` writes through `{b}`, which has the type of `{root}` (`{_type_label(ctx.root_type(root))}`)",
-                            f"`{fn}`가 `{root}`와 같은 타입(`{_type_label(ctx.root_type(root))}`)인 `{b}`를 통해 씀")])
+                            f"`{fn}` writes through `{b}`, which has the type of `{root}` (`{tl}`)",
+                            f"`{fn}`가 `{root}`와 같은 타입(`{tl}`)인 `{b}`를 통해 씀")])
+                        break
+                    mm = _this_member(ctx, f, dest, root)
+                    if mm:
+                        t = _type_label(ctx.this_type(f))
+                        c = _Cand(f, ln, "copy", 3, [(
+                            f"`{fn}` writes into member `{mm}` of `this`, a `{t}` like `{root}`",
+                            f"`{fn}`가 `{root}`와 같은 `{t}`인 `this`의 멤버 `{mm}`에 씀")])
                         break
                 if c is None and any(_member(mm).search(dest) for mm in members):
                     mm = next(mm for mm in members if _member(mm).search(dest))
@@ -975,6 +1284,19 @@ def _free_sites(ctx: _Ctx, double: bool) -> Tuple[List[_Cand], Dict[str, int]]:
                     else:
                         base = re.match(r"^\s*\(?\s*([A-Za-z_]\w*)", arg)
                         b = base.group(1) if base else None
+                        mm = _this_member(ctx, f, arg, root)
+                        if mm:
+                            t = _type_label(ctx.this_type(f))
+                            c = _Cand(f, ln, "free", 3, [(
+                                f"frees member `{mm}` of `this`, a `{t}` like `{root}` (the subjects name `{root}`'s "
+                                f"`{mm}`)", f"`{root}`와 같은 `{t}`인 `this`의 멤버 `{mm}`를 해제함")])
+                            if _cleared_after(ctx, f, ln, arg):
+                                c.score -= 2
+                                c.reasons.append((f"`{arg}` is set to NULL right after", f"해제 직후 `{arg}`를 NULL로 지움"))
+                            else:
+                                c.add(1, "the pointer is not cleared afterwards", "해제 뒤 포인터를 지우지 않음")
+                            out.append(c)
+                            continue
                         if not b or rk is None or _type_key(ctx.var_pointee(f, b)) != rk:
                             continue
                         c = _Cand(f, ln, "free", 2, [(
@@ -1033,65 +1355,159 @@ def _double_free(ctx: _Ctx) -> List[_Cand]:
     return _free_sites(ctx, double=True)[0]
 
 
-def _lock_lines(ctx: _Ctx, f: _Func, lock: str) -> Tuple[List[int], List[int]]:
+_LOCK_CALL_RE = re.compile(r"\b(" + "|".join(_LOCK_FUNCS) + r")\s*\(")
+_UNLOCK_CALL_RE = re.compile(r"\b(" + "|".join(_UNLOCK_FUNCS) + r")\s*\(")
+_RAII_LOCK_RE = re.compile(r"\b(lock_guard|unique_lock|scoped_lock|shared_lock)\b\s*(<[^;{}()]*>)?\s*"
+                           r"([A-Za-z_]\w*)?\s*[({]")
+_OBJ = r"([A-Za-z_]\w*(?:\s*(?:\.|->)\s*[A-Za-z_]\w*|\s*\[[^\]]*\])*)"
+_METHOD_LOCK_RE = re.compile(_OBJ + r"\s*(?:\.|->)\s*(?:lock|lock_shared|try_lock)\s*\(\s*\)")
+_METHOD_UNLOCK_RE = re.compile(_OBJ + r"\s*(?:\.|->)\s*(?:unlock|unlock_shared)\s*\(\s*\)")
+
+
+def _norm_lock_expr(expr: str) -> str:
+    """``&(&jobs)->lock`` -> ``jobs.lock``; ``&m_in`` -> ``m_in``; ``this->mu_`` -> ``this.mu_``."""
+    e = re.sub(r"[\s&*()]", "", expr or "")
+    return e.replace("->", ".")
+
+
+def _lock_calls(code: str, unlock: bool, wrappers: Dict[str, int]) -> List[Tuple[int, str, bool]]:
+    """(position, lock expression, scoped) of every lock (or unlock) call on a line: pthread / C11 calls,
+    RAII guards (lock_guard / unique_lock / scoped_lock: scoped=True, released at the end of their scope), member
+    calls ``m.lock()`` and calls of the program's own wrapper functions that lock their parameter."""
+    out: List[Tuple[int, str, bool]] = []
+    for m in (_UNLOCK_CALL_RE if unlock else _LOCK_CALL_RE).finditer(code):
+        args = _call_args(code, m.end() - 1)
+        if args and args[0]:
+            out.append((m.start(), args[0], False))
+    if not unlock:
+        for m in _RAII_LOCK_RE.finditer(code):
+            for a in _call_args(code, m.end() - 1):
+                if a and not re.fullmatch(r"\s*std\s*::\s*\w+\s*", a):   # std::defer_lock / adopt_lock tags
+                    out.append((m.start(), a, True))
+    for m in (_METHOD_UNLOCK_RE if unlock else _METHOD_LOCK_RE).finditer(code):
+        out.append((m.start(), m.group(1), False))
+    for w, idx in wrappers.items():
+        for m in re.finditer(r"(?<![\w.])" + re.escape(w) + r"\s*\(", code):
+            args = _call_args(code, m.end() - 1)
+            if idx < len(args):
+                out.append((m.start(), args[idx], False))
+    return sorted(out)
+
+
+def _lock_wrappers(ctx: _Ctx, unlock: bool) -> Dict[str, int]:
+    """The program's own functions that lock (unlock) the mutex passed as their parameter: name -> parameter
+    index (``void take(pthread_mutex_t *m) { pthread_mutex_lock(m); }``)."""
+    out: Dict[str, int] = {}
+    for n, f in ctx.prog.funcs.items():
+        params = [v.name for v in f.locals.values() if v.is_parameter]
+        for _ln, code in ctx.prog.body(f):
+            for _pos, expr, scoped in _lock_calls(code, unlock, {}):
+                e = _norm_lock_expr(expr)
+                if not scoped and e in params:
+                    out[n] = params.index(e)
+    return out
+
+
+def _names_lock(ctx: _Ctx, f: _Func, expr: str, lock: str) -> Optional[str]:
+    """How the lock expression ``expr`` in ``f`` denotes the finding's lock ``lock`` (a reason), or None.
+    The lock itself (``m``, ``&q->lock`` for ``q.lock``); a variable of the same type as the lock's owner with
+    the same member path (``from.mu`` for ``g_checking.mu``); in a member function of the owner's type, the bare
+    member (``mu_`` for ``g_registry.mu_``)."""
+    e, lk = _norm_lock_expr(expr), _norm_lock_expr(lock)
+    root = lk.split(".", 1)[0].split("[", 1)[0]
+    rest = lk[len(root) + 1:] if lk.startswith(root + ".") else ""
+    if e == lk:
+        return "" if (not ctx.shadowed(f, root) and (root in ctx.prog.globals or root in f.locals)) else None
+    if not rest:
+        return None
+    if e in (rest, "this." + rest):
+        t = ctx.this_type(f)
+        return (f"`{rest}` of `this`, a `{_type_label(t)}` like `{root}`" if t is not None
+                and _type_key(t) in ctx.root_type_keys(root) else None)
+    if e.endswith("." + rest):
+        b = e[:-len(rest) - 1]
+        if re.fullmatch(r"[A-Za-z_]\w*", b) and b != root and b in f.locals:
+            keys = ctx.root_type_keys(root)
+            if _type_key(ctx.var_type(f, b)) in keys or _type_key(ctx.var_pointee(f, b)) in keys:
+                return f"`{b}.{rest}`, `{b}` having the type of `{root}`"
+    return None
+
+
+def _lock_sites(ctx: _Ctx, f: _Func, lock: str, lw: Dict[str, int], uw: Dict[str, int]):
+    """Lock and unlock sites of ``lock`` in ``f``: ([(line, pos, scoped, how)], [(line, pos)])."""
     lk, ul = [], []
-    name = re.escape(lock)
-    lock_re = re.compile(r"\b(" + "|".join(_LOCK_FUNCS) + r")\s*\(\s*&?\s*\(?\s*" + name + r"\b|"
-                         r"\b(lock_guard|unique_lock|scoped_lock|shared_lock)\b[^;]*[({]\s*" + name + r"\b|"
-                         r"(?<![\w.])" + name + r"\s*(\.|->)\s*(lock|lock_shared|try_lock)\s*\(")
-    unlock_re = re.compile(r"\b(" + "|".join(_UNLOCK_FUNCS) + r")\s*\(\s*&?\s*\(?\s*" + name + r"\b|"
-                           r"(?<![\w.])" + name + r"\s*(\.|->)\s*(unlock|unlock_shared)\s*\(")
-    if ctx.shadowed(f, lock):
-        return lk, ul
     for ln, code in ctx.prog.body(f):
-        if lock_re.search(code):
-            lk.append(ln)
-        if unlock_re.search(code):
-            ul.append(ln)
+        for pos, expr, scoped in _lock_calls(code, False, {k: v for k, v in lw.items() if k != f.name}):
+            how = _names_lock(ctx, f, expr, lock)
+            if how is not None:
+                lk.append((ln, pos, scoped, how))
+        for pos, expr, _s in _lock_calls(code, True, {k: v for k, v in uw.items() if k != f.name}):
+            if _names_lock(ctx, f, expr, lock) is not None:
+                ul.append((ln, pos))
     return lk, ul
+
+
+def _calls_while_held(ctx: _Ctx, f: _Func, ln: int, pos: int, ul: List[Tuple[int, int]]) -> List[Tuple[int, str]]:
+    """(line, callee) of the calls made after the lock at (``ln``, ``pos``) and before the next unlock of it (the
+    end of the function when there is none, e.g. a scoped guard), within one line or across lines."""
+    nxt = min(((l, p) for l, p in ul if (l, p) > (ln, pos)), default=None)
+    out: List[Tuple[int, str]] = []
+    for l2 in range(ln, (nxt[0] if nxt else f.last) + 1):
+        code = ctx.prog.code(f, l2)
+        lo = pos + 1 if l2 == ln else 0
+        hi = nxt[1] if (nxt and l2 == nxt[0]) else len(code)
+        for m in re.finditer(r"([A-Za-z_]\w*)\s*\(", code):
+            if lo <= m.start() < hi:
+                out.append((l2, m.group(1)))
+    return out
 
 
 def _locks(ctx: _Ctx, kind: str) -> List[_Cand]:
     out: List[_Cand] = []
     subj_funcs = set(ctx.functions) | set(ctx.named_thread_funcs().values())
-    sites: Dict[str, Dict[str, Tuple[List[int], List[int]]]] = {}
+    lw, uw = _lock_wrappers(ctx, False), _lock_wrappers(ctx, True)
+    sites: Dict[str, Dict[str, Any]] = {}
     for lock in ctx.locks:
-        if lock not in ctx.prog.globals and not any(lock in f.locals for f in ctx.prog.funcs.values()):
+        root = _norm_lock_expr(lock).split(".", 1)[0].split("[", 1)[0]
+        if root not in ctx.prog.globals and not any(root in f.locals for f in ctx.prog.funcs.values()):
             continue
         for f in ctx.prog.funcs.values():
-            lk, ul = _lock_lines(ctx, f, lock)
+            if f.name in lw or f.name in uw:
+                continue   # the wrapper's own lock call names its parameter; its callers are the sites
+            lk, ul = _lock_sites(ctx, f, lock, lw, uw)
             if lk:
                 sites.setdefault(lock, {})[f.name] = (lk, ul)
     for lock, per in sites.items():
         for n, (lk, ul) in per.items():
             f = ctx.prog.funcs[n]
-            for ln in lk:
-                c = _Cand(f, ln, "lock", 1, [(f"takes `{lock}`", f"`{lock}`를 잠금")])
+            explicit = [s for s in lk if not s[2]]
+            for ln, pos, scoped, how in lk:
+                c = _Cand(f, ln, "lock", 1, [(f"takes `{lock}`" + (f" (as {how})" if how else ""),
+                                              f"`{lock}`를 잠금" + (f" ({how})" if how else ""))])
                 if n in subj_funcs:
                     c.add(1, f"`{n}` is named by the finding", f"`{n}`는 발견이 가리킨 함수임")
-                if kind == "ORPHAN_LOCK" and len(ul) < len(lk):
+                if kind == "ORPHAN_LOCK" and not scoped and len(ul) < len(explicit):
                     c.add(2, f"`{n}` has no matching unlock of `{lock}`", f"`{n}`에 `{lock}`의 짝이 되는 해제가 없음")
                 if kind == "SELF_DEADLOCK":
-                    end = next((u for u in ul if u > ln), f.last)
-                    for l2 in range(ln + 1, end):
-                        for m in re.finditer(r"([A-Za-z_]\w*)\s*\(", ctx.prog.code(f, l2)):
-                            g = m.group(1)
-                            if g in per and g != n:
-                                c.add(2, f"while holding it, calls `{g}()` (line {l2}), which takes `{lock}` again",
-                                      f"잠근 채로 `{lock}`를 다시 잠그는 `{g}()`를 부름({l2}행)")
-                                for gl in per[g][0]:
-                                    out.append(_Cand(ctx.prog.funcs[g], gl, "lock", 3, [(
-                                        f"takes `{lock}` again while its caller `{n}` holds it (call on line {l2})",
-                                        f"호출한 `{n}`가 `{lock}`를 쥔 채로 다시 잠금({l2}행에서 호출)")]))
+                    for l2, g in _calls_while_held(ctx, f, ln, pos, ul):
+                        if g in per and g != n:
+                            c.add(2, f"while holding it, calls `{g}()` (line {l2}), which takes `{lock}` again",
+                                  f"잠근 채로 `{lock}`를 다시 잠그는 `{g}()`를 부름({l2}행)")
+                            for gl, _gp, _gs, _gh in per[g][0]:
+                                out.append(_Cand(ctx.prog.funcs[g], gl, "lock", 3, [(
+                                    f"takes `{lock}` again while its caller `{n}` holds it (call on line {l2})",
+                                    f"호출한 `{n}`가 `{lock}`를 쥔 채로 다시 잠금({l2}행에서 호출)")]))
                 if kind == "DEADLOCK_INDICATORS":
                     for other, per2 in sites.items():
                         if other == lock or n not in per2:
                             continue
-                        if any(o > ln for o in per2[n][0]) and not any(ln < u < min(o for o in per2[n][0] if o > ln)
-                                                                         for u in ul):
+                        olines = [o[0] for o in per2[n][0]]
+                        ulines = [u[0] for u in ul]
+                        if any(o > ln for o in olines) and not any(ln < u < min(o for o in olines if o > ln)
+                                                                   for u in ulines):
                             c.add(2, f"takes `{lock}` and then `{other}` while still holding it",
                                   f"`{lock}`를 쥔 채로 `{other}`를 잠금")
-                        elif any(o < ln for o in per2[n][0]):
+                        elif any(o < ln for o in olines):
                             c.add(1, f"takes `{lock}` while holding `{other}`", f"`{other}`를 쥔 채로 `{lock}`를 잠금")
                 out.append(c)
     return out
@@ -1102,6 +1518,17 @@ def _thread_leak(ctx: _Ctx) -> List[_Cand]:
     targets = set(f for f in ctx.functions if f in ctx.prog.funcs) | set(ctx.named_thread_funcs().values())
     if not targets:
         return out
+    # the program's own functions that start a thread with the start routine passed as their parameter
+    wrappers: Dict[str, int] = {}
+    wrapper_lines: Dict[str, int] = {}
+    for f in ctx.prog.funcs.values():
+        params = [v.name for v in f.locals.values() if v.is_parameter]
+        for ln, code in ctx.prog.body(f):
+            m = _THREAD_CREATE_RE.search(code)
+            args = _call_args(code, m.end() - 1) if m else []
+            if len(args) >= 3 and re.sub(r"[&()\s]", "", args[2]) in params:
+                wrappers[f.name] = params.index(re.sub(r"[&()\s]", "", args[2]))
+                wrapper_lines[f.name] = ln
     for f in ctx.prog.funcs.values():
         joins = any(re.search(r"\bpthread_(join|detach)\s*\(", c) for _l, c in ctx.prog.body(f))
         for ln, code in ctx.prog.body(f):
@@ -1115,10 +1542,25 @@ def _thread_leak(ctx: _Ctx) -> List[_Cand]:
                 m2 = _STD_THREAD_RE.search(code)
                 if m2 and m2.group(2) in targets:
                     started = m2.group(2)
+            via = None
+            if not started:
+                for w, idx in wrappers.items():
+                    for mw in re.finditer(r"(?<![\w.])" + re.escape(w) + r"\s*\(", code):
+                        args = _call_args(code, mw.end() - 1)
+                        if w != f.name and idx < len(args):
+                            started = next((t for t in targets if _ident(t).search(args[idx])), None)
+                            if started:
+                                via = w
+                                break
+                    if started:
+                        break
             if not started:
                 continue
-            c = _Cand(f, ln, "thread_create", 3, [(f"starts `{started}`, the function of the accumulating threads",
-                                                   f"쌓이는 스레드의 함수 `{started}`를 시작함")])
+            c = _Cand(f, ln, "thread_create", 3, [(
+                f"starts `{started}`, the function of the accumulating threads"
+                + (f", through `{via}()` (which passes it to pthread_create, line {wrapper_lines[via]})" if via else ""),
+                f"쌓이는 스레드의 함수 `{started}`를 시작함"
+                + (f" (`{via}()`를 통해, {wrapper_lines[via]}행의 pthread_create)" if via else ""))])
             if not joins:
                 c.add(1, f"`{f.name}` neither joins nor detaches the thread", f"`{f.name}`가 스레드를 join·detach하지 않음")
             out.append(c)
@@ -1150,18 +1592,40 @@ def _loop_body_end(ctx: _Ctx, f: _Func, line: int) -> int:
 def _busy_loop(ctx: _Ctx) -> List[_Cand]:
     out: List[_Cand] = []
     spinning: Dict[str, str] = {}
+    spinner_names: Set[str] = set()
     for ob in ctx.failing_observations():
         for row in ob.get("runaway_threads") or []:
             if isinstance(row, dict):
+                if row.get("name"):
+                    spinner_names.add(str(row["name"]))
                 for fn in (row.get("top_function"), row.get("function")):
                     if fn in ctx.prog.funcs and fn not in spinning:
                         spinning[str(fn)] = str(row.get("name") or row.get("tid") or "")
+    base, how_en, how_ko = 3, "where thread `{who}` was observed spinning", "스레드 `{who}`가 공회전하는 것이 관측된"
+    if not spinning and spinner_names:
+        # A thread was observed spinning but its top frame is not in the program's own code (e.g. a std::thread
+        # trampoline with the loop inlined into it): the loops reached from the function that names that thread,
+        # ranked lower.
+        named = ctx.named_thread_funcs()
+        for name, start in sorted(named.items()):
+            if name not in spinner_names:
+                continue
+            for fn in sorted(ctx.reachable([start], depth=3)):
+                spinning.setdefault(fn, name)
+        base = 2
+        how_en = "reached from the function that names thread `{who}`, which was observed spinning"
+        how_ko = "공회전하는 것이 관측된 스레드 `{who}`의 이름을 붙이는 함수에서 도달하는"
     for n, who in spinning.items():
         f = ctx.prog.funcs[n]
         for ln, code in ctx.prog.body(f):
             if not _LOOP_RE.search(code):
                 continue
             end = _loop_body_end(ctx, f, ln)
+            at = ln
+            if ln not in f.code_lines():
+                # an unconditional header (`for (;;)`, `while (1)`) has no machine code of its own: point at the
+                # first statement of the loop that has
+                at = next((x for x in range(ln + 1, end + 1) if x in f.code_lines()), ln)
             body = " ".join(ctx.prog.code(f, x) for x in range(ln, end + 1))
             # calls into a user function that blocks count as blocking too (one level)
             blocking = bool(_BLOCKING_RE.search(body)) or any(
@@ -1169,9 +1633,9 @@ def _busy_loop(ctx: _Ctx) -> List[_Cand]:
                 for g in re.findall(r"([A-Za-z_]\w*)\s*\(", body) if g in ctx.prog.funcs and g != n)
             if blocking:
                 continue
-            c = _Cand(f, ln, "loop", 3, [(f"loop in `{n}`, where thread `{who}` was observed spinning; nothing in the "
-                                          f"loop blocks", f"스레드 `{who}`가 공회전하는 것이 관측된 `{n}`의 반복문이며, "
-                                          f"반복문 안에 대기하는 호출이 없음")])
+            c = _Cand(f, at, "loop", base, [(
+                f"loop in `{n}` (line {ln}), {how_en.format(who=who)}; nothing in the loop blocks",
+                f"{how_ko.format(who=who)} `{n}`의 반복문({ln}행)이며, 반복문 안에 대기하는 호출이 없음")])
             cond = re.search(r"(while|for)\s*\((.*)\)", code)
             polled = []
             if cond:

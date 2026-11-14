@@ -146,6 +146,8 @@ def _user_frame(callstack: Any) -> Tuple[Optional[str], Optional[str]]:
     """The top frame of a stack that has a source line (the process's own code), as (function, file:line)."""
     for fr in callstack or []:
         if isinstance(fr, dict) and fr.get("source_location") and fr.get("function_name"):
+            if fr.get("source_line_basis") == "NOT_OBSERVED_RUNNING_THREAD_STACK_SAMPLE":
+                return str(fr["function_name"]), None   # running thread: its line was not observed
             return str(fr["function_name"]), str(fr["source_location"])
     return None, None
 
@@ -185,7 +187,7 @@ def _threads_section(ev: _Evidence) -> Optional[Dict[str, Any]]:
             owner_name = st["waiting_on_lock"].get("held_by_thread_name")
         cpu, runnable = _num(s.get("cpu_share")), _num(s.get("runnable_fraction"))
         fn, loc = s.get("top_function"), s.get("top_source_location")
-        if not (fn and loc):
+        if not (fn and loc) and s.get("top_location_observed", True):
             fn2, loc2 = _user_frame(st.get("callstack"))
             fn, loc = (fn or fn2), (loc or loc2)
         row: Dict[str, Any] = {

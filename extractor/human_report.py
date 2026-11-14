@@ -89,6 +89,10 @@ T: Dict[str, Tuple[str, str]] = {
     "w_lines_note": ("The source line given for a function is where that function is defined; the exact line of "
                      "the call it is blocked in was not resolved.",
                      "함수에 붙은 소스 줄은 그 함수가 정의된 곳입니다. 멈춰 있는 호출의 정확한 줄은 해석하지 못했습니다."),
+    "w_running_note": ("The thread was running on a CPU: the line it executes cannot be read without stopping it, so it "
+                       "was not observed. The source line given is where the function is defined.",
+                       "스레드가 CPU에서 실행 중이었으므로, 멈추지 않고는 실행 중인 줄을 읽을 수 없어 관측하지 못했습니다. "
+                       "함수에 붙은 소스 줄은 그 함수가 정의된 곳입니다."),
     "w_dl_samename": ("The operating system gives all these threads the same name ({name}), so they are told apart "
                       "by the function they run and their thread id.",
                       "이 스레드들은 운영체제상 이름이 모두 같아({name}) 실행 함수와 스레드 ID로 구분했습니다."),
@@ -912,11 +916,12 @@ def _render_thread(ctx: _Ctx, f: Dict[str, Any], report: Optional[Dict[str, Any]
                 spins.append(r)
     if spins:
         ctx.term("spin"); ctx.term("runnable")
-    inexact = False
+    inexact = unobserved = False
     for r in spins:
         fn = r.get("top_function") or r.get("function")
-        loc = r.get("top_source_location")
+        loc = r.get("top_source_location") or r.get("top_function_decl_location")
         if fn and loc and r.get("runnable_fraction") is not None:
+            row_unobserved = r.get("top_location_observed") is False
             frac = round(float(r["runnable_fraction"]) * 100)
             cpu = r.get("cpu_share_pct") if r.get("cpu_share_pct") is not None else round(float(r.get("cpu_share") or 0) * 100, 1)
             disp = r.get("cpu_dispatches") if r.get("judgement_basis") == "schedstat_runnable_fraction_dispatches" else None
@@ -928,7 +933,12 @@ def _render_thread(ctx: _Ctx, f: Dict[str, Any], report: Optional[Dict[str, Any]
             else:
                 lines.append(ctx.t(k, thr=_c(r.get("name")), tid=r.get("tid"), frac=frac, cpu=cpu, n=disp,
                                    fn=_c(fn), loc=_c(loc)))
-                inexact = True
+                if row_unobserved:
+                    unobserved = True
+                else:
+                    inexact = True
+    if lines and unobserved:
+        lines.append(ctx.t("w_running_note"))
     if lines and inexact:
         lines.append(ctx.t("w_lines_note"))
     if not lines:
@@ -1019,7 +1029,8 @@ def _finding_next(ctx: _Ctx, f: Dict[str, Any], rendered: Dict[str, Any]) -> Lis
             out.append(ctx.t("n_generic_none"))
     elif cat == "PROCESS_INSTABILITY" and rendered.get("spins"):
         for r in rendered["spins"]:
-            fn, loc = r.get("top_function") or r.get("function"), r.get("top_source_location")
+            fn = r.get("top_function") or r.get("function")
+            loc = r.get("top_source_location") or r.get("top_function_decl_location")
             if fn and loc:
                 out.append(ctx.t("n_spin_at" if r.get("top_source_line_exact") else "n_spin",
                                  fn=_c(fn), loc=_c(loc), thr=_c(r.get("name"))))

@@ -1,0 +1,48 @@
+{
+  "id": "ho_wrapped_locks",
+  "suite": "heldout",
+  "origin": "new",
+  "naming": "neutral",
+  "kind": "deadlock",
+  "source": "benchmarks/diagnosis_accuracy/heldout/targets/ho_wrapped_locks/main.c",
+  "sources": [
+    "benchmarks/diagnosis_accuracy/heldout/targets/ho_wrapped_locks/main.c",
+    "benchmarks/diagnosis_accuracy/heldout/targets/ho_wrapped_locks/sync.c"
+  ],
+  "language": "c",
+  "build": {
+    "compiler": "gcc",
+    "opt": "-O2",
+    "flags": []
+  },
+  "style": "multi-file, pthread_mutex_lock only inside wrapper functions, -O2",
+  "symptom": "the service stopped responding",
+  "ready": {
+    "mode": "stdout_marker"
+  },
+  "causes": {
+    "variables": [],
+    "locks": [
+      "cache_mu",
+      "disk_mu"
+    ],
+    "threads": [
+      "evictor",
+      "loader"
+    ],
+    "functions": []
+  },
+  "locations": [
+    {
+      "file": "benchmarks/diagnosis_accuracy/heldout/targets/ho_wrapped_locks/main.c",
+      "line": 18,
+      "text": "take(&disk_mu);"
+    },
+    {
+      "file": "benchmarks/diagnosis_accuracy/heldout/targets/ho_wrapped_locks/main.c",
+      "line": 32,
+      "text": "take(&cache_mu);"
+    }
+  ],
+  "notes": "ABBA through take()/give() wrappers"
+}
