@@ -2599,6 +2599,17 @@ def _rule_suspicious_boundary_values(recipe: DiagnosticRecipe, data: Dict[str, A
             recommended_action="Verify arithmetic underflow protection.",
             details={"boundary_violation": True},
         )
+    if isinstance(val, int) and not isinstance(val, bool) and data.get("variable_type_kind", "integer") in ("integer", "enum"):
+        # the recipe's contradicting criterion: an integer state value that is no boundary / sentinel value
+        return RecipeEvaluationResult(
+            recipe_id=rid,
+            status=RECIPE_STATUS_CONTRADICTED,
+            confidence=0.70,
+            confidence_basis=f"{data.get('variable_name') or 'the state variable'} holds {val}, not a boundary or "
+                             f"sentinel value.",
+            contradicting_facts=[f"value {val} is no boundary / sentinel value"],
+            details={"boundary_violation": False},
+        )
     return None
 
 

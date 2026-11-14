@@ -343,12 +343,12 @@ struct bag g_bag;
 enum phase g_phase = P_RUN;
 int *g_ptr;
 unsigned long g_alloc_count = 5, g_free_count = 5;
-unsigned long g_capacity = 64, g_length = 3;
+unsigned long g_buf_capacity = 64, g_buf_length = 3;  /* related by the stem "buf", not by the g_ prefix */
 unsigned int g_magic = 0x600dcafe;
 int g_mode = 7;
 pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
 static void *worker(void *a) {
-    for (;;) { pthread_mutex_lock(&g_lock); g_length = 3; pthread_mutex_unlock(&g_lock); usleep(20000); }
+    for (;;) { pthread_mutex_lock(&g_lock); g_buf_length = 3; pthread_mutex_unlock(&g_lock); usleep(20000); }
 }
 int main(void) {
     pthread_t t; pthread_create(&t, 0, worker, 0);
@@ -366,7 +366,7 @@ FIXTURE_ANOMALOUS = r"""
 #include <unistd.h>
 int g_mode = -1;
 unsigned long g_alloc_count = 0, g_free_count = 0;
-unsigned long g_capacity = 8, g_length = 20;
+unsigned long g_buf_capacity = 8, g_buf_length = 20;
 int main(void) {
     puts("READY"); fflush(stdout);
     for (;;) { g_alloc_count++; usleep(500); }

@@ -56,10 +56,11 @@ class TestPhase241RecipeAccuracyAndEvidencePath(unittest.TestCase):
                 #include <stdint.h>
                 #include <pthread.h>
 
-                int g_capacity = 64;
-                int g_length = 8;
+                /* a capacity/length pair shares a stem; a name prefix (g_) alone does not relate two globals */
+                int g_buf_capacity = 64;
+                int g_buf_length = 8;
                 uint32_t g_magic_canary = 0x12345678;
-                char *g_active_ptr = (char*)&g_capacity;
+                char *g_active_ptr = (char*)&g_buf_capacity;
 
                 int main(void) {
                     printf("HEALTHY_READY %d\\n", getpid());
@@ -85,9 +86,13 @@ class TestPhase241RecipeAccuracyAndEvidencePath(unittest.TestCase):
                 #include <unistd.h>
                 #include <stdint.h>
 
-                int g_capacity = 10;
-                int g_length = 100;
+                int g_buf_capacity = 10;
+                int g_buf_length = 100;
+                /* 0xDEADBEEF is not corrupt by its value: the expected magic comes from the sibling objects,
+                   and the last object's magic alone disagrees with them */
                 uint32_t g_magic_canary = 0xDEADBEEF;
+                struct obj { uint32_t magic; int id; } g_objs[4] = {
+                    {0x12345678, 1}, {0x12345678, 2}, {0x12345678, 3}, {0xDEADBEEF, 4} };
                 void *g_bad_ptr = (void*)0xBAADF00D;
 
                 int main(void) {
@@ -343,7 +348,8 @@ class TestPhase241RecipeAccuracyAndEvidencePath(unittest.TestCase):
             },
             "RECIPE_LONG_LIVED_OBJECT_ACCUMULATION": {
                 "healthy": {"container_size": 5, "container_delta": 0},
-                "defect": {"monotonic_growth": True, "container_size_delta": 2000},
+                "defect": {"monotonic_growth": True, "container_size_delta": 2000,
+                           "heap_growth_bytes": 4 * 1024 * 1024},  # a growing count backed by memory growth
             },
             # Memory Integrity Domain
             "RECIPE_DOUBLE_FREE": {
