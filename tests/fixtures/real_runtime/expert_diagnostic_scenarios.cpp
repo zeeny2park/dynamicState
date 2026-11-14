@@ -29,6 +29,10 @@ volatile uint32_t g_buffer_capacity = 1024;
 volatile uint32_t g_buffer_length = 64;
 
 WorkerNode g_active_node = {0xCAFEBABE, 1, 42, "WorkerNode_01", nullptr};
+// Sibling nodes: their agreeing magic (0xCAFEBABE) is the expected value a corrupted node is judged against.
+// A magic value alone (0xDEADBEEF) is not evidence of corruption - it is often a program's VALID magic.
+WorkerNode g_worker_pool[4] = {{0xCAFEBABE, 1, 1, "pool_0", nullptr}, {0xCAFEBABE, 1, 2, "pool_1", nullptr},
+                               {0xCAFEBABE, 1, 3, "pool_2", nullptr}, {0xCAFEBABE, 1, 4, "pool_3", nullptr}};
 
 std::mutex g_mutex_a;
 std::mutex g_mutex_b;
@@ -44,6 +48,7 @@ void worker_healthy_loop() {
 
 void trigger_memory_corruption() {
     g_active_node.magic = 0xDEADBEEF; // Corrupt magic
+    g_worker_pool[2].magic = 0xDEADBEEF; // the same overwrite hits a pooled node: it now disagrees with its siblings
     g_active_node.payload_ptr = (void*)0x40; // Low-memory invalid address (within NULL page guard)
 }
 
@@ -77,6 +82,16 @@ void trigger_alloc_imbalance() {
         void* p = malloc(1024 * 32);
         if (p) g_leak_pool.push_back(p);
     }
+    // The imbalance keeps growing: allocations continue, frees do not (a static ratio alone is not a leak).
+    // FIXTURE_CAP: 1500 x 4 KiB over ~30 s.
+    std::thread([]() {
+        for (int i = 0; i < 1500; ++i) {
+            void* p = malloc(4096);
+            if (p) { memset(p, 0x5C, 4096); g_leak_pool.push_back(p); }
+            g_alloc_count++;
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        }
+    }).detach();
 }
 
 void trigger_abnormal_state() {

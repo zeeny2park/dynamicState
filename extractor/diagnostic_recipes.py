@@ -328,6 +328,10 @@ _register(DiagnosticRecipe(
     version="1.0.0",
     name="Invalid Free & Non-Heap Pointer Deallocation Audit",
     domain=DOMAIN_MEMORY_INTEGRITY,
+    # A pointer VALUE read from memory is not a free() argument: which pointer is passed to free() is only known
+    # from a free() history.  Without it the rule can only say "not observed" (free_call_observed False).
+    requires_capabilities=(CAP_ALLOCATION_TRACING,),
+    unsupported_question="Was free() called on a pointer that is not a heap block (stack / global / interior)?",
     observations=(OBS_MEMORY_INTEGRITY, OBS_PROCESS_INFO,),
     applicable_problem_categories=[CATEGORY_INVALID_DOUBLE_FREE, CATEGORY_MEMORY_CORRUPTION],
     required_prerequisites=["memory_read_available", "memory_maps_available"],

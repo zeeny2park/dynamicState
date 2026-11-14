@@ -100,6 +100,16 @@ void trigger_alloc_imbalance() {
         void* mem = malloc(1024 * 16);
         if (mem) g_retained_telemetry_records.push_back(mem);
     }
+    // The imbalance keeps growing: allocations continue, releases do not (a static ratio alone is not a leak).
+    // FIXTURE_CAP: 1500 x 4 KiB over ~30 s.
+    std::thread([]() {
+        for (int i = 0; i < 1500; ++i) {
+            void* mem = malloc(4096);
+            if (mem) { memset(mem, 0x5D, 4096); g_retained_telemetry_records.push_back(mem); }
+            g_alloc_ops++;
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        }
+    }).detach();
 }
 
 void trigger_field_invariant_violation() {

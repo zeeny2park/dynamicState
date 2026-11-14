@@ -905,7 +905,14 @@ class RuntimeEvidenceProvider:
                     # pairs only inside this struct: the struct is the relation, the stem says which fields
                     for a, b in related_pairs(int_members, ROLE_ALLOC, ROLE_FREE):
                         discovered["alloc_free_pairs"].append((f"{v.name}.{a}", f"{v.name}.{b}"))
-                    for c, ln in related_pairs(int_members, ROLE_CAPACITY, ROLE_LENGTH):
+                    cl_pairs = related_pairs(int_members, ROLE_CAPACITY, ROLE_LENGTH)
+                    caps = [m for m in int_members if name_has_role(m, ROLE_CAPACITY) and not name_has_role(m, ROLE_LENGTH)]
+                    lens = [m for m in int_members if name_has_role(m, ROLE_LENGTH) and not name_has_role(m, ROLE_CAPACITY)]
+                    if not cl_pairs and len(caps) == 1 and len(lens) == 1:
+                        # the struct's ONLY capacity field and its ONLY length field (max_capacity / payload_length):
+                        # the struct relates them; with several of either nothing says which belong together
+                        cl_pairs = [(caps[0], lens[0])]
+                    for c, ln in cl_pairs:
                         discovered["capacity_length_pairs"].append((f"{v.name}.{c}", f"{v.name}.{ln}"))
 
                 elif t and t.tag == "DW_TAG_array_type" and t.array_count and t.array_count >= 3:
