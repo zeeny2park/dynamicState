@@ -80,6 +80,18 @@ never loaded by the default run and never changes the main suite's totals. Growi
 (`FIXTURE_CAP`), launches go through `fixture_popen` as for the main suite. Purpose: measure whether the candidates
 generalise. The first-run result (before any heuristic was changed for these programs) is committed unchanged.
 
+| held-out, 21 defects | first run (`c8509f1`, `...-c8509f1-heldout-first-run.json`) | after (`9e9e6c0`, `...-9e9e6c0-heldout.json`) |
+|---|---|---|
+| detected | 20 | 20 |
+| strict location | 6 | 5 (the running-thread line of `ho_ring_poll` was a stale stack-sample address) |
+| candidates shown | 6 | 18 |
+| contain the true location / at rank 1 | 5 / 4 | 18 / 16 |
+| wrong (shown, truth not among them) | 1 (`ho_session_table`) | 0 |
+
+The "after" column is no longer a held-out measurement: the rules were improved while looking at these programs
+(only where they failed for a general reason, see the commit messages). A new held-out set is needed to measure
+generalisation again. Engine-level misses found by the suite are listed in the commit that records these results.
+
 ## Scoring (per target, one `diagnose` call)
 
 - Unscored targets: a ground-truth record with `"scored": false` (and a mandatory `"scored_reason"`) is still built, run
