@@ -315,6 +315,9 @@ def _memory_section(ev: _Evidence) -> Optional[Dict[str, Any]]:
                                 "blocks_delta": g.get("blocks_delta")})
         if classes:
             heap["growing_classes"] = sorted(classes, key=lambda c: -c["blocks"] * c["chunk_b"])[:3]
+        conts = _containers(li)
+        if conts:
+            heap["containers"] = conts
     if heap:
         out["heap"] = heap
     # integrity
@@ -542,6 +545,26 @@ def build_process_profile(result: Dict[str, Any], report: Optional[Dict[str, Any
     prof["not_observed"] = _not_observed(ev, secs)
     prof["available"] = bool(secs)
     return prof
+
+
+def _containers(li: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """C++ containers the leak investigation decoded under global/static owners (extractor.cpp_containers): the owner's
+    and the observed ones whose size changed; only validated decodes, at most 4."""
+    out: List[Dict[str, Any]] = []
+    rows = [(g.get("container"), True) for g in li.get("growth_owners") or [] if isinstance(g, dict)]
+    rows += [(c, False) for c in li.get("container_observations") or []]
+    walks = [w for w in li.get("heap_walks") or [] if isinstance(w, dict)]
+    for c, growing in rows:
+        if not isinstance(c, dict) or not c.get("decoded") or c.get("size_last") is None:
+            continue
+        item = {"variable": c.get("path"), "type": c.get("type"), "size": c["size_last"],
+                "size_series": c.get("size_series"), "growth_owner": growing,
+                "basis": _series(int(c.get("walks") or len(walks)), li.get("window_s"))}
+        for k in ("capacity", "buckets"):
+            if c.get(k) is not None:
+                item[k] = c[k]
+        out.append(item)
+    return out[:4]
 
 
 def _not_observed(ev: _Evidence, secs: Dict[str, Any]) -> List[Dict[str, Any]]:

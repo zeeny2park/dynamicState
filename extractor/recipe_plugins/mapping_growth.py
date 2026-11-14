@@ -327,16 +327,64 @@ def _typed_owners(provider: Any, ctx: Dict[str, Any], rd: _Reader, ranges: List[
         wanted.append((var, kind, t, (bias + var.link_time_address) if is_dyn else var.link_time_address, sz))
     datas = rd.read_many([(a, sz) for _, _, _, a, sz in wanted])
     owners = []
+    cont = _ContainerOwners(mname, idx, bias, is_dyn, rd, maps, inside)
     for (var, kind, t, a, sz), buf in zip(wanted, datas):
         if not buf:
             continue
         hits.clear()
         scan(buf, 0, t, var.name, 0)
         for path, n in hits.items():
-            owners.append({"variable": var.name, "variable_path": path, "root_kind": kind, "module": mname,
-                           "pointers_into_new_ranges": n})
+            owners.append({"variable": var.name, "variable_path": cont.readable(path), "root_kind": kind,
+                           "module": mname, "pointers_into_new_ranges": n})
+        row = cont.elements(var, kind)
+        if row:
+            owners.append(row)
     owners.sort(key=lambda o: -o["pointers_into_new_ranges"])
     return {"status": "COMPLETED", "globals_read": len(wanted), "owners": owners[:MAX_OWNERS]}
+
+
+MAX_CONTAINER_ELEMENTS = 8192        # pointer elements of one std::vector read for the owner search (64 KiB)
+
+
+class _ContainerOwners:
+    """Stage 3: owners whose pointers into the new ranges sit inside a C++ ``std::vector<T*>`` (its heap storage, not
+    the global itself): the vector is decoded and validated first (extractor.cpp_containers), then at most
+    ``MAX_CONTAINER_ELEMENTS`` element pointers are read.  A vector that does not decode is skipped (raw behaviour)."""
+
+    def __init__(self, mname: str, idx: Any, bias: int, is_dyn: bool, rd: "_Reader", maps: List[Dict[str, Any]],
+                 inside: Any):
+        from ..cpp_containers import ContainerPaths
+        self.mname, self.idx, self.rd, self.maps, self.inside = mname, idx, rd, maps, inside
+        self.paths = ContainerPaths([(mname, idx, bias, is_dyn)])
+
+    def readable(self, path: str) -> str:
+        try:
+            hit = self.paths.resolve(self.mname, path)
+        except Exception:  # noqa: BLE001
+            hit = None
+        return hit[1] if hit else path
+
+    def elements(self, var: Any, kind: str) -> Optional[Dict[str, Any]]:
+        from ..cpp_containers import K_VECTOR, ContainerMemory, decode, summary
+        try:
+            ref = self.paths.at_variable(self.mname, var.name)
+            if ref is None or ref.layout.kind != K_VECTOR or ref.layout.elem_size != 8 \
+                    or not str(ref.layout.elem_type or "").endswith("*"):
+                return None
+            d = decode(ref.layout, ref.address, ContainerMemory(self.rd.read_many, self.maps))
+            if not d.get("decoded") or not d.get("size"):
+                return None
+            n = min(int(d["size"]), MAX_CONTAINER_ELEMENTS)
+            buf = self.rd.read_many([(int(d["storage"], 16), n * 8)])[0]
+            if not buf:
+                return None
+            hits = sum(1 for k in range(len(buf) // 8) if self.inside(struct.unpack_from("<Q", buf, 8 * k)[0]))
+        except Exception:  # noqa: BLE001 - an addition to the typed-global search, never its failure
+            return None
+        if not hits:
+            return None
+        return {"variable": var.name, "variable_path": var.name + "[*]", "root_kind": kind, "module": self.mname,
+                "pointers_into_new_ranges": hits, "container": dict(summary(d), elements_read=n)}
 
 
 def _leak_walks(provider: Any, ctx: Dict[str, Any]) -> List[Dict[str, Any]]:

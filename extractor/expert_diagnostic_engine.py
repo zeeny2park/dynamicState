@@ -4572,6 +4572,10 @@ def _diagnose_run(
         # Never subjects, never a status or verdict input; debug image + source text only (no target access).
         from .static_location_candidates import attach_location_candidates
         attach_location_candidates(res.findings, debug_image, report=report, profile=res.process_profile)
+        # Roadmap stage 3: finding -> memory object -> variable -> thread (findings[].object_relations); presentation
+        # of the evidence above, never a status or verdict input.
+        from .object_relations import attach_object_relations
+        attach_object_relations(res.findings, report)
 
         try:
             rep_dir = os.path.join(engine.corpus_dir, "reports")
