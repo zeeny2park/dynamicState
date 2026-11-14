@@ -69,6 +69,17 @@ INCOMPLETE_LOCK_OWNER_UNSUPPORTED = "LOCK_OWNER_UNSUPPORTED"
 INCOMPLETE_HEAP_NOT_WALKED = "HEAP_NOT_WALKED"
 INCOMPLETE_RULE_UNDECIDED = "RULE_UNDECIDED"              # the rule could not decide from what was observed
 
+# Verification scope (stage 1): an observation cut for one of these reasons cannot show that the invariant holds.
+# (A /proc trend may clear MEMORY_BOUNDED without a heap walk; the poison / magic invariant needs the heap read.)
+INVARIANT_SCOPE_REASONS: Dict[str, frozenset] = {
+    INV_NO_POISON: frozenset({INCOMPLETE_HEAP_NOT_WALKED, INCOMPLETE_RULE_UNDECIDED}),
+    INV_NO_CIRCULAR_WAIT: frozenset({INCOMPLETE_LOCK_GRAPH, INCOMPLETE_LOCK_OWNER_UNSUPPORTED,
+                                     INCOMPLETE_RULE_UNDECIDED}),
+    INV_ADDRESS_VALID: frozenset({INCOMPLETE_RULE_UNDECIDED}),
+    INV_MEMORY_BOUNDED: frozenset({INCOMPLETE_RULE_UNDECIDED}),
+    INV_STATE_LEGAL: frozenset({INCOMPLETE_RULE_UNDECIDED}),
+}
+
 # Verification criteria families.  A problem category selects the criteria that verify its hypotheses; the table is
 # the explicit form of the former category-name substring test (CORRUPTION/FREE, LEAK/GROWTH, DEADLOCK/CONCURRENCY,
 # STATE/VARIABLE); tests/test_typed_evidence.py checks it against every registered category.
@@ -167,7 +178,15 @@ class TypedEvidence:
         return self.invariants.get(invariant) == VIOLATED
 
     def upholds(self, invariant: str) -> bool:
-        return self.invariants.get(invariant) == HOLDS
+        """The evidence asserts the invariant holds AND its observation covered what the invariant needs (an
+        observation cut for a reason that matters to this invariant cannot clear it: stage 1, verification scope)."""
+        if self.invariants.get(invariant) != HOLDS:
+            return False
+        return not (set(self.incomplete_reasons) & INVARIANT_SCOPE_REASONS.get(invariant, frozenset()))
+
+    def claims_hold_without_scope(self, invariant: str) -> bool:
+        """It asserts HOLDS, but its observation was cut for a reason that matters to the invariant."""
+        return self.invariants.get(invariant) == HOLDS and not self.upholds(invariant)
 
     @property
     def lock_graph_incomplete(self) -> bool:
@@ -220,21 +239,31 @@ def _no_poison(pol: str, rid: str, cat: str, det: Dict[str, Any], obs: Dict[str,
         if obs.get("magic_corrupted") or obs.get("observed_magic") is not None or obs.get("poison_pattern") \
                 or obs.get("corruption_hint_source") is not None or det.get("corruption_hint_only"):
             return VIOLATED
-        # was: "poison" in str(evidence) - RECIPE_USE_AFTER_FREE writes "poison_detected=<bool>" into every
-        # positive finding, whatever the bool (suspected defect, kept)
-        if rid == "RECIPE_USE_AFTER_FREE" and det.get("uaf_confirmed"):
+        # Defect 1 (fixed, stage 1): the former "poison" in str(evidence) matched the text "poison_detected=<bool>"
+        # that RECIPE_USE_AFTER_FREE writes into every positive finding, whatever the bool, so a use-after-free
+        # without poison bytes claimed poison.  The rule now records the bool it measured; only True claims it.
+        if rid == "RECIPE_USE_AFTER_FREE" and det.get("uaf_confirmed") and det.get("poison_detected") is True:
             return VIOLATED
     elif pol == POLARITY_CONTRADICTS:
-        # was: "clean" / "valid" in str(evidence).  Matched systematically by: the category INVALID_DOUBLE_FREE and
-        # the recipe ids RECIPE_INVALID_* / *_NULL_OR_INVALID_* ("invalid" contains "valid"); the details key
-        # object_valid; the fact "Canaries valid" (suspected defect: none of these is an observation of poison
-        # bytes, kept)
-        if cat == "INVALID_DOUBLE_FREE" or rid in ("RECIPE_INVALID_MEMORY_ACCESS", "RECIPE_INVALID_FREE",
-                                                   "RECIPE_UNEXPECTED_NULL_OR_INVALID_POINTERS"):
+        # The former "clean" / "valid" in str(evidence) matched words that are no observation of the memory's bytes:
+        # Defect 2 (fixed): the category INVALID_DOUBLE_FREE ("invalid" contains "valid");
+        # Defect 3 (fixed): the recipe ids RECIPE_INVALID_* / *_NULL_OR_INVALID_* (same substring);
+        # Defect 4 (fixed): the details key object_valid, which RECIPE_INVALID_MEMORY_ACCESS writes into every
+        #   negative result (True by default, whether or not any object header / magic was read).
+        # None of them claims anything now.  What does observe the bytes:
+        if det.get("canaries_intact"):          # the heap chunk canaries were read and are intact ("Canaries valid")
             return HOLDS
-        if det.get("object_valid") is not None or det.get("canaries_intact"):
+        if _magic_observed_intact(obs):         # an object header / magic value was read and is not corrupted
             return HOLDS
     return None
+
+
+def _magic_observed_intact(obs: Dict[str, Any]) -> bool:
+    """The observation carries a magic / canary / object-header reading and it is intact (an explicit value in the
+    observation, never a default the rule writes into its result)."""
+    if obs.get("magic_corrupted") is False or obs.get("canary_corrupted") is False:
+        return True
+    return obs.get("canary_valid") is True or obs.get("object_valid") is True
 
 
 _NO_GROWTH_CLASSIFICATIONS = ("STABLE_PLATEAU",)
@@ -396,7 +425,13 @@ def derive_typed_evidence(ev: Dict[str, Any], domain: Optional[str] = None) -> T
         has_observation=ev.get("observed_value") is not None,
         subject=str(ev["symbol"]) if ev.get("symbol") else None,
         certainty_cap=str(cap) if isinstance(cap, str) else None,
-        fault_confirmed=bool(det.get("leak_confirmed") or det.get("corruption_confirmed")),
+        # A confirmed fault: an unreachable leak, confirmed corruption, or a confirmed allocation / free counter
+        # imbalance (the program's own counters show allocations not freed).  The imbalance is a fault observation
+        # independent of whether the growing blocks are still referenced, so a capped growth observation next to it
+        # does not lower the verdict (the verdict must not get stronger when the heap walks fail: before this, the
+        # same leak target was CONFIRMED when the walks ran out of budget and LIKELY when they completed).
+        fault_confirmed=bool(det.get("leak_confirmed") or det.get("corruption_confirmed")
+                             or (pol == POLARITY_SUPPORTS and det.get("imbalance_confirmed") is True)),
         corruption_confirmed=bool(det.get("corruption_confirmed")),
     )
 

@@ -129,6 +129,7 @@ def make_authoritative_record(
     operation_id: str = "",
     receipt: LiveCaptureReceipt = None,
     parent_evidence_ids: list = None,
+    extra_details: dict = None,
 ) -> EvidenceRecord:
     """Creates a cryptographically receipted authoritative EvidenceRecord in ledger."""
     eff_proc = process_identity or f"proc_{pid}_start1000"
@@ -169,6 +170,7 @@ def make_authoritative_record(
             "live_capture_receipt": receipt.to_dict(),
             "target_pid": pid,
             "operation_id": operation_id,
+            **(extra_details or {}),
         },
         target_identity=t_ident,
         snapshot_ref=snap_ref,
@@ -632,11 +634,14 @@ class TestPhase218CompleteValidation(unittest.TestCase):
             ledger,
             "EV_CANARY_GOOD",
             observation="Canary word overwritten with 0x41414141 in chunk header",
+            # stage 1: the rule reads the structured reading, not the words of the observation
+            extra_details={"canary_corrupted": True},
         )
         make_authoritative_record(
             ledger,
             "EV_CANARY_CLEAN",
             observation="Canary intact and zero corrupt headers found",
+            extra_details={"canaries_intact": True},
         )
 
         # 1. Built-in rules cannot be overwritten by external registration
@@ -725,6 +730,8 @@ class TestPhase218CompleteValidation(unittest.TestCase):
             status=CheckStatus.FAIL,
             is_required=True,
         )
+        # stage 1: "manual" is a structured flag of the check, not a word in its name
+        chk_manual.manual_override = True
         agg = DiagnosticVerdictAggregator.aggregate(
             lifecycle_state=STATE_COMPLETED,
             stop_reason="ALL_HYPOTHESES_REFUTED",

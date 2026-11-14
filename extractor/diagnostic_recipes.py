@@ -1766,7 +1766,8 @@ def _rule_use_after_free(recipe: DiagnosticRecipe, data: Dict[str, Any]) -> Opti
             confidence_basis="Pointer dereferences a memory block currently on freelist, tracked as freed, or containing deallocation poison markers.",
             supporting_facts=[f"in_freelist={in_free}", f"poison_detected={poison}"],
             recommended_action="Locate dangling reference holders and nullify upon deallocation.",
-            details={"uaf_confirmed": True, "chain": ["FREED_ALLOCATION", "STALE_POINTER_CANDIDATE", "CONFIRMED_USE_AFTER_FREE"]},
+            details={"uaf_confirmed": True, "in_freelist": bool(in_free), "poison_detected": bool(poison),
+                     "chain": ["FREED_ALLOCATION", "STALE_POINTER_CANDIDATE", "CONFIRMED_USE_AFTER_FREE"]},
         )
     if active and not in_free and not poison:
         return RecipeEvaluationResult(

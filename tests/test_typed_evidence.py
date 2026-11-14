@@ -20,7 +20,7 @@ import unittest
 from types import SimpleNamespace
 from typing import Any, Dict, List, Tuple
 
-from extractor import healthy_verdict, typed_evidence
+from extractor import competing_hypotheses, diagnostic_verdict_aggregator, healthy_verdict, typed_evidence
 from extractor.diagnostic_recipes import ALL_PROBLEM_CATEGORIES, DiagnosticRecipeRegistry
 from extractor.expert_diagnostic_engine import AdaptiveInvestigationSession
 from extractor.typed_evidence import (
@@ -195,8 +195,9 @@ class TypedEvidenceSpecTest(unittest.TestCase):
     def test_claims_per_invariant(self):
         def claims(name):
             return [(typed_evidence_of(e).polarity, typed_evidence_of(e).invariants) for e in _scenario_evidence(name)]
-        self.assertIn((POLARITY_CONTRADICTS, {INV_ADDRESS_VALID: HOLDS, INV_NO_POISON: HOLDS}),
-                      claims("valid_mapped_pointer"))
+        # a validly mapped address says nothing about poison bytes (defect 4: its default object_valid=True used to
+        # claim NO_POISON HOLDS); see VerdictDefectRegressionTest
+        self.assertIn((POLARITY_CONTRADICTS, {INV_ADDRESS_VALID: HOLDS}), claims("valid_mapped_pointer"))
         self.assertEqual(claims("rss_growth")[0][1].get(INV_MEMORY_BOUNDED), VIOLATED)
         self.assertEqual(claims("heap_stable")[0][1].get(INV_MEMORY_BOUNDED), HOLDS)
         self.assertEqual(claims("deadlock_persistent")[0][1].get(INV_NO_CIRCULAR_WAIT), VIOLATED)
@@ -259,10 +260,12 @@ class WordingDoesNotChangeVerdictTest(unittest.TestCase):
     def test_expected_verdicts(self):
         # the verdicts the wording test holds fixed (and which the former string search reached the same way)
         expect = {
-            # address violated, but the probed memory shows no poison: fault criteria and a passed criterion
-            "unmapped_access": ("MEMORY_CORRUPTION", "LIKELY"),
+            # address violated and nothing passed: before stage 1 (verification scope) the poison criterion PASSed
+            # because an observed value existed ("memory slice audited clean"), although no rule read the bytes;
+            # that PASS held these two at LIKELY.  The criterion is INCONCLUSIVE now, so the fault is CONFIRMED.
+            "unmapped_access": ("MEMORY_CORRUPTION", "CONFIRMED"),
             "invalid_free_on_stack": ("INVALID_DOUBLE_FREE", "LIKELY"),
-            "null_pointer_in_active_state": ("MEMORY_CORRUPTION", "LIKELY"),
+            "null_pointer_in_active_state": ("MEMORY_CORRUPTION", "CONFIRMED"),
             "valid_mapped_pointer": ("MEMORY_CORRUPTION", "REFUTED"),
             "rss_growth": ("MEMORY_LEAK", "CONFIRMED"),
             "heap_stable": ("MEMORY_LEAK", "REFUTED"),
@@ -286,6 +289,155 @@ class WordingDoesNotChangeVerdictTest(unittest.TestCase):
                 for cid, result, _ids in r[3]:
                     if cid == "CRIT_NO_CIRCULAR_WAIT":
                         self.assertEqual(result, "INCONCLUSIVE")
+
+
+class VerdictDefectRegressionTest(unittest.TestCase):
+    """The four verdict defects the typed-evidence work preserved on purpose (roadmap 8.3), one test each."""
+
+    @staticmethod
+    def _claims(recipe_id, data, status=None, symbol=None):
+        return [typed_evidence_of(e) for e in _evidence_from_recipe(recipe_id, data, 0, symbol)
+                if status is None or e.get("status") == status]
+
+    def test_defect_1_uaf_without_poison_does_not_claim_poison(self):
+        # RECIPE_USE_AFTER_FREE wrote "poison_detected=False" into its finding and the old substring test read
+        # "poison" in it: a use-after-free without poison bytes claimed the poison invariant violated
+        no_poison = self._claims("RECIPE_USE_AFTER_FREE", {"in_freelist": True, "poison_detected": False}, "SUPPORTED")
+        self.assertTrue(no_poison)
+        for t in no_poison:
+            self.assertIsNone(t.invariants.get(INV_NO_POISON), t.invariants)
+            self.assertIs(t.measured.get("poison_detected"), False)
+        poison = self._claims("RECIPE_USE_AFTER_FREE", {"in_freelist": True, "poison_detected": True}, "SUPPORTED")
+        self.assertTrue(poison)
+        self.assertTrue(all(t.violates(INV_NO_POISON) for t in poison))
+
+    def test_defect_2_invalid_double_free_category_is_not_clean_memory(self):
+        # "invalid" contains "valid": every counter-indicator filed under INVALID_DOUBLE_FREE read as "memory clean"
+        ev = {"evidence_id": "e", "status": "CONTRADICTED", "recipe_id": "RECIPE_DOUBLE_FREE",
+              "problem_category": "INVALID_DOUBLE_FREE", "details": {"double_free_confirmed": False},
+              "raw_observation": {}}
+        self.assertIsNone(derive_typed_evidence(ev).invariants.get(INV_NO_POISON))
+
+    def test_defect_3_invalid_recipe_ids_are_not_clean_memory(self):
+        # the recipe ids RECIPE_INVALID_* / *_NULL_OR_INVALID_* matched "valid" in every counter-indicator
+        for rid in ("RECIPE_INVALID_MEMORY_ACCESS", "RECIPE_INVALID_FREE", "RECIPE_UNEXPECTED_NULL_OR_INVALID_POINTERS"):
+            with self.subTest(rid=rid):
+                ev = {"evidence_id": "e", "status": "CONTRADICTED", "recipe_id": rid,
+                      "problem_category": "MEMORY_CORRUPTION", "details": {}, "raw_observation": {}}
+                self.assertIsNone(derive_typed_evidence(ev).invariants.get(INV_NO_POISON))
+
+    def test_defect_4_default_object_valid_is_not_a_magic_reading(self):
+        # RECIPE_INVALID_MEMORY_ACCESS writes object_valid=True into every negative result; no header was read
+        unread = self._claims("RECIPE_INVALID_MEMORY_ACCESS",
+                              {"faulting_address": "0x55550000", "is_mapped": True, "vma_permissions": "rw-p"},
+                              "CONTRADICTED")
+        self.assertTrue(unread)
+        for t in unread:
+            self.assertIs(t.measured.get("object_valid"), True)
+            self.assertIsNone(t.invariants.get(INV_NO_POISON))
+        # a header the provider did read and found intact still clears it
+        read = self._claims("RECIPE_INVALID_MEMORY_ACCESS",
+                            {"faulting_address": "0x55550000", "is_mapped": True, "vma_permissions": "rw-p",
+                             "magic_corrupted": False}, "CONTRADICTED")
+        self.assertTrue(all(t.upholds(INV_NO_POISON) for t in read))
+        # intact heap canaries are a reading of the bytes and still clear it
+        canary = self._claims("RECIPE_HEAP_METADATA_CORRUPTION", {"canary_valid": True}, "CONTRADICTED")
+        self.assertTrue(canary and all(t.upholds(INV_NO_POISON) for t in canary))
+
+    def test_defect_2_no_fake_memory_clean_pass_in_verification(self):
+        # a double-free hypothesis with a supporting finding and an INVALID_DOUBLE_FREE counter-indicator was held
+        # at LIKELY by the fake "memory clean" PASS (defect 2); without it the fault criteria decide alone
+        tmp = tempfile.mkdtemp(prefix="typed_ev_def_")
+        try:
+            sup = _evidence_from_recipe("RECIPE_INVALID_FREE", {"pointer_address": 4096, "vma_name": "[stack]"}, 0)
+            con = {"evidence_id": "ev_c", "status": "CONTRADICTED", "recipe_id": "RECIPE_DOUBLE_FREE",
+                   "problem_category": "INVALID_DOUBLE_FREE", "details": {}, "raw_observation": {},
+                   "counter_indicator": "no block listed twice", "step_id": "step_09"}
+            rows = _Session(tmp, sup + [attach_typed_evidence(con)]).verify()
+            row = next(r for r in rows if r[0] == "INVALID_DOUBLE_FREE")
+            crit = {cid: res for cid, res, _ in row[3]}
+            self.assertEqual(crit.get("CRIT_NO_POISON_PATTERN"), "INCONCLUSIVE")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+
+class VerdictDoesNotDependOnWalkOutcomeTest(unittest.TestCase):
+    """A capped observation never lowers the verdict the other evidence supports.  Found as an order dependency of
+    tests/test_phase2_1_1_scenarios_a_to_j.py (scenario c): the leak fixture's heap is close to the per-walk read
+    budget, so whether the third heap walk fits depends on how long the diagnosis took to start (a first diagnosis
+    in a Python process is slower: cold imports and caches).  Walks failed -> only the allocation / free imbalance
+    supported the leak -> CONFIRMED; walks completed -> the same imbalance plus the walks' referenced-growth finding
+    (capped at PROBABLE, IMP-008) -> LIKELY.  More evidence must not give a weaker verdict."""
+
+    def test_capped_growth_next_to_confirmed_imbalance(self):
+        tmp = tempfile.mkdtemp(prefix="typed_ev_mono_")
+        try:
+            imbalance = _evidence_from_recipe("RECIPE_ALLOCATION_FREE_IMBALANCE",
+                                              {"alloc_delta": 400, "free_delta": 2}, 0)
+            self.assertTrue(any(typed_evidence_of(e).fault_confirmed for e in imbalance))
+            capped = attach_typed_evidence({
+                "evidence_id": "ev_cap", "status": "SUPPORTED", "recipe_id": "RECIPE_PROCESS_MEMORY_GROWTH",
+                "problem_category": "MEMORY_LEAK", "finding": "growth under a referenced container",
+                "details": {"growth_confirmed": True, "certainty_cap": "PROBABLE", "leak_verdict": "GROWTH_REFERENCED",
+                            "certainty_cap_reason": "still referenced"},
+                "raw_observation": {}, "step_id": "step_05"})
+            alone = _Session(tmp, copy.deepcopy(imbalance)).verify()
+            both = _Session(tmp, copy.deepcopy(imbalance) + [capped]).verify()
+            st = lambda rows: next(r[1] for r in rows if r[0] == "MEMORY_LEAK")
+            self.assertEqual(st(alone), "CONFIRMED")
+            self.assertEqual(st(both), st(alone))
+            # the capped observation alone stays capped
+            self.assertEqual(st(_Session(tmp, [copy.deepcopy(capped)]).verify()), "LIKELY")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+
+class VerificationScopeTest(unittest.TestCase):
+    """Stage 1: a criterion PASSes only when a rule decided its invariant on an observation that covered it; an
+    observed value alone, or a HOLDS claim from an observation cut for a reason that matters, is INCONCLUSIVE."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="typed_ev_scope_")
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _criteria(self, evidence, category):
+        rows = _Session(self.tmp, evidence).verify()
+        row = next(r for r in rows if r[0] == category)
+        return row[1], {cid: res for cid, res, _ in row[3]}
+
+    def test_observed_value_is_not_a_poison_check(self):
+        _status, crit = self._criteria(_scenario_evidence("unmapped_access"), "MEMORY_CORRUPTION")
+        self.assertEqual(crit["CRIT_POINTER_VALID_VMA"], "FAIL")
+        self.assertEqual(crit["CRIT_NO_POISON_PATTERN"], "INCONCLUSIVE")
+
+    def test_read_variable_is_not_a_domain_check(self):
+        ev = {"evidence_id": "ev_s", "status": "SUPPORTED", "recipe_id": "RECIPE_INCONSISTENT_RELATED_VARIABLES",
+              "problem_category": "FUNCTIONAL_STATE_INCONSISTENCY", "details": {}, "raw_observation": {},
+              "symbol": "g_state", "observed_value": 3, "finding": "x", "step_id": "step_01"}
+        _status, crit = self._criteria([attach_typed_evidence(ev)], "FUNCTIONAL_STATE_INCONSISTENCY")
+        self.assertEqual(crit["CRIT_VALID_STATE_DOMAIN"], "INCONCLUSIVE")
+        self.assertEqual(crit["CRIT_LEGAL_STATE_TRANSITION"], "INCONCLUSIVE")
+
+    def test_clean_claim_from_unwalked_heap_does_not_pass(self):
+        # canaries reported intact, but the heap walk of the same observation did not run: not a clean reading
+        ev = attach_typed_evidence({
+            "evidence_id": "ev_c", "status": "CONTRADICTED", "recipe_id": "RECIPE_HEAP_METADATA_CORRUPTION",
+            "problem_category": "MEMORY_CORRUPTION", "details": {"canaries_intact": True},
+            "raw_observation": {"memory_integrity": {"heap": {"status": "NOT_CHECKED"}}},
+            "counter_indicator": "x", "step_id": "step_01"})
+        t = typed_evidence_of(ev)
+        self.assertTrue(t.claims_hold_without_scope(INV_NO_POISON))
+        self.assertFalse(t.upholds(INV_NO_POISON))
+        _status, crit = self._criteria([ev], "MEMORY_CORRUPTION")
+        self.assertEqual(crit["CRIT_NO_POISON_PATTERN"], "INCONCLUSIVE")
+        # the same claim from a walked heap clears it
+        ok = attach_typed_evidence(dict(ev, raw_observation={"memory_integrity": {"heap": {"status": "COMPLETED"}}},
+                                        typed_evidence=None))
+        self.assertTrue(typed_evidence_of(ok).upholds(INV_NO_POISON))
+        _status, crit = self._criteria([ok], "MEMORY_CORRUPTION")
+        self.assertEqual(crit["CRIT_NO_POISON_PATTERN"], "PASS")
 
 
 class HealthyRuleReadsStructuredReasonTest(unittest.TestCase):
@@ -359,12 +511,78 @@ class NoStringSearchInVerificationPathTest(unittest.TestCase):
         healthy_verdict._uaf_cap_scope_limit,
         healthy_verdict._double_free_cap_scope_limit,
         healthy_verdict._heap_cap_scope_limit,
+        healthy_verdict.symptom_question_gaps,
+        # stage 1, rest of the verdict path: the aggregator, the null-hypothesis / remediation choice, the hypothesis
+        # model binding and the competing-hypothesis model's rules
+        AdaptiveInvestigationSession._step_analyze,
+        AdaptiveInvestigationSession._finalize_conclusion,
+        AdaptiveInvestigationSession._bind_competing_candidates,
+        diagnostic_verdict_aggregator.DiagnosticVerdictAggregator.aggregate,
+        diagnostic_verdict_aggregator.DiagnosticVerdictAggregator._is_not_applicable_justified,
+        diagnostic_verdict_aggregator.DiagnosticVerdictAggregator._does_required_fail_satisfy_confirmation,
+        diagnostic_verdict_aggregator.limitation_is_blocking,
+        competing_hypotheses.CompetingHypothesis.evaluate_verdict,
+        competing_hypotheses.CompetingHypothesis._evaluate_decisive_contradiction_rule,
+        competing_hypotheses.CompetingHypothesis.get_independent_root_sources,
+        competing_hypotheses.CompetingHypothesis.validate_primary_evidence_rule,
+        competing_hypotheses.CompetingHypothesisManager.generate_competing_hypotheses_for_symptom,
+        competing_hypotheses.candidate_verdict_source,
+        competing_hypotheses._record_is_static_storage,
+        competing_hypotheses._validate_rule_canary,
+        competing_hypotheses._validate_rule_double_free,
+        competing_hypotheses._validate_rule_segv_crash,
+        competing_hypotheses._validate_rule_deadlock_cycle,
+        competing_hypotheses._validate_rule_oom_kill,
+        competing_hypotheses._validate_rule_clean_refutation,
     )
 
     def test_guarded_functions(self):
         for fn in self.GUARDED:
             with self.subTest(fn=fn.__qualname__):
                 self.assertEqual(_violations(_func_tree(fn)), [])
+
+    def test_primary_rules_are_guarded(self):
+        # every built-in primary evidence rule's criteria function is in the guarded set
+        guarded = set(self.GUARDED)
+        for rid in competing_hypotheses.PrimaryEvidenceRuleRegistry._builtin_ids:
+            fn = competing_hypotheses.PrimaryEvidenceRuleRegistry.get(rid).validator_fn
+            self.assertIn(fn, guarded, rid)
+
+    def test_candidate_set_table_matches_registered_categories(self):
+        # explicit table replacing the substring tests on the category name; the one intended difference is
+        # ABNORMAL_VARIABLE_CHANGES ("CHANGES" contains "HANG")
+        def legacy(c):
+            if "GROWTH" in c or "LEAK" in c or "ACCUMULATION" in c or "IMBALANCE" in c:
+                return "LEAK"
+            if "CORRUPT" in c or "USE_AFTER_FREE" in c or "DOUBLE_FREE" in c or "INVALID_MEMORY" in c or "OVERFLOW" in c:
+                return "CORRUPTION"
+            if any(w in c for w in ("DEADLOCK", "CONCURRENCY", "CONTENTION", "FREEZE", "HANG", "THREAD")):
+                return "CONCURRENCY"
+            if "INSTABILITY" in c or "CRASH" in c or "EXHAUSTION" in c:
+                return "INSTABILITY"
+            return "GENERAL"
+        cats = set(ALL_PROBLEM_CATEGORIES) | {r.problem_category for r in DiagnosticRecipeRegistry.list_recipes()}
+        for cat in sorted(cats):
+            got = competing_hypotheses.SYMPTOM_CANDIDATE_SET.get(cat, competing_hypotheses.CANDIDATES_GENERAL)
+            want = "GENERAL" if cat == "ABNORMAL_VARIABLE_CHANGES" else legacy(cat)
+            self.assertEqual(got, want, cat)
+
+    def test_rule_criteria_ignore_observation_wording(self):
+        # the observation text of a ledger record neither satisfies nor fails a primary evidence rule
+        rec = SimpleNamespace(observation="Canary overwritten 0xdeadbeef corrupt overflow deadlock cycle oom clean",
+                              details={})
+        for rid in competing_hypotheses.PrimaryEvidenceRuleRegistry._builtin_ids:
+            ok, _ = competing_hypotheses.PrimaryEvidenceRuleRegistry.get(rid).evaluate_criteria(rec)
+            self.assertFalse(ok, rid)
+        rec = SimpleNamespace(observation="lorem ipsum", details={"canary_corrupted": True})
+        self.assertTrue(competing_hypotheses._validate_rule_canary(rec)[0])
+
+    def test_blocking_limitation_ignores_wording(self):
+        agg = diagnostic_verdict_aggregator
+        for text in ("timeout", "permission denied", "lorem ipsum"):
+            self.assertTrue(agg.limitation_is_blocking(text))
+            self.assertTrue(agg.limitation_is_blocking({"text": text}))
+            self.assertFalse(agg.limitation_is_blocking({"text": text, "blocking": False}))
 
     def test_typed_evidence_module(self):
         with open(typed_evidence.__file__, encoding="utf-8") as fh:

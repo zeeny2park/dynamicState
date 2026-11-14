@@ -76,6 +76,7 @@ from .temporal_observation_window import (
     MemoryAnalysisResult,
 )
 from .competing_hypotheses import (
+    candidate_verdict_source,
     CompetingHypothesis,
     CompetingHypothesisManager,
     HypothesisComparisonResult,
@@ -720,6 +721,11 @@ class TargetAssessor:
 # 5. Stage C: Investigation Planner & Step Representation
 # -----------------------------------------------------------------------------
 
+# Recipes whose confirmed growth schedules the heap follow-ups (the recipe ids containing "GROWTH" when the former
+# substring test was written; explicit so a new recipe is added deliberately)
+_GROWTH_FOLLOWUP_TRIGGERS = frozenset({"RECIPE_PROCESS_MEMORY_GROWTH", "RECIPE_HEAP_GROWTH", "RECIPE_MAPPING_GROWTH"})
+
+
 @dataclass
 class InvestigationStep:
     """An executable step in an investigation plan."""
@@ -737,6 +743,7 @@ class InvestigationStep:
     status: str = "PENDING"  # PENDING, RUNNING, COMPLETED, SKIPPED, FAILED
     result: Optional[Dict[str, Any]] = None
     executed_at: Optional[str] = None
+    dynamic_followup: bool = False  # scheduled by a confirmed growth step (IMP-004); structured, not the rationale
 
 
 @dataclass
@@ -2208,7 +2215,7 @@ class AdaptiveInvestigationSession:
         if eval_result.status == RECIPE_STATUS_SUPPORTED:
             # If RSS growth was observed, dynamically schedule heap growth and object accumulation
             dynamic_followups: List[InvestigationStep] = []
-            if "MEMORY_GROWTH" in recipe.recipe_id or "GROWTH" in recipe.recipe_id:
+            if recipe.recipe_id in _GROWTH_FOLLOWUP_TRIGGERS:
                 followup_ids = ["RECIPE_HEAP_GROWTH", "RECIPE_LONG_LIVED_OBJECT_ACCUMULATION"]
                 for fid in reversed(followup_ids):
                     if (
@@ -2226,6 +2233,7 @@ class AdaptiveInvestigationSession:
                                 target_assessment=self.target_assessment,
                                 rationale_override=f"Dynamic follow-up: isolated from confirmed {recipe.recipe_id}",
                             )
+                            new_step.dynamic_followup = True
                             remaining_steps.insert(0, new_step)
                             dynamic_followups.append(new_step)
 
@@ -2247,7 +2255,7 @@ class AdaptiveInvestigationSession:
                 # (IMP-008: also the follow-ups scheduled by an EARLIER growth step - a supported first follow-up
                 # must not cut off the second one.)
                 if (not any(s.status == "PENDING" for s in dynamic_followups)
-                        and not any(s.status == "PENDING" and str(s.rationale or "").startswith("Dynamic follow-up")
+                        and not any(s.status == "PENDING" and s.dynamic_followup
                                     for s in remaining_steps)
                         and not any(s.status == "PENDING" and s.recipe_id in BASELINE_RECIPE_IDS
                                     for s in remaining_steps)):
@@ -2483,12 +2491,23 @@ class AdaptiveInvestigationSession:
 
         # Filter out refuted hypotheses
         self.active_hypotheses = [h for h in self.active_hypotheses if h.status != "REFUTED"]
+        self._bind_competing_candidates()
         self._record_timeline_event("HYPOTHESES_VERIFIED", {
             "active_count": len(self.active_hypotheses),
             "rejected_count": len(self.rejected_hypotheses),
         })
         self.state = STATE_NARROWING
         return {"action": "VERIFY", "state": self.state}
+
+    def _bind_competing_candidates(self) -> None:
+        """Stage 1, one hypothesis model: the verified hypotheses are the source of truth for the final verdict and
+        for the report's competing candidates; each candidate becomes a view of the verified hypothesis that
+        consumed its rules' evidence (competing_hypotheses.candidate_verdict_source)."""
+        verified = list(self.active_hypotheses) + list(self.rejected_hypotheses)
+        if not verified:
+            return
+        for ch in self.competing_hypotheses:
+            ch.bind_verdict(candidate_verdict_source(ch, verified), ledger=self.ledger)
 
     def _execute_verification_for_hypothesis(self, hyp: ExpertHypothesis) -> Dict[str, Any]:
         """Executes explicit verification criteria for a single hypothesis.
@@ -2557,15 +2576,17 @@ class AdaptiveInvestigationSession:
                     consumed_ids.append(clean_ev.get("evidence_id", ""))
                     rationale = "Memory slice verified intact with zero corruption or poison patterns."
                 else:
-                    # Check if memory was actually read and verified
-                    mem_ev = first(both, lambda t: t.has_observation)
-                    if mem_ev:
-                        outcome = "PASS"
-                        consumed_ids.append(mem_ev.get("evidence_id", ""))
-                        rationale = "Memory slice audited clean without poison markers."
+                    # Verification scope (stage 1): an observed value is not a reading of the memory's bytes.  Only
+                    # a rule that read the bytes (canaries, magic, heap headers) and found them intact clears this.
+                    outcome = "INCONCLUSIVE"
+                    missing_ev.append("memory_slice_read")
+                    cut = first(contra, lambda t: t.claims_hold_without_scope(inv))
+                    if cut is not None:
+                        consumed_ids.append(cut.get("evidence_id", ""))
+                        rationale = ("The memory was reported intact, but the observation did not cover it: "
+                                     + ", ".join(typed_evidence_of(cut).incomplete_reasons) + ".")
                     else:
-                        outcome = "INCONCLUSIVE"
-                        missing_ev.append("memory_slice_read")
+                        rationale = "No rule read the memory's bytes (canaries / magic / heap headers) for this hypothesis."
 
             # 3. Memory growth / leak check
             elif cid in ("CRIT_RSS_GROWTH_STABLE", "CRIT_CHUNK_RECLAMATION"):
@@ -2619,15 +2640,14 @@ class AdaptiveInvestigationSession:
                     consumed_ids.append(valid_trans_ev.get("evidence_id", ""))
                     rationale = "Observed state transitions conform to valid specification."
                 else:
-                    # Check if state variable was actually observed
+                    # Verification scope (stage 1): reading a variable is not checking it against its domain or its
+                    # transitions; without a rule that decided the invariant the criterion stays open.
+                    outcome = "INCONCLUSIVE"
+                    missing_ev.append("state_variable_value_checked_against_domain")
                     state_obs_ev = first(both, lambda t: bool(t.subject))
-                    if state_obs_ev:
-                        outcome = "PASS"
-                        consumed_ids.append(state_obs_ev.get("evidence_id", ""))
-                        rationale = f"Observed variable '{state_obs_ev.get('symbol')}' conforms to normal operational state."
-                    else:
-                        outcome = "INCONCLUSIVE"
-                        missing_ev.append("state_variable_value")
+                    rationale = (f"Variable '{state_obs_ev.get('symbol')}' was read, but no rule checked it against its "
+                                 "domain or transitions." if state_obs_ev else
+                                 "No state variable was checked against its domain or transitions.")
 
             # 6. Clean check
             elif cid == "CRIT_ZERO_ANOMALIES":
@@ -2817,24 +2837,26 @@ class AdaptiveInvestigationSession:
                 "Investigation inconclusive due to insufficient evidence or collection failures; "
                 "verify target permissions, debug symbols, and process accessibility before re-running."
             )
-        elif primary_finding:
-            pf_up = primary_finding.upper()
-            if "INCONCLUSIVE" in pf_up:
+        elif primary_finding and self.active_hypotheses:
+            # by the leading hypothesis's category (stage 1: never by the words of the finding text)
+            top = self.active_hypotheses[0]
+            fam = criteria_family(top.category)
+            if top.status == "INCONCLUSIVE" or top.category == "UNKNOWN":
                 remediations.append(
                     "Investigation inconclusive due to insufficient evidence or collection failures; "
                     "verify target permissions, debug symbols, and process accessibility before re-running."
                 )
-            elif "MEMORY" in pf_up or "CORRUPT" in pf_up or "POINTER" in pf_up:
+            elif top.category == "HEALTHY":
+                remediations.append("No active remediation required: runtime state verified clean within investigated scope.")
+            elif fam == FAMILY_CORRUPTION:
                 remediations.append("Audit pointer dereference bounds and verify memory mapping permissions before dereference.")
                 remediations.append("Enable AddressSanitizer (ASan) during build: `-fsanitize=address -g`.")
-            elif "LEAK" in pf_up or "GROWTH" in pf_up or "IMBALANCE" in pf_up:
+            elif fam == FAMILY_GROWTH or top.category in ("HEAP_RETENTION", "RESOURCE_EXHAUSTION"):
                 remediations.append("Profile heap allocations and verify balanced free/delete calls across container lifecycles.")
                 remediations.append("Inspect long-lived container capacities and unbounded cache queue limits.")
-            elif "DEADLOCK" in pf_up or "LOCK" in pf_up:
+            elif fam == FAMILY_DEADLOCK or top.category in ("LOCK_CONTENTION", "ORPHAN_LOCK"):
                 remediations.append("Enforce strict global lock acquisition ordering hierarchy across all threads.")
                 remediations.append("Consider replacing nested mutexes with lock-free structures or fine-grained atomics.")
-            elif "HEALTHY" in pf_up or "CLEAN" in pf_up or "NO ABNORMAL" in pf_up:
-                remediations.append("No active remediation required: runtime state verified clean within investigated scope.")
             else:
                 remediations.append("Review state transition logic and enforce assertions for valid enum state transitions.")
         elif agg.overall_result == VERDICT_HEALTHY:
@@ -3666,6 +3688,9 @@ class AdaptiveInvestigationSession:
                 for h in data["competing_hypotheses"]
                 if isinstance(h, dict)
             ]
+        # one hypothesis model: candidates are re-bound to the verified hypotheses (never trusted from disk)
+        if any(h.verification_execution_results for h in sess.active_hypotheses + sess.rejected_hypotheses):
+            sess._bind_competing_candidates()
         return sess
 
 
@@ -4483,7 +4508,8 @@ def _diagnose_run(
         # Checks this mode cannot execute (declared capability requirement): "not examined", one row per capability.
         for _cap in dict.fromkeys(e["unsupported_capability"] for e in _excl_rows if e.get("unsupported_capability")):
             _ids = [e.get("recipe_id") for e in _excl_rows if e.get("unsupported_capability") == _cap]
-            nc.append({"kind": "unsupported_in_mode", "item": ",".join(map(str, _ids)), "capability": _cap,
+            nc.append({"kind": "unsupported_in_mode", "item": ",".join(map(str, _ids)), "recipe_ids": list(_ids),
+                       "capability": _cap,
                        "reason": "not supported in this mode: needs " + CAPABILITY_DESCRIPTIONS.get(_cap, (_cap, _cap))[0]})
         if excluded:
             nc.append({"kind": "recipes_not_planned", "item": ",".join(map(str, excluded)),
@@ -4498,10 +4524,16 @@ def _diagnose_run(
         # HEALTHY rule (extractor.healthy_verdict): every baseline check cleared, nothing blocking -> HEALTHY
         # within the stated scope; otherwise never HEALTHY (an aggregator HEALTHY is re-checked by the same rule).
         nc.extend(long_wait_scope_items(executed))
+        # Verification scope (stage 1): the categories a specific symptom asks about must each be answered by a
+        # completed check; a vague / general health check is scoped to the baseline.
+        _cls = session.classification_result
+        _sym_cats = ([str(c) for c, _w in (_cls.candidate_categories or [])]
+                     if _cls is not None and not _cls.is_vague and getattr(_cls, "understood", True) else [])
         res.healthy_scope = evaluate_healthy(
             verdict=res.verdict, findings=res.findings, checks=executed, not_covered=nc,
             baseline_ids=BASELINE_RECIPE_IDS,
-            recipe_names={r.recipe_id: r.name for r in DiagnosticRecipeRegistry.list_recipes()})
+            recipe_names={r.recipe_id: r.name for r in DiagnosticRecipeRegistry.list_recipes()},
+            symptom_categories=_sym_cats)
         if res.healthy_scope["healthy"]:
             res.verdict = VERDICT_HEALTHY
         elif res.verdict == VERDICT_HEALTHY:

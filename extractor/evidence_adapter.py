@@ -750,7 +750,7 @@ class EvidenceAdapter:
             "problem_category", "domain", "address", "symbol", "observed_value",
             "raw_observation", "normalized_observation", "correlation",
             "source_correlation", "limitations", "collection_status",
-            "parent_evidence_ids",
+            "parent_evidence_ids", "typed_evidence",
         ):
             if meta_k in tool_result and tool_result[meta_k] is not None:
                 compact_details[meta_k] = tool_result[meta_k]

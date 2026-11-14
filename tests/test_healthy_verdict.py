@@ -341,6 +341,38 @@ class TestHealthyRule(unittest.TestCase):
         self.assertNotRegex(en, "[가-힣]")
         self.assertIn("데이터 레이스", ko)
 
+    def test_symptom_question_needs_a_completed_check(self):
+        # stage 1 verification scope: the categories a specific symptom asks about are answered by a PASS check
+        base = [_chk(r) for r in BASELINE_RECIPE_IDS]
+
+        def ev(cats, checks=None, nc=None):
+            return hv.evaluate(verdict="INCONCLUSIVE", findings=[], checks=base if checks is None else checks,
+                               not_covered=nc or [], baseline_ids=BASELINE_RECIPE_IDS, symptom_categories=cats)
+
+        # answered by a baseline check of the category (memory growth / deadlock): unchanged
+        for cats in (["MEMORY_LEAK"], ["DEADLOCK_INDICATORS"], ["LOCK_CONTENTION", "DEADLOCK_INDICATORS"], [], None):
+            with self.subTest(cats=cats):
+                self.assertTrue(ev(cats)["healthy"], ev(cats)["blocking"])
+        # a category whose only checks reached no result: INCONCLUSIVE with the reason stated
+        s = ev(["UNEXPECTED_STATE_TRANSITIONS"],
+               checks=base + [_chk("RECIPE_STATE_TRANSITION_VIOLATIONS", "INCONCLUSIVE")])
+        self.assertFalse(s["healthy"])
+        gap = [b for b in s["blocking"] if b["kind"] == "symptom_question_unanswered"]
+        self.assertEqual([b["item"] for b in gap], ["UNEXPECTED_STATE_TRANSITIONS"])
+        self.assertIn("RECIPE_STATE_TRANSITION_VIOLATIONS INCONCLUSIVE", gap[0]["reason"])
+        # ... or that could not run in this mode
+        s = ev(["UNEXPECTED_STATE_TRANSITIONS"],
+               nc=[{"kind": "unsupported_in_mode", "item": "RECIPE_STATE_TRANSITION_VIOLATIONS",
+                    "recipe_ids": ["RECIPE_STATE_TRANSITION_VIOLATIONS"],
+                    "capability": "caller_specification", "reason": "x"}])
+        self.assertFalse(s["healthy"])
+        self.assertIn("not supported in this mode", s["blocking"][0]["reason"])
+        # the same check with a clear result answers it
+        s = ev(["UNEXPECTED_STATE_TRANSITIONS"], checks=base + [_chk("RECIPE_STATE_TRANSITION_VIOLATIONS")])
+        self.assertTrue(s["healthy"], s["blocking"])
+        # a category no recipe looks at is not a question this tool can be asked
+        self.assertTrue(ev(["NO_SUCH_CATEGORY"])["healthy"])
+
     def test_unsupported_feature_of_a_baseline_check_blocks(self):
         base = [_chk(r) for r in BASELINE_RECIPE_IDS if r != "RECIPE_POTENTIAL_DEADLOCK_PATTERNS"]
         s = self._eval(checks=base + [_chk("RECIPE_POTENTIAL_DEADLOCK_PATTERNS", "INCONCLUSIVE")],
