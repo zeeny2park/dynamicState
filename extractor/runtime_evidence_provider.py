@@ -581,6 +581,25 @@ class RuntimeEvidenceProvider:
         ev_records.append(rec)
         return data, method, err, ev_records
 
+    @staticmethod
+    def _pointer_value(companion_elf: str, val_item: Dict[str, Any]) -> Optional[int]:
+        """The address held by an evaluated expression, only when its DWARF type is a pointer (else None)."""
+        if not isinstance(val_item, dict) or val_item.get("status") != "OBSERVED":
+            return None
+        try:
+            from .dwarf_indexer import DwarfIndexer
+            t_off = val_item.get("type_offset")
+            t = DwarfIndexer.get_index(companion_elf).resolve_canonical_type(t_off) if t_off else None
+        except Exception:  # noqa: BLE001 - an unresolvable type is "not known to be a pointer"
+            t = None
+        if not t or t.tag != "DW_TAG_pointer_type":
+            return None
+        v = val_item.get("value")
+        try:
+            return int(v, 16) if isinstance(v, str) and v.startswith("0x") else int(v)
+        except Exception:  # noqa: BLE001
+            return None
+
     def evaluate_dwarf_expression(
         self,
         pid: int,
@@ -723,7 +742,9 @@ class RuntimeEvidenceProvider:
                         mn = m.name or ""
                         mn_low = mn.lower()
                         mt = idx.resolve_canonical_type(m.type_offset) if m.type_offset else None
-                        if (mt and mt.tag == "DW_TAG_pointer_type") or any(k in mn_low for k in ("ptr", "addr", "payload", "buf", "cache", "record")):
+                        # Only the DWARF type says a member is a pointer.  A name is not evidence: an int32_t
+                        # `total_buffers` (value 32) used to be read as a pointer to 0x20 because it contains "buf".
+                        if mt and mt.tag == "DW_TAG_pointer_type":
                             discovered["pointers"].append(f"{v.name}.{mn}")
                         if any(k in mn_low for k in ("magic", "canary", "header", "tag")):
                             discovered["magic_canaries"].append(f"{v.name}.{mn}")
@@ -919,22 +940,20 @@ class RuntimeEvidenceProvider:
                 all_records.extend(v_recs)
                 if val_item.get("status") == "OBSERVED":
                     ptr_val = val_item.get("value")
-                    ptr_name = cand
-                    # Extract integer pointer address
                     if isinstance(ptr_val, dict):
-                        for k, v in ptr_val.items():
-                            if any(pk in k.lower() for pk in ("ptr", "addr", "payload", "buf", "cache", "record")):
-                                try:
-                                    observed_addr = int(v, 16) if isinstance(v, str) and v.startswith("0x") else int(v)
-                                    ptr_name = f"{cand}.{k}"
-                                    break
-                                except Exception:
-                                    pass
+                        # a struct: only its members whose DWARF type is a pointer hold an address
+                        for k in list(ptr_val)[:16]:
+                            sub_item, s_recs = self.evaluate_dwarf_expression(pid, companion_elf, f"{cand}.{k}")
+                            all_records.extend(s_recs)
+                            sub_addr = self._pointer_value(companion_elf, sub_item)
+                            if sub_addr is not None:
+                                observed_addr, ptr_name = sub_addr, f"{cand}.{k}"
+                                break
                     else:
-                        try:
-                            observed_addr = int(ptr_val, 16) if isinstance(ptr_val, str) and ptr_val.startswith("0x") else int(ptr_val)
-                        except Exception:
-                            pass
+                        # the value of a non-pointer (an integer counter, a flag) is not an address
+                        observed_addr = self._pointer_value(companion_elf, val_item)
+                        if observed_addr is not None:
+                            ptr_name = cand
                     if observed_addr is not None:
                         break
 
@@ -985,6 +1004,10 @@ class RuntimeEvidenceProvider:
                 if observed_addr == 0:
                     observation_data["null_pointer_value"] = True
                 elif 0 < observed_addr <= 4096:
+                    # A pointer VALUE inside the NULL page is observed; whether anything dereferenced it is not
+                    # observable from outside (no fault is caught).  Say so explicitly: the rule must not read
+                    # a missing key as "dereferenced".
+                    observation_data["dereference_attempted"] = False
                     observation_data["is_mapped"] = False
                     observation_data["vma_permissions"] = "---p"
                     observation_data["violation_type"] = "NULL_PAGE_POINTER_VALUE"

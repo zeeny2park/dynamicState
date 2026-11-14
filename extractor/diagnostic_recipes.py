@@ -1585,7 +1585,9 @@ def _rule_invalid_memory_access(recipe: DiagnosticRecipe, data: Dict[str, Any]) 
             or data.get("chunk_state") == "CORRUPTED"
             or data.get("magic_corrupted")
         )
-        if not is_dereferenced and data.get("dereference_attempted") is False:
+        # Only positive evidence of a dereference confirms a fault.  A zero-stop observation carries no
+        # "dereference_attempted" key at all; a missing key is "not observed", never "dereferenced".
+        if not is_dereferenced and data.get("dereference_attempted") is not True:
             return RecipeEvaluationResult(
                 recipe_id=rid,
                 status=RECIPE_STATUS_INSUFFICIENT_EVIDENCE,
