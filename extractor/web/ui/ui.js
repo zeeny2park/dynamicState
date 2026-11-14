@@ -724,6 +724,7 @@
       esc(tr(lang, "checks_h")) + '</h2><span class="card-description">' + esc(tr(lang, "checks_desc", { done: n.done, total: n.total })) +
       '</span><span class="right">' + esc(tr(lang, "checks_hint")) + "</span></div>" +
       '<div class="card-content"><ul class="ck">' + rows + "</ul>" + skip +
+      (V && V.timeline_html ? '<div class="dsv" lang="' + lang + '" data-static="tl-' + lang + '">' + V.timeline_html + "</div>" : "") +
       (s.verdict ? link(reportHref(s, ui, "scope-detail"), tr(lang, "scope_detail")) : "") + "</div></section>";
   }
 
