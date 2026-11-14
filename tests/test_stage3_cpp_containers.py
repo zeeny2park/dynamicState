@@ -241,6 +241,19 @@ class TestRejection(_Base):
         self.assertIsNone(cc.classify(Idx(T("Registry")), 1))
 
 
+class TestExploreNote(unittest.TestCase):
+    def test_value_note_states_size_or_why_not(self):
+        from extractor.web.ui.explore_fragments import container_note
+        ok = {"kind": cc.K_VECTOR, "type": "std::vector<int>", "decoded": True, "size": 3, "capacity": 4}
+        self.assertIn("3", container_note("en", ok))
+        self.assertIn("capacity 4", container_note("en", ok))
+        self.assertIn("원소 3개", container_note("ko", ok))
+        bad = {"kind": cc.K_MAP, "type": "std::map<int, int>", "decoded": False, "reason": "root does not link back"}
+        self.assertIn("not decoded (root does not link back)", container_note("en", bad))
+        self.assertNotIn("size", container_note("en", bad))
+        self.assertEqual(container_note("en", None), "")
+
+
 class TestPaths(_Base):
     def test_c_private_member_paths_name_the_container(self):
         cp = cc.ContainerPaths([("m", self.idx, 0, True)])
