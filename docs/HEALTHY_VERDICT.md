@@ -22,6 +22,10 @@ HEALTHY only if all hold:
    the baseline walk cap (`memory_integrity.heap.not_checked_reason == "above_baseline_cap"`) while the global
    adjacency and stack-margin parts completed clean: a declared cost limit, listed as not checked. Every other
    non-PASS baseline status (INCONCLUSIVE, ERROR, NOT_APPLICABLE, UNSUPPORTED, NOT_EXECUTED) blocks.
+   A baseline check left out by the time budget of the default checks (`extractor/check_budget.py`, decision 6.1-2:
+   plan step `not_run_reason == "time_budget"`, `not_covered` row `baseline_check_not_run` with the same field) is
+   the same coverage gap: it blocks (rule 1 and `baseline_check_missing` with `not_run_reason`), so the budget never
+   yields a HEALTHY that skipped part of the baseline. Checks the symptom asks for are never budgeted.
 4. Scope limits do not block; they are listed in `healthy_scope.not_checked` and named in the first sentence of
    the summary ("healthy within the checked scope ... Not checked: ...").
 5. Verification scope (stage 1): every problem category a *specific* symptom asks about (the classifier's candidate

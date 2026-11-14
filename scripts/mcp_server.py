@@ -772,6 +772,8 @@ def runtime_diagnose_process(
     symptom_duration: Optional[str] = None,
     affected_area: Optional[str] = None,
     related_objects: Optional[List[str]] = None,
+    default_check_budget_s: Optional[float] = None,
+    default_check_max_s: Optional[float] = None,
 ) -> str:
     """Diagnose a live Linux process end to end in ONE call and return the final verdict.
 
@@ -795,6 +797,9 @@ def runtime_diagnose_process(
         symptom: Optional natural-language symptom (e.g. 'process hangs', 'memory keeps growing').
             Defaults to a general health check.
         time_limit_s: Optional wall-clock observation budget in seconds.
+        default_check_budget_s / default_check_max_s: Optional time budget (total / per check, seconds) for the
+            default checks the symptom did not ask for (default 6 / 2.5, or the DYNAMICSTATE_DEFAULT_CHECK_* environment;
+            <= 0: no limit). A default check left out is reported as not run and the verdict is then never HEALTHY.
         language: Language of human_summary: 'en' (default) or 'ko'. Pass the user's language.
         remote_host: Set this (SSH host name or IP) when the process runs on a REMOTE embedded Linux target
             (ARM64 / x86-64, glibc) instead of on this machine; then 'pid' is the PID on that target and the
@@ -841,7 +846,8 @@ def runtime_diagnose_process(
         out, summary = diagnose_with_summary(
             pid, debug_image=debug_image, symptom=symptom, time_limit_s=time_limit_s,
             engine=runtime.expert_diagnostic_engine, lang=lang, target=remote_target,
-            symptom_fields=symptom_fields,
+            symptom_fields=symptom_fields, default_check_budget_s=default_check_budget_s,
+            default_check_max_s=default_check_max_s,
         )
         out["human_summary"] = summary
         return _format_watch_result(out)

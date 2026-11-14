@@ -528,6 +528,12 @@ def main():
     from .symptom_interpretation import add_cli_arguments as _add_symptom_field_arguments
     _add_symptom_field_arguments(dx_p)   # optional structured symptom input, shared with the MCP tool and the web API
     dx_p.add_argument("--time-limit", dest="time_limit_s", type=float, default=None, help="Wall-clock observation budget in seconds")
+    dx_p.add_argument("--default-check-budget", dest="default_check_budget_s", type=float, default=None,
+                      help="Time budget in seconds for the default checks the symptom did not ask for (env "
+                           "DYNAMICSTATE_DEFAULT_CHECK_BUDGET_S, default 6; <= 0: no limit)")
+    dx_p.add_argument("--default-check-max", dest="default_check_max_s", type=float, default=None,
+                      help="Per-check limit in seconds for a default check (env DYNAMICSTATE_DEFAULT_CHECK_MAX_S, "
+                           "default 2.5; <= 0: no limit)")
     dx_p.add_argument("--corpus", type=str, default="corpus", help="State Corpus directory (reports are written under <corpus>/reports)")
     dx_p.add_argument("--json", action="store_true", default=False,
                       help="Print the full result as JSON (the readable summary is under 'human_summary')")
@@ -1809,6 +1815,7 @@ def main():
             args.pid, debug_image=args.debug_image, symptom=args.symptom, time_limit_s=args.time_limit_s,
             engine=ExpertDiagnosticEngine(corpus_dir=os.path.abspath(args.corpus)), lang=args.lang,
             target=remote_target, symptom_fields=symptom_fields,
+            default_check_budget_s=args.default_check_budget_s, default_check_max_s=args.default_check_max_s,
         )
         if args.json:
             result["human_summary"] = summary

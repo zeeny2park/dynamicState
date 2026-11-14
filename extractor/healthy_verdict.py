@@ -280,10 +280,18 @@ def evaluate(*, verdict: str, findings: List[Dict[str, Any]], checks: List[Any],
     by_recipe: Dict[str, List[Any]] = {}
     for c in checks:
         by_recipe.setdefault(str(getattr(c, "recipe_id", "")), []).append(c)
+    # baseline checks left out on purpose (structured reason on the not_covered row, e.g. the default-check time
+    # budget): still a coverage gap, never cleared; the reason is carried into the blocking row
+    not_run = {str(n.get("item")): n.get("not_run_reason") for n in not_covered
+               if isinstance(n, dict) and n.get("kind") == "baseline_check_not_run" and n.get("not_run_reason")}
     for rid in baseline:
         cs = by_recipe.get(rid) or []
         if not cs:
-            block("baseline_check_missing", rid, "baseline check was not executed")
+            if rid in not_run:
+                block("baseline_check_missing", rid, f"baseline check was not run ({not_run[rid]})")
+                blocking[-1]["not_run_reason"] = not_run[rid]
+            else:
+                block("baseline_check_missing", rid, "baseline check was not executed")
             continue
         ok = True
         partial: List[str] = []
