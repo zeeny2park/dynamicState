@@ -413,6 +413,50 @@ T: Dict[str, Tuple[str, str]] = {
     "f_cands": ("**Location candidates** (static analysis, not observed): {locs}.",
                 "**위치 후보**(정적 분석, 관측 아님): {locs}."),
     "f_cands_head": ("Location candidates (static analysis, not observed)", "위치 후보 (정적 분석, 관측 아님)"),
+    # object relations (extractor.object_relations): memory object <- owning variable <- thread, each link with how
+    "f_rel": ("**Relation**: {chain}.", "**관계**: {chain}."),
+    "rel_arrow": (" ← ({how}) ", " ← ({how}) "),
+    "rel_ne": ("not established: {why}", "확인되지 않음: {why}"),
+    "rel_m_heap_blocks": ("heap blocks +{n}{kb}", "힙 블록 +{n}개{kb}"),
+    "rel_m_heap_blocks_class": ("heap blocks of {c} B +{n}{kb}", "{c} B 힙 블록 +{n}개{kb}"),
+    "rel_kb": (" (+{kb} KB)", "(+{kb} KB)"),
+    "rel_m_heap_block": ("heap block {x}", "힙 블록 {x}"),
+    "rel_m_heap_block_free": ("freed heap block {x}", "해제된 힙 블록 {x}"),
+    "rel_m_mapping": ("grown mapping {x}{kb}", "늘어난 매핑 {x}{kb}"),
+    "rel_m_lock": ("lock {x}", "락 {x}"),
+    "rel_m_global_storage": ("storage of {x}", "{x}의 저장 공간"),
+    "rel_m_none": ("no memory object", "메모리 객체 없음"),
+    "rel_m_unknown": ("memory object", "메모리 객체"),
+    "rel_var": ("variable {x}", "변수 {x}"),
+    "rel_var_cont": ("variable {x} ({t}, {n} elements)", "변수 {x}({t}, 원소 {n}개)"),
+    "rel_var_ne": ("variable", "변수"),
+    "rel_thr": ("thread {x}", "스레드 {x}"),
+    "rel_thr_ne": ("thread", "스레드"),
+    "rel_how_typed_pointer_path": ("observed pointer path", "관측한 포인터 경로"),
+    "rel_how_dangling_pointer": ("pointer still holding the freed address", "해제된 주소를 아직 가진 포인터"),
+    "rel_how_holds_reference": ("pointer holding its address", "주소를 가진 포인터"),
+    "rel_how_pointer_into_mapping": ("pointer into the mapping", "매핑 안을 가리키는 포인터"),
+    "rel_how_debug_symbol": ("debug information", "디버그 정보"),
+    "rel_how_arena_attribution": ("arena attribution", "아레나 귀속"),
+    "rel_how_run_counters": ("per-thread run counters", "스레드별 실행 카운터"),
+    "rel_how_lock_owner_field": ("mutex owner field", "뮤텍스 소유자 필드"),
+    "rel_how_thread_samples": ("thread samples", "스레드 샘플"),
+    "rel_ne_unreachable": ("no reference remains", "참조가 남아 있지 않음"),
+    "rel_ne_untraced_use": ("using thread not observable without tracing", "추적 없이는 사용 스레드를 볼 수 없음"),
+    "rel_ne_untraced_free": ("free() calls are not traced", "free() 호출은 추적하지 않음"),
+    "rel_ne_untraced_write": ("writing thread not observable without tracing", "추적 없이는 쓴 스레드를 볼 수 없음"),
+    "rel_ne_mmapped_no_arena": ("mmapped blocks have no arena", "mmap 블록은 아레나가 없음"),
+    "rel_ne_arena_shared": ("several threads share the arena", "여러 스레드가 아레나를 공유함"),
+    "rel_ne_arena_unattributed": ("arena not tied to one thread", "아레나가 한 스레드에 묶이지 않음"),
+    "rel_ne_no_owner_variable": ("no variable holds its address", "주소를 가진 변수를 찾지 못함"),
+    "rel_ne_no_path": ("no variable path reaches it", "이르는 변수 경로가 없음"),
+    "rel_ne_no_mapping_owner": ("no variable points into it", "가리키는 변수가 없음"),
+    "rel_ne_no_single_thread": ("not exactly one thread ran", "실행한 스레드가 하나가 아님"),
+    "rel_ne_owner_changed": ("the owner changed between samples", "샘플마다 소유자가 바뀜"),
+    "rel_ne_owner_unread": ("owner field not read", "소유자 필드를 읽지 못함"),
+    "rel_ne_no_symbol": ("no variable at that address", "그 주소의 변수가 없음"),
+    "rel_ne_not_memory": ("about execution, not memory", "실행에 관한 발견이며 메모리 객체가 아님"),
+    "rel_ne_other": ("see the result JSON", "결과 JSON 참고"),
     "f_cands_note": ("Chosen from the debug information and the source text, not seen at runtime; they do not "
                      "confirm where the defect happened. Ranked by how directly they relate to the finding.",
                      "디버그 정보와 소스 코드로 고른 후보이며 실행 중에 본 위치가 아닙니다. 결함이 생긴 위치를 확인한 "
@@ -1281,6 +1325,8 @@ def _finding_blocks(ctx: _Ctx, res: Dict[str, Any], renders: List[Dict[str, Any]
             body.append(ctx.t("w_noname"))
         if (f.get("subjects") or f.get("subject_details")) or r.get("registered"):
             body.extend(r["lines"])
+        for chain in relation_lines(ctx, f)[:3]:
+            facts.append(ctx.t("f_rel", chain=chain))
         cands = location_candidate_lines(ctx, f)
         if cands:
             facts.append(ctx.t("f_cands", locs=_join([f"`{c['location']}`" for c in
@@ -1292,6 +1338,68 @@ def _finding_blocks(ctx: _Ctx, res: Dict[str, Any], renders: List[Dict[str, Any]
                     "facts": facts, "body": body, "diagram": diagram, "why": _finding_why(ctx, f, r),
                     "cands": cands})
     return out
+
+
+def relation_lines(ctx: _Ctx, f: Dict[str, Any]) -> List[str]:
+    """``findings[].object_relations`` as one chain line each: memory object <- (how) variable <- (how) thread; a link
+    that is not established says so and why (extractor.object_relations)."""
+    rel = f.get("object_relations") if isinstance(f.get("object_relations"), dict) else {}
+    out = []
+    for ch in rel.get("chains") or []:
+        nodes = {n.get("role"): n for n in ch.get("nodes") or [] if isinstance(n, dict)}
+        links = {x.get("target"): x for x in ch.get("links") or [] if isinstance(x, dict)}
+        m, v, th = nodes.get("memory_object") or {}, nodes.get("variable") or {}, nodes.get("thread") or {}
+        if not m:
+            continue
+        parts = [_rel_memory(ctx, m)]
+        for node, label in ((v, _rel_var(ctx, v)), (th, _rel_thread(ctx, th))):
+            ln = links.get(node.get("id")) or {}
+            if ln.get("established") and node.get("established", True):
+                key = "rel_how_" + str(ln.get("how"))
+                parts.append(ctx.t("rel_arrow", how=ctx.t(key) if key in T else _c(ln.get("how"))) + label)
+            else:
+                rk = "rel_ne_" + str(ln.get("reason"))
+                parts.append(ctx.t("rel_arrow", how=ctx.t("rel_ne", why=ctx.t(rk if rk in T else "rel_ne_other")))
+                             + label)
+        out.append("".join(parts))
+    return out
+
+
+def _rel_memory(ctx: _Ctx, m: Dict[str, Any]) -> str:
+    a = m.get("attrs") or {}
+    kind = m.get("kind")
+    kb = ctx.t("rel_kb", kb=round(float(a["bytes_delta"]) / 1024.0)) if a.get("bytes_delta") else ""
+    if kind == "heap_blocks":
+        if a.get("chunk_size"):
+            return ctx.t("rel_m_heap_blocks_class", c=a["chunk_size"], n=a.get("blocks_delta") or "?", kb=kb)
+        return ctx.t("rel_m_heap_blocks", n=a.get("blocks_delta") or "?", kb=kb)
+    if kind == "heap_block":
+        return ctx.t("rel_m_heap_block_free" if str(a.get("state") or "").startswith("free") else "rel_m_heap_block",
+                     x=_c(m.get("name") or "?"))
+    if kind == "mapping":
+        return ctx.t("rel_m_mapping", x=_c(m.get("name")) if m.get("name") else "",
+                     kb=ctx.t("rel_kb", kb=a["added_kb"]) if a.get("added_kb") else "").replace("  ", " ")
+    if kind in ("lock", "global_storage"):
+        return ctx.t("rel_m_" + kind, x=_c(m.get("name") or "?"))
+    return ctx.t("rel_m_none" if kind == "none" else "rel_m_unknown")
+
+
+def _rel_var(ctx: _Ctx, v: Dict[str, Any]) -> str:
+    if not v.get("established", True) or not v.get("name"):
+        return ctx.t("rel_var_ne")
+    c = (v.get("attrs") or {}).get("container")
+    if isinstance(c, dict) and c.get("type") and c.get("size_last") is not None:
+        return ctx.t("rel_var_cont", x=_c(v["name"]), t=_c(c["type"]), n=_num(c["size_last"]))
+    return ctx.t("rel_var", x=_c(v["name"]))
+
+
+def _rel_thread(ctx: _Ctx, t: Dict[str, Any]) -> str:
+    if not t.get("established", True):
+        return ctx.t("rel_thr_ne")
+    tid = (t.get("attrs") or {}).get("tid")
+    if t.get("name"):
+        return ctx.t("rel_thr", x=_c(t["name"]) + (f" (tid {tid})" if tid is not None else ""))
+    return ctx.t("rel_thr", x=f"tid {tid}" if tid is not None else "?")
 
 
 def location_candidate_lines(ctx: _Ctx, f: Dict[str, Any]) -> List[str]:

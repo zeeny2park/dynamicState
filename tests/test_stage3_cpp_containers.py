@@ -294,6 +294,12 @@ class TestLeakFinding(_Base):
         self.assertGreater(c["size_delta"], 0)
         decoded = [x for x in c["size_series"] if x is not None]
         self.assertEqual(decoded, sorted(decoded))
+        # the relation model of the finding (extractor.object_relations): blocks <- variable <- thread
+        chain = next(ch for ch in leaks[0]["object_relations"]["chains"]
+                     if any(n["role"] == "variable" and n.get("name") == var + "[*]" for n in ch["nodes"]))
+        how = {x["target"]: x["how"] for x in chain["links"]}
+        self.assertEqual((how["v"], how["t"]), ("typed_pointer_path", "arena_attribution"))
+        self.assertEqual(next(n for n in chain["nodes"] if n["role"] == "thread")["name"], gt["thread"])
         for lang, unit in (("en", "elements"), ("ko", "원소")):
             md = render_human_report(r, lang=lang)
             self.assertIn("`%s`" % c["type"], md)
