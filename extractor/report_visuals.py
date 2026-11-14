@@ -1006,6 +1006,9 @@ def _finding_card(lx: _Lx, i: int, f: Dict[str, Any], report: Optional[Dict[str,
         parts.append(_md_html(block["diagram"]))
     if block is not None and block["why"]:
         parts.append(f'<div class="dsv-text">{_md_html([T["f_why"][lx.i], ""] + [f"{n}. {x}" for n, x in enumerate(block["why"], 1)])}</div>')
+    if block is not None and block.get("competing"):
+        from .report_story import competing_html
+        parts.append(competing_html(lx.lang, block["competing"], i))
     if facts:
         parts.append(f'<details class="collapsible"><summary>{E(lx.t("evidence"))}</summary>'
                      f'<ul class="dsv-facts in">{facts}</ul></details>')
@@ -1233,7 +1236,9 @@ def build_visual_summary(result: Dict[str, Any], report: Optional[Dict[str, Any]
             parts.append(_card(_SEC_ID[key], s["title"], body, desc=str(len(findings))))
         elif key == "checks":
             c = comp["counts"]
-            parts.append(_card(_SEC_ID[key], s["title"], _checklist(lx, res, report, findings, comp, details),
+            from .report_story import timeline_html
+            parts.append(_card(_SEC_ID[key], s["title"], _checklist(lx, res, report, findings, comp, details)
+                               + timeline_html(lx.lang, comp.get("timeline")),
                                desc=E(lx.t("ck_desc", run=c["run"], n=c["not_run"])), right=E(lx.t("ck_open_hint"))))
         elif key == "not_examined":
             parts.append(_card(_SEC_ID[key], s["title"], _md_html(s["lines"]), right=E(lx.t("ne_right"))))

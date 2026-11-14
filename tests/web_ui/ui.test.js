@@ -300,3 +300,17 @@ test("a pool that is only a part of a larger array says so in the card (ko and e
   }
   assert.doesNotMatch(draw("en", Object.assign({}, pool, { count: 4096, total: 4096, truncated: false })), /only the first/);
 });
+
+test("the course of the diagnosis from the view is drawn under the checks, once, and never as a card in a card", () => {
+  for (const n of NAMES) {
+    const d = load(n);
+    if (!d.events.some((e) => e.type === "verdict" && e.data.view)) continue;
+    for (const lang of ["ko", "en"]) {
+      const html = UI.render(UI.reduce(d.events, d.request), UIS(lang));
+      assert.strictEqual((html.match(/id="dsv-timeline"/g) || []).length, 1, `${n} ${lang}`);
+      assert.ok(html.indexOf('id="dsv-timeline"') > html.indexOf('id="checks"'), n);
+      assert.ok(html.indexOf('id="dsv-timeline"') < html.indexOf('id="not-examined"') || html.indexOf('id="not-examined"') < 0, n);
+      assert.strictEqual(nestedCards(html), 0, n);
+    }
+  }
+});

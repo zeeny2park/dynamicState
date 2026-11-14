@@ -1305,6 +1305,8 @@ def _section2(ctx: _Ctx, blocks: List[Dict[str, Any]]) -> List[str]:
         if b.get("cands"):
             out += [f"**{ctx.t('f_cands_head')}**", "", ctx.t("f_cands_note"), ""] + [
                 f"{n}. {x}" for n, x in enumerate(b["cands"], 1)] + [""]
+        if b.get("competing_lines"):
+            out += b["competing_lines"] + [""]
     while out and out[-1] == "":
         out.pop()
     return out
@@ -1726,6 +1728,27 @@ _SECTION_TITLE = {"conclusion": "s_conclusion", "target": "s_target", "profile":
                   "reference": "s_reference"}
 
 
+def _story_parts(ctx: _Ctx, res: Dict[str, Any], report: Optional[Dict[str, Any]], rows: List[Dict[str, Any]],
+                 renders: List[Dict[str, Any]], blocks: List[Dict[str, Any]], verdict: str) -> Dict[str, Any]:
+    """The competing causes of each finding and the time-ordered course of the diagnosis (``report_story``): the
+    causes are attached to their finding block (``competing`` data, ``competing_lines`` Markdown), the timeline is
+    returned for the end of the checks section.  Never raises: a report without them is still a report."""
+    from . import report_story as rs
+    out: Dict[str, Any] = {"competing": [], "timeline": None, "timeline_lines": []}
+    try:
+        out["competing"] = rs.competing_causes(ctx.lang, res, report, rows)
+        for item in out["competing"]:
+            b = blocks[item["finding"] - 1]
+            b["competing"] = item
+            b["competing_lines"] = rs.competing_markdown(ctx.lang, item)
+        v = verdict if f"v_{verdict}" in T else "INCONCLUSIVE"
+        out["timeline"] = rs.build_timeline(ctx.lang, res, report, rows, renders, ctx.t(f"v_{v}"), v)
+        out["timeline_lines"] = [""] + rs.timeline_markdown(ctx.lang, out["timeline"]) if out["timeline"] else []
+    except Exception:  # noqa: BLE001 - rendering only; the verdict and the rest of the report do not depend on it
+        out["competing"], out["timeline"], out["timeline_lines"] = out["competing"], None, []
+    return out
+
+
 def profile_of(res: Dict[str, Any], report: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     """The process profile of a result: built from its report (the same data the checks left), else the one the
     result carries (a result saved without its report)."""
@@ -1772,13 +1795,14 @@ def compose(result: Dict[str, Any], report: Optional[Dict[str, Any]] = None, lan
         concl += [""] + sym
     glance = _glance_line(ctx, res, rows)
     blocks = _finding_blocks(ctx, res, renders, report, rows)
+    story = _story_parts(ctx, res, report, rows, renders, blocks, verdict)
     extra_sections = extra_sections or {}
     body: Dict[str, List[str]] = {
         "conclusion": concl + ([""] + glance if glance else []),
         "target": _section_target(ctx, res, report, repro),
         "profile": profile_lines(profile, lang),
         "findings": _section2(ctx, blocks) if blocks else [],
-        "checks": _section4(ctx, res, rows),
+        "checks": _section4(ctx, res, rows) + story["timeline_lines"],
         "not_examined": _section_not_examined(ctx, res, rows),
         "next": _section5(ctx, res, renders),
         "hypothesis": list(extra_sections.get("hypothesis") or []),
@@ -1800,7 +1824,7 @@ def compose(result: Dict[str, Any], report: Optional[Dict[str, Any]] = None, lan
     return {"lang": lang, "ctx": ctx, "res": res, "report": report, "renders": renders, "blocks": blocks, "rows": rows,
             "counts": check_counts(rows), "verdict": verdict, "verdict_line": concl[0], "conclusion": concl[2],
             "symptom_note": sym, "glossary": g, "sections": sections, "glance": glance_parts(ctx, res, rows),
-            "repro": repro, "profile": profile,
+            "repro": repro, "profile": profile, "competing": story["competing"], "timeline": story["timeline"],
             "scope_head": _scope_head(ctx, res, rows), "not_examined": _not_examined_lines(ctx, res)}
 
 

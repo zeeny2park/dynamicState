@@ -50,6 +50,7 @@ def build_view(result: Dict[str, Any], lang: str, report: Optional[Dict[str, Any
     """Everything the UI shows for a finished diagnosis, in one language, as plain data and report HTML fragments."""
     from extractor import human_report as hr
     from extractor import report_visuals as rv
+    from extractor import report_story as rs
     from extractor.diagnostic_recipes import CAPABILITY_DESCRIPTIONS
     from extractor.web.ui import explore_fragments as xf
 
@@ -142,6 +143,9 @@ def build_view(result: Dict[str, Any], lang: str, report: Optional[Dict[str, Any
         "conclusion_html": hr._inline_html(comp["conclusion"]),
         "symptom_html": [hr._inline_html(x) for x in comp.get("symptom_note") or [] if x],
         "scope_html": " ".join(hr._inline_html(x) for x in comp.get("scope_head") or [] if x),
+        # the time-ordered course of the diagnosis, shown under the checks (the competing causes are in each
+        # finding's body_html); same builder as the report
+        "timeline_html": rs.timeline_html(lang, comp.get("timeline")),
         "tiles": tiles, "checks": checks, "findings": fviews, "profile": profile,
         "not_examined_html": rv._md_html(comp.get("not_examined") or []) if comp.get("not_examined") else "",
         "next_html": rv._md_html(next_lines) if next_lines else "",

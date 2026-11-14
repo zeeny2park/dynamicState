@@ -618,6 +618,10 @@ def export_incident_report(
         "report_html": report_html,
         "report_json": report_json,
         "reproducibility": repro.to_dict(),
+        # the two reader-facing parts of the report body, as data (report language): the causes considered per
+        # finding and the time-ordered course of the diagnosis (extractor.report_story)
+        "competing_causes": comp.get("competing") or [],
+        "investigation_timeline": comp.get("timeline") or {},
         "session_report_extras": extras,
         "report_path": res.get("report_path"),
         "saved_path": saved_path,
