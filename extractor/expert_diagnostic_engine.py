@@ -1230,6 +1230,7 @@ class AdaptiveInvestigationSession:
         budget_tracker: Optional[ObservationBudgetTracker] = None,
         budget_limits: Optional[ObservationBudgetLimits] = None,
         symptom_fields: Any = None,
+        _persist_on_create: bool = True,
     ):
         from .symptom_interpretation import parse_symptom_fields
         self.investigation_id = investigation_id
@@ -1315,7 +1316,9 @@ class AdaptiveInvestigationSession:
         self.checks: List[DiagnosticCheck] = []
 
         self._record_timeline_event("SESSION_CREATED", {"investigation_id": investigation_id, "pid": pid})
-        self._save_to_disk()
+        if _persist_on_create:
+            # A reload (from_dict) must not overwrite the file it is being restored from with an empty session.
+            self._save_to_disk()
 
     def _save_to_disk(self) -> DurableCommitOutcome:
         """Persists authoritative investigation state atomically to disk.
@@ -1352,19 +1355,14 @@ class AdaptiveInvestigationSession:
             if hasattr(os, "O_NOFOLLOW"):
                 flags |= os.O_NOFOLLOW
 
+            # Serialized before the temp file exists: an encoding failure leaves nothing behind (NOT_COMMITTED).
+            # Each large observation is serialized once and stored once (extractor.session_store); C encoder only
+            # (json.dump() and indent= run the pure-Python encoder).
+            text = self._persist_text()
             fd = os.open(tmp_path, flags, 0o600)
             try:
-                def _serialize_fallback(o):
-                    if hasattr(o, "to_dict"):
-                        return o.to_dict()
-                    if hasattr(o, "value"):
-                        return o.value
-                    return str(o)
-
                 with os.fdopen(fd, "w", encoding="utf-8") as f:
-                    # json.dump() always runs the pure-Python encoder and indent= disables the C encoder:
-                    # on a many-thread target (tens of MB per save, one save per step) that was ~80% of a diagnosis.
-                    f.write(json.dumps(self.to_dict(), default=_serialize_fallback))
+                    f.write(text)
                     f.flush()
                     # Apply and verify chmod 0600 - DO NOT SWALLOW
                     os.chmod(tmp_path, 0o600)
@@ -1468,7 +1466,18 @@ class AdaptiveInvestigationSession:
         self._save_to_disk()
 
     def step(self) -> Dict[str, Any]:
-        """Advances the investigation session by exactly one state transition or collection step."""
+        """Advances the investigation session by exactly one state transition or collection step.
+
+        A caller-driven step (MCP / web step tools, tests) is a durable point: the session is saved after it so a
+        restarted server can reload it.  ``run_to_completion`` advances through ``_advance`` instead and saves only at
+        its own durable points (see there)."""
+        res = self._advance()
+        if res.get("status") not in ("PAUSED", "TERMINATED"):
+            self._save_to_disk()
+        return res
+
+    def _advance(self) -> Dict[str, Any]:
+        """One state transition without persisting (the caller decides when the session is durable)."""
         if self.is_paused:
             return {"status": "PAUSED", "state": self.state, "investigation_id": self.investigation_id}
 
@@ -1498,8 +1507,6 @@ class AdaptiveInvestigationSession:
             res = self._step_narrow()
         else:
             res = {"status": "UNKNOWN_STATE", "state": self.state}
-
-        self._save_to_disk()
         return res
 
     def run_to_completion(self, max_steps: Optional[int] = None) -> DiagnosticConclusion:
@@ -1520,11 +1527,19 @@ class AdaptiveInvestigationSession:
             planned = int(getattr(self.plan, "total_steps", 0) or 0) if self.plan is not None else 0
             return max(DEFAULT_MIN_STEP_CAP, planned + STEP_MARGIN_BEYOND_PLAN)
 
+        # Durable points of a run: the plan (a crashed / restarted run reloads it and can be continued from the
+        # collection phase) and the end (a completed diagnosis is fully on disk before its result is returned).
+        # Nothing reads the investigation file between those points: the web progress stream and the MCP tools read
+        # the in-memory session.  Saving after every collection step rewrote the whole, growing session each time
+        # (tens of MB per save on a many-thread target; most of a diagnosis's CPU time).
         while self.state not in TERMINAL_STATES and steps_executed < limit():
             if self.is_paused:
                 break
-            self.step()
+            before = self.state
+            self._advance()
             steps_executed += 1
+            if before != STATE_COLLECTING and self.state == STATE_COLLECTING:
+                self._save_to_disk()
 
         if self.state not in TERMINAL_STATES and steps_executed >= limit():
             self.state = STATE_INCONCLUSIVE
@@ -3512,8 +3527,16 @@ class AdaptiveInvestigationSession:
         res["diagnostic_limitations"] = self.target_assessment.limitations if self.target_assessment else []
         return res
 
-    def to_dict(self) -> Dict[str, Any]:
-        """Serializes complete session state to a dictionary for persistence / recovery (Part F)."""
+    def to_dict(self, _parts: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """Serializes complete session state to a dictionary for persistence / recovery (Part F).
+
+        ``_parts`` (internal, ``_persist_text``): ready-made values for the heavy keys, so the session file is built
+        from the one key list below without deep-copying the observations first."""
+        parts = _parts or {}
+
+        def part(key: str, build: Callable[[], Any]) -> Any:
+            return parts[key] if key in parts else build()
+
         return {
             "schema_version": "2.1.8",
             "investigation_id": self.investigation_id,
@@ -3526,20 +3549,37 @@ class AdaptiveInvestigationSession:
             "is_paused": self.is_paused,
             "timeline": self.timeline,
             "plan": self.plan.to_dict() if self.plan else None,
-            "collected_evidence": self.collected_evidence,
-            "collected_evidence_records": [r.to_dict() for r in self.collected_evidence_records],
+            "collected_evidence": part("collected_evidence", lambda: self.collected_evidence),
+            "collected_evidence_records": part("collected_evidence_records",
+                                               lambda: [r.to_dict() for r in self.collected_evidence_records]),
             "active_hypotheses": [h.to_dict() for h in self.active_hypotheses],
             "rejected_hypotheses": [h.to_dict() for h in self.rejected_hypotheses],
-            "conclusion": asdict(self.conclusion) if self.conclusion else None,
+            "conclusion": part("conclusion", lambda: asdict(self.conclusion) if self.conclusion else None),
             "classification_result": asdict(self.classification_result) if self.classification_result else None,
             "target_assessment": self.target_assessment.to_dict() if self.target_assessment else None,
             "verified_checks_count": self.verified_checks_count,
             "temporal_memory_samples": self.temporal_memory_samples,
-            "ledger": self.ledger.to_dict() if self.ledger else None,
-            "methodology": self.methodology.to_dict() if self.methodology else None,
-            "checks": [c.to_dict() for c in self.checks],
+            "ledger": part("ledger", lambda: self.ledger.to_dict() if self.ledger else None),
+            "methodology": part("methodology", lambda: self.methodology.to_dict() if self.methodology else None),
+            "checks": part("checks", lambda: [c.to_dict() for c in self.checks]),
             "competing_hypotheses": [h.to_dict() for h in self.competing_hypotheses],
         }
+
+    def _persist_text(self) -> str:
+        """The session file text: the same content as ``to_dict()`` (a reload gives the same session), with every
+        large observation payload serialized once and stored once (see extractor.session_store).  The heavy parts are
+        handed over as the live objects (dataclasses become their fields while the tree is walked, the same result
+        as their asdict-based to_dict) instead of being deep-copied first."""
+        from .session_store import BlobInterner, encode_document, intern_observations
+        it = BlobInterner()
+        doc = self.to_dict(_parts={
+            "collected_evidence": self.collected_evidence,
+            "collected_evidence_records": self.collected_evidence_records,
+            "conclusion": self.conclusion,
+            "methodology": self.methodology,
+            "checks": self.checks,
+        })
+        return encode_document(intern_observations(doc, it), it.blobs)
 
     def reconcile_durability(self) -> Dict[str, Any]:
         """Reconciles durability state after an unknown commit outcome or crash (Part F)."""
@@ -3595,6 +3635,8 @@ class AdaptiveInvestigationSession:
         """Reconstructs session state from a serialized dictionary with schema migration and authority re-validation (Part A5 & F)."""
         if not isinstance(data, dict) or not data.get("investigation_id"):
             raise ValueError("Invalid or corrupted session dictionary: missing investigation_id")
+        from .session_store import resolve_blobs
+        data = resolve_blobs(data)  # a session file stores each large observation once (extractor.session_store)
 
         sess = cls(
             investigation_id=str(data["investigation_id"]),
@@ -3603,6 +3645,7 @@ class AdaptiveInvestigationSession:
             companion_elf=data.get("companion_elf"),
             corpus_dir=data.get("corpus_dir"),
             symptom_fields=data.get("symptom_fields"),
+            _persist_on_create=False,
         )
         sess.state = data.get("state", STATE_CREATED)
         sess.is_paused = bool(data.get("is_paused", False))
@@ -4573,17 +4616,20 @@ def _diagnose_run(
         from .static_location_candidates import attach_location_candidates
         attach_location_candidates(res.findings, debug_image, report=report, profile=res.process_profile)
 
+        # Serialized once (C encoder; json.dump() runs the pure-Python one): the same text is the report file and,
+        # when asked for, the returned copy.
+        report_text = json.dumps(report, default=str)
         try:
             rep_dir = os.path.join(engine.corpus_dir, "reports")
             os.makedirs(rep_dir, exist_ok=True)
             path = os.path.join(rep_dir, f"{session.investigation_id}.report.json")
             with open(path, "w", encoding="utf-8") as fh:
-                json.dump(report, fh, default=str)
+                fh.write(report_text)
             res.report_path = path
         except OSError as exc:
             nc.append({"kind": "report_not_saved", "item": "report", "reason": str(exc)})
         if include_report:
-            res.report = json.loads(json.dumps(report, default=str))
+            res.report = json.loads(report_text)
 
         passed = sum(1 for r in res.checks_run if r["status"] == CheckStatus.PASS)
         if res.verdict == VERDICT_HEALTHY:
