@@ -272,6 +272,35 @@ class DwarfIndex:
                 chain.append({"function": fn, "file": os.path.basename(m.group(1)), "line": int(m.group(2)),
                               "path": m.group(1)})
             if chain:
+                # Align source file with DWARF DIE subprogram declaration file when addr2line
+                # attributes an out-of-line or inlined header function to the compilation unit's base source file (DWARF-5 addr2line issue).
+                code_addr = self.resolve_code_address(link_time_pc)
+                if code_addr and code_addr.get("decl_file"):
+                    decl_file = code_addr["decl_file"]
+                    decl_base = os.path.basename(decl_file)
+                    target_frame = chain[-1] if len(chain) > 1 else chain[0]
+                    if target_frame["file"] != decl_base and (decl_file.endswith((".h", ".hpp", ".hxx", ".tcc")) or not target_frame["file"].endswith((".h", ".hpp", ".hxx"))):
+                        target_frame["file"] = decl_base
+                        target_frame["path"] = decl_file
+                    if len(chain) == 1:
+                        chain[0]["file"] = decl_base
+                        chain[0]["path"] = decl_file
+
+                for fr in chain:
+                    fn_raw = fr.get("function") or ""
+                    fn_base = re.sub(r"\(.*\)$", "", fn_raw).strip()
+                    candidates = []
+                    for fn_key in (fn_base, fn_base.split("::")[-1], fn_raw):
+                        if fn_key in self.subprograms_by_name:
+                            candidates.extend(self.subprograms_by_name[fn_key])
+                    for subp in candidates:
+                        if subp.decl_file and (subp.decl_file.endswith((".h", ".hpp", ".hxx", ".tcc")) or "/include/" in subp.decl_file):
+                            decl_base = os.path.basename(subp.decl_file)
+                            if fr["file"] != decl_base and not fr["file"].endswith((".h", ".hpp", ".hxx")):
+                                fr["file"] = decl_base
+                                fr["path"] = subp.decl_file
+                            break
+
                 res = {"file": chain[0]["file"], "line": chain[0]["line"], "path": chain[0]["path"],
                        "inlined_chain": chain}
             break

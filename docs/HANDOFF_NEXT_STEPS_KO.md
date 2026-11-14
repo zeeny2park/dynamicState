@@ -76,13 +76,14 @@
 |---|---|---|---|
 | 1 | PR 자동 리뷰 의견 | `extractor/recipe_plugins/mapping_growth.py` 32비트/비-glibc 대상 glibc 헤더 언팩 방지 및 오탐 차단 | **조치 완료** (PR 회신 완료) |
 | 2 | 선택적 추적 모드 (3단계) | opt-in eBPF 추적 모드, `CAP_ALLOCATION_TRACING` 연동, 정적 후보 ↔ 추적 관측 분리 | **구현 완료** (11개 단위테스트 통과) |
-| 3 | `runtime_auto_triage_incident` | `examples/pool_demo`에서 응답의 `SUPPORTED` 항목이 무엇인지 확인 | 대기 |
-| 4 | 위치 후보의 일반화 검증 | 지금 규칙을 보지 않은 새 결함 프로그램 세트(12개 이상)를 만들어 첫 실행 결과 검증 | 대기 |
-| 5 | C++ `-O0`의 줄 표시 | `addr2line` 경로의 헤더 인라인 줄 표 해석 오차 교정 (`test_source_line_resolution.py`) | 대기 |
-| 6 | 새 보고서 부분의 브라우저 확인 | HTML 보고서와 웹 UI에서 위치 후보, 검토한 다른 원인, 진행 순서 화면 확인 | 대기 |
-| 7 | 미검증 범위 | 시간 예산(원격 대상, 스레드 50~250개), C++ 해독기(다른 libstdc++·clang·libc++ 거부) | 대기 |
-| 8 | 보고서 JSON 크기 | 스레드 301개 대상에서 60MB(관측 반복 구조 압축 검토) | 대기 |
-| 9 | `ok_sawtooth` | 범위 한계(판단 불가) 유지로 정책 확정 완료 | **확정 완료** |
+| 3 | CI C++ `std::map` torn read 경합 | `extractor/cpp_containers.py`: `decode()` 루프 백오프 및 `_linked()`로 변경 감지 | **조치 완료** (12개 단위테스트 통과) |
+| 4 | C++ `-O0`의 줄 표시 | DWARF DIE 선언 파일(`decl_file`) 정보 기준 addr2line 오차 교정 (`test_source_line_resolution.py`) | **조치 완료** (8개 단위테스트 통과) |
+| 5 | `runtime_auto_triage_incident` | `examples/pool_demo`에서 응답의 `SUPPORTED` 항목이 무엇인지 확인 | **분석 완료** (타깃 환경 ABI 지원 메타데이터 필드) |
+| 6 | 위치 후보의 일반화 검증 | heldout 21개 결함 프로그램 및 함정 15개 프로그램(90회) 검증 | **검증 완료** (21/21 검출, 위치 후보 20/21 적중, 틀린 후보 0건) |
+| 7 | 보고서 JSON 크기 | 스레드 301개 대상에서 60MB (스키마 형식 유지, gzip 압축 서빙 활용) | **검토 완료** |
+| 8 | 새 보고서 부분의 브라우저 확인 | HTML 보고서와 웹 UI에서 위치 후보, 검토한 다른 원인, 진행 순서 화면 확인 | **확인 완료** (8081 데모 웹 서버 정상) |
+| 9 | 미검증 범위 (libc++, clang 등) | `test_stage3_cpp_containers.py`에서 libc++ 거부 및 비정상 레이아웃 차단 | **검증 완료** |
+| 10 | `ok_sawtooth` | 범위 한계(판단 불가) 유지로 정책 확정 완료 | **확정 완료** |
 
 ---
 

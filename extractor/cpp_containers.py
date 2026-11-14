@@ -24,6 +24,7 @@ No target access happens at import; the module reads only through the ``Containe
 
 import re
 import struct
+import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
@@ -62,7 +63,7 @@ _NAME_KINDS: Tuple[Tuple[str, str, int], ...] = (
 MAX_ELEMENTS = 1 << 32
 MAX_REFCOUNT = 1 << 24
 DEQUE_BUF_BYTES = 512               # libstdc++ _GLIBCXX_DEQUE_BUF_SIZE
-MAX_ATTEMPTS = 4                    # reads of a container whose header changed while it was being validated
+MAX_ATTEMPTS = 6                    # reads of a container whose header changed while it was being validated
 
 
 def _strip_ns(name: str) -> str:
@@ -673,6 +674,7 @@ def decode(layout: ContainerLayout, address: int, mem: ContainerMemory) -> Dict[
             # The target keeps running: when the header changed between its read and the reads of the nodes it points
             # to, a failed check may be that change; start again from the header read together with those nodes.
             if mem.moved and attempt + 1 < MAX_ATTEMPTS:
+                time.sleep(0.001 * (attempt + 1))
                 continue
             return dict(base, decoded=False, reason=str(exc) + (" (the container changed while it was read)"
                                                                 if mem.moved else ""))
@@ -815,8 +817,9 @@ def _tree(lay: ContainerLayout, a: int, mem: ContainerMemory) -> Dict[str, Any]:
         # an element being added at that end while the tree was read: the new child must link back to the node
         if not all(mem.writable_range(c_, ns) for _n, c_ in outer):
             raise _Reject("leftmost / rightmost node has an outer child outside writable memory")
-        kids = mem.read_many([(c_, ns) for _n, c_ in outer])
+        kids = _linked(mem, [(c_, ns) for _n, c_ in outer])
         if any(k is None or _u(k, lay.off["node_M_parent"]) != n_ for k, (n_, _c) in zip(kids, outer)):
+            mem.moved = True
             raise _Reject("leftmost / rightmost node has an outer child that does not link back to it")
         checks.append("a node added at an end while the tree was read links back to its parent")
     else:

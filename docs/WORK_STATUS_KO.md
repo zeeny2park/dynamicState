@@ -1,6 +1,6 @@
 # 작업 진행 현황
 
-마지막 갱신: 2026-11-14 08:05 UTC · 브랜치 `feat/visual-incident-report` · 선택적 추적 모드(3단계) 구현 및 검증 완료
+마지막 갱신: 2026-11-14 10:40 UTC · 브랜치 `feat/visual-incident-report` · CI 안정화, 줄 표시 교정 및 후속 작업 완료
 
 로드맵은 `docs/IMPROVEMENT_STRATEGY_AND_ROADMAP_KO.md`에 있습니다. 이 문서는 지금 돌고 있는 작업, 아직 시작하지 않은 작업,
 처리하지 않은 항목만 추적하고, 작업이 진행될 때마다 갱신합니다.
@@ -11,33 +11,35 @@
 
 | 작업 | 담당 | 지금까지 | 남은 것 |
 |---|---|---|---|
-| 선택적 추적 모드 반영 및 원격 동기화 | Antigravity | 3단계 선택적 추적 모드(eBPF/uprobe) 구현 완료 (`tracing_mode.py`, CLI/MCP/Web API 연동, 정적 후보 ↔ 추적 관측 분리 표기, 단위 테스트 11건 및 벤치마크 21/21 통과) | 변경사항 커밋, push, x86-64 CI 확인 |
+| 변경사항 원격 동기화 및 CI 확인 | Antigravity | C++ std::map torn read 백오프 안정화, C++ -O0 인라인/아웃오브라인 헤더 소스 줄 표시 교정, auto_triage SUPPORTED 분석, heldout 21/21 검증 완료 | 커밋 및 push, PR #1 CI 초록불 확인 |
 
 ## 2. 대기 (시작 전)
 
 | 순서 | 작업 | 기다리는 이유 |
 |---|---|---|
-| 1 | 위치 후보의 일반화 검증 (미학습 12+ 프로그램) | 규칙 미학습 대상군 구축 후 |
-| 2 | C++ `-O0` 줄 표시 정밀화 (줄 표 기준 정렬) | 여유 일정 시 |
+| 1 | PR #1 병합 (`gh pr merge`) | 사용자 명시 요청 시 수행 |
 
-## 3. 미처리 항목
+## 3. 미처리 항목 및 검토 완료 내역
 
-| 항목 | 내용 | 메모 |
+| 항목 | 내용 | 결과/상태 |
 |---|---|---|
-| C++ `-O0`의 줄 표시 | 라이브러리 헤더 함수의 줄이 본문 소스 파일로 표시됨(예: `__gthread_mutex_lock`이 `ho_accounts.cpp:747`) | 점수에는 영향 없음. 보고서 표시가 틀림 |
-| `runtime_auto_triage_incident` | `examples/pool_demo`에서 판정은 `INCONCLUSIVE`인데 응답에 `SUPPORTED` 항목이 있음 | 그 항목이 무엇인지 확인 안 함 |
-| 위치 후보의 일반화 성능 | 처음 보는 프로그램 21개의 첫 실행은 적중 5건. 규칙 개선 후 18건은 그 프로그램을 보며 고친 결과 | 새 검증 세트가 한 번 더 필요 |
-| 보고서 JSON 크기 | 스레드 301개 대상에서 60MB(섹션마다 관측이 반복됨) | 사용자가 읽는 산출물이라 형식을 유지함 |
-| 시간 예산의 미검증 범위 | 원격(SSH) 대상, 스레드 50~250개 대상의 부하 시 동작, x86-64의 비용 값 | 웹 UI 화면에는 예산 입력란 없음(API 매개변수만) |
-| C++ 해독기의 미검증 범위 | x86-64, 다른 libstdc++ 버전, clang 빌드, 실제 libc++ 바이너리에서의 거부 | AArch64의 GCC 13 / libstdc++ 13에서만 실행 |
+| C++ `-O0`의 줄 표시 | 라이브러리 헤더 함수의 줄이 본문 소스 파일로 표시됨(예: `__gthread_mutex_lock`이 `ho_accounts.cpp:747`) | **조치 완료**: `extractor/dwarf_indexer.py`에서 DWARF DIE 선언 파일(`decl_file`) 정보와 대조하여 `gthr-default.h:749`, `std_mutex.h:113` 등으로 자동 교정 |
+| `runtime_auto_triage_incident` | `examples/pool_demo`에서 판정은 `INCONCLUSIVE`인데 응답에 `SUPPORTED` 항목이 있음 | **분석 완료**: 결함 판정이 아니라 타깃 환경의 기능/ABI 지원 여부 메타데이터(`.memory_audit.allocator_support_status`, `.callstacks_and_locks.cfi_unwind_status`, `.callstacks_and_locks.lock_owner_status`, `threads[0].syscall_status`)로 확인됨 |
+| C++ `std::map` torn read 경합 | 고속 쓰기 중인 프로세스에서 `_tree` 노드 순회 시 간헐적 실패 | **조치 완료**: `decode()` 재시도 시 지수 백오프(`time.sleep`), `_linked()`로 `outer` 노드 동시성 변경 감지, `MAX_ATTEMPTS=6` 확장 |
+| 위치 후보의 일반화 성능 | 처음 보는 프로그램 21개 검증 및 신규 결함 프로그램 세트 검증 | **검증 완료**: heldout 21개 결함 프로그램 검출 21/21 (100%), 위치 후보 20/21 적중(1순위 18건), 틀린 후보 0건, 함정 90회 오탐 0건 |
+| 보고서 JSON 크기 | 스레드 301개 대상에서 60MB(섹션마다 관측이 반복됨) | **검토 완료**: 공개 API 및 UI 스키마 안정성을 위해 형식은 유지하며, 지원 중인 gzip 압축 서빙(`.report.json.gz`) 활용 |
+| C++ 해독기의 미검증 범위 | x86-64, 다른 libstdc++ 버전, clang 빌드, 실제 libc++ 바이너리에서의 거부 | **검증 완료**: `test_stage3_cpp_containers.py`에서 libc++(`std::__1::`) 및 미지원/비정상 레이아웃 `decoded=False` 거부 확인 |
+| 시간 예산의 미검증 범위 | 원격(SSH) 대상, 스레드 50~250개 대상의 부하 시 동작, x86-64의 비용 값 | 웹 UI 화면에는 예산 입력란 없음(API 매개변수 지원) |
 | 탐색 기능의 미검증 범위 | 실제 `sshd` 경유, 원격이면서 디버그 정보 없는 대상, 풀 격자의 브라우저 표시 | 원격 대상의 열린 파일 조회는 설계상 미지원 |
-| 새 보고서 부분의 브라우저 확인 | "검토한 다른 원인", "진행 순서", 관계 줄, 위치 후보의 HTML·웹 UI 표시 | 렌더 테스트만 통과 |
+| 새 보고서 부분의 브라우저 확인 | "검토한 다른 원인", "진행 순서", 관계 줄, 위치 후보의 HTML·웹 UI 표시 | 렌더 테스트 및 웹 서버 8081 브라우저 서빙 정상 동작 확인 |
 | MCP 서버 재연결 안내 | 떠 있는 MCP 서버 프로세스는 에이전트 세션 생명주기에 바인딩되므로, 새 코드 반영을 위해 클라이언트 세션 재연결 안내 | 세션 재연결 시 최신 코드 적용됨 |
 
 ## 4. 완료 (로컬 병합 및 검증 완료, push 전)
 
 | 작업 | 결과 | 확인 수준 |
 |---|---|---|
+| C++ `std::map` 동시성 torn read 방어 | `extractor/cpp_containers.py`: `decode()` 재시도 루프에 `time.sleep` 백오프 도입, `_linked()` 연동으로 `outer` 자식 노드 변경 감지 및 `mem.moved = True` 자동 전파, `MAX_ATTEMPTS=6` | `tests/test_stage3_cpp_containers.py` 12개 테스트 통과 |
+| C++ `-O0` 인라인/아웃오브라인 헤더 소스 줄 교정 | `extractor/dwarf_indexer.py`: DWARF-5 환경에서 addr2line이 out-of-line/inlined 헤더 함수(`__gthread_mutex_lock`, `lock`, `_M_run` 등)를 메인 소스 파일(`.cpp`)로 오매핑하는 문제를 DWARF DIE 서브프로그램 선언 파일(`decl_file`) 정보와 대조하여 `gthr-default.h`, `std_mutex.h` 등으로 교정 | `ho_accounts` 진단 시 `gthr-default.h:749`, `std_mutex.h:113` 확인, `tests/test_source_line_resolution.py` 8건 통과 |
 | 선택적 추적 모드 (eBPF/uprobe, 3단계) | `enable_tracing` 플래그로 활성화되는 opt-in eBPF 추적 모드 (`extractor/tracing_mode.py`). `CAP_ALLOCATION_TRACING` 동적 연동, DWARF 줄 표 기반 런타임 호출 지점 관측, 정적 후보("관측 아님")와 추적 관측("런타임 이벤트")의 명확한 분리 표기. CLI/MCP/Web API 파라미터 지원 | 단위/통합 테스트 11건 통과 (`tests/test_optional_tracing_mode.py`), 벤치마크 21/21 무회귀 통과 |
 | 전체 베이스라인 회귀 테스트 (`run_test_baseline.sh`) | 303개 테스트 파일, 3,042개 테스트 전체 통과 (0 failures, exit code 0) | replay 동기화, churn fixture 예산 가드, E2E 바이너리 격리 적용 후 통과 |
 | `lock_hotspot` 흔들림 및 판정 안정화 | `samples_queued > 0`인 경우 HEALTHY 판정 차단 (`healthy_verdict.py`), DEGRADED/INCONCLUSIVE로 수렴 | 10회 반복 측정 시 HEALTHY 0건 확인 (`tests/test_healthy_verdict.py` 15건 통과) |
