@@ -1,0 +1,45 @@
+{
+  "id": "ho_conn_close",
+  "suite": "heldout",
+  "origin": "new",
+  "naming": "neutral",
+  "kind": "use_after_free",
+  "source": "benchmarks/diagnosis_accuracy/heldout/targets/ho_conn_close.cpp",
+  "sources": [
+    "benchmarks/diagnosis_accuracy/heldout/targets/ho_conn_close.cpp"
+  ],
+  "language": "c++",
+  "build": {
+    "compiler": "g++",
+    "opt": "-O0",
+    "flags": [
+      "-std=c++17"
+    ]
+  },
+  "style": "C++ delete in a helper, the write goes through a member function",
+  "symptom": "this program crashes sometimes and data looks wrong",
+  "ready": {
+    "mode": "stdout_marker"
+  },
+  "causes": {
+    "variables": [
+      "g_active"
+    ],
+    "locks": [],
+    "threads": [],
+    "functions": []
+  },
+  "locations": [
+    {
+      "file": "benchmarks/diagnosis_accuracy/heldout/targets/ho_conn_close.cpp",
+      "line": 31,
+      "text": "delete c;"
+    },
+    {
+      "file": "benchmarks/diagnosis_accuracy/heldout/targets/ho_conn_close.cpp",
+      "line": 40,
+      "text": "g_active->account(4096);"
+    }
+  ],
+  "notes": "the active connection is deleted and then accounted to through the stale global pointer"
+}

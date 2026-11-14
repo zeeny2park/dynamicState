@@ -1,0 +1,42 @@
+{
+  "id": "ho_journal",
+  "suite": "heldout",
+  "origin": "new",
+  "naming": "neutral",
+  "kind": "memory_leak",
+  "source": "benchmarks/diagnosis_accuracy/heldout/targets/ho_journal/main.c",
+  "sources": [
+    "benchmarks/diagnosis_accuracy/heldout/targets/ho_journal/main.c",
+    "benchmarks/diagnosis_accuracy/heldout/targets/ho_journal/journal.c",
+    "benchmarks/diagnosis_accuracy/heldout/targets/ho_journal/mem.c"
+  ],
+  "language": "c",
+  "build": {
+    "compiler": "gcc",
+    "opt": "-O2",
+    "flags": []
+  },
+  "style": "multi-file, allocation through a wrapper in another file, -O2",
+  "symptom": "memory usage of this process keeps growing",
+  "ready": {
+    "mode": "stdout_marker"
+  },
+  "causes": {
+    "variables": [
+      "journal"
+    ],
+    "locks": [],
+    "threads": [
+      "appender"
+    ],
+    "functions": []
+  },
+  "locations": [
+    {
+      "file": "benchmarks/diagnosis_accuracy/heldout/targets/ho_journal/journal.c",
+      "line": 10,
+      "text": "mem_get(sizeof *r)"
+    }
+  ],
+  "notes": "leak with owner: records chained into a global journal through mem_get(); malloc itself sits in mem.c"
+}

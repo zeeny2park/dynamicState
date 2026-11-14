@@ -358,5 +358,72 @@ class TestTimingAndRepeat(unittest.TestCase):
         self.assertIn("timing", rep)
 
 
+HELDOUT = rb.load_ground_truth(rb.HELDOUT_GT_DIR)
+
+
+class TestHeldOutSuite(unittest.TestCase):
+    """The held-out suite (stage 3 validation) is a separate manifest; it never enters the main suite."""
+
+    def test_heldout_records_are_well_formed_and_separate(self):
+        self.assertGreaterEqual(len(HELDOUT), 12)
+        main_ids = {g["id"] for g in GT}
+        for g in HELDOUT:
+            with self.subTest(target=g["id"]):
+                self.assertEqual(rb.validate_ground_truth(g), [])
+                self.assertEqual(g.get("suite"), "heldout")
+                self.assertNotIn(g["id"], main_ids)
+                self.assertTrue(os.path.isfile(os.path.join(rb.HELDOUT_GT_DIR, g["id"] + ".json")))
+        self.assertFalse(any(g.get("suite") == "heldout" for g in GT))
+
+    def test_heldout_covers_every_scored_kind_and_styles(self):
+        kinds = {g["kind"] for g in SCORED_DEFECTS}
+        self.assertLessEqual(kinds, {g["kind"] for g in HELDOUT})
+        self.assertGreaterEqual(sum(1 for g in HELDOUT if (g.get("build") or {}).get("opt") == "-O2"), 4)
+        self.assertTrue(any(g["language"] == "c++" for g in HELDOUT))
+        self.assertTrue(any(len(rb.source_files(g)) > 1 for g in HELDOUT))
+
+    def test_build_command(self):
+        main = next(g for g in GT if "build" not in g)
+        self.assertEqual(rb.build_command(main, "/x/out"),
+                         ["gcc", "-g", "-O0", "-pthread", "-Wl,--build-id=sha1", main["source"], "-o", "/x/out"])
+        multi = next(g for g in HELDOUT if len(rb.source_files(g)) > 1 and g["build"]["opt"] == "-O2")
+        cmd = rb.build_command(multi, "/x/out")
+        self.assertEqual(cmd[:3], [multi["build"]["compiler"], "-g", "-O2"])
+        for s in multi["sources"]:
+            self.assertIn(s, cmd)
+
+    def test_location_in_a_second_translation_unit(self):
+        g = next(x for x in HELDOUT if any(l["file"] != x["source"] for l in x["locations"]))
+        loc = next(l for l in g["locations"] if l["file"] != g["source"])
+        cat = sorted(rb.KIND_CATEGORIES[g["kind"]])[0]
+        res = _clean_result(g)
+        res["findings"] = [{"category": cat, "subjects": [f"{os.path.basename(loc['file'])}:{loc['line']}"]}]
+        self.assertTrue(rb.score_result(g, res)["location_match"])
+        bad = dict(g, locations=[dict(loc, file="benchmarks/diagnosis_accuracy/heldout/targets/nope.c")])
+        self.assertTrue(rb.validate_ground_truth(bad))
+
+    def test_wrong_candidates_are_counted(self):
+        g = SCORED_DEFECTS[0]
+        loc = g["locations"][0]
+        cat = sorted(rb.KIND_CATEGORIES[g["kind"]])[0]
+        base = os.path.basename(loc["file"])
+
+        def res_with(cands):
+            r = _clean_result(g)
+            r["verdict"] = "CONFIRMED_FAULT"
+            r["findings"] = [{"category": cat, "subjects": [], "location_candidates": {"candidates": cands}}]
+            return r
+        right = rb.score_result(g, res_with([{"rank": 1, "location": f"{base}:{loc['line']}"}]))
+        wrong = rb.score_result(g, res_with([{"rank": 1, "location": f"{base}:{loc['line'] + 40}"}]))
+        none = rb.score_result(g, res_with([]))
+        self.assertEqual((right["location_candidates_shown"], right["location_candidate_wrong"]), (True, False))
+        self.assertEqual((wrong["location_candidates_shown"], wrong["location_candidate_wrong"]), (True, True))
+        self.assertEqual((none["location_candidates_shown"], none["location_candidate_wrong"]), (False, False))
+        totals = rb.summarize([dict(right, scored=True), dict(wrong, scored=True), dict(none, scored=True)])
+        self.assertEqual(totals["overall"]["location_candidate_wrong"], 1)
+        self.assertEqual(totals["overall"]["location_candidates_shown"], 2)
+        self.assertIn("WRONG", rb.format_table({"rows": [wrong], "totals": totals, "total_wall_s": 0}))
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -1,0 +1,42 @@
+{
+  "id": "ho_arena_maps",
+  "suite": "heldout",
+  "origin": "new",
+  "naming": "neutral",
+  "kind": "mapping_growth",
+  "source": "benchmarks/diagnosis_accuracy/heldout/targets/ho_arena_maps.cpp",
+  "sources": [
+    "benchmarks/diagnosis_accuracy/heldout/targets/ho_arena_maps.cpp"
+  ],
+  "language": "c++",
+  "build": {
+    "compiler": "g++",
+    "opt": "-O0",
+    "flags": [
+      "-std=c++17"
+    ]
+  },
+  "style": "C++ class, mmap reached through a function pointer member",
+  "symptom": "memory usage of this process keeps growing",
+  "ready": {
+    "mode": "stdout_marker"
+  },
+  "causes": {
+    "variables": [
+      "g_arena"
+    ],
+    "locks": [],
+    "threads": [
+      "builder"
+    ],
+    "functions": []
+  },
+  "locations": [
+    {
+      "file": "benchmarks/diagnosis_accuracy/heldout/targets/ho_arena_maps.cpp",
+      "line": 13,
+      "text": "void *p = mmap(nullptr, bytes"
+    }
+  ],
+  "notes": "mapping growth: the arena keeps every 512 KiB block it maps"
+}

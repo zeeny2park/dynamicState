@@ -66,6 +66,20 @@ one block on the tcache and the unsorted bin (freed while the tcache was full, t
 `double_free` and `thread_growth` the `file:line` (the free / pthread_create calls) is not expected to match: which code
 made the call is not observable from memory.
 
+## Held-out suite (`--suite heldout`, reported separately)
+
+    python3 benchmarks/diagnosis_accuracy/run_benchmark.py --suite heldout     # writes results/<date>-<arch>-<commit>-heldout.json
+
+`heldout/ground_truth/*.json` + `heldout/targets/`: 21 defect programs written after the static location candidate
+heuristics (`extractor/static_location_candidates.py`) and deliberately in other styles than the main targets: C++
+(classes, `std::mutex` / `lock_guard`, `new` / `delete`, `std::vector` / `std::map`, `std::thread`, `std::atomic`),
+multi-file programs (`sources` lists every translation unit; a ground-truth location may lie in any of them),
+allocation / locking / thread creation through wrapper functions and function pointers, macros, and 11 of them built
+at `-O2` (`build`: `compiler`, `opt`, `flags`). Every scored defect kind is covered. Its own manifest directory: it is
+never loaded by the default run and never changes the main suite's totals. Growing targets cap themselves
+(`FIXTURE_CAP`), launches go through `fixture_popen` as for the main suite. Purpose: measure whether the candidates
+generalise. The first-run result (before any heuristic was changed for these programs) is committed unchanged.
+
 ## Scoring (per target, one `diagnose` call)
 
 - Unscored targets: a ground-truth record with `"scored": false` (and a mandatory `"scored_reason"`) is still built, run
@@ -104,6 +118,9 @@ made the call is not observable from memory.
   same +-3 lines of a ground-truth location (None if none), `location_candidate_hit`; totals
   `location_candidate_hit` ("candidates contain the true location") and `location_candidate_rank1`. Printed on their
   own line and as the table's `cand` column (`#rank`); they are never added to `location_match`.
+  `location_candidates_shown` (a matching finding carries at least one candidate) and `location_candidate_wrong`
+  (candidates shown, the true location not among them: a misleading list, worse than none; `WRONG` in the `cand`
+  column) are counted per row and in the totals.
 - Also recorded: verdict, categories, subjects, `not_covered` kinds, wall time, capture mode, measured stop time;
   `non_zero_stop` flags any non-zero-stop collection. A `diagnose` exception or hang becomes a row with `error`.
 

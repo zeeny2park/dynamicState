@@ -1,0 +1,44 @@
+{
+  "id": "ho_accounts",
+  "suite": "heldout",
+  "origin": "new",
+  "naming": "neutral",
+  "kind": "deadlock",
+  "source": "benchmarks/diagnosis_accuracy/heldout/targets/ho_accounts.cpp",
+  "sources": [
+    "benchmarks/diagnosis_accuracy/heldout/targets/ho_accounts.cpp"
+  ],
+  "language": "c++",
+  "build": {
+    "compiler": "g++",
+    "opt": "-O0",
+    "flags": [
+      "-std=c++17"
+    ]
+  },
+  "style": "C++ std::mutex members + lock_guard, lambdas on std::thread",
+  "symptom": "the service stopped responding",
+  "ready": {
+    "mode": "stdout_marker"
+  },
+  "causes": {
+    "variables": [],
+    "locks": [
+      "g_checking.mu",
+      "g_savings.mu"
+    ],
+    "threads": [
+      "teller_a",
+      "teller_b"
+    ],
+    "functions": []
+  },
+  "locations": [
+    {
+      "file": "benchmarks/diagnosis_accuracy/heldout/targets/ho_accounts.cpp",
+      "line": 20,
+      "text": "std::lock_guard<std::mutex> dst(to.mu);"
+    }
+  ],
+  "notes": "ABBA through one function called with swapped arguments"
+}

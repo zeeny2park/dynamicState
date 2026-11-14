@@ -1,0 +1,46 @@
+{
+  "id": "ho_job_spawn",
+  "suite": "heldout",
+  "origin": "new",
+  "naming": "neutral",
+  "kind": "thread_growth",
+  "source": "benchmarks/diagnosis_accuracy/heldout/targets/ho_job_spawn/main.c",
+  "sources": [
+    "benchmarks/diagnosis_accuracy/heldout/targets/ho_job_spawn/main.c",
+    "benchmarks/diagnosis_accuracy/heldout/targets/ho_job_spawn/jobs.c"
+  ],
+  "language": "c",
+  "build": {
+    "compiler": "gcc",
+    "opt": "-O0",
+    "flags": []
+  },
+  "style": "multi-file, pthread_create in a wrapper taking a function pointer",
+  "symptom": "the number of threads of this process keeps increasing",
+  "ready": {
+    "mode": "stdout_marker"
+  },
+  "causes": {
+    "variables": [],
+    "locks": [],
+    "threads": [
+      "exporter"
+    ],
+    "functions": [
+      "export_job"
+    ]
+  },
+  "locations": [
+    {
+      "file": "benchmarks/diagnosis_accuracy/heldout/targets/ho_job_spawn/main.c",
+      "line": 24,
+      "text": "if (start_job(export_job, NULL) != 0)"
+    },
+    {
+      "file": "benchmarks/diagnosis_accuracy/heldout/targets/ho_job_spawn/jobs.c",
+      "line": 8,
+      "text": "return pthread_create(&tid, NULL, fn, arg);"
+    }
+  ],
+  "notes": "one export thread per request, each blocked in read() forever"
+}
