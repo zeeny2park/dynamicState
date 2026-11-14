@@ -1,6 +1,6 @@
 # 인수인계: 이어서 할 일
 
-작성: 2026-11-14 08:05 UTC · 브랜치 `feat/visual-incident-report` · 선택적 추적 모드(3단계) 구현 및 검증 완료
+작성: 2026-11-14 10:52 UTC · 브랜치 `main` · PR #1 병합 완료 및 main 브랜치 동기화 완료
 
 이 문서만 읽고 이어서 작업할 수 있게 썼습니다. 현황 표는 `docs/WORK_STATUS_KO.md`, 로드맵은
 `docs/IMPROVEMENT_STRATEGY_AND_ROADMAP_KO.md`(6.1 결정, 8 진행 현황)에 있습니다. 작업이 진행되면 `WORK_STATUS_KO.md`를 고치고
@@ -12,28 +12,24 @@
 
 | 항목 | 값 |
 |---|---|
-| 작업 디렉터리 | `/home/ubuntu/workspace/ut` (브랜치 `feat/visual-incident-report`) |
-| PR | https://github.com/zeeny2park/dynamicState/pull/1 (열림, 병합 전). CI는 `feat/visual-incident-report` 대상 push/PR에서 실행(x86-64) |
+| 작업 디렉터리 | `/home/ubuntu/workspace/ut` (브랜치 `main`, origin/main 동기화 완료) |
+| PR | https://github.com/zeeny2park/dynamicState/pull/1 (병합 완료, 머지 커밋 `e3b4b78`) |
 | 호스트 | AArch64, 4코어, RAM 24GB, 디스크 45GB(여유 약 9.3GB) |
 | 지켜야 할 범위 | `.aidlc-rule-details/`, `.claude/`, `aidlc-docs/`, `*.patch`, `.claude.zip` (건드리지 않음), `/home/ubuntu/workspace/ut-webui` |
 | 데모 프로세스 보존 | `deadlock_pipeline` (PID 419893), `ok_busy_server` (PID 419894) 상주 유지 |
 
 ### 0.2 작업 및 검증 현황 (병합 및 안정화 완료)
 
-- **3단계 선택적 추적 모드(eBPF/uprobe) 구현 완료**:
-  - `extractor/tracing_mode.py`: `enable_tracing=True` 옵션 시 동작하는 opt-in eBPF 추적 모듈 구현.
-  - `extractor/diagnostic_recipes.py`: `temporary_capabilities([CAP_ALLOCATION_TRACING])` 동적 활성화 연동.
-  - `extractor/expert_diagnostic_engine.py`: `diagnose()`에 `enable_tracing` 연동 및 findings에 `traced_locations` 부착.
-  - `extractor/human_report.py`: 정적 위치 후보(관측 아님)와 추적 관측 위치(런타임 이벤트)를 별도 블록으로 명확히 구분 렌더링.
-  - CLI(`--enable-tracing`/`--tracing`), MCP(`runtime_diagnose_process`), Web API 연동 완료.
-  - 신규 단위/통합 테스트 11건 통과 (`tests/test_optional_tracing_mode.py`).
-  - 통합 벤치마크 21/21 무회귀 통과.
-- **기존 베이스라인 완료 내역**:
-  - 에이전트 1(`worktree-agent-a014e64fe14f5206a`), 에이전트 2(`worktree-agent-a84d5a8a832de2b37`) 병합 완료.
-  - PR 자동 리뷰 의견: 32비트/비-glibc 대상 `mapping_growth` ABI 가드 및 미지원 오탐 차단 조치 완료.
-  - `lock_hotspot`: 락 대기자 큐잉(`samples_queued > 0`) 발생 시 HEALTHY 오판 완전 차단 및 안정화 완료.
-  - 통합 베이스라인: 303개 파일, 3,042개 테스트 전체 통과 (0 failures).
-  - 샘플 보고서 `/var/www/dynamicstate-samples` 배포 및 데모 웹 서버 재시작 완료.
+- **GitHub PR #1 병합 완료 (`main` 브랜치 반영)**:
+  - 1단계: 가설 기반 진단 모델 통일, 판정 경로 문자열 검색 0건, 정상 판정 범위 가드
+  - 2단계: 증상 해석 및 징후 검증기 (다중 관측 수렴 판정)
+  - 3단계: 정적 위치 후보 및 선택적 eBPF 추적 모드 (`extractor/tracing_mode.py`, `--enable-tracing`), DWARF DIE 선언 파일 기반 소스 줄 정밀 정렬, C++ 컨테이너(11종) 해독
+  - 4단계: 적응형 예산 모델, 배타적 원인 분리, 공유 검사 판정 가드
+  - 5단계: 인간 친화형 보고서 통일, 웹 UI(Redesigned Dark/Light 테마, 프로세스 탐색기, 실시간 진단)
+  - CI 안정화: C++ `std::map` 고속 삽입 torn read 방어 (`decode()` 백오프 및 `_linked()` 변경 감지)
+  - 통합 회귀 테스트: 303개 테스트 파일 3,042개 테스트 100% 통과 (0 failures)
+  - 벤치마크: 결함 21/21 검출, 위치 후보 20/21 포함(틀린 후보 0건), 함정 프로그램 90회 오탐 0건, 5회 반복 일치율 100%
+  - 데모 서버: 포트 8081 웹 서버 무중단 운영 및 `/var/www/dynamicstate-samples` 최신 배포 완료
 
 ### 0.3 지켜야 할 규칙
 
@@ -57,16 +53,8 @@
 
 ## 1. 진행 순서 (현재 단계)
 
-### 1단계: 변경사항 커밋 및 push
-
-1. `docs/WORK_STATUS_KO.md`, `docs/HANDOFF_NEXT_STEPS_KO.md`, `docs/IMPROVEMENT_STRATEGY_AND_ROADMAP_KO.md` 8절 갱신.
-2. 커밋 생성 (커밋 메시지 끝에 `Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>` 포함).
-3. `git push origin feat/visual-incident-report`.
-4. PR #1의 CI 확인:
-   ```bash
-   gh run list --branch feat/visual-incident-report -L 5
-   ```
-5. PR 병합(`gh pr merge`)은 사용자가 명시적으로 요청할 때만 수행.
+모든 로드맵 및 후속 조치가 완료되어 `main` 브랜치에 병합되었습니다.
+향후 유지보수 또는 신규 기능 요청이 있을 때 새 브랜치를 생성하여 작업을 진행합니다.
 
 ---
 

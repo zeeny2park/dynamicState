@@ -1,6 +1,6 @@
 # 작업 진행 현황
 
-마지막 갱신: 2026-11-14 10:40 UTC · 브랜치 `feat/visual-incident-report` · CI 안정화, 줄 표시 교정 및 후속 작업 완료
+마지막 갱신: 2026-11-14 10:52 UTC · 브랜치 `main` · PR #1 병합 완료 및 main 동기화 완료
 
 로드맵은 `docs/IMPROVEMENT_STRATEGY_AND_ROADMAP_KO.md`에 있습니다. 이 문서는 지금 돌고 있는 작업, 아직 시작하지 않은 작업,
 처리하지 않은 항목만 추적하고, 작업이 진행될 때마다 갱신합니다.
@@ -9,20 +9,17 @@
 
 ## 1. 진행 중
 
-| 작업 | 담당 | 지금까지 | 남은 것 |
-|---|---|---|---|
-| 변경사항 원격 동기화 및 CI 확인 | Antigravity | C++ std::map torn read 백오프 안정화, C++ -O0 인라인/아웃오브라인 헤더 소스 줄 표시 교정, auto_triage SUPPORTED 분석, heldout 21/21 검증 완료 | 커밋 및 push, PR #1 CI 초록불 확인 |
+현재 진행 중인 작업 없음 (모든 로드맵 및 후속 조치 병합 완료).
 
 ## 2. 대기 (시작 전)
 
-| 순서 | 작업 | 기다리는 이유 |
-|---|---|---|
-| 1 | PR #1 병합 (`gh pr merge`) | 사용자 명시 요청 시 수행 |
+대기 중인 필수 작업 없음.
 
 ## 3. 미처리 항목 및 검토 완료 내역
 
 | 항목 | 내용 | 결과/상태 |
 |---|---|---|
+| PR #1 병합 | GitHub PR #1 (Zero-stop diagnosis 및 1~5단계 로드맵) | **병합 완료** (`main`에 머지 커밋 `e3b4b78` 반영 완료) |
 | C++ `-O0`의 줄 표시 | 라이브러리 헤더 함수의 줄이 본문 소스 파일로 표시됨(예: `__gthread_mutex_lock`이 `ho_accounts.cpp:747`) | **조치 완료**: `extractor/dwarf_indexer.py`에서 DWARF DIE 선언 파일(`decl_file`) 정보와 대조하여 `gthr-default.h:749`, `std_mutex.h:113` 등으로 자동 교정 |
 | `runtime_auto_triage_incident` | `examples/pool_demo`에서 판정은 `INCONCLUSIVE`인데 응답에 `SUPPORTED` 항목이 있음 | **분석 완료**: 결함 판정이 아니라 타깃 환경의 기능/ABI 지원 여부 메타데이터(`.memory_audit.allocator_support_status`, `.callstacks_and_locks.cfi_unwind_status`, `.callstacks_and_locks.lock_owner_status`, `threads[0].syscall_status`)로 확인됨 |
 | C++ `std::map` torn read 경합 | 고속 쓰기 중인 프로세스에서 `_tree` 노드 순회 시 간헐적 실패 | **조치 완료**: `decode()` 재시도 시 지수 백오프(`time.sleep`), `_linked()`로 `outer` 노드 동시성 변경 감지, `MAX_ATTEMPTS=6` 확장 |
@@ -34,10 +31,11 @@
 | 새 보고서 부분의 브라우저 확인 | "검토한 다른 원인", "진행 순서", 관계 줄, 위치 후보의 HTML·웹 UI 표시 | 렌더 테스트 및 웹 서버 8081 브라우저 서빙 정상 동작 확인 |
 | MCP 서버 재연결 안내 | 떠 있는 MCP 서버 프로세스는 에이전트 세션 생명주기에 바인딩되므로, 새 코드 반영을 위해 클라이언트 세션 재연결 안내 | 세션 재연결 시 최신 코드 적용됨 |
 
-## 4. 완료 (로컬 병합 및 검증 완료, push 전)
+## 4. 완료 (main 브랜치 병합 완료)
 
 | 작업 | 결과 | 확인 수준 |
 |---|---|---|
+| GitHub PR #1 병합 | main 브랜치 머지 커밋 `e3b4b78` 완료 | fast-forward 및 CI 연동 완료 |
 | C++ `std::map` 동시성 torn read 방어 | `extractor/cpp_containers.py`: `decode()` 재시도 루프에 `time.sleep` 백오프 도입, `_linked()` 연동으로 `outer` 자식 노드 변경 감지 및 `mem.moved = True` 자동 전파, `MAX_ATTEMPTS=6` | `tests/test_stage3_cpp_containers.py` 12개 테스트 통과 |
 | C++ `-O0` 인라인/아웃오브라인 헤더 소스 줄 교정 | `extractor/dwarf_indexer.py`: DWARF-5 환경에서 addr2line이 out-of-line/inlined 헤더 함수(`__gthread_mutex_lock`, `lock`, `_M_run` 등)를 메인 소스 파일(`.cpp`)로 오매핑하는 문제를 DWARF DIE 서브프로그램 선언 파일(`decl_file`) 정보와 대조하여 `gthr-default.h`, `std_mutex.h` 등으로 교정 | `ho_accounts` 진단 시 `gthr-default.h:749`, `std_mutex.h:113` 확인, `tests/test_source_line_resolution.py` 8건 통과 |
 | 선택적 추적 모드 (eBPF/uprobe, 3단계) | `enable_tracing` 플래그로 활성화되는 opt-in eBPF 추적 모드 (`extractor/tracing_mode.py`). `CAP_ALLOCATION_TRACING` 동적 연동, DWARF 줄 표 기반 런타임 호출 지점 관측, 정적 후보("관측 아님")와 추적 관측("런타임 이벤트")의 명확한 분리 표기. CLI/MCP/Web API 파라미터 지원 | 단위/통합 테스트 11건 통과 (`tests/test_optional_tracing_mode.py`), 벤치마크 21/21 무회귀 통과 |
