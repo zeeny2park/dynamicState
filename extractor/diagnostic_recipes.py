@@ -1655,6 +1655,19 @@ def _rule_invalid_free(recipe: DiagnosticRecipe, data: Dict[str, Any]) -> Option
     alloc_insp = data.get("allocator_inspector") or data.get("allocator")
     ptr_addr = data.get("pointer_address") if "pointer_address" in data else (data.get("target_address") if "target_address" in data else data.get("address"))
     maps = data.get("maps") or data.get("proc_maps") or []
+    if data.get("free_call_observed") is False:
+        # The live observation holds a pointer VALUE; nobody was seen passing it to free().  A pointer to a global
+        # or into an object is valid as a pointer, and "would be an invalid free target" is not an invalid free.
+        return RecipeEvaluationResult(
+            recipe_id=rid,
+            status=RECIPE_STATUS_INSUFFICIENT_EVIDENCE,
+            confidence=0.20,
+            confidence_basis="A pointer value was observed, but no free() of it was observed (zero-stop, no "
+                             "allocation tracing): whether it is ever freed cannot be decided.",
+            missing_evidence=["observed_free_call"],
+            limitations=recipe.limitations,
+            details={"is_invalid_free": False, "free_call_observed": False},
+        )
     if alloc_insp and ptr_addr is not None:
         val_res = alloc_insp.validate_free_target(ptr_addr, maps=maps)
         if not val_res.is_valid:
@@ -2849,7 +2862,9 @@ def _rule_repeated_allocation_patterns(recipe: DiagnosticRecipe, data: Dict[str,
     rid = recipe.recipe_id
     if not (not ("positive_evidence_found" in data or "negative_evidence_found" in data)):
         return None
-    if data.get("unreclaimed_site_growth") is True or (data.get("alloc_delta", 0) > 100 and data.get("free_delta", 0) == 0):
+    # alloc_delta / free_delta are None when the counter source changed between epochs: not comparable
+    a_d, f_d = data.get("alloc_delta"), data.get("free_delta")
+    if data.get("unreclaimed_site_growth") is True or (a_d is not None and f_d is not None and a_d > 100 and f_d == 0):
         return RecipeEvaluationResult(
             recipe_id=rid,
             status=RECIPE_STATUS_SUPPORTED,

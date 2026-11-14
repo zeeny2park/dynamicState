@@ -1158,6 +1158,8 @@ class RuntimeEvidenceProvider:
                 observation_data["faulting_address"] = f"0x{observed_addr:x}"
                 observation_data["address"] = observed_addr
                 observation_data["target_address"] = observed_addr
+                # a pointer value read from memory, not an observed free() argument (no allocation tracing)
+                observation_data["free_call_observed"] = False
                 observation_data["pointer_name"] = ptr_name
                 observation_data["pointer_value"] = f"0x{observed_addr:x}"
 
