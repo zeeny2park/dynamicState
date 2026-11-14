@@ -75,6 +75,7 @@ from .temporal_observation_window import (
     MemoryBehavior,
     MemoryAnalysisResult,
 )
+from .cause_predictions import evaluate_causes
 from .competing_hypotheses import (
     candidate_verdict_source,
     CompetingHypothesis,
@@ -2621,8 +2622,12 @@ class AdaptiveInvestigationSession:
         verified = list(self.active_hypotheses) + list(self.rejected_hypotheses)
         if not verified:
             return
+        # what the collected evidence says about each cause (declared predictions, typed evidence only)
+        outcomes = evaluate_causes([(ch.hypothesis_id, ch.domain) for ch in self.competing_hypotheses],
+                                   self.collected_evidence)
         for ch in self.competing_hypotheses:
-            ch.bind_verdict(candidate_verdict_source(ch, verified), ledger=self.ledger)
+            ch.bind_verdict(candidate_verdict_source(ch, verified, outcomes.get(ch.hypothesis_id)),
+                            ledger=self.ledger)
 
     def _execute_verification_for_hypothesis(self, hyp: ExpertHypothesis) -> Dict[str, Any]:
         """Executes explicit verification criteria for a single hypothesis.
@@ -3508,7 +3513,8 @@ class AdaptiveInvestigationSession:
                 {"hypothesis_id": rh.hypothesis_id, "rationale": rh.confidence_basis}
                 for rh in self.rejected_hypotheses
             ] + [
-                {"hypothesis_id": ch.hypothesis_id, "rationale": "; ".join(ch.contradicting_observations)}
+                {"hypothesis_id": ch.hypothesis_id,
+                 "rationale": "; ".join(ch.contradicting_observations) or ch.confidence_basis}
                 for ch in self.competing_hypotheses if ch.status == "REFUTED"
             ],
             missing_evidence_preventing_conclusions=[m for h in self.active_hypotheses for m in h.missing_evidence] + [

@@ -67,6 +67,28 @@ class TestCompetingCauses(unittest.TestCase):
         self.assertEqual([c["outcome_word"] for c in en], ["supported", "ruled out", "undecided"])
         self.assertEqual(en[2]["evidence"], "the related check was not run")
 
+    def test_reasons_of_the_evidence_outcome(self):
+        # cause bound by what the evidence says about it (extractor.cause_predictions): the supported cause names
+        # the check that found it (even when that check is not one of its declared rules), a ruled-out one the
+        # observation that contradicts it, an undecided one the rival the evidence cannot tell it from
+        vs_a = {"outcome": "supported", "reason": "DISCRIMINATING_EVIDENCE", "rules": [self.failed],
+                "signals": [{"signal": "heap_header_damage", "observed": "DAMAGED", "rules": [self.failed]}]}
+        vs_b = {"outcome": "refuted", "reason": "CONTRADICTED_BY_EVIDENCE", "rules": [self.passed],
+                "signals": [{"signal": "free_list_repeat", "observed": "NONE", "rules": [self.passed]}]}
+        vs_c = {"outcome": "undecided", "reason": "NOT_DISTINGUISHED", "rules": [],
+                "rivals_not_distinguished": ["A"], "signals": []}
+        cands = [_cand("A", "Out-of-Bounds Heap Buffer Write", "CONFIRMED", ["RECIPE_NOT_A_CHECK"], verdict_source=vs_a),
+                 _cand("B", "Duplicate Memory Release (Double Free)", "REFUTED", [], verdict_source=vs_b),
+                 _cand("C", "Dangling Pointer Dereference (Use-After-Free)", "INCONCLUSIVE", [], verdict_source=vs_c)]
+        by = {c["id"]: c for c in self._causes(cands)[0]["causes"]}
+        self.assertEqual(by["A"]["recipe_id"], self.failed)
+        self.assertEqual(by["B"]["recipe_id"], self.passed)
+        self.assertIn("해제 목록에 중복된 블록 없음: 이 원인과 맞지 않음", by["B"]["evidence"])
+        self.assertEqual(by["C"]["evidence"], "증거가 이 원인을 다음과 구별하지 못함: 힙 버퍼 범위를 넘어선 쓰기")
+        en = {c["id"]: c for c in self._causes(cands, "en")[0]["causes"]}
+        self.assertIn("no block is on the free list twice: does not fit this cause", en["B"]["evidence"])
+        self.assertEqual(en["C"]["evidence"], "the evidence does not distinguish it from: Out-of-Bounds Heap Buffer Write")
+
     def test_only_with_more_than_one_candidate(self):
         self.assertEqual(self._causes([_cand("A", "Out-of-Bounds Heap Buffer Write", "CONFIRMED", [self.failed])]), [])
         self.assertEqual(self._causes([]), [])
