@@ -3367,6 +3367,22 @@ class WebApiAdapter:
                 return {"success": False, "error": {"code": "INVALID_PARAM", "message": "time_limit_s must be a positive number"}}
             time_limit_s = min(time_limit_s, self.DIAGNOSE_REMOTE_MAX_TIME_LIMIT_S if params.get("remote_host") not in (None, "")
                                else self.DIAGNOSE_MAX_TIME_LIMIT_S)
+        # Time budget of the default checks (extractor.check_budget): seconds, <= 0 = no limit; same as CLI / MCP.
+        check_budget: Dict[str, Optional[float]] = {}
+        for k in ("default_check_budget_s", "default_check_max_s"):
+            v = params.get(k)
+            if v is None:
+                check_budget[k] = None
+                continue
+            try:
+                if isinstance(v, bool):
+                    raise ValueError
+                v = float(v)
+                if v != v or v in (float("inf"), float("-inf")):
+                    raise ValueError
+            except (TypeError, ValueError):
+                return {"success": False, "error": {"code": "INVALID_PARAM", "message": f"{k} must be a number of seconds"}}
+            check_budget[k] = v
         language = params.get("language") or "en"
         if language not in ("en", "ko"):
             return {"success": False, "error": {"code": "INVALID_PARAM", "message": "language must be 'en' or 'ko'"}}
@@ -3401,7 +3417,7 @@ class WebApiAdapter:
             return {"success": False, "error": {"code": "INVALID_PARAM", "message": str(exc)}}
         return {"success": True, "args": {
             "pid": pid, "debug_image": debug_image, "symptom": symptom, "time_limit_s": time_limit_s,
-            "language": language, "remote_target": remote_target, "symptom_fields": symptom_fields}}
+            "language": language, "remote_target": remote_target, "symptom_fields": symptom_fields, **check_budget}}
 
     def diagnose_api(self, params: Dict[str, Any]) -> Dict[str, Any]:
         """POST /api/diagnose: the one-call entry point (IMP-006). Calls the same diagnose() as MCP and CLI.
@@ -3421,7 +3437,8 @@ class WebApiAdapter:
             result, summary = diagnose_with_summary(
                 pid, debug_image=debug_image, symptom=symptom, time_limit_s=time_limit_s,
                 engine=self.runtime.expert_diagnostic_engine, lang=language, target=remote_target,
-                symptom_fields=symptom_fields,
+                symptom_fields=symptom_fields, default_check_budget_s=a.get("default_check_budget_s"),
+                default_check_max_s=a.get("default_check_max_s"),
             )
             return {"success": True, "result": _to_json_serializable({**result, "human_summary": summary})}
         except Exception as e:

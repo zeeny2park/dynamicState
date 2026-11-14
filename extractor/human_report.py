@@ -70,6 +70,10 @@ T: Dict[str, Tuple[str, str]] = {
                         "{raw}",
                         "; 기본 검사 '{what}'({rid})이(가) 결론을 내지 못해 정상으로 판정하지 않았습니다 "
                         "(엔진 원문: {raw})"),
+    "r_baseline_time_budget": ("; it is not called healthy because the baseline check for {what} ({rid}) was not run: "
+                               "it did not fit the time budget for default checks",
+                               "; 기본 검사 '{what}'({rid})을(를) 기본 검사 시간 예산 때문에 실행하지 않아 정상으로 "
+                               "판정하지 않았습니다"),
     # --- what is wrong
     "w_none": ("No cause could be named: the diagnosis produced no finding.",
                "원인으로 지목할 대상이 없습니다. 이번 진단은 발견을 만들지 못했습니다."),
@@ -221,6 +225,12 @@ T: Dict[str, Tuple[str, str]] = {
                                "이 증상에는 선택되지 않아 실행하지 않은 다른 검사 {n}개: {items}."),
     "nc_baseline_check_not_run": ("Planned checks that never ran because the investigation ended early: {items}.",
                                   "조사가 일찍 끝나 실행되지 못한 계획된 검사: {items}."),
+    "nc_baseline_not_run_time_budget": (
+        "Default checks not run because of the time budget for default checks ({total} s in total, {per} s per "
+        "check): {items}. They were not examined, so the process cannot be called healthy; name the symptom (or "
+        "raise the budget) to run them.",
+        "기본 검사 시간 예산(전체 {total}초, 검사당 {per}초) 때문에 실행 안 함: {items}. 확인하지 않았으므로 정상이라고 "
+        "할 수 없습니다. 증상을 지정하거나 예산을 늘리면 실행됩니다."),
     "nc_budget_exhausted": ("The observation budget ran out, so the observation was cut short.",
                             "관측 예산이 소진되어 관측이 중간에 끊겼습니다."),
     "nc_leak_owner_limited": ("Finding the owner of the growing memory was only partly possible.",
@@ -447,6 +457,10 @@ T: Dict[str, Tuple[str, str]] = {
     "g_not_in_mode": ("not examined in this mode: a zero-stop diagnosis cannot answer these (they need {cap})",
                       "무정지 진단으로는 답할 수 없어 점검하지 않은 검사 (필요한 것: {cap})"),
     "g_not_executed": ("planned but not executed before the investigation ended", "계획했지만 조사가 끝날 때까지 실행되지 않음"),
+    "g_not_run_time_budget": ("not run: time budget for default checks (expected {exp} s; {spent} s of {total} s "
+                              "already used; per-check limit {per} s)",
+                              "시간 예산 때문에 실행 안 함 (예상 {exp}초, 기본 검사 예산 {total}초 중 {spent}초 사용, "
+                              "검사당 한도 {per}초)"),
     "st_NOT_APPLICABLE": ("the check does not apply to this target", "이 대상에는 적용되지 않는 검사"),
     "st_ERROR": ("the check itself ended with an error", "검사 자체가 오류로 끝남"),
     "st_UNSUPPORTED": ("not supported on this target", "이 대상에서 지원되지 않음"),
@@ -993,6 +1007,8 @@ def _baseline_open_reason(ctx: _Ctx, res: Dict[str, Any]) -> str:
         if not raw:
             continue
         what = (BASELINE_SCOPE_LABELS.get(rid) or (rid, rid))[ctx.i]
+        if b.get("not_run_reason") == "time_budget":
+            return ctx.t("r_baseline_time_budget", what=what, rid=_c(rid))
         return ctx.t("r_baseline_open", what=what, rid=_c(rid), raw=_c(raw))
     return ""
 
@@ -1128,7 +1144,8 @@ def check_rows(res: Dict[str, Any], report: Optional[Dict[str, Any]]) -> List[Di
                      "limits": [str(x) for x in (c.get("limitations") or [])] + [str(x) for x in (c.get("missing_evidence") or [])],
                      "dur": c.get("duration_seconds", c.get("duration_s")), "check_id": c.get("check_id"),
                      "required": c.get("is_required"), "n_ev": len(c.get("supporting_evidence_ids") or []),
-                     "cap": obs.get("missing_capability"), "err": c.get("error_details"), "planned": True})
+                     "cap": obs.get("missing_capability"), "err": c.get("error_details"), "planned": True,
+                     "not_run": obs.get("not_run") if isinstance(obs.get("not_run"), dict) else None})
     for n in res.get("not_covered") or []:
         kind = str(n.get("kind") or "") if isinstance(n, dict) else ""
         rid = str(n.get("item") or "") if kind.startswith("check_") else ""
@@ -1181,6 +1198,13 @@ def check_label(rid: str, i: int, fallback: Any = None) -> str:
     return f"{name} ({_c(rid)})" if name != str(rid) else _c(rid)
 
 
+def _secs(v: Any) -> str:
+    """Seconds for a sentence: '2.5', or '∞' for no limit."""
+    if not isinstance(v, (int, float)):
+        return "∞"
+    return f"{float(v):.1f}".rstrip("0").rstrip(".") if float(v) >= 0.1 else f"{float(v):.2f}"
+
+
 def _undecided_reason(ctx: _Ctx, r: Dict[str, Any], reasons: Dict[str, List[str]]) -> str:
     if r.get("raw_status") == "NOT_IN_MODE":
         from .diagnostic_recipes import CAPABILITY_DESCRIPTIONS
@@ -1189,6 +1213,10 @@ def _undecided_reason(ctx: _Ctx, r: Dict[str, Any], reasons: Dict[str, List[str]
     if not r.get("planned", True):
         return ctx.t("g_not_planned")
     if r["status"] == "SKIPPED":
+        nr = r.get("not_run") or {}
+        if nr.get("reason") == "time_budget":
+            return ctx.t("g_not_run_time_budget", exp=_secs(nr.get("expected_cost_s")), spent=_secs(nr.get("spent_s")),
+                         total=_secs(nr.get("total_s")), per=_secs(nr.get("per_check_s")))
         interp = str(r.get("interp") or "")
         if interp and interp != "Check executed":
             return ko_text(interp, ctx.i).rstrip(".")
@@ -1363,7 +1391,17 @@ def _not_examined_lines(ctx: _Ctx, res: Dict[str, Any]) -> List[str]:
         elif kind == "long_wait_not_judged":
             line = ctx.t("nc_long_wait_not_judged", items=_join(names))
         elif kind == "baseline_check_not_run":
-            line = ctx.t("nc_baseline_check_not_run", items=_join(names))
+            budgeted = [n for n in items if n.get("not_run_reason") == "time_budget"]
+            other = [nm for nm, n in zip(names, items) if n.get("not_run_reason") != "time_budget"]
+            parts = []
+            if budgeted:
+                b = budgeted[0].get("budget") or {}
+                parts.append(ctx.t("nc_baseline_not_run_time_budget", total=_secs(b.get("total_s")),
+                                   per=_secs(b.get("per_check_s")),
+                                   items=_join([nm for nm, n in zip(names, items) if n.get("not_run_reason") == "time_budget"])))
+            if other:
+                parts.append(ctx.t("nc_baseline_check_not_run", items=_join(other)))
+            line = " ".join(parts)
         elif kind in ("unattributed_finding", "stage_failed", "unexpected_error"):
             line = ctx.t(f"nc_{kind}", items=_join(names))
         elif kind == "unsupported_in_mode":
@@ -1832,7 +1870,8 @@ def diagnose_with_summary(pid: int, debug_image: Optional[str] = None, symptom: 
                           time_limit_s: Optional[float] = None, engine: Any = None, lang: str = "en",
                           corpus_dir: Optional[str] = None, target: Any = None,
                           adapter: Any = None, symptom_fields: Any = None,
-                          keep_report: bool = False) -> Tuple[Dict[str, Any], str]:
+                          keep_report: bool = False, default_check_budget_s: Optional[float] = None,
+                          default_check_max_s: Optional[float] = None) -> Tuple[Dict[str, Any], str]:
     """Run ``diagnose`` once and return ``(result_dict_without_inline_report, human_summary_markdown)``.
 
     The inline full report is requested only to give the summary its names and numbers; it is dropped from the
@@ -1846,6 +1885,10 @@ def diagnose_with_summary(pid: int, debug_image: Optional[str] = None, symptom: 
         kw["adapter"] = adapter
     if symptom_fields is not None:
         kw["symptom_fields"] = symptom_fields
+    if default_check_budget_s is not None:
+        kw["default_check_budget_s"] = default_check_budget_s
+    if default_check_max_s is not None:
+        kw["default_check_max_s"] = default_check_max_s
     res = diagnose(pid, debug_image=debug_image, symptom=symptom, time_limit_s=time_limit_s,
                    include_report=True, **kw)
     d = res.to_dict()

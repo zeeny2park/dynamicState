@@ -192,6 +192,12 @@ class DiagnosticRecipe:
     # ``unsupported_question`` is that question in plain words.  A baseline recipe must not declare any.
     requires_capabilities: Tuple[str, ...] = ()
     unsupported_question: str = ""
+    # Declared wall-clock cost on a quiet host (extractor.check_budget): base seconds + seconds per target thread, plus
+    # the shared collection named by ``shared_cost`` (check_budget.SHARED_COSTS) when no earlier check of the run
+    # collected it.  Used to decide whether a default (baseline, not symptom-requested) check fits the time budget.
+    expected_cost_s: float = 0.05
+    cost_per_thread_s: float = 0.0
+    shared_cost: str = ""
 
     @property
     def problem_category(self) -> str:
@@ -265,6 +271,14 @@ _RECIPES: Dict[str, DiagnosticRecipe] = {}
 
 def _register(recipe: DiagnosticRecipe) -> None:
     _RECIPES[recipe.recipe_id] = recipe
+
+
+def declare_cost(recipe_id: str, expected_cost_s: float, cost_per_thread_s: float = 0.0, shared_cost: str = "") -> None:
+    """Declare a registered recipe's cost metadata (see DiagnosticRecipe.expected_cost_s)."""
+    r = _RECIPES[recipe_id]
+    r.expected_cost_s = float(expected_cost_s)
+    r.cost_per_thread_s = float(cost_per_thread_s)
+    r.shared_cost = str(shared_cost or "")
 
 
 def register_recipe(recipe: DiagnosticRecipe, baseline: bool = False, category: Optional[str] = None) -> DiagnosticRecipe:
@@ -2849,3 +2863,31 @@ def _load_recipe_plugins() -> None:
 
 
 _load_recipe_plugins()
+
+
+# Declared cost of the baseline recipes (extractor.check_budget), measured on a quiet 4-core aarch64 host
+# (2026-11-14): a 2-thread idle server and a 301-thread target, per-check wall time from ``checks_run[].duration_s``.
+# (recipe, base seconds, seconds per target thread, shared collection paid by the first check that needs it)
+_WINDOW, _LOCK_WAIT = "observation_window", "lock_wait_samples"
+_DECLARED_COSTS = (
+    ("RECIPE_THREAD_STATE_ANOMALIES", 0.02, 0.002, _WINDOW),      # 0.014 s (2 thr, window paid) / 0.61 s (301 thr)
+    ("RECIPE_LONG_RUNNING_BLOCKED_THREADS", 0.02, 0.002, _WINDOW),  # 0.014 s / 0.60 s
+    ("RECIPE_SUSPICIOUS_LOCK_OWNERSHIP", 0.02, 0.0017, ""),       # 0.013 s / 0.50 s
+    ("RECIPE_POTENTIAL_DEADLOCK_PATTERNS", 0.02, 0.0018, ""),     # 0.013 s / 0.54 s
+    ("RECIPE_PROCESS_MEMORY_GROWTH", 0.05, 0.0, _WINDOW),         # 0.76 s / 2.85 s when it pays the window, else 0.07 s
+    ("RECIPE_HEAP_METADATA_CORRUPTION", 0.05, 0.0, ""),           # 0.004-0.01 s (heap walk capped at 8 MiB)
+    ("RECIPE_DOUBLE_FREE", 0.1, 0.001, ""),                       # 0.11 s / 0.29 s
+    ("RECIPE_FD_LEAK", 0.8, 0.0003, ""),                          # 0.81 s / 0.89 s (own fd sampling series)
+    ("RECIPE_LOCK_CONTENTION", 0.01, 0.0005, ""),                 # 0.007 s / 0.15 s
+    ("RECIPE_ORPHAN_LOCK", 0.01, 0.0002, _LOCK_WAIT),             # 0.17 s / 1.03 s when it pays the lock-wait samples
+    ("RECIPE_SELF_DEADLOCK", 0.01, 0.0002, _LOCK_WAIT),           # 0.006 s / 0.09 s after them, 1.08 s when it pays
+    ("RECIPE_MAPPING_GROWTH", 0.9, 0.0003, ""),                   # 0.91 s / 1.00 s (own maps series)
+    ("RECIPE_THREAD_LEAK", 0.02, 0.0, _WINDOW),                   # 0.0075 s / 2.96 s when it pays the window
+    ("RECIPE_FREED_MEMORY_USE", 0.05, 0.0004, ""),                # 0.006 s / 0.13 s (reuses the integrity heap walk)
+    # not baseline (never budgeted), declared so a run knows they collected the shared window (memory trend)
+    ("RECIPE_ALLOCATION_FREE_IMBALANCE", 0.05, 0.0, _WINDOW),
+    ("RECIPE_HEAP_GROWTH", 0.05, 0.0, _WINDOW),
+)
+for _rid, _base, _per_thread, _shared in _DECLARED_COSTS:
+    if _rid in _RECIPES:
+        declare_cost(_rid, _base, _per_thread, _shared)

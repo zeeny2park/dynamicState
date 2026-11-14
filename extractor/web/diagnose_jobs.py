@@ -400,6 +400,9 @@ class DiagnoseJobManager:
                 from extractor.human_report import diagnose_with_summary as fn  # same function as POST /api/diagnose
                 extra["keep_report"] = True     # the view and the report are made from this very result
             p = job.params
+            for k in ("default_check_budget_s", "default_check_max_s"):   # time budget of the default checks
+                if p.get(k) is not None:
+                    extra[k] = p[k]
             result, summary = fn(
                 p["pid"], debug_image=p.get("debug_image"), symptom=p.get("symptom"), time_limit_s=p.get("time_limit_s"),
                 engine=engine, lang=job.language, target=p.get("remote_target"), symptom_fields=p.get("symptom_fields"),
