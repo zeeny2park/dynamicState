@@ -673,6 +673,9 @@ def _top_frame(thread_report: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         "inlined_into": f.get("inlined_into"),
         "estimated": bool(f.get("estimated")),
         "unwind": f.get("unwind"),
+        # the line was not observed (running thread, stack-sample frame): `source_location` is the definition line
+        "location_observed": f.get("source_line_basis") != "NOT_OBSERVED_RUNNING_THREAD_STACK_SAMPLE",
+        "sampled_source_location": f.get("sampled_source_location"),
     }
 
 
@@ -911,9 +914,18 @@ def derive(series: ThreadSeries) -> Dict[str, Any]:
         d["top_frames"] = frames
         known = [f for f in frames if f]
         d["top_function"] = known[-1] if known else None
-        d["top_source_location"] = next(((r.get("top_frame") or {}).get("source_location") for r in reversed(recs)
-                                         if (r.get("top_frame") or {}).get("function")), None)
         _tf = next(((r.get("top_frame") or {}) for r in reversed(recs) if (r.get("top_frame") or {}).get("function")), {})
+        # `top_source_location` is where the thread was observed.  For a running thread no PC is readable without
+        # stopping it; its frames come from a stack sample whose return addresses can be stale, so it has no
+        # observed location: only the definition of the function (`top_function_decl_location`) is given.
+        if _tf.get("location_observed", True):
+            d["top_source_location"] = _tf.get("source_location")
+        else:
+            d["top_source_location"] = None
+            d["top_location_observed"] = False
+            d["top_function_decl_location"] = _tf.get("function_decl_location") or _tf.get("source_location")
+            if _tf.get("sampled_source_location"):
+                d["top_sampled_return_location"] = _tf.get("sampled_source_location")
         d["top_source_line_exact"] = bool(_tf.get("source_line_exact"))
         if _tf.get("source_line_text"):
             d["top_source_text"] = _tf.get("source_line_text")

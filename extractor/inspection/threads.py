@@ -158,6 +158,37 @@ def _apply_exact_source_line(resolved: Dict[str, Any], idx: "DwarfIndex", lookup
     return out
 
 
+LINE_BASIS_NOT_OBSERVED = "NOT_OBSERVED_RUNNING_THREAD_STACK_SAMPLE"
+_NOT_OBSERVED_NOTE = ("the thread was running on a CPU and no program counter of it can be read without stopping it "
+                      "(/proc reports no PC/SP and the syscall record says 'running'); this address is a return "
+                      "address found by scanning its stack and may be stale, so its line is not where the thread "
+                      "is executing")
+
+
+def _unobserved_line_frame(fr: Dict[str, Any]) -> Dict[str, Any]:
+    """A frame of a thread whose PC was not observed (running thread: stack sample / scan).  Its address is a
+    return address read from the stack, possibly left there by an earlier call, not an observed PC, so its
+    line-table line is neither exact nor "where the thread executes".  The function stays (it is what the
+    estimated unwind names, labelled ``estimated``); the location falls back to the function's definition line
+    (as for any frame without an exact line) and the scanned line is kept apart as ``sampled_source_location``."""
+    if not fr.get("source_line_exact"):
+        return fr
+    out = dict(fr)
+    out["sampled_source_location"] = fr.get("source_location")
+    out["sampled_source_line"] = fr.get("source_line")
+    if "source_line_text" in out:
+        out["sampled_source_line_text"] = out.pop("source_line_text")
+    for k in ("inlined_chain", "inlined_function", "inlined_into"):
+        if k in out:
+            out["sampled_" + k] = out.pop(k)
+    out["source_location"] = fr.get("function_decl_location")
+    out["source_line"] = fr.get("function_decl_line")
+    out["source_line_exact"] = False
+    out["source_line_basis"] = LINE_BASIS_NOT_OBSERVED
+    out["source_line_note"] = _NOT_OBSERVED_NOTE
+    return out
+
+
 def inspect_thread_callstacks_and_locks(
     mgr,
     pid: int,
@@ -653,10 +684,17 @@ def inspect_thread_callstacks_and_locks(
                                     "inferred": True,
                                 })
 
+        # No kernel-reported PC (a thread running on a CPU): every frame came from a stack sample / scan, so no
+        # frame line is an observed position (see _unobserved_line_frame).
+        pc_observed = pc_int > 0
+        if not pc_observed and (sc_info.get("state") == "running" or t_state == "R"):
+            frames = [_unobserved_line_frame(f) if f.get("estimated") else f for f in frames]
+
         thread_reports.append({
             "tid": t_tid,
             "name": t_name,
             "state": t_state,
+            "pc_observed": pc_observed,
             "syscall": syscall_name,
             "syscall_nr": syscall_nr,
             "syscall_status": syscall_support.status,
