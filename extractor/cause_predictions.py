@@ -154,6 +154,9 @@ def _by_polarity(present: str, absent: str, need_inspected: bool = False) -> Cal
 
 
 def _heap_header_damage(te: TypedEvidence) -> Optional[str]:
+    """Allocator chunk headers as read by a heap walk (evidence without a heap-check status did not walk the heap)."""
+    if te.measured.get("heap_check_status") is None:
+        return None
     if te.polarity == POLARITY_SUPPORTS:
         return "DAMAGED"
     if te.polarity == POLARITY_CONTRADICTS and te.complete and te.measured.get("heap_check_status") == "COMPLETED":

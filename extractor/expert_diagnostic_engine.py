@@ -752,6 +752,10 @@ class InvestigationStep:
     default_check: bool = False
     not_run_reason: Optional[str] = None
     budget: Optional[Dict[str, Any]] = None
+    # An optional follow-up the adaptive loop added (a discriminating check after a clean result, a growth follow-up
+    # after a supported trend), as opposed to a check the symptom asked for or a baseline check.  Only these are
+    # decided by their expected outcome when expensive (extractor.followup_value).
+    optional_followup: bool = False
 
 
 @dataclass
@@ -1306,6 +1310,8 @@ class AdaptiveInvestigationSession:
         )
         self.competing_hypotheses: List[CompetingHypothesis] = []
         self.observation_selection_log: List[Dict[str, Any]] = []  # discriminating-selector decisions (replanning)
+        # expensive optional follow-ups decided by their expected outcome (extractor.followup_value), in order
+        self.followup_decisions: List[Dict[str, Any]] = []
         self.invariant_evaluator = InvariantEvaluator()
         self.allocator_inspector: Optional[AllocatorInspector] = None
         self.structural_discovery = CppStructuralDiscovery()
@@ -1780,6 +1786,105 @@ class AdaptiveInvestigationSession:
         self._record_timeline_event("CHECK_NOT_RUN_TIME_BUDGET", {"step_id": step.step_id, "recipe_id": step.recipe_id,
                                                                    **step.budget})
         return "skip"
+
+    # ---- expensive optional follow-ups: expected outcomes and stop condition (extractor.followup_value) ----
+    def _followup_cost_s(self, recipe_id: str) -> float:
+        """Expected seconds of a follow-up run now: declared cost (shared collections not yet paid included) x the
+        run's measured correction (the same estimate as the default-check time budget)."""
+        _spent, corr, collected = self._default_check_spending()
+        return round(self._recipe_cost_s(recipe_id, collected) * corr, 4)
+
+    def _followup_context(self) -> Dict[str, Any]:
+        """What an expected-outcome table needs: the open competing causes, the signals observed so far, the signals
+        and direct-evidence categories of the pending required checks, the categories already decided directly."""
+        from .cause_predictions import OUTCOME_REFUTED, evaluate_causes, observe_signals
+        from .recipe_metadata import EVIDENCE_DIRECT, proof_of
+        observed = observe_signals(self.collected_evidence)
+        outcomes = evaluate_causes([(c.hypothesis_id, c.domain) for c in self.competing_hypotheses],
+                                   self.collected_evidence, observed=observed)
+        open_causes = [cid for cid, o in outcomes.items() if o["outcome"] != OUTCOME_REFUTED]
+        idx = self.plan.current_step_index if self.plan else 0
+        pending = [s for s in (self.plan.steps[idx + 1:] if self.plan else [])
+                   if s.status == "PENDING" and not s.optional_followup]
+        pending_signals: Set[str] = set()
+        pending_direct: Set[str] = set()
+        for s in pending:
+            pr = proof_of(s.recipe_id)
+            if pr is None:
+                continue
+            pending_signals.update(pr.observes)
+            if pr.evidence == EVIDENCE_DIRECT:
+                pending_direct.update(pr.supports)
+        decided: Set[str] = set()
+        for c in self.checks:
+            pr = proof_of(c.recipe_id)
+            if pr is not None and pr.evidence == EVIDENCE_DIRECT and c.status in (CheckStatus.PASS, CheckStatus.FAIL):
+                decided.update(pr.supports)
+        return {"open_causes": open_causes, "observed": set(observed), "pending_signals": pending_signals,
+                "pending_direct": pending_direct, "decided": decided}
+
+    def _evaluate_followup(self, recipe_id: str, after_recipe: str,
+                           ctx: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
+        """None for a cheap follow-up (fixed order, nothing decided); for an expensive one its expected-outcome table,
+        gain and decision, recorded in ``followup_decisions``."""
+        from .followup_value import evaluate_followup, is_expensive
+        cost = self._followup_cost_s(recipe_id)
+        if not is_expensive(cost):
+            return None
+        ctx = ctx or self._followup_context()
+        ev = evaluate_followup(recipe_id, cost, ctx["open_causes"], ctx["observed"], ctx["pending_signals"],
+                               ctx["decided"], ctx["pending_direct"])
+        ev["after_recipe"] = after_recipe
+        self.followup_decisions.append(ev)
+        self._record_timeline_event("FOLLOWUP_EVALUATED", {k: ev[k] for k in ("recipe_id", "decision", "gain",
+                                                                              "expected_cost_s", "after_recipe")})
+        return ev
+
+    def adaptive_stop_record(self) -> Optional[Dict[str, Any]]:
+        """Why the loop stopped adding follow-ups: the expensive follow-ups left out (last decision per check, only
+        checks that never ran), with gain, cost and expected-outcome table (followup_value.stop_record)."""
+        from .followup_value import DECISION_RUN, stop_record
+        ran = {c.recipe_id for c in self.checks}
+        last: Dict[str, Dict[str, Any]] = {}
+        for d in self.followup_decisions:
+            last[str(d.get("recipe_id"))] = d
+        return stop_record([d for rid, d in last.items() if rid not in ran and d.get("decision") != DECISION_RUN])
+
+    def _select_followup(self, after_recipe: str, select: Callable[[Set[str]], Tuple[Optional[str], Any, str]],
+                         plan_ids: Set[str]) -> Tuple[Optional[str], Any, str, List[Dict[str, Any]], Set[str]]:
+        """Run the discriminating selector, deciding the expensive new follow-ups it proposes by expected outcome.
+
+        ``select(excluded)`` is the selector over the candidate recipes minus ``excluded``.  A pick that is already in
+        the plan (a required check moved forward) or a cheap new follow-up is returned as the selector made it.  An
+        expensive new pick is decided with every other expensive new candidate: the one with most gain per expected
+        second runs; those that cannot change the causes or the verdict, or whose gain is below their cost, are left
+        out and the selector is asked again without them.  Returns (pick, log, rationale, evaluations, left out)."""
+        from .followup_value import choose
+        excluded: Set[str] = set()
+        evaluations: List[Dict[str, Any]] = []
+        ctx: Optional[Dict[str, Any]] = None
+        while True:
+            sel_rid, sel_log, sel_why = select(excluded)
+            if not sel_rid or sel_rid in plan_ids:
+                return sel_rid, sel_log, sel_why, evaluations, excluded
+            ctx = ctx or self._followup_context()
+            first = self._evaluate_followup(sel_rid, after_recipe, ctx)
+            if first is None:
+                return sel_rid, sel_log, sel_why, evaluations, excluded
+            evs = [first]
+            for entry in sel_log or []:
+                rid = entry.get("recipe_id")
+                if entry.get("eligible") and rid not in plan_ids and rid != sel_rid and rid not in excluded:
+                    e = self._evaluate_followup(rid, after_recipe, ctx)
+                    if e is not None:
+                        evs.append(e)
+            evaluations += evs
+            best = choose(evs)
+            if best is not None:
+                why = (f"Expected outcomes: {best['recipe_id']} separates {best['separates']} "
+                       f"(gain {best['gain']}, {best['expected_cost_s']} s): " + "; ".join(best["outcome_lines"]))
+                return best["recipe_id"], sel_log, why, evaluations, excluded
+            excluded.update(e["recipe_id"] for e in evs)
 
     def _step_start_collection(self) -> Dict[str, Any]:
         return self._step_collect_next()
@@ -3691,6 +3796,7 @@ class AdaptiveInvestigationSession:
             "checks": part("checks", lambda: [c.to_dict() for c in self.checks]),
             "competing_hypotheses": [h.to_dict() for h in self.competing_hypotheses],
             "default_check_budget": self.default_check_budget.to_dict(),
+            "followup_decisions": self.followup_decisions,
         }
 
     def _persist_text(self) -> str:
@@ -3797,6 +3903,7 @@ class AdaptiveInvestigationSession:
             if isinstance(h, dict)
         ]
         sess.verified_checks_count = int(data.get("verified_checks_count", 0))
+        sess.followup_decisions = [d for d in data.get("followup_decisions") or [] if isinstance(d, dict)]
         sess.temporal_memory_samples = list(data.get("temporal_memory_samples", []))
         if data.get("classification_result") and isinstance(data["classification_result"], dict):
             valid_cr = {f.name for f in fields(ProblemClassificationResult)}
