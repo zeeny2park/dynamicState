@@ -122,6 +122,7 @@ class TestDiagnosisSaves(unittest.TestCase):
         exe = os.path.join(tmp, "ok_idle_server")
         subprocess.run(["gcc", "-g", "-O0", "-pthread", os.path.join(TARGETS, "ok_idle_server.c"), "-o", exe], check=True)
         p = fixture_popen([exe], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, name="ok_idle_server")
+        self.addCleanup(p.stdout.close)
         self.addCleanup(p.kill_tree)
         self.assertEqual(p.stdout.readline().strip(), b"READY")
         time.sleep(0.2)
