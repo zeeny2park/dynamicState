@@ -311,6 +311,15 @@ def evaluate(*, verdict: str, findings: List[Dict[str, Any]], checks: List[Any],
         for c in cs:
             st = _st(c)
             if st == CheckStatus.PASS:
+                if rid == "RECIPE_LOCK_CONTENTION":
+                    lc_obs = _obs(c).get("lock_contention") or {}
+                    busiest = (lc_obs.get("mutexes") or [{}])[0] if lc_obs.get("mutexes") else {}
+                    if busiest.get("samples_queued", 0) > 0:
+                        ok = False
+                        block("baseline_check_inconclusive", rid,
+                              f"baseline check {rid} had queued waiters ({busiest.get('samples_queued')} sample(s)); "
+                              "requires uncontended observation window to clear as healthy")
+                        continue
                 continue
             lim = None
             if st == CheckStatus.INCONCLUSIVE:

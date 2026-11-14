@@ -108,6 +108,20 @@ class TestMappingGrowthRule(unittest.TestCase):
         self.assertEqual(self.ev(_mg_obs(nets=(2048, -512, 1024))).status, RECIPE_STATUS_INSUFFICIENT_EVIDENCE)
         self.assertEqual(self.ev(_mg_obs(rss=(10000, 10000, 10010, 10020))).status, RECIPE_STATUS_INSUFFICIENT_EVIDENCE)
 
+    def test_unsupported_allocator_chunks_abi_is_insufficient_and_produces_no_finding(self):
+        # When allocator chunks cannot be decoded (e.g. 32-bit or non-glibc), sustained growth must not trigger MAPPING_GROWTH
+        o = _mg_obs()
+        o["allocator_chunks_supported"] = False
+        o["allocator_chunks_decision"] = {
+            "feature": "allocator_chunks",
+            "status": "NOT_SUPPORTED_ON_TARGET",
+            "message": "allocator_chunks: not supported on target (arm/musl)",
+        }
+        res = self.ev(o)
+        self.assertEqual(res.status, RECIPE_STATUS_INSUFFICIENT_EVIDENCE)
+        self.assertIn("cannot decode mmapped allocator chunks", res.confidence_basis)
+        self.assertNotIn("finding_category", res.details)
+
 
 class TestMappingGrowthHelpers(unittest.TestCase):
     def test_subtract(self):
@@ -139,6 +153,30 @@ class TestMappingGrowthHelpers(unittest.TestCase):
         self.assertEqual(mg._malloc_chain(Rd(two), base, base + 0x400000), 0x400000)
         self.assertEqual(mg._malloc_chain(Rd({base: b"\x5a" * 16}), base, base + 0x40000), 0)   # application data
         self.assertEqual(mg._malloc_chain(Rd({}), base, base + 0x40000), 0)                     # unreadable
+
+    def test_unsupported_abi_leaves_added_ranges_unclassified(self):
+        from extractor.target_abi import TargetABI
+        # 32-bit ARM or musl target: allocator chunk decoding not supported
+        abi_32bit = TargetABI(architecture="arm", word_size=32, endianness="little", libc="glibc")
+        class Rd(mg._Reader):
+            def __init__(self, mem):
+                super().__init__(None, 1, target_abi=abi_32bit)
+                self.mem = mem
+
+            def read_many(self, ranges):
+                return [self.mem.get(a) for a, _ in ranges]
+
+        base = 0x7f0000000000
+        two = {base: struct.pack("<QQ", 0, 0x200000 | 0x2)}
+        rd = Rd(two)
+        self.assertFalse(rd.can_decode_chunks)
+        self.assertEqual(mg._malloc_chain(rd, base, base + 0x200000), 0)
+
+        added = [(base, base + 0x200000)]
+        cur = [{"start": base, "end": base + 0x200000, "kind": mg.KIND_OUTSIDE}]
+        classified = mg._classify_added(rd, added, cur)
+        self.assertEqual(len(classified), 1)
+        self.assertEqual(classified[0]["kind"], mg.KIND_UNCLASSIFIED)
 
     def test_growth_thread_only_when_exactly_one_thread_ran(self):
         def rec(tid, name, slices):

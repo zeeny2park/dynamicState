@@ -96,7 +96,8 @@ class _Base(unittest.TestCase):
             proc.stdout.close()
 
     def _diagnose(self, pid, binary, symptom=None):
-        r = diagnose(pid, binary, symptom, corpus_dir=self.corpus, include_report=True).to_dict()
+        r = diagnose(pid, binary, symptom, corpus_dir=self.corpus, include_report=True,
+                     default_check_budget_s=0).to_dict()
         rec, mi = None, None
         for c in r["report"]["section_d_detailed_inspection_results"]["checks"]:
             ob = c.get("actual_observations") or {}

@@ -511,7 +511,8 @@ class TestLive(unittest.TestCase):
     def _diagnose(self, src, symptom=None):
         from extractor.expert_diagnostic_engine import diagnose
         proc, binary = self._launch(src)
-        r = diagnose(proc.pid, binary, symptom, corpus_dir=self.corpus, include_report=True).to_dict()
+        r = diagnose(proc.pid, binary, symptom, corpus_dir=self.corpus, include_report=True,
+                     default_check_budget_s=0).to_dict()
         rec = None
         for c in r["report"]["section_d_detailed_inspection_results"]["checks"]:
             ob = c.get("actual_observations") or {}

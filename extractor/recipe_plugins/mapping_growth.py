@@ -67,6 +67,7 @@ KIND_OUTSIDE = "anonymous"
 KIND_STACK = "thread_stack_like"
 KIND_MALLOC_MMAP = "malloc_mmapped"
 KIND_HEAP = "malloc_heap"
+KIND_UNCLASSIFIED = "unclassified"
 
 
 # ------------------------------------------------------------------------------------------------ collection
@@ -121,10 +122,21 @@ def _subtract(a: List[Tuple[int, int]], b: List[Tuple[int, int]]) -> List[Tuple[
 class _Reader:
     """16-byte header reads and the typed-global reads, through the zero-stop batch path, counted."""
 
-    def __init__(self, adapter: Any, pid: int):
+    def __init__(self, adapter: Any, pid: int, target_abi: Optional[Any] = None, can_decode_chunks: Optional[bool] = None):
         self.adapter, self.pid = adapter, int(pid)
         self.bytes_read = 0
         self.header_reads = 0
+        self.target_abi = target_abi
+        if can_decode_chunks is not None:
+            self.can_decode_chunks = bool(can_decode_chunks)
+        elif target_abi is not None:
+            try:
+                from ..target_abi import FEATURE_ALLOCATOR_CHUNKS, check_support
+                self.can_decode_chunks = check_support(target_abi, FEATURE_ALLOCATOR_CHUNKS).supported
+            except Exception:  # noqa: BLE001
+                self.can_decode_chunks = True
+        else:
+            self.can_decode_chunks = True
 
     def read_many(self, ranges: List[Tuple[int, int]]) -> List[Optional[bytes]]:
         if not ranges:
@@ -145,6 +157,8 @@ class _Reader:
 def _malloc_chain(rd: _Reader, s: int, e: int, page: int = 4096) -> int:
     """Bytes at the start of [s, e) that form a chain of glibc mmapped chunks (header: prev_size, size|IS_MMAPPED;
     a chunk occupies prev_size + size bytes, page aligned)."""
+    if not getattr(rd, "can_decode_chunks", True):
+        return 0
     pos = s
     while pos < e and rd.header_reads < MAX_HEADER_READS:
         rd.header_reads += 1
@@ -164,12 +178,16 @@ def _classify_added(rd: _Reader, added: List[Tuple[int, int]], cur: List[Dict[st
     """Each added range with its owner class (malloc chain split off the anonymous kind)."""
     starts = [m["start"] for m in cur]
     out: List[Dict[str, Any]] = []
+    can_decode = getattr(rd, "can_decode_chunks", True)
     for s, e in added:
         i = bisect.bisect_right(starts, s) - 1
         m = cur[i] if i >= 0 and cur[i]["start"] <= s < cur[i]["end"] else None
         kind = m["kind"] if m else KIND_OUTSIDE
         vma = (m["start"], m["end"]) if m else (s, e)
         if kind == KIND_OUTSIDE:
+            if not can_decode:
+                out.append({"start": s, "end": e, "kind": KIND_UNCLASSIFIED, "vma": vma})
+                continue
             n = _malloc_chain(rd, s, e)
             if n == 0 and rd.header_reads < MAX_HEADER_READS:
                 time.sleep(0.005)               # the allocator may not have written the header yet
@@ -399,9 +417,18 @@ def _leak_walks(provider: Any, ctx: Dict[str, Any]) -> List[Dict[str, Any]]:
 def collect_mapping_growth(provider: Any, ctx: Dict[str, Any]) -> None:
     from ..runtime_evidence_provider import (COLLECTION_STATUS_PARTIAL, COLLECTION_STATUS_SUCCESS,
                                              PROVENANCE_LIVE_RUNTIME_CAPTURE, RuntimeEvidenceRecord)
+    from ..target_abi import FEATURE_ALLOCATOR_CHUNKS, check_support, detect_target_abi
     pid = ctx["pid"]
     adapter = provider.adapter
-    rd = _Reader(adapter, pid)
+    abi = getattr(provider, "target_abi", None)
+    if abi is None:
+        try:
+            abi = detect_target_abi(adapter, pid, probe_version=False)
+        except Exception:  # noqa: BLE001
+            abi = None
+    alloc_decision = check_support(abi, FEATURE_ALLOCATOR_CHUNKS) if abi is not None else None
+    can_decode_chunks = alloc_decision.supported if alloc_decision is not None else True
+    rd = _Reader(adapter, pid, target_abi=abi, can_decode_chunks=can_decode_chunks)
     snaps: List[Dict[str, Any]] = []
     steps: List[Dict[str, Any]] = []
     known_malloc: List[Tuple[int, int]] = []         # ranges classified as malloc in this window
@@ -438,12 +465,16 @@ def collect_mapping_growth(provider: Any, ctx: Dict[str, Any]) -> None:
             steps.append({"added_outside_kb": (sz(KIND_OUTSIDE) + sz(KIND_STACK)) // 1024,
                           "added_stack_like_kb": sz(KIND_STACK) // 1024,
                           "added_malloc_kb": (sz(KIND_HEAP) + sz(KIND_MALLOC_MMAP)) // 1024,
+                          "added_unclassified_kb": sz(KIND_UNCLASSIFIED) // 1024,
                           "removed_outside_kb": rem_outside // 1024, "removed_malloc_kb": rem_malloc // 1024,
                           "net_outside_kb": (sz(KIND_OUTSIDE) + sz(KIND_STACK) - rem_outside) // 1024})
         snaps.append(s)
         if i + 1 < SAMPLES:
             time.sleep(INTERVAL_S)
     obs: Dict[str, Any] = {"samples": [], "steps": steps, "t0": snaps[0]["t"] if snaps else None}
+    obs["allocator_chunks_supported"] = can_decode_chunks
+    if alloc_decision is not None and not alloc_decision.supported:
+        obs["allocator_chunks_decision"] = alloc_decision.to_dict()
     if not snaps:
         obs["unavailable"] = "/proc/<pid>/maps or status could not be read"
     t0 = snaps[0]["t"] if snaps else 0.0
@@ -507,6 +538,13 @@ def collect_mapping_growth(provider: Any, ctx: Dict[str, Any]) -> None:
 def mapping_growth_rule(recipe: DiagnosticRecipe, data: Dict[str, Any]) -> Optional[RecipeEvaluationResult]:
     rid = recipe.recipe_id
     mg = data.get(OBS_MAPPING_GROWTH) or {}
+    if mg.get("allocator_chunks_supported") is False:
+        dec = mg.get("allocator_chunks_decision") or {}
+        why = dec.get("message") or "target ABI does not support allocator chunk decoding"
+        return RecipeEvaluationResult(
+            recipe_id=rid, status=RECIPE_STATUS_INSUFFICIENT_EVIDENCE, confidence=0.0,
+            confidence_basis=f"cannot decode mmapped allocator chunks on this target ({why}); mmapped malloc mappings cannot be separated from outside-malloc growth",
+            missing_evidence=["supported_allocator_chunks"], limitations=list(recipe.limitations), details={"mapping_growth": mg})
     s = [x for x in mg.get("samples") or [] if isinstance(x, dict)]
     steps = [x for x in mg.get("steps") or [] if isinstance(x, dict)]
     if len(s) < 2 or len(steps) != len(s) - 1:

@@ -1,55 +1,72 @@
-# commit=136c2c7 date=2026-11-12T13:48Z arch=aarch64 python=3.12.3 kernel=7.0.0-1013-oracle
+# commit=3cd206e+dirty date=2026-11-14T06:35Z arch=aarch64 python=3.12.3 kernel=7.0.0-1013-oracle
 file	exit_code	tests_ran	last_line
+test_aarch64_tcb_discovery	0	3	OK
 test_adaptive_investigation_engine	0	6	OK
+test_adversarial_healthy	0	28	OK
 test_agent_models	0	7	OK
 test_agent_protocol	0	5	OK
 test_agent_runtime	0	10	OK
 test_agent_semantic_contract	0	7	OK
 test_audit_hardening	0	20	OK
 test_binary_identity	0	5	OK
+test_budget_stop_keeps_findings	0	2	OK
 test_candidate_ranker	0	4	OK
 test_capabilities	0	2	OK
 test_capture_benchmark	0	12	OK
 test_capture_lifecycle_seam	0	54	OK
 test_capture_safety_and_diff_accuracy	0	27	OK
 test_causal_validation_hardening	0	83	OK
+test_cause_predictions	0	16	OK
+test_cfi_epilogue_detection	0	12	OK
 test_ci_workflow_parity	0	8	OK
 test_cli	0	5	OK
 test_cli_adaptive_report_integration	0	12	OK
+test_collector_rule_contract	0	2	OK
+test_corpus_retention	0	11	OK
 test_cpp_e2e_investigation	0	5	OK
 test_deadlock_real_process_baseline	0	4	OK
 test_debug_artifacts	0	7	OK
 test_debug_image	0	8	OK
 test_debug_image_provenance	0	3	OK
 test_def_arm_1_lock_owner_unsupported	0	2	OK
+test_default_check_budget	0	9	OK
 test_diagnose_baseline_checks	0	6	OK
-test_diagnosis_accuracy_benchmark	0	25	OK
+test_diagnosis_accuracy_benchmark	0	38	OK
+test_double_free	0	20	OK
 test_dwarf_evaluator_correctness	0	27	OK
+test_dwarf_loclists_binary	0	6	OK
+test_dwarf_multi_cu_decl_file	0	1	OK
 test_dwarf_semantic_reconstruction	0	9	OK
 test_ebpf_integration	0	17	OK
 test_ebpf_tracer	0	84	OK
 test_evidence_schema	0	12	OK
 test_exploration_artifact	0	1	OK
+test_explore_mock	0	6	/tmp/tmphzwuzo43/x.html (221669 bytes)
 test_explorer	0	2	OK
 test_explorer_branching	0	1	OK
 test_fast_capture_and_state_lab	0	11	OK
+test_fixture_process	0	13	OK
+test_fixture_process_policy	0	5	OK
 test_gdb_compat	0	6	OK
 test_gdb_env	0	3	OK
 test_harness_scenarios	0	12	OK
+test_healthy_verdict	0	15	OK
+test_hypothesis_model_unification	0	4	OK
 test_imp006_remote_diagnose	0	13	[f] mcp=CONFIRMED_FAULT cli=CONFIRMED_FAULT web=CONFIRMED_FAULT
 test_imp007_heap_ownership	0	23	OK
 test_imp008_leak_owner	0	14	[proc_leak_append_list.c] READY, ground truth {'owner': 'g_pending_items', 'thread': 'producer', 'item_size': '216'}
 test_imp009_overflow_detection	0	15	OK
-test_imp011_remote_thread_info	0	16	[IMP-011 cost] no-collector: 5 samples in 400.4 ms, 5 commands
+test_imp011_remote_thread_info	0	16	[IMP-011 cost] no-collector: 5 samples in 414.1 ms, 5 commands
 test_imp014_find_processes_regression	0	3	OK
 test_imp014_qemu_matrix_logic	0	33	OK
 test_imp014_qemu_matrix_qemu	0	1	OK
 test_imp016_collector_dist_and_deploy	0	12	OK
 test_imp020_collection_impact	0	15	OK
 test_imp021_collector_daemon_channel	0	13	OK (skipped=1)
+test_imp022_remote_command_cost	0	5	[imp022] ssh invocations: 9 (runs 8, channel opens 1)
 test_imp_001_002_003_004_019	0	19	OK
-test_imp_006_diagnose	0	11	[diagnose pid=2] 0.00s verdict=INCONCLUSIVE findings=[]
-test_imp_010_runnable_fraction	0	7	OK
+test_imp_006_diagnose	0	12	[diagnose pid=2] 0.00s verdict=INCONCLUSIVE findings=[]
+test_imp_010_runnable_fraction	0	9	OK
 test_imp_010_thread_sampling	0	17	OK
 test_imp_011_cfi_unwinding	0	16	OK
 test_imp_012_human_report	0	16	OK
@@ -57,6 +74,8 @@ test_imp_017_observation_selector	0	5	OK
 test_imp_017_one_verdict_vocabulary	0	6	OK
 test_imp_018_declarative_recipes	0	6	OK
 test_imp_022_023_packaging_and_skill	0	10	OK
+test_incident_report_html	0	6	OK
+test_integer_member_not_a_pointer	0	6	OK
 test_invariant_candidates	0	1	OK
 test_investigation_api	0	4	OK
 test_investigation_backward_compatibility	0	4	OK
@@ -65,29 +84,40 @@ test_investigation_e2e_fixture	0	1	OK
 test_investigation_hypothesis	0	14	OK
 test_investigation_identity_and_static	0	11	OK
 test_investigation_quality_benchmark	0	22	OK
-test_investigation_ui	0	12	OK
+test_investigation_ui	0	9	OK
+test_korean_report_language	0	8	OK
+test_leak_attribution_type_cache	0	2	OK
 test_live_capture_integrity	0	12	OK
+test_lock_contention	0	20	OK
+test_lock_faults	0	20	OK
+test_lock_graph_reread	0	6	OK
+test_lock_waiter_sources	0	3	OK
 test_low_impact_runtime	0	4	OK
+test_mapping_growth_and_heap_retention	0	25	OK
 test_mcp_first_phase1	0	14	OK
 test_mcp_runtime_diagnostics	0	7	OK
 test_memory_capture	0	3	OK
 test_memory_maps	0	1	OK
 test_memory_region	0	3	OK
+test_memory_sawtooth	0	14	[ok_sawtooth/general health check] verdict=INCONCLUSIVE rss=[21836, 36172, 52556, 66896, 83280, 89424]
 test_memory_snapshot_protocol	0	4	OK
 test_memory_snapshot_summary	0	5	OK
 test_modules	0	13	OK
 test_multithread_exploration	0	18	OK
 test_mutation	0	10	OK
 test_mutation_candidate	0	5	OK
+test_mutex_layout_discovery	0	4	OK
 test_object_graph	0	4	OK
+test_object_relations	0	8	OK
 test_observation_backends	0	4	OK
 test_offline_analyzer	0	3	OK
+test_overflow_uaf_summary	0	7	OK
 test_phase10_ci_security_gates	0	16	OK
 test_phase11_real_target_release_readiness	0	17	OK
 test_phase12_investigation_loop	0	11	OK
 test_phase13_operational_acceptance	0	16	OK
 test_phase14_production_pilot	0	13	OK
-test_phase15_conversational_llm	1	22	FAILED (errors=1)
+test_phase15_conversational_llm	0	22	OK
 test_phase16_cli_security_and_truthfulness	0	18	OK
 test_phase17_process_isolation_regression	0	10	OK
 test_phase1_1_hardening_and_trust_closure	0	18	OK
@@ -99,13 +129,12 @@ test_phase1_2_4_cryptographic_conformance_and_legacy_migration	0	15	OK
 test_phase1_2_controlled_execution_trust_closure	0	15	OK
 test_phase1_canonical_evidence_ingestion_and_trust_boundary	0	10	OK
 test_phase21_watch_session	0	10	OK
-test_phase22_zero_config_live_capture	0	14	OK
+test_phase22_zero_config_live_capture	0	12	OK
 test_phase23_remote_watch_session	0	10	OK
 test_phase24_temporal_investigation	0	12	OK
 test_phase25_grounded_investigation	0	18	
 test_phase26_real_execution_quality	0	19	
 test_phase28_memory_explorer_ux	0	11	OK
-test_phase29_browser_e2e	0	5	sys:1: ResourceWarning: unclosed <socket.socket fd=3, family=2, type=1, proto=0, laddr=('127.0.0.1', 41589)>
 test_phase2_0_a_3_10_adversarial_provenance	0	18	OK
 test_phase2_0_a_3_10_real_cpp_e2e	0	11	OK
 test_phase2_0_a_3_11_attestation_security	0	18	OK
@@ -160,9 +189,9 @@ test_phase2_1_3_expert_diagnostic_semantics	0	16	OK
 test_phase2_1_4_diagnostic_execution_integration	0	35	OK
 test_phase2_1_5_diagnostic_methodology_and_reporting	0	16	OK
 test_phase2_1_6_diagnostic_verdict_integrity_and_report_completeness	0	20	OK
-test_phase2_1_7_verdict_authority_evidence_graph_and_diagnostic_validation	1	24	FAILED (failures=1)
+test_phase2_1_7_verdict_authority_evidence_graph_and_diagnostic_validation	0	24	OK
 test_phase2_1_8_complete_validation	0	29	OK
-test_phase2_1_adaptive_investigation_lifecycle	0	4	OK
+test_phase2_1_adaptive_investigation_lifecycle	0	5	OK
 test_phase2_1_classification_and_planning	0	6	OK
 test_phase2_1_deterministic_recipes	0	13	OK
 test_phase2_1_evidence_source_correlation	0	4	OK
@@ -205,43 +234,72 @@ test_phase2_4_adaptive_investigation_and_quality	0	3	OK
 test_phase2_4_collection_reliability_and_overhead	0	4	OK
 test_phase2_4_real_world_targets	0	4	OK
 test_phase2_4_remote_and_mcp_workflow	0	3	OK
-test_phase30_real_capture_e2e	0	4	sys:1: ResourceWarning: unclosed file <_io.TextIOWrapper name=7 encoding='UTF-8'>
-test_phase31_basic_mode_ux	0	6	sys:1: ResourceWarning: unclosed file <_io.TextIOWrapper name=7 encoding='UTF-8'>
-test_phase32_remote_and_mcp_improvements	0	4	OK
+test_phase32_remote_and_mcp_improvements	0	3	OK
 test_phase33_collector_batch_and_lazy_dwarf	0	4	OK
-test_phase34_scenario_recipes_and_golden_baseline	0	4	OK
+test_phase34_scenario_recipes_and_golden_baseline	0	3	OK
 test_phase35_auto_deploy_cli_and_playbook	0	3	OK
 test_phase36_cpp_stl_and_shared_lib_dwarf	0	2	OK
 test_phase37_resource_stability_and_low_overhead	0	5	OK
 test_phase38_pool_scanner_and_thread_owner_lookup	0	4	OK
-test_phase39_chat_trace_workspace_ui	0	2	OK
+test_phase39_chat_trace_workspace_ui	0	1	OK
 test_phase40_advanced_mcp_tools	0	6	OK
 test_phase41_auto_triage_and_frame_locals	0	3	OK
 test_phase42_ipc_pipeline_and_heap_scanner	0	3	OK
 test_phase43_symptom_investigator_and_dependency_graph	0	3	OK
 test_phase44_statistical_hotspots_and_fuzzy_intent	0	3	OK
 test_phase45_flight_recorder_and_behavioral_drift	0	3	OK
-test_phase46_tls_and_concurrency_verifier	0	3	OK (expected failures=2)
-test_phase47_dpdk_isolated_lcore_and_pmd	0	4	OK (expected failures=1)
+test_phase46_tls_and_concurrency_verifier	0	3	OK
+test_phase47_dpdk_isolated_lcore_and_pmd	0	4	OK
 test_phase48_stateful_context_and_forgiving_expressions	0	4	OK
 test_phase49_token_budget_batch_macro_and_self_repair	0	3	OK
 test_phase50_hypothesis_verifier_and_incident_report	0	2	OK
-test_phase51_real_workspace_web_service	0	4	OK
+test_phase51_real_workspace_web_service	0	3	OK
 test_phase52_web_and_mcp_defensive_hardening	0	8	OK
-test_real_runtime_validation	0	20	  max:    2687.6 us
+test_process_profile	0	19	OK
+test_real_runtime_validation	0	20	  max:    5594.7 us
 test_real_target_runner	0	14	OK
+test_remote_new_diagnoses	0	10	[request_threads] local ('CONFIRMED_FAULT', ['THREAD_LEAK']) | remote ('CONFIRMED_FAULT', ['THREAD_LEAK']) | local /proc hits []
+test_report_outline	0	22	OK
+test_report_registry	0	5	OK
+test_report_single_path_and_reproducibility	0	21	OK
+test_report_story	0	15	OK
+test_report_visuals	0	15	OK
+test_report_yield_busy_wait_sentence	0	5	OK
+test_running_thread_location	0	6	OK
 test_serializer	0	2	OK
+test_session_persistence_cost	0	6	OK
+test_skill_transports	0	19	OK
 test_snapshot	0	4	OK
 test_snapshot_code_navigation	0	6	OK
 test_snapshot_consistency	0	3	OK
 test_snapshot_reader	0	2	OK
+test_source_line_resolution	0	8	OK
+test_stage2_symptom_interpretation	0	22	TOTAL dev 141/141 = 1.000   held-out 51/51 = 1.000
+test_stage3_cpp_containers	0	12	OK
 test_state_corpus	0	4	OK
 test_state_diff	0	10	OK
 test_state_hash	0	11	OK
 test_state_restorer	0	7	OK
+test_static_location_candidates	0	19	OK
+test_static_location_candidates_general	0	12	OK
 test_target_abi_detection	0	27	OK
 test_target_collector	0	59	OK
+test_thread_leak_recipe	0	13	OK
+test_thread_read_budget	0	4	OK
+test_tmp_path_policy	0	3	OK
 test_transition_analyzer	0	3	OK
 test_type_resolver	0	1	OK
-test_web_api	0	29	OK
+test_typed_evidence	0	25	OK
+test_uaf_detection	0	11	OK
+test_unsupported_recipes	0	20	OK
+test_web_api	0	26	OK
+test_web_diagnose_jobs	0	30	OK
+test_web_explore	0	23	OK
+test_web_explore_bigpool	0	12	OK
+test_web_explore_nodebug	0	8	OK
+test_web_explore_remote	0	3	[explore-remote] ssh processes: diagnosis 8, per route {'chips': 0, 'thread': 2, 'threads': 0, 'maps': 0, 'range_addr': 0, 'range_expr': 0, 'files': 0, 'modules': 0, 'vars': 0, 'value': 0, 'lock': 0, 'watch_status': 0, 'watch_session': 0}
+test_web_readonly_routes	0	11	OK
 test_web_server_lifecycle	0	2	OK
+test_web_ui	0	23	OK
+test_web_ui_browser	0	11	OK
+test_web_ui_prefix	0	2	OK

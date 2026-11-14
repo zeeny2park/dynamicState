@@ -170,8 +170,9 @@ class Run:
         anchors = sorted({a.split("#", 1)[1] for a in scr["anchors"] if "#" in a})
         missing = [a for a in anchors if f'id="{a}"' not in html]
         word = comp["verdict_line"]
+        v = res.get("verdict") or ""
         return {"report_status": rh.status, "csp": rh.headers.get("content-security-policy"),
-                "verdict_same": res.get("verdict") in scr["badge"] or bool(re.search(re.escape(scr["badge"].split(": ", 1)[-1]), word)),
+                "verdict_same": bool(v and v in scr["badge"]) or bool(re.search(re.escape(scr["badge"].split(": ", 1)[-1]), word)),
                 "report_verdict": res.get("verdict"), "findings_same": scr["findings"] == len(comp["blocks"]),
                 "counts_same": scr["counts"] == [c["found"], c["undecided"], c["clean"], c["not_run"]],
                 "checks_tile_same": scr["checks_tile"] == str(c["run"]), "anchors": anchors, "anchors_missing": missing,
@@ -453,7 +454,8 @@ def main() -> int:
     server = targets = None
     targets = []
     try:
-        bins = {n: build(tmp, n) for n in ("deadlock_pipeline", "ok_idle_server", "overflow_ring", "ok_busy_server", "request_threads")}
+        bins = {n: build(tmp, f"e2e_{n}" if n == "deadlock_pipeline" else n, os.path.join(TARGETS, n + ".c"))
+                for n in ("deadlock_pipeline", "ok_idle_server", "overflow_ring", "ok_busy_server", "request_threads")}
         bins["slot_server"] = build(tmp, "slot_server", os.path.join(ROOT, "tests", "fixtures", "real_runtime", "slot_server.c"))
         src = os.path.join(tmp, "exits_soon.c")
         with open(src, "w") as fh:
@@ -487,7 +489,7 @@ def main() -> int:
             out["name_not_found"] = page.inner_text("#form .alert")
 
             # 1. deadlock, by name, ko
-            run.start("deadlock_pipeline", "the service stopped responding")
+            run.start(os.path.basename(bins["deadlock_pipeline"]), "the service stopped responding")
             rec = run.follow(scroll_to_checks=True)
             scr = run.screen()
             run.shot("real-deadlock-ko")
