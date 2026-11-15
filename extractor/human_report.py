@@ -431,6 +431,11 @@ T: Dict[str, Tuple[str, str]] = {
     "f_traced": ("**Traced locations** (observed at runtime via eBPF/uprobe): {locs}.",
                  "**추적 관측 위치**(eBPF/uprobe 런타임 관측): {locs}."),
     "f_traced_head": ("Traced locations (observed at runtime via eBPF/uprobe)", "추적 관측 위치 (eBPF/uprobe 런타임 관측)"),
+    "f_trace_collection": ("**Tracing collection**: {status}; lost events {lost}, malformed records {malformed}, "
+                           "events omitted by limit {truncated}{errors}.",
+                           "**추적 수집 상태**: {status}; 손실 이벤트 {lost}건, 잘못된 기록 {malformed}건, "
+                           "제한으로 제외된 이벤트 {truncated}건{errors}."),
+    "f_trace_errors": ("; errors: {errors}", "; 오류: {errors}"),
     # object relations (extractor.object_relations): memory object <- owning variable <- thread, each link with how
     "f_rel": ("**Relation**: {chain}.", "**관계**: {chain}."),
     "rel_arrow": (" ← ({how}) ", " ← ({how}) "),
@@ -1383,6 +1388,20 @@ def _finding_blocks(ctx: _Ctx, res: Dict[str, Any], renders: List[Dict[str, Any]
         if traced:
             facts.append(ctx.t("f_traced", locs=_join([f"`{c['location']}`" for c in
                                                        (f.get("traced_locations") or {}).get("locations")])))
+        traced_meta = f.get("traced_locations") if isinstance(f.get("traced_locations"), dict) else {}
+        collection_status = str(traced_meta.get("collection_status") or "")
+        if collection_status and (collection_status != "OBSERVED" or
+                                  traced_meta.get("lost_events") or traced_meta.get("malformed_records") or
+                                  traced_meta.get("events_truncated")):
+            errors = [str(err) for err in (traced_meta.get("errors") or []) if err]
+            facts.append(ctx.t(
+                "f_trace_collection",
+                status=collection_status,
+                lost=int(traced_meta.get("lost_events") or 0),
+                malformed=int(traced_meta.get("malformed_records") or 0),
+                truncated=int(traced_meta.get("events_truncated") or 0),
+                errors=ctx.t("f_trace_errors", errors=_join(errors)) if errors else "",
+            ))
         diagram = []
         if r.get("diagram"):
             diagram = [f"**{ctx.t('h2_wait')}**", "```", ctx.t("d_hdr")] + list(r["diagram"]) + ["```"]

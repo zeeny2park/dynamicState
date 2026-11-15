@@ -6,8 +6,12 @@ known to be wrong or known to claim everything.
 """
 
 import os
+import json
 import shutil
+import subprocess
+import tempfile
 import unittest
+from unittest.mock import patch
 
 from benchmarks.diagnosis_accuracy import run_benchmark as rb
 
@@ -163,6 +167,7 @@ class TestScorer(unittest.TestCase):
         row = rb.score_result(g, _wrong_result(g))
         self.assertFalse(row["detected"])
 
+
     def test_names_are_exact_and_case_sensitive(self):
         g = next(x for x in DEFECTS if x["causes"]["locks"])
         cat = sorted(rb.KIND_CATEGORIES[g["kind"]])[0]
@@ -218,6 +223,120 @@ class TestScorer(unittest.TestCase):
         row = rb.score_result(DEFECTS[0], None, "RuntimeError: boom")
         self.assertEqual(row["error"], "RuntimeError: boom")
         self.assertFalse(row["detected"])
+
+
+class TestBenchmarkProvenance(unittest.TestCase):
+    def test_working_tree_check_covers_untracked_files_and_does_not_scope_paths(self):
+        result = subprocess.CompletedProcess(
+            args=["git", "status"], returncode=0, stdout="?? docs/new-requirement.md\n", stderr="")
+        with patch.object(rb.subprocess, "run", return_value=result) as run:
+            state = rb.working_tree_state("/repo")
+        self.assertEqual(state, {"dirty": True, "check_ok": True, "error": None})
+        args = run.call_args.args[0]
+        self.assertEqual(args, ["git", "status", "--porcelain=v1", "--untracked-files=all"])
+        self.assertNotIn("--", args)
+
+    def test_clean_run_output_must_not_dirty_checkout(self):
+        with tempfile.TemporaryDirectory() as repo:
+            subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+            ignored = os.path.join(repo, ".gitignore")
+            with open(ignored, "w", encoding="utf-8") as fh:
+                fh.write("artifacts/\n")
+            self.assertTrue(rb.clean_run_output_allowed(os.path.join(repo, "artifacts", "result.json"), repo))
+            self.assertFalse(rb.clean_run_output_allowed(os.path.join(repo, "result.json"), repo))
+            self.assertTrue(rb.clean_run_output_allowed(os.path.join(repo, "..", "outside.json"), repo))
+
+    def test_failed_git_status_is_unknown_not_clean(self):
+        result = subprocess.CompletedProcess(args=["git", "status"], returncode=128, stdout="", stderr="not a repo")
+        with patch.object(rb.subprocess, "run", return_value=result):
+            state = rb.working_tree_state("/not-a-repo")
+        self.assertIsNone(state["dirty"])
+        self.assertFalse(state["check_ok"])
+        self.assertIn("not a repo", state["error"])
+
+    def test_authoritative_requires_clean_start_and_end_on_same_commit(self):
+        clean = {"commit": "abc123", "dirty": False, "dirty_check_ok": True}
+        self.assertEqual(rb._authoritative_run(clean, dict(clean)), (True, []))
+        dirty_end = dict(clean, dirty=True)
+        ok, reasons = rb._authoritative_run(clean, dirty_end)
+        self.assertFalse(ok)
+        self.assertIn("end: working tree is dirty", reasons)
+        changed = dict(clean, commit="def456")
+        ok, reasons = rb._authoritative_run(clean, changed)
+        self.assertFalse(ok)
+        self.assertIn("source commit changed during benchmark", reasons)
+
+    def test_target_build_identity_is_required_for_authoritative_result(self):
+        rows = [{"id": "case", "build": {"build_id": "abc", "compiler": "gcc"}}]
+        self.assertEqual(rb._target_provenance_reasons(rows), [])
+        rows[0]["build"]["build_id"] = None
+        self.assertTrue(any("build ID is unavailable" in reason
+                            for reason in rb._target_provenance_reasons(rows)))
+
+    def test_wilson_interval_and_result_schema_validation(self):
+        self.assertEqual(rb._wilson_rate(0, 0)["ci95"], None)
+        perfect = rb._wilson_rate(10, 10)
+        self.assertEqual(perfect["rate"], 1.0)
+        self.assertLess(perfect["ci95"][0], 1.0)
+        self.assertEqual(perfect["ci95"][1], 1.0)
+        report = {"schema_version": rb.SCHEMA_VERSION,
+                  "environment": {"commit": "abc", "dirty": False},
+                  "environment_start": {"commit": "abc", "dirty": False},
+                  "authority": "AUTHORITATIVE", "authority_reasons": [],
+                  "dataset": {"version": "sha256:abc"}, "rows": [{"build": {"build_id": "id"}}]}
+        self.assertEqual(rb.validate_benchmark_report(report), [])
+        del report["rows"][0]["build"]
+        self.assertTrue(any("missing build provenance" in error
+                            for error in rb.validate_benchmark_report(report)))
+
+    def test_confidence_calibration_reports_accuracy_and_abstention_sample_sizes(self):
+        calibration = rb._confidence_calibration([
+            {"verdict_confidence": 0.9, "verdict_confidence_correct": True},
+            {"verdict_confidence": 0.8, "verdict_confidence_correct": False},
+            {"verdict_confidence": None, "verdict_confidence_correct": None},
+        ])
+        self.assertEqual(calibration["eligible_targets"], 2)
+        self.assertEqual(calibration["abstentions_or_unknown_confidence"], 1)
+        high = calibration["bins"][-1]
+        self.assertEqual(high["n"], 2)
+        self.assertEqual(high["accuracy"], 0.5)
+
+    def test_main_and_heldout_duplicate_source_content_is_reported(self):
+        with tempfile.TemporaryDirectory() as root:
+            main_gt = os.path.join(root, "main", "ground_truth")
+            heldout_gt = os.path.join(root, "heldout", "ground_truth")
+            src_dir = os.path.join(root, "targets")
+            os.makedirs(main_gt)
+            os.makedirs(heldout_gt)
+            os.makedirs(src_dir)
+            for target_id, gt_dir, src_name in (("train_case", main_gt, "train.c"),
+                                                ("heldout_case", heldout_gt, "heldout.c")):
+                src = os.path.join(src_dir, src_name)
+                with open(src, "w", encoding="utf-8") as fh:
+                    fh.write("int main(void) { return 0; }\n")
+                with open(os.path.join(gt_dir, target_id + ".json"), "w", encoding="utf-8") as fh:
+                    json.dump({"id": target_id, "source": os.path.relpath(src, root)}, fh)
+            overlaps = rb.find_dataset_source_overlaps(main_gt, heldout_gt, repo_root=root)
+            self.assertEqual(len(overlaps), 1)
+            self.assertEqual(overlaps[0]["main_target"], "train_case")
+            self.assertEqual(overlaps[0]["heldout_target"], "heldout_case")
+
+    def test_dataset_fingerprint_tracks_manifest_and_target_contents(self):
+        with tempfile.TemporaryDirectory() as suite_root:
+            os.makedirs(os.path.join(suite_root, "ground_truth"))
+            os.makedirs(os.path.join(suite_root, "targets"))
+            gt = os.path.join(suite_root, "ground_truth", "case.json")
+            src = os.path.join(suite_root, "targets", "case.c")
+            with open(gt, "w", encoding="utf-8") as fh:
+                fh.write('{"id":"case"}\n')
+            with open(src, "w", encoding="utf-8") as fh:
+                fh.write("int main(void) { return 0; }\n")
+            first = rb.dataset_fingerprint(suite_root)
+            second = rb.dataset_fingerprint(suite_root)
+            self.assertEqual(first, second)
+            with open(src, "a", encoding="utf-8") as fh:
+                fh.write("/* changed */\n")
+            self.assertNotEqual(first, rb.dataset_fingerprint(suite_root))
 
 
 @unittest.skipUnless(shutil.which("gcc"), "gcc not available")

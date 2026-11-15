@@ -10,6 +10,7 @@ Verifies:
 """
 
 import os
+from types import SimpleNamespace
 from unittest.mock import patch, MagicMock
 import unittest
 
@@ -24,6 +25,7 @@ from extractor.expert_diagnostic_engine import diagnose
 from extractor.human_report import diagnose_with_summary, render_human_report
 from extractor.tracing_mode import (
     ENV_ENABLE_TRACING,
+    SelectiveTracingSession,
     attach_traced_locations,
     check_tracing_support,
     format_traced_locations_for_finding,
@@ -126,6 +128,40 @@ class TestLocationDistinction(unittest.TestCase):
         self.assertEqual(res["locations"][0]["function"], "free")
         self.assertEqual(res["locations"][0]["location"], "app.c:25")
 
+    def test_partial_trace_status_and_lost_events_are_preserved(self):
+        event = MagicMock()
+        event.to_dict.return_value = {"registers": {}}
+        sessions = [
+            SimpleNamespace(status="SUCCESS", events=[event], total_events=1, lost_events=0,
+                            malformed_records=0, error_message=None, session_id="s1"),
+            SimpleNamespace(status="PARTIAL", events=[], total_events=3, lost_events=2,
+                            malformed_records=1, error_message="ring buffer overflow", session_id="s2"),
+        ]
+        with patch("extractor.tracing_mode.check_tracing_support", return_value=(True, "", None)), \
+             patch("extractor.tracing_mode.EbpfTracer") as tracer_cls:
+            tracer_cls.return_value.run.side_effect = sessions
+            trace = SelectiveTracingSession(123, "/bin/true", max_events=10).run_trace(["free", "malloc"])
+
+        self.assertEqual(trace["status"], "PARTIAL")
+        self.assertEqual(trace["lost_events"], 2)
+        self.assertEqual(trace["malformed_records"], 1)
+        self.assertEqual(trace["reported_events_count"], 4)
+        self.assertEqual([s["status"] for s in trace["sessions"]], ["SUCCESS", "PARTIAL"])
+        finding = {"category": "USE_AFTER_FREE"}
+        attached = format_traced_locations_for_finding(finding, [], trace)
+        self.assertEqual(attached["status"], "PARTIAL")
+        self.assertEqual(attached["collection_status"], "PARTIAL")
+        self.assertEqual(attached["lost_events"], 2)
+
+    def test_uniform_unsupported_session_status_is_preserved(self):
+        session = SimpleNamespace(status="UNSUPPORTED_ENVIRONMENT", events=[], total_events=0,
+                                  lost_events=0, malformed_records=0, error_message="kernel unsupported")
+        with patch("extractor.tracing_mode.check_tracing_support", return_value=(True, "", None)), \
+             patch("extractor.tracing_mode.EbpfTracer") as tracer_cls:
+            tracer_cls.return_value.run.return_value = session
+            trace = SelectiveTracingSession(123, "/bin/true").run_trace(["free"])
+        self.assertEqual(trace["status"], "UNSUPPORTED_ENVIRONMENT")
+
 
 class TestDiagnoseIntegrationWithTracing(unittest.TestCase):
     """Test diagnose engine behavior with enable_tracing flag."""
@@ -172,7 +208,12 @@ class TestDiagnoseIntegrationWithTracing(unittest.TestCase):
                     "traced_locations": {
                         "basis": "tracing",
                         "observed": True,
-                        "status": "OBSERVED",
+                        "status": "PARTIAL",
+                        "collection_status": "PARTIAL",
+                        "lost_events": 4,
+                        "malformed_records": 1,
+                        "events_truncated": 2,
+                        "errors": ["free: PARTIAL"],
                         "locations": [
                             {"location": "worker.c:85", "function": "free", "action": "free",
                              "reason": "Observed runtime call to free()", "reason_ko": "런타임에 free() 호출 직접 관측"}
@@ -192,12 +233,16 @@ class TestDiagnoseIntegrationWithTracing(unittest.TestCase):
         self.assertIn("Traced locations (observed at runtime via eBPF/uprobe)", report_en)
         self.assertIn("worker.c:110", report_en)
         self.assertIn("worker.c:85", report_en)
+        self.assertIn("Tracing collection", report_en)
+        self.assertIn("lost events 4", report_en)
 
         # Korean report must contain both distinct sections with proper Korean labels
         self.assertIn("위치 후보 (정적 분석, 관측 아님)", report_ko)
         self.assertIn("추적 관측 위치 (eBPF/uprobe 런타임 관측)", report_ko)
         self.assertIn("worker.c:110", report_ko)
         self.assertIn("worker.c:85", report_ko)
+        self.assertIn("추적 수집 상태", report_ko)
+        self.assertIn("손실 이벤트 4건", report_ko)
 
 
 if __name__ == "__main__":

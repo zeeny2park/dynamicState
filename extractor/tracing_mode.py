@@ -85,6 +85,10 @@ class SelectiveTracingSession:
                 "reason": self.unsupported_reason,
                 "events": [],
                 "locations": [],
+                "events_count": 0,
+                "lost_events": 0,
+                "malformed_records": 0,
+                "sessions": [],
             }
 
         if not target_functions:
@@ -92,6 +96,12 @@ class SelectiveTracingSession:
 
         events_out: List[Dict[str, Any]] = []
         locations_out: List[Dict[str, Any]] = []
+        session_summaries: List[Dict[str, Any]] = []
+        failures: List[str] = []
+        reported_events = 0
+        lost_events = 0
+        malformed_records = 0
+        truncated_events = 0
 
         # Trace each function briefly within time budget
         per_fn_duration = max(0.5, self.duration_s / max(len(target_functions), 1))
@@ -107,22 +117,81 @@ class SelectiveTracingSession:
                     max_events=self.max_events,
                 )
                 session = tracer.run()
-                if session and session.events:
-                    for ev in session.events:
-                        ed = ev.to_dict()
-                        events_out.append(ed)
-                        # Extract return address / caller location if observed
-                        loc_entry = self._extract_call_location(ed, fn)
-                        if loc_entry:
-                            locations_out.append(loc_entry)
+                if session is None:
+                    failures.append(f"{fn}: tracer returned no session")
+                    session_summaries.append({"function": fn, "status": "FAILED",
+                                              "error_message": "tracer returned no session"})
+                    continue
+
+                session_status = str(getattr(session, "status", "UNKNOWN"))
+                session_events = list(getattr(session, "events", []) or [])
+                session_lost = max(0, int(getattr(session, "lost_events", 0) or 0))
+                session_malformed = max(0, int(getattr(session, "malformed_records", 0) or 0))
+                session_total = max(len(session_events), int(getattr(session, "total_events", 0) or 0))
+                lost_events += session_lost
+                malformed_records += session_malformed
+                reported_events += session_total
+                session_summary = {
+                    "function": fn,
+                    "session_id": getattr(session, "session_id", None),
+                    "status": session_status,
+                    "total_events": session_total,
+                    "lost_events": session_lost,
+                    "malformed_records": session_malformed,
+                    "error_message": getattr(session, "error_message", None),
+                    "target_pid": getattr(session, "target_pid", self.pid),
+                    "target_binary": getattr(session, "target_binary", self.binary_path),
+                    "target_build_id": getattr(session, "target_build_id", None),
+                    "build_id_status": getattr(session, "build_id_status", None),
+                    "consistency_level": getattr(session, "consistency_level", None),
+                }
+                session_summaries.append(session_summary)
+                if session_status not in ("SUCCESS", "OBSERVED"):
+                    failures.append(f"{fn}: {session_status}")
+                if session_summary["error_message"]:
+                    failures.append(f"{fn}: {session_summary['error_message']}")
+
+                remaining = max(0, self.max_events - len(events_out))
+                if len(session_events) > remaining:
+                    truncated_events += len(session_events) - remaining
+                for ev in session_events[:remaining]:
+                    ed = ev.to_dict()
+                    events_out.append(ed)
+                    # Extract return address / caller location if observed
+                    loc_entry = self._extract_call_location(ed, fn)
+                    if loc_entry:
+                        locations_out.append(loc_entry)
             except Exception as exc:
                 logger.debug("eBPF tracing for %s encountered non-fatal error: %s", fn, exc)
+                failures.append(f"{fn}: {type(exc).__name__}: {exc}")
+                session_summaries.append({"function": fn, "status": "FAILED",
+                                          "error_message": f"{type(exc).__name__}: {exc}"[:500]})
                 continue
 
         self.collected_events = events_out
+        incomplete = bool(failures or lost_events or malformed_records or truncated_events)
+        session_statuses = [str(item.get("status") or "UNKNOWN") for item in session_summaries]
+        if session_statuses and all(value == "UNSUPPORTED_ENVIRONMENT" for value in session_statuses):
+            status = "UNSUPPORTED_ENVIRONMENT"
+        elif session_statuses and all(value == "PERMISSION_DENIED" for value in session_statuses):
+            status = "PERMISSION_DENIED"
+        elif not session_summaries:
+            status = "FAILED"
+        elif incomplete:
+            status = "PARTIAL"
+        elif events_out:
+            status = "OBSERVED"
+        else:
+            status = "NO_EVENTS_OBSERVED"
         return {
-            "status": "OBSERVED" if events_out else "NO_EVENTS_OBSERVED",
+            "status": status,
             "events_count": len(events_out),
+            "reported_events_count": reported_events,
+            "lost_events": lost_events,
+            "malformed_records": malformed_records,
+            "events_truncated": truncated_events,
+            "sessions": session_summaries,
+            "errors": failures,
             "events": events_out,
             "locations": locations_out,
         }
@@ -189,17 +258,31 @@ class SelectiveTracingSession:
 def format_traced_locations_for_finding(
     finding: Dict[str, Any],
     traced_locations: List[Dict[str, Any]],
+    trace_summary: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Format observed runtime tracing locations for a finding, clearly distinguishing from static candidates."""
+    summary = trace_summary or {}
+    collection_status = str(summary.get("status") or "")
+    details = {
+        "collection_status": collection_status,
+        "events_count": int(summary.get("events_count") or 0),
+        "lost_events": int(summary.get("lost_events") or 0),
+        "malformed_records": int(summary.get("malformed_records") or 0),
+        "events_truncated": int(summary.get("events_truncated") or 0),
+        "sessions": list(summary.get("sessions") or []),
+        "errors": list(summary.get("errors") or []),
+    }
     if not traced_locations:
+        status = "NOT_OBSERVED" if collection_status in ("", "OBSERVED", "NO_EVENTS_OBSERVED") else collection_status
         return {
             "basis": "tracing",
             "observed": False,
             "is_traced": True,
-            "status": "NOT_OBSERVED",
+            "status": status,
             "status_text": "no runtime events observed for this defect",
             "status_text_ko": "이 결함과 관련된 런타임 추적 이벤트가 관측되지 않음",
             "locations": [],
+            **details,
         }
 
     # Filter or match locations relevant to finding category
@@ -218,11 +301,12 @@ def format_traced_locations_for_finding(
         "basis": "tracing",
         "observed": True,
         "is_traced": True,
-        "status": "OBSERVED",
+        "status": "OBSERVED" if collection_status in ("", "OBSERVED") else collection_status,
         "status_text": "observed at runtime via eBPF/uprobe",
         "status_text_ko": "eBPF/uprobe를 통해 런타임에 직접 관측됨",
         "method": "Linux eBPF uprobe/uretprobe dynamic event tracing",
         "locations": relevant[:3],
+        **details,
     }
 
 
@@ -260,5 +344,5 @@ def attach_traced_locations(
 
     for f in findings:
         if isinstance(f, dict):
-            f["traced_locations"] = format_traced_locations_for_finding(f, all_locs)
+            f["traced_locations"] = format_traced_locations_for_finding(f, all_locs, trace_res)
 

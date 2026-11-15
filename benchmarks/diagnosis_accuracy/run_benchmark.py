@@ -12,7 +12,9 @@ Exit status is non-zero only if the runner itself crashes; a low score never fai
 import argparse
 import datetime
 import glob
+import hashlib
 import json
+import math
 import os
 import platform
 import re
@@ -24,7 +26,7 @@ import sys
 import tempfile
 import threading
 import time
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -41,7 +43,7 @@ HELDOUT_GT_DIR = os.path.join(HERE, "heldout", "ground_truth")
 SUITES = {"main": GT_DIR, "heldout": HELDOUT_GT_DIR}
 RESULTS_DIR = os.path.join(HERE, "results")
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 LINE_TOLERANCE = 3
 READY_TIMEOUT_S = 20.0
 DIAGNOSE_TIMEOUT_S = 90.0
@@ -220,6 +222,15 @@ def score_result(gt: Dict[str, Any], result: Optional[Dict[str, Any]], error: Op
     findings = list(result.get("findings") or [])
     impact = result.get("collection_impact") or {}
     verdict = result.get("verdict")
+    raw_confidence = result.get("confidence")
+    confidence = (float(raw_confidence) if isinstance(raw_confidence, (int, float))
+                  and not isinstance(raw_confidence, bool) and math.isfinite(float(raw_confidence))
+                  and 0.0 <= float(raw_confidence) <= 1.0 else None)
+    decisive_verdict = verdict in FAULT_VERDICTS or verdict in CLEARED_VERDICTS
+    row["verdict_confidence"] = confidence
+    row["verdict_confidence_correct"] = (
+        (verdict in FAULT_VERDICTS) == (gt["kind"] != HEALTHY_KIND) if decisive_verdict else None
+    )
     all_subjects = [s for f in findings for s in (f.get("subjects") or [])]
     mode = impact.get("capture_mode")
     stop_ms = impact.get("measured_stop_ms")
@@ -302,7 +313,7 @@ def candidates_shown(findings: List[Dict[str, Any]]) -> bool:
 def _stats(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     d = [r for r in rows if r["kind"] != HEALTHY_KIND]
     h = [r for r in rows if r["kind"] == HEALTHY_KIND]
-    return {
+    counts = {
         "defect_targets": len(d),
         "detected": sum(1 for r in d if r.get("detected")),
         "name_full": sum(1 for r in d if r.get("name_match") == "full"),
@@ -321,6 +332,58 @@ def _stats(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
         "errors": sum(1 for r in rows if r.get("error")),
         "non_zero_stop": sum(1 for r in rows if r.get("non_zero_stop")),
     }
+    metrics = {
+        "detection": (counts["detected"], counts["defect_targets"]),
+        "cause_name_full": (counts["name_full"], counts["defect_targets"]),
+        "cause_name_partial": (counts["name_partial"], counts["defect_targets"]),
+        "exact_location": (counts["location_match"], counts["defect_targets"]),
+        "candidate_recall": (counts["location_candidate_hit"], counts["defect_targets"]),
+        "candidate_rank1": (counts["location_candidate_rank1"], counts["defect_targets"]),
+        "healthy_cleared": (counts["cleared"], counts["healthy_targets"]),
+        "healthy_false_positive": (counts["false_positives"], counts["healthy_targets"]),
+    }
+    counts["valid_targets"] = sum(1 for r in rows if not r.get("error"))
+    counts["rates"] = {name: _wilson_rate(successes, total) for name, (successes, total) in metrics.items()}
+    return counts
+
+
+def _wilson_rate(successes: int, total: int, z: float = 1.96) -> Dict[str, Any]:
+    """Wilson 95% interval for a binomial rate; error rows remain in the denominator as misses."""
+    if total <= 0:
+        return {"successes": successes, "n": total, "rate": None, "ci95": None}
+    p = successes / total
+    z2 = z * z
+    denom = 1.0 + z2 / total
+    center = (p + z2 / (2.0 * total)) / denom
+    half = z * ((p * (1.0 - p) / total + z2 / (4.0 * total * total)) ** 0.5) / denom
+    return {"successes": successes, "n": total, "rate": round(p, 4),
+            "ci95": [round(max(0.0, center - half), 4), round(min(1.0, center + half), 4)]}
+
+
+def validate_benchmark_report(report: Dict[str, Any]) -> List[str]:
+    """Validate required provenance and row shape before a result can be authoritative."""
+    errors = []
+    for key in ("schema_version", "environment", "environment_start", "authority", "authority_reasons",
+                "dataset", "rows"):
+        if key not in report:
+            errors.append(f"missing report field: {key}")
+    if report.get("schema_version") != SCHEMA_VERSION:
+        errors.append(f"schema_version must be {SCHEMA_VERSION}")
+    if report.get("authority") not in ("AUTHORITATIVE", "NON_AUTHORITATIVE"):
+        errors.append("authority must be AUTHORITATIVE or NON_AUTHORITATIVE")
+    env = report.get("environment") if isinstance(report.get("environment"), dict) else {}
+    if not env.get("commit") or env.get("dirty") not in (True, False, None):
+        errors.append("environment commit/dirty provenance is malformed")
+    dataset = report.get("dataset") if isinstance(report.get("dataset"), dict) else {}
+    if not dataset.get("version") or not isinstance(report.get("rows"), list):
+        errors.append("dataset fingerprint or rows are missing")
+    for index, row in enumerate(report.get("rows") or []):
+        if not isinstance(row, dict):
+            errors.append(f"row {index} must be an object")
+            continue
+        if "build" not in row or not isinstance(row.get("build"), dict):
+            errors.append(f"row {index} is missing build provenance")
+    return errors
 
 
 def summarize(all_rows: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -346,6 +409,34 @@ def summarize(all_rows: List[Dict[str, Any]]) -> Dict[str, Any]:
                      if any(r["kind"] == k for r in rows)},
         "per_origin": {o: _stats([r for r in rows if r["origin"] == o]) for o in ORIGINS},
         "per_naming": {n: _stats([r for r in rows if r["naming"] == n]) for n in ("neutral", "project")},
+        "verdict_confidence_calibration": _confidence_calibration(rows),
+    }
+
+
+def _confidence_calibration(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Compare terminal fault/healthy verdict confidence with binary fault-presence correctness."""
+    eligible = [r for r in rows if isinstance(r.get("verdict_confidence"), (int, float))
+                and isinstance(r.get("verdict_confidence_correct"), bool)]
+    edges = (0.0, 0.2, 0.4, 0.6, 0.8, 1.0000001)
+    bins = []
+    for lo, hi in zip(edges, edges[1:]):
+        bucket = [r for r in eligible if lo <= float(r["verdict_confidence"]) < hi]
+        bins.append({
+            "range": [lo, min(1.0, hi)],
+            "n": len(bucket),
+            "mean_confidence": round(sum(float(r["verdict_confidence"]) for r in bucket) / len(bucket), 4)
+            if bucket else None,
+            "accuracy": round(sum(bool(r["verdict_confidence_correct"]) for r in bucket) / len(bucket), 4)
+            if bucket else None,
+        })
+    return {
+        "target": "terminal fault-versus-healthy verdict correctness",
+        "eligible_targets": len(eligible),
+        "abstentions_or_unknown_confidence": len(rows) - len(eligible),
+        "brier_score": round(sum((float(r["verdict_confidence"]) -
+                                   float(r["verdict_confidence_correct"])) ** 2 for r in eligible) / len(eligible), 4)
+        if eligible else None,
+        "bins": bins,
     }
 
 
@@ -415,6 +506,106 @@ def summarize_timing(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
 
 
 # ------------------------------------------------------------------------------------------------ running
+def working_tree_state(repo_root: str = REPO_ROOT) -> Dict[str, Any]:
+    """Inspect the complete worktree, including untracked files; failure is never treated as clean."""
+    try:
+        res = subprocess.run(["git", "status", "--porcelain=v1", "--untracked-files=all"], cwd=repo_root,
+                             capture_output=True, text=True, timeout=20)
+    except (OSError, subprocess.SubprocessError) as exc:
+        return {"dirty": None, "check_ok": False, "error": f"{type(exc).__name__}: {exc}"}
+    if res.returncode != 0:
+        return {"dirty": None, "check_ok": False, "error": (res.stderr or "git status failed").strip()[:500]}
+    return {"dirty": bool(res.stdout.strip()), "check_ok": True, "error": None}
+
+
+def clean_run_output_allowed(path: str, repo_root: str = REPO_ROOT) -> bool:
+    """A clean official run may write outside the checkout or to a Git-ignored artifact path."""
+    resolved = os.path.realpath(os.path.abspath(path))
+    root = os.path.realpath(repo_root)
+    try:
+        inside_repo = os.path.commonpath((root, resolved)) == root
+    except ValueError:
+        inside_repo = False
+    if not inside_repo:
+        return True
+    try:
+        res = subprocess.run(["git", "check-ignore", "-q", "--", resolved], cwd=root,
+                             capture_output=True, text=True, timeout=20)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return res.returncode == 0
+
+
+def _authoritative_run(start: Dict[str, Any], end: Dict[str, Any]) -> Tuple[bool, List[str]]:
+    """A benchmark is authoritative only when both complete-tree checks pass on the same clean commit."""
+    reasons = []
+    for label, env in (("start", start), ("end", end)):
+        if not env.get("dirty_check_ok"):
+            reasons.append(f"{label}: working-tree cleanliness could not be verified")
+        elif env.get("dirty") is not False:
+            reasons.append(f"{label}: working tree is dirty")
+    if not start.get("commit") or start.get("commit") == "unknown":
+        reasons.append("start: source commit is unavailable")
+    if start.get("commit") != end.get("commit"):
+        reasons.append("source commit changed during benchmark")
+    return not reasons, reasons
+
+
+def _target_provenance_reasons(rows: List[Dict[str, Any]]) -> List[str]:
+    """Each benchmark target needs enough build identity to reproduce the measured binary."""
+    reasons = []
+    for row in rows:
+        build = row.get("build") if isinstance(row.get("build"), dict) else {}
+        target_id = str(row.get("id") or "unknown-target")
+        if not build.get("build_id"):
+            reasons.append(f"{target_id}: ELF build ID is unavailable")
+        if build.get("inspection_error"):
+            reasons.append(f"{target_id}: ELF identity inspection failed")
+        if not build.get("compiler"):
+            reasons.append(f"{target_id}: compiler is unavailable")
+    return reasons
+
+
+def dataset_fingerprint(suite_root: str, subdirs: Tuple[str, ...] = ("ground_truth", "targets")) -> str:
+    """Hash ground-truth manifests and target sources for one suite, including local headers."""
+    digest = hashlib.sha256()
+    for subdir in subdirs:
+        root = os.path.join(suite_root, subdir)
+        for path in sorted(glob.glob(os.path.join(root, "**", "*"), recursive=True)):
+            if not os.path.isfile(path):
+                continue
+            rel = os.path.relpath(path, suite_root).replace(os.sep, "/")
+            digest.update(rel.encode("utf-8"))
+            digest.update(b"\0")
+            with open(path, "rb") as fh:
+                for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+                    digest.update(chunk)
+            digest.update(b"\0")
+    return digest.hexdigest()
+
+
+def find_dataset_source_overlaps(main_gt_dir: str = GT_DIR, heldout_gt_dir: str = HELDOUT_GT_DIR,
+                                 repo_root: str = REPO_ROOT) -> List[Dict[str, str]]:
+    """Find exact source-content duplicates between tuning and held-out target manifests."""
+    def fingerprints(gt_dir: str) -> Dict[str, str]:
+        by_hash: Dict[str, List[str]] = {}
+        for gt in load_ground_truth(gt_dir):
+            digest = hashlib.sha256()
+            for rel in sorted(source_files(gt)):
+                path = os.path.join(repo_root, rel)
+                with open(path, "rb") as fh:
+                    content = fh.read()
+                digest.update(len(content).to_bytes(8, "big"))
+                digest.update(content)
+            by_hash.setdefault(digest.hexdigest(), []).append(str(gt["id"]))
+        return {fingerprint: target_id for fingerprint, target_ids in by_hash.items() for target_id in target_ids}
+
+    main = fingerprints(main_gt_dir)
+    heldout = fingerprints(heldout_gt_dir)
+    return [{"main_target": main[digest], "heldout_target": heldout[digest], "source_sha256": digest}
+            for digest in sorted(set(main) & set(heldout))]
+
+
 def environment() -> Dict[str, Any]:
     def sh(*cmd):
         try:
@@ -428,9 +619,12 @@ def environment() -> Dict[str, Any]:
         glibc = libc.gnu_get_libc_version().decode()
     except (OSError, AttributeError):
         glibc = "unknown"
+    tree = working_tree_state()
     return {
         "commit": sh("git", "rev-parse", "HEAD") or "unknown",
-        "dirty": bool(sh("git", "status", "--porcelain", "--", "extractor", "benchmarks/diagnosis_accuracy")),
+        "dirty": tree["dirty"],
+        "dirty_check_ok": tree["check_ok"],
+        "dirty_check_error": tree["error"],
         "arch": platform.machine(),
         "kernel": platform.release(),
         "glibc": glibc,
@@ -452,6 +646,33 @@ def build_target(gt: Dict[str, Any], out_dir: str) -> str:
     out = os.path.join(out_dir, gt["id"])
     subprocess.run(build_command(gt, out), cwd=REPO_ROOT, check=True, capture_output=True, timeout=120)
     return out
+
+
+def target_build_metadata(gt: Dict[str, Any], binary: Optional[str]) -> Dict[str, Any]:
+    """Record the exact per-target build recipe and ELF identity used by the benchmark."""
+    cmd = build_command(gt, "<benchmark-output>")
+    b = gt.get("build") or {}
+    meta: Dict[str, Any] = {
+        "command": cmd,
+        "compiler": b.get("compiler", "gcc"),
+        "optimization": b.get("opt", "-O0"),
+        "flags": list(b.get("flags") or []),
+        "debug_info_expected": True,
+        "build_id": None,
+        "target_arch": None,
+        "debug_info_present": None,
+        "inspection_error": None,
+    }
+    if binary is None:
+        return meta
+    try:
+        from extractor.debug_image import inspect_elf
+        ident = inspect_elf(binary)
+        meta.update({"build_id": ident.build_id, "target_arch": ident.architecture,
+                     "debug_info_present": ident.has_debug_info})
+    except Exception as exc:  # noqa: BLE001 - retain the row but make missing provenance visible
+        meta["inspection_error"] = f"{type(exc).__name__}: {exc}"[:500]
+    return meta
 
 
 def _wait_ready(proc: subprocess.Popen, gt: Dict[str, Any]) -> None:
@@ -518,8 +739,10 @@ def run_target(gt: Dict[str, Any], tmp: str, diagnose_fn: Callable, symptom_mode
         binary = build_target(gt, tmp)
     except (subprocess.SubprocessError, OSError) as exc:
         row = score_result(gt, None, f"build failed: {exc}")
+        row["build"] = target_build_metadata(gt, None)
         row["wall_s"] = round(time.monotonic() - t_start, 2)
         return row
+    build_meta = target_build_metadata(gt, binary)
     restart = repeat > 1 and gt.get("kind") in GROWTH_KINDS
     proc = _launch(binary, gt, 1 if restart else max(1, repeat))
     result, error, diag_s = None, None, None
@@ -572,22 +795,40 @@ def run_target(gt: Dict[str, Any], tmp: str, diagnose_fn: Callable, symptom_mode
         row["check_runs"] = [check_timings(r["result"]) for r in runs]
     row["wall_s"] = round(time.monotonic() - t_start, 2)
     row["symptom"] = symptom
+    row["build"] = build_meta
     return row
 
 
 def run_all(targets: List[Dict[str, Any]], diagnose_fn: Callable = _default_diagnose,
-            symptom_mode: str = "ground_truth", repeat: int = 1, suite: str = "main") -> Dict[str, Any]:
+            symptom_mode: str = "ground_truth", repeat: int = 1, suite: str = "main",
+            environment_start: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     t0 = time.monotonic()
+    env_start = environment_start or environment()
     tmp = tempfile.mkdtemp(prefix="diagacc_")
     try:
         rows = [run_target(gt, tmp, diagnose_fn, symptom_mode, repeat) for gt in targets]
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
+    env_end = environment()
+    is_authoritative, authority_reasons = _authoritative_run(env_start, env_end)
+    authority_reasons.extend(_target_provenance_reasons(rows))
+    source_overlaps = find_dataset_source_overlaps()
+    if source_overlaps:
+        authority_reasons.append(f"main/held-out contain {len(source_overlaps)} exact source duplicate(s)")
+    is_authoritative = not authority_reasons
+    suite_root = os.path.dirname(SUITES.get(suite, GT_DIR))
     report = {
         "schema_version": SCHEMA_VERSION,
-        "environment": environment(),
+        "environment": env_end,
+        "environment_start": env_start,
+        "authority": "AUTHORITATIVE" if is_authoritative else "NON_AUTHORITATIVE",
+        "authority_reasons": authority_reasons,
         "symptom_mode": symptom_mode,
         "suite": suite,
+        "dataset": {"version": dataset_fingerprint(suite_root),
+                    "target_ids": [g["id"] for g in targets],
+                    "manifest_directory": os.path.relpath(SUITES.get(suite, GT_DIR), REPO_ROOT),
+                    "source_overlaps_with_other_suite": source_overlaps},
         "category_to_kind": {k: sorted(v) for k, v in KIND_CATEGORIES.items()},
         "line_tolerance": LINE_TOLERANCE,
         "totals": summarize(rows),
@@ -602,6 +843,11 @@ def run_all(targets: List[Dict[str, Any]], diagnose_fn: Callable = _default_diag
         report["host_loadavg"] = list(os.getloadavg())  # at the end of the run; other jobs may share the host
     except OSError:
         pass
+    schema_errors = validate_benchmark_report(report)
+    report["schema_errors"] = schema_errors
+    if schema_errors:
+        report["authority_reasons"].extend(f"schema: {error}" for error in schema_errors)
+        report["authority"] = "NON_AUTHORITATIVE"
     return report
 
 
@@ -628,8 +874,16 @@ def run_adversarial(diagnose_fn: Callable = _adversarial_diagnose,
             except subprocess.CalledProcessError as e:
                 rows.append({"program": name, "kind": None, "error": f"build failed: {e.stderr[-300:]}"})
                 continue
+            source = adv.source_of(name)
+            compiler = "g++" if source.endswith(".cpp") else "gcc"
+            build_meta = target_build_metadata({"build": {"compiler": compiler, "opt": "-O0",
+                                                          "flags": ["-g", "-fno-omit-frame-pointer", "-pthread"]}},
+                                               binary)
+            # adv.build selects gcc/g++ based on the source extension; record that exact command.
+            build_meta["command"] = [build_meta["compiler"], "-g", "-O0", "-fno-omit-frame-pointer",
+                                     "-pthread", source, "-o", "<benchmark-output>"]
             for kind in adv.SYMPTOM_KINDS:
-                row: Dict[str, Any] = {"program": name, "symptom_kind": kind}
+                row: Dict[str, Any] = {"program": name, "symptom_kind": kind, "build": build_meta}
                 proc = fixture_popen([binary], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                                      stderr=subprocess.DEVNULL, max_lifetime_s=READY_TIMEOUT_S + DIAGNOSE_TIMEOUT_S + 60,
                                      name="adv_" + name)
@@ -650,6 +904,8 @@ def run_adversarial(diagnose_fn: Callable = _adversarial_diagnose,
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
     ok_rows = [r for r in rows if "error" not in r]
+    target_builds = {name: next((r["build"] for r in rows if r.get("program") == name and r.get("build")),
+                                None) for name in sorted({r["program"] for r in rows})}
     return {
         "programs": sorted({r["program"] for r in rows}),
         "runs": len(ok_rows),
@@ -658,6 +914,7 @@ def run_adversarial(diagnose_fn: Callable = _adversarial_diagnose,
         "errors": len(rows) - len(ok_rows),
         "verdicts": {v: sum(1 for r in ok_rows if r.get("verdict") == v) for v in sorted({str(r.get("verdict")) for r in ok_rows})},
         "wall_s": round(time.monotonic() - t0, 1),
+        "target_builds": target_builds,
         "rows": rows,
     }
 
@@ -754,6 +1011,8 @@ def main(argv: Optional[List[str]] = None) -> int:
                     help="target set: the main benchmark (default) or the held-out validation suite, reported "
                          "separately (results file suffix -heldout)")
     ap.add_argument("--list", action="store_true", help="list targets and exit")
+    ap.add_argument("--require-clean", action="store_true",
+                    help="refuse to run unless the complete Git working tree is clean; official runs should use this")
     ap.add_argument("--adversarial", choices=("on", "off", "only"), default="on",
                     help="the separately reported adversarial-healthy suite (tests/fixtures/adversarial_healthy): "
                          "on (default, after the targets), off, or only")
@@ -763,6 +1022,14 @@ def main(argv: Optional[List[str]] = None) -> int:
         for gt in targets:
             print(f"{gt['id']:20} {gt['kind']:15} {gt['origin']:15} {gt['naming']:8} {gt['source']}")
         return 0
+    env_start = environment()
+    if args.require_clean and (not env_start.get("dirty_check_ok") or env_start.get("dirty") is not False or
+                               not env_start.get("commit") or env_start.get("commit") == "unknown"):
+        print("refusing official benchmark: working tree is dirty or cleanliness could not be verified",
+              file=sys.stderr)
+        if env_start.get("dirty_check_error"):
+            print(env_start["dirty_check_error"], file=sys.stderr)
+        return 2
     if args.only:
         known = {g["id"] for g in targets}
         bad = [o for o in args.only if o not in known]
@@ -770,18 +1037,71 @@ def main(argv: Optional[List[str]] = None) -> int:
             print(f"unknown target(s): {bad}", file=sys.stderr)
             return 2
         targets = [g for g in targets if g["id"] in args.only]
+    if args.require_clean:
+        if args.adversarial == "only":
+            default_name = f"{datetime.date.today().isoformat()}-adversarial.json"
+        else:
+            default_name = (f"{datetime.date.today().isoformat()}-{env_start['arch']}-{env_start['commit'][:7]}"
+                            f"{'' if args.suite == 'main' else '-' + args.suite}"
+                            f"{'' if args.symptom == 'ground_truth' else '-generic-symptom'}"
+                            f"{'' if args.repeat <= 1 else '-repeat%d' % args.repeat}.json")
+        planned_out = args.output or os.path.join(RESULTS_DIR, default_name)
+        if not clean_run_output_allowed(planned_out):
+            print("refusing official benchmark: output must be outside the checkout or Git-ignored",
+                  file=sys.stderr)
+            return 2
     if args.adversarial == "only":
         adv_report = run_adversarial()
+        env_end = environment()
+        is_authoritative, authority_reasons = _authoritative_run(env_start, env_end)
+        adv_build_rows = [{"id": name, "build": build} for name, build in adv_report.get("target_builds", {}).items()]
+        authority_reasons.extend(_target_provenance_reasons(adv_build_rows))
+        if adv_report.get("errors"):
+            authority_reasons.append(f"adversarial suite had {adv_report['errors']} failed run(s)")
+        is_authoritative = not authority_reasons
+        adv_report.update({"schema_version": SCHEMA_VERSION, "environment": env_end,
+                           "environment_start": env_start,
+                           "dataset": {"version": dataset_fingerprint(os.path.join(REPO_ROOT, "tests", "fixtures"),
+                                                                         ("adversarial_healthy",)),
+                                       "suite": "adversarial_healthy"},
+                           "authority": "AUTHORITATIVE" if is_authoritative else "NON_AUTHORITATIVE",
+                           "authority_reasons": authority_reasons})
+        schema_errors = validate_benchmark_report(adv_report)
+        adv_report["schema_errors"] = schema_errors
+        if schema_errors:
+            adv_report["authority_reasons"].extend(f"schema: {error}" for error in schema_errors)
+            adv_report["authority"] = "NON_AUTHORITATIVE"
+            is_authoritative = False
         out = args.output or os.path.join(RESULTS_DIR, f"{datetime.date.today().isoformat()}-adversarial.json")
         with open(out, "w", encoding="utf-8") as fh:
             json.dump(adv_report, fh, indent=2)
             fh.write("\n")
         print(format_adversarial(adv_report))
+        print(f"benchmark authority: {adv_report['authority']}" +
+              (f" ({'; '.join(authority_reasons)})" if authority_reasons else ""))
         print(f"results written to {out}")
-        return 0
-    report = run_all(targets, symptom_mode=args.symptom, repeat=max(1, args.repeat), suite=args.suite)
+        return 2 if args.require_clean and not is_authoritative else 0
+    report = run_all(targets, symptom_mode=args.symptom, repeat=max(1, args.repeat), suite=args.suite,
+                     environment_start=env_start)
     if args.adversarial == "on" and not args.only:
         report["adversarial_healthy"] = run_adversarial()
+    env_end = environment()
+    _, source_reasons = _authoritative_run(env_start, env_end)
+    authority_reasons = source_reasons + _target_provenance_reasons(report["rows"])
+    if report.get("dataset", {}).get("source_overlaps_with_other_suite"):
+        overlap_count = len(report["dataset"]["source_overlaps_with_other_suite"])
+        authority_reasons.append(f"main/held-out contain {overlap_count} exact source duplicate(s)")
+    if isinstance(report.get("adversarial_healthy"), dict):
+        adversarial = report["adversarial_healthy"]
+        adv_build_rows = [{"id": name, "build": build}
+                          for name, build in adversarial.get("target_builds", {}).items()]
+        authority_reasons.extend(_target_provenance_reasons(adv_build_rows))
+        if adversarial.get("errors"):
+            authority_reasons.append(f"adversarial suite had {adversarial['errors']} failed run(s)")
+    authority_reasons.extend(f"schema: {error}" for error in validate_benchmark_report(report))
+    report["environment"] = env_end
+    report["authority_reasons"] = authority_reasons
+    report["authority"] = "AUTHORITATIVE" if not authority_reasons else "NON_AUTHORITATIVE"
     env = report["environment"]
     out = args.output or os.path.join(
         RESULTS_DIR, f"{datetime.date.today().isoformat()}-{env['arch']}-{env['commit'][:7]}"
@@ -793,13 +1113,15 @@ def main(argv: Optional[List[str]] = None) -> int:
         json.dump(report, fh, indent=2)
         fh.write("\n")
     print(format_table(report))
+    print(f"benchmark authority: {report['authority']}" +
+          (f" ({'; '.join(report['authority_reasons'])})" if report["authority_reasons"] else ""))
     if report.get("adversarial_healthy"):
         print(format_adversarial(report["adversarial_healthy"]))
     print(f"results written to {out}")
     sys.stdout.flush()
     if any(r.get("error", "").endswith("(hang)") for r in report["rows"]):
-        os._exit(0)  # a hung diagnose thread must not keep the runner alive
-    return 0
+        os._exit(2 if args.require_clean and report["authority"] != "AUTHORITATIVE" else 0)
+    return 2 if args.require_clean and report["authority"] != "AUTHORITATIVE" else 0
 
 
 if __name__ == "__main__":

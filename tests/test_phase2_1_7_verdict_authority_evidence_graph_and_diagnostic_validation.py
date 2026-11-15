@@ -133,8 +133,8 @@ def make_trusted_record(
     )
     if target_pid:
         rec.target_pid = target_pid
-    ledger._by_id[evidence_id] = rec
-    ledger._records.append(rec)
+    ledger.add_record(rec)
+    ledger.accept_record(evidence_id)
     return rec
 
 
@@ -194,6 +194,8 @@ class TestPhase217VerdictAuthorityAndEvidenceGraph(unittest.TestCase):
 
     def test_case_a4_confirmed_fault_with_incomplete_investigation(self):
         """Case A.4: Confirmed fault takes precedence even if investigation is incomplete (e.g. COLLECTING)."""
+        ledger = EvidenceLedger(session_id="INV_A4")
+        evidence = make_trusted_record(ledger, "EV_CONFIRMED_DEADLOCK", target_pid=1234)
         hyp = ExpertHypothesis(
             hypothesis_id="HYP_DEADLOCK",
             category="THREAD_DEADLOCK",
@@ -202,12 +204,14 @@ class TestPhase217VerdictAuthorityAndEvidenceGraph(unittest.TestCase):
             status="CONFIRMED",
             confidence=0.96,
             confidence_basis="2 threads in cycle verified",
+            supporting_evidence_ids=[evidence.evidence_id],
         )
         agg = DiagnosticVerdictAggregator.aggregate(
             lifecycle_state=STATE_COLLECTING,  # Incomplete lifecycle
             stop_reason=None,
             checks=[],
             active_hypotheses=[hyp],
+            ledger=ledger,
         )
         self.assertEqual(agg.overall_result, VERDICT_CONFIRMED_FAULT)
         self.assertIn("Circular mutex lock wait graph verified", agg.confirmed_problems)
@@ -322,8 +326,7 @@ class TestPhase217VerdictAuthorityAndEvidenceGraph(unittest.TestCase):
             provenance={"provenance_class": PROVENANCE_CLASS_IMPORTED_UNVERIFIED},
             observation="Synthetic unverified observation",
         )
-        ledger._by_id["EV_UNTRUSTED"] = rec_untrusted
-        ledger._records.append(rec_untrusted)
+        ledger.add_record(rec_untrusted)
 
         # Speculative hypothesis nature
         rec_hypothesis = make_trusted_record(ledger, "EV_SPECULATIVE", nature="hypothesis")
@@ -552,8 +555,7 @@ class TestPhase217VerdictAuthorityAndEvidenceGraph(unittest.TestCase):
             provenance={"provenance_class": PROVENANCE_CLASS_IMPORTED_UNVERIFIED},  # Untrusted!
             observation="Unverified report claiming normal state",
         )
-        ledger._by_id["EV_UNTRUSTED_COUNTER"] = rec_untrusted_counter
-        ledger._records.append(rec_untrusted_counter)
+        ledger.add_record(rec_untrusted_counter)
 
         hyp = CompetingHypothesis(
             hypothesis_id="HYP_I",

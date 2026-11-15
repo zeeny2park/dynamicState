@@ -210,8 +210,8 @@ class TestPhase216DiagnosticVerdictIntegrity(unittest.TestCase):
                 target_identity={"pid": 1234, "process_identity": "proc_1234", "executable_identity": "/proc/1234/exe", "build_id": "sha1:testbuildid12345"},
                 observation=f"Observation for {eid}",
             )
-            ledger._by_id[eid] = rec
-            ledger._records.append(rec)
+            ledger.add_record(rec)
+            ledger.accept_record(eid)
         hyp = CompetingHypothesis(
             hypothesis_id="HYP_E",
             category="MEMORY_LEAK",
@@ -307,8 +307,8 @@ class TestPhase216DiagnosticVerdictIntegrity(unittest.TestCase):
                 target_identity={"pid": 1234, "process_identity": "proc_1234", "executable_identity": "/proc/1234/exe", "build_id": "sha1:testbuildid12345"},
                 observation=obs_txt,
             )
-            ledger._by_id[eid] = rec
-            ledger._records.append(rec)
+            ledger.add_record(rec)
+            ledger.accept_record(eid)
         hyp = CompetingHypothesis(
             hypothesis_id="HYP_G",
             category="USE_AFTER_FREE",
@@ -418,6 +418,36 @@ class TestPhase216DiagnosticVerdictIntegrity(unittest.TestCase):
 
     def test_case_l_confirmed_fault_remains_visible_despite_unrelated_pass_checks(self):
         """Case L: Confirmed fault remains visible despite unrelated PASS checks."""
+        from extractor.capture_backend import get_trusted_capture_authority_token, issue_live_capture_receipt
+        from extractor.evidence_ledger import PROVENANCE_CLASS_LIVE_RUNTIME_CAPTURE
+        ledger = EvidenceLedger(session_id="INV_T6_L")
+        evidence_ids = []
+        for evidence_id in ("EV_CONFIRMED_CORRUPTION", "EV_CONFIRMED_CORRUPTION_INDEPENDENT"):
+            rcpt = issue_live_capture_receipt(
+                session_id=ledger.session_id,
+                pid=1234,
+                process_identity="proc_1234",
+                executable_identity="/proc/1234/exe",
+                build_id="sha1:testbuildid12345",
+                snapshot_binding="snap_1",
+                capture_authority_token=get_trusted_capture_authority_token(),
+            )
+            evidence = EvidenceRecord(
+                evidence_id=evidence_id,
+                session_id=ledger.session_id,
+                evidence_type="DIAGNOSTIC",
+                nature="observation",
+                provenance={"provenance_class": PROVENANCE_CLASS_LIVE_RUNTIME_CAPTURE,
+                            "live_capture_receipt": rcpt.to_dict()},
+                details={"provenance_class": PROVENANCE_CLASS_LIVE_RUNTIME_CAPTURE,
+                         "live_capture_receipt": rcpt.to_dict(), "target_pid": 1234},
+                target_identity={"pid": 1234, "process_identity": "proc_1234",
+                                 "executable_identity": "/proc/1234/exe", "build_id": "sha1:testbuildid12345"},
+                observation=f"Chunk header invariant failed ({evidence_id})",
+            )
+            ledger.add_record(evidence)
+            ledger.accept_record(evidence_id)
+            evidence_ids.append(evidence_id)
         checks = [
             DiagnosticCheck(check_id="CHK_PASS_01", description="CPU usage", status=CheckStatus.PASS),
             DiagnosticCheck(check_id="CHK_PASS_02", description="Network buffers", status=CheckStatus.PASS),
@@ -427,13 +457,17 @@ class TestPhase216DiagnosticVerdictIntegrity(unittest.TestCase):
             hypothesis_id="HYP_CORRUPTION",
             category="MEMORY_CORRUPTION",
             title="Chunk Header Overwrite",
+            confidence=0.95,
             status=VERDICT_CONFIRMED,
+            supporting_evidence_ids=evidence_ids,
+            ledger=ledger,
         )
         verdict = DiagnosticVerdictAggregator.aggregate(
             lifecycle_state="COMPLETED",
             stop_reason="HYPOTHESIS_CONFIRMED",
             checks=checks,
             active_hypotheses=[hyp],
+            ledger=ledger,
         )
         self.assertEqual(verdict.overall_result, VERDICT_CONFIRMED_FAULT)
         self.assertIn("Chunk Header Overwrite", verdict.confirmed_problems)

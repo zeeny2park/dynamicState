@@ -9,11 +9,28 @@ on real processes. It replaces self-declared completion: a low score is a valid 
     python3 benchmarks/diagnosis_accuracy/run_benchmark.py --list
     python3 benchmarks/diagnosis_accuracy/run_benchmark.py --only deadlock_pipeline spin_flag --output /tmp/r.json
     python3 benchmarks/diagnosis_accuracy/run_benchmark.py --symptom generic   # every target gets "general health check"
+    python3 benchmarks/diagnosis_accuracy/run_benchmark.py --require-clean --output /tmp/diagnosis-baseline.json
 
     python3 benchmarks/diagnosis_accuracy/run_benchmark.py --repeat 20 --only spin_yield ok_sawtooth   # repeat-verdict agreement
 
 Needs gcc and permission to read same-user process memory. About 20 s on this host. Exit status is non-zero only if
 the runner crashes. Tests of the machinery (not of accuracy): `python3 -m unittest tests/test_diagnosis_accuracy_benchmark.py`.
+
+`--require-clean` is the gate for an official run. Results from ordinary runs are still written for development, but
+the JSON marks them `NON_AUTHORITATIVE` if the complete Git worktree (including untracked files) is dirty, cannot be
+checked, or the source commit changes during the run. Schema version 2 records start/end environment state, a SHA-256
+fingerprint of the suite ground truth and target sources, target IDs, and per-target build recipe/compiler/flags,
+architecture, debug-info presence, and ELF build ID where available. The adversarial-only suite records the same
+build identity per program. A result is non-authoritative when a successful target build has no compiler or ELF build
+ID, or identity inspection fails. Build identity inspection failures remain visible in the JSON. This provenance does
+not make an otherwise dirty run official.
+An official run must write its JSON outside the checkout or to a Git-ignored artifact path; otherwise the result file
+itself would dirty the source tree and make the provenance ambiguous.
+
+The JSON report validates required top-level, dataset, environment, row, and build-provenance fields before it can be
+marked authoritative. Metric counts include valid sample counts; binary detection, cause-name, exact-location,
+candidate, and healthy-control rates include Wilson 95% intervals. Failed target runs remain denominator misses, so an
+execution error cannot improve a score.
 
 ## Diagnosis time and repeat-verdict agreement (additive; scoring is unchanged)
 
@@ -116,7 +133,9 @@ generalisation again. Engine-level misses found by the suite are listed in the c
   carry the flag but are not counted. There is no threshold or assertion on the real diagnoser; the number is reported.
 
 - Detection (defect): some finding's `category` is in `KIND_CATEGORIES[kind]` (table in `run_benchmark.py`). A fault
-  verdict without a matching-category finding is not a detection. `confidence` is never used.
+  verdict without a matching-category finding is not a detection. Verdict confidence does not change detection scoring;
+  when a terminal fault/healthy verdict provides a numeric confidence, it is evaluated separately in the calibration
+  summary with bin counts, accuracy, Brier score, and the number of targets excluded for missing confidence.
 - Healthy control: any fault-class verdict (CONFIRMED_FAULT, PROBABLE_FAULT, FAULT) or any finding is a false positive.
   Any other verdict without findings and not HEALTHY (INCONCLUSIVE, DEGRADED, ABORTED) is counted as "not cleared".
 - Cause names: exact, case-sensitive match of ground-truth names against `subjects` of the matching-category findings.
@@ -135,6 +154,10 @@ generalisation again. Engine-level misses found by the suite are listed in the c
   column) are counted per row and in the totals.
 - Also recorded: verdict, categories, subjects, `not_covered` kinds, wall time, capture mode, measured stop time;
   `non_zero_stop` flags any non-zero-stop collection. A `diagnose` exception or hang becomes a row with `error`.
+
+The report includes an exact source-content overlap check between the main and held-out ground-truth suites. Any
+cross-suite duplicate makes the result `NON_AUTHORITATIVE`; this detects byte-identical source leakage and does not
+claim to detect semantically equivalent programs.
 
 ## Adversarial healthy suite (separate; not in the totals)
 

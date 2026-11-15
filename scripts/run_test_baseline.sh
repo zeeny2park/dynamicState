@@ -7,7 +7,7 @@
 # fact rather than a claim.
 #
 # Usage: scripts/run_test_baseline.sh [output_dir]   (default: docs/test_baseline)
-# Env:   BASELINE_JOBS (default 3), BASELINE_TIMEOUT seconds per file (default 600)
+# Env:   BASELINE_JOBS (default 2, never above available CPUs), BASELINE_TIMEOUT seconds per file (default 600)
 # Exit:  0 when every file passes, 1 otherwise.
 # ==============================================================================
 set -uo pipefail
@@ -15,8 +15,24 @@ set -uo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${REPO_ROOT}"
 OUT="${1:-docs/test_baseline}"
-JOBS="${BASELINE_JOBS:-3}"
+CPU_COUNT="$(python3 -c 'import os; print(max(1, len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else (os.cpu_count() or 1))')"
+DEFAULT_JOBS=2
+if (( CPU_COUNT < DEFAULT_JOBS )); then DEFAULT_JOBS="${CPU_COUNT}"; fi
+JOBS="${BASELINE_JOBS:-${DEFAULT_JOBS}}"
 TMO="${BASELINE_TIMEOUT:-600}"
+
+if ! [[ "${JOBS}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "BASELINE_JOBS must be a positive integer (got: ${JOBS})" >&2
+    exit 2
+fi
+if (( JOBS > CPU_COUNT )); then
+    echo "BASELINE_JOBS=${JOBS} exceeds ${CPU_COUNT} available CPU(s); lower BASELINE_JOBS before running." >&2
+    exit 2
+fi
+if ! [[ "${TMO}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "BASELINE_TIMEOUT must be a positive integer number of seconds (got: ${TMO})" >&2
+    exit 2
+fi
 LOGS="$(mktemp -d)"
 trap 'rm -rf "${LOGS}"' EXIT
 mkdir -p "${OUT}"
@@ -41,7 +57,8 @@ export -f run_one; export LOGS TMO OUT
 
 rm -f "${OUT}"/failed_*.log
 # Files that saturate the CPU on purpose (marked with the token BASELINE_SERIAL) would starve the files
-# running next to them, so they run alone after the parallel batch.
+# running next to them, so they run alone after the parallel batch. The parallel batch is capped at two
+# workers by default; resource-sensitive hosts should set BASELINE_JOBS=1.
 SERIAL_FILES="$(grep -l "BASELINE_SERIAL" tests/test_*.py || true)"
 ls tests/test_*.py | grep -vxF "${SERIAL_FILES:-__none__}" | xargs -P "${JOBS}" -I{} bash -c 'run_one "$1"' _ {}
 for f in ${SERIAL_FILES}; do run_one "$f"; done
