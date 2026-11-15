@@ -18,6 +18,7 @@ import uuid
 from typing import Any, Dict, List, Optional, Set, Tuple, Union
 
 from .canonical_json import rfc8785_canonical_json, rfc8785_canonical_str
+from .capture_backend import SecurityViolationError
 
 
 PROVENANCE_CLASS_LIVE_RUNTIME_CAPTURE = "LIVE_RUNTIME_CAPTURE"
@@ -2219,12 +2220,33 @@ class EvidenceLedger:
                 rec.admission_reason = reason
 
     def accept_record(self, evidence_id: str) -> None:
-        """Promote an evidence record to authoritative ACCEPTED status."""
+        """Promote an evidence record to authoritative ACCEPTED status under controlled rules."""
         with self._lock:
             rec = self._by_id.get(evidence_id)
-            if rec:
-                rec.admission_state = EvidenceAdmissionState.ACCEPTED
-                rec.admission_reason = None
+            if not rec:
+                raise KeyError(f"Evidence record '{evidence_id}' not found in ledger")
+            if rec.admission_state == EvidenceAdmissionState.REJECTED:
+                raise SecurityViolationError(
+                    f"Cannot promote REJECTED record '{evidence_id}' to ACCEPTED: "
+                    f"cryptographic or identity verification failed: {rec.admission_reason}"
+                )
+            if rec.admission_state == EvidenceAdmissionState.QUARANTINED:
+                if rec.parent_evidence_ids:
+                    missing_parents = [pid for pid in rec.parent_evidence_ids if pid not in self._by_id]
+                    if missing_parents:
+                        raise ValueError(
+                            f"Cannot promote QUARANTINED record '{evidence_id}': missing parent records {missing_parents}"
+                        )
+                    unaccepted_parents = [
+                        pid for pid in rec.parent_evidence_ids
+                        if self._by_id[pid].admission_state != EvidenceAdmissionState.ACCEPTED
+                    ]
+                    if unaccepted_parents:
+                        raise ValueError(
+                            f"Cannot promote QUARANTINED record '{evidence_id}': parents not in ACCEPTED state: {unaccepted_parents}"
+                        )
+            rec.admission_state = EvidenceAdmissionState.ACCEPTED
+            rec.admission_reason = None
 
     def find_by_semantic_digest(self, semantic_digest: str) -> Optional[EvidenceRecord]:
         """Look up existing record by semantic digest for deduplication."""

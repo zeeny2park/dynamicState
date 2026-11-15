@@ -273,13 +273,25 @@ class DiagnosticVerdictAggregator:
         # 3. If evidence_records list was explicitly provided, require that the check's evidence_ids
         #    (or at least one trusted record in evidence_records) back the failure with trusted provenance.
         if evidence_records:
-            trusted_ids = {
-                getattr(r, "evidence_id", None)
-                for r in evidence_records
-                if getattr(r, "provenance_class", None) in TRUSTED_PROVENANCE_CLASSES
-                and getattr(r, "nature", "observation") == "observation"
-            }
-            chk_ev_ids = getattr(c, "evidence_ids", None) or []
+            trusted_ids = set()
+            for r in evidence_records:
+                prov_cls = getattr(r, "provenance_class", None)
+                if not prov_cls and isinstance(getattr(r, "provenance", None), dict):
+                    prov_cls = r.provenance.get("provenance_class")
+                if prov_cls not in TRUSTED_PROVENANCE_CLASSES:
+                    continue
+                if getattr(r, "nature", "observation") != "observation":
+                    continue
+                # Enforce fail-closed admission: rejected or quarantined evidence can NEVER satisfy confirmation
+                adm_state = getattr(r, "admission_state", None)
+                if adm_state is not None:
+                    state_val = getattr(adm_state, "value", adm_state)
+                    if state_val != "ACCEPTED":
+                        continue
+                eid = getattr(r, "evidence_id", None)
+                if eid:
+                    trusted_ids.add(eid)
+            chk_ev_ids = getattr(c, "supporting_evidence_ids", None) or getattr(c, "evidence_ids", None) or []
             if chk_ev_ids:
                 return any(eid in trusted_ids for eid in chk_ev_ids)
             return len(trusted_ids) > 0

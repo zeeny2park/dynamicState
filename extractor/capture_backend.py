@@ -969,6 +969,15 @@ class ProcessIdentity:
         }
 
 
+def _normalize_canonical_value(val: Any) -> Any:
+    """Recursively sort dictionary keys and normalize iterables for canonical serialization."""
+    if isinstance(val, dict):
+        return {str(k): _normalize_canonical_value(v) for k, v in sorted(val.items(), key=lambda item: str(item[0]))}
+    elif isinstance(val, (list, tuple)):
+        return [_normalize_canonical_value(x) for x in val]
+    return val
+
+
 @dataclass(frozen=True)
 class CanonicalOperationIdentity:
     """Complete Canonical Operation Identity for Replay Defense and auditability."""
@@ -998,6 +1007,26 @@ class CanonicalOperationIdentity:
         if self.normalized_parameters is None or not isinstance(self.normalized_parameters, dict):
             raise MissingIdentityFieldError("normalized_parameters must be a dict")
 
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "operation_id": self.operation_id,
+            "operation_kind": self.operation_kind,
+            "process_identity": self.process_identity.to_dict(),
+            "build_id": self.build_id,
+            "session_identity": self.session_identity,
+            "request_scope": self.request_scope,
+            "normalized_parameters": self.normalized_parameters,
+            "schema_version": self.schema_version,
+        }
+
+    def to_canonical_json(self) -> str:
+        """Deterministic RFC 8785-compliant JSON representation with key-sorting and compact separators."""
+        return json.dumps(self.to_dict(), sort_keys=True, separators=(",", ":"))
+
+    def digest(self) -> str:
+        """Generate SHA-256 hex digest of the canonical JSON representation."""
+        return hashlib.sha256(self.to_canonical_json().encode("utf-8")).hexdigest()
+
 
 def build_canonical_replay_identity(
     operation_id: str,
@@ -1010,7 +1039,9 @@ def build_canonical_replay_identity(
     schema_version: str = "1.0",
 ) -> CanonicalOperationIdentity:
     """Build normalized, key-sorted CanonicalOperationIdentity."""
-    norm_params = dict(sorted((parameters or {}).items()))
+    norm_params = _normalize_canonical_value(parameters or {})
+    if not isinstance(norm_params, dict):
+        norm_params = {}
     return CanonicalOperationIdentity(
         operation_id=validate_operation_id(operation_id),
         operation_kind=str(operation_kind),
@@ -1028,20 +1059,20 @@ _CURRENT_MACHINE_ID_CACHE: Optional[str] = None
 
 
 def resolve_current_boot_id() -> str:
-    """Resolve OS kernel boot ID with caching."""
+    """Resolve OS kernel boot ID with caching. Fails closed if unavailable."""
     global _CURRENT_BOOT_ID_CACHE
     if _CURRENT_BOOT_ID_CACHE:
         return _CURRENT_BOOT_ID_CACHE
     try:
         if os.path.exists("/proc/sys/kernel/random/boot_id"):
             with open("/proc/sys/kernel/random/boot_id", "r", encoding="utf-8") as f:
-                _CURRENT_BOOT_ID_CACHE = f.read().strip()
-                if _CURRENT_BOOT_ID_CACHE:
+                content = f.read().strip()
+                if content:
+                    _CURRENT_BOOT_ID_CACHE = content
                     return _CURRENT_BOOT_ID_CACHE
-    except Exception:
-        pass
-    _CURRENT_BOOT_ID_CACHE = "boot-default"
-    return _CURRENT_BOOT_ID_CACHE
+    except Exception as e:
+        raise ProcessIdentityUnavailableError(f"Failed to read kernel boot_id from /proc: {e}") from e
+    raise ProcessIdentityUnavailableError("Kernel boot_id is missing or unavailable on this system")
 
 
 def resolve_machine_id() -> str:
@@ -1134,6 +1165,21 @@ class DurableTrustStore:
                     flags |= os.O_NOFOLLOW
                 fd = os.open(lock_path, flags, 0o600)
                 try:
+                    st = os.fstat(fd)
+                    if not stat.S_ISREG(st.st_mode):
+                        raise SecurityViolationError(f"Lock file '{lock_path}' is not a regular file")
+                    if hasattr(os, "getuid") and st.st_uid != os.getuid():
+                        raise SecurityViolationError(f"Lock file '{lock_path}' owned by UID {st.st_uid}, expected {os.getuid()}")
+                    if st.st_nlink > 1:
+                        raise SecurityViolationError(
+                            f"Lock file '{lock_path}' has hard links (nlink={st.st_nlink}), rejecting due to hard-link replacement risk"
+                        )
+                    if (st.st_mode & 0o077) != 0:
+                        try:
+                            os.fchmod(fd, 0o600)
+                        except OSError as fe:
+                            raise SecurityViolationError(f"Lock file permissions broader than 0600: {fe}") from fe
+
                     t_start = time.perf_counter()
                     backoff = 0.001
                     locked = False
@@ -1206,20 +1252,40 @@ class DurableTrustStore:
                 except OSError as e:
                     raise SecurityViolationError(f"Failed to secure trust store permissions to 0600: {e}") from e
 
-    def _cleanup_stale_temp_files(self) -> None:
-        """Scan and remove abandoned .trust_tmp_* files in trust store directory."""
+    def _cleanup_stale_temp_files(self, max_age_seconds: Optional[float] = None) -> None:
+        """Scan and remove abandoned .trust_tmp_* files in trust store directory under exclusive lock."""
         if not self.store_path:
             return
         dir_name = os.path.dirname(os.path.abspath(self.store_path))
         if not os.path.exists(dir_name) or os.path.islink(dir_name):
             return
+        now = time.time()
         try:
             for fname in os.listdir(dir_name):
                 if fname.startswith(".trust_tmp_"):
                     fpath = os.path.join(dir_name, fname)
                     try:
                         if not os.path.islink(fpath) and os.path.isfile(fpath):
-                            os.remove(fpath)
+                            # Try to acquire non-blocking lock to verify no active writer is holding it
+                            try:
+                                check_fd = os.open(fpath, os.O_RDWR)
+                                try:
+                                    fcntl.flock(check_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                                    # We have exclusive lock on temp file, so no active writer is holding it
+                                    if max_age_seconds is not None:
+                                        st = os.stat(fpath)
+                                        if now - st.st_mtime < max_age_seconds:
+                                            continue
+                                    os.remove(fpath)
+                                except (BlockingIOError, OSError) as lock_err:
+                                    if getattr(lock_err, "errno", None) in (errno.EACCES, errno.EAGAIN, errno.EWOULDBLOCK):
+                                        # Active writer holds the lock: NEVER delete!
+                                        continue
+                                    raise
+                                finally:
+                                    os.close(check_fd)
+                            except OSError:
+                                pass
                     except OSError:
                         pass
         except OSError:
@@ -1343,6 +1409,9 @@ class DurableTrustStore:
                             if str_field in op_rec and not isinstance(op_rec[str_field], str):
                                 raise ValueError(f"used_operation_ids entry '{op_id}' has invalid non-string '{str_field}'")
 
+                if "identity_conflict_events" in data and isinstance(data["identity_conflict_events"], list):
+                    self.identity_conflict_events = list(data["identity_conflict_events"])
+
                 self.keys = {str(k): str(v) for k, v in data.get("keys", {}).items()}
                 self.active_key_id = str(data.get("active_key_id", "default"))
                 self.revoked_keys = dict(data.get("revoked_keys", {}))
@@ -1366,12 +1435,15 @@ class DurableTrustStore:
                             reconciled_count += 1
                     self._startup_reconciled = True
                     if reconciled_count > 0:
-                        try:
-                            self.save()
-                        except Exception:
-                            pass
+                        self.save()
             except Exception as e:
                 raise RuntimeError(f"Durable trust store at '{self.store_path}' is corrupted or unreadable: {e}") from e
+
+    def get_identity_conflict_events(self) -> List[Dict[str, Any]]:
+        """Retrieve persisted identity conflict events for security audit."""
+        with self._file_lock():
+            self.load()
+            return list(getattr(self, "identity_conflict_events", []))
 
     def reconcile_from_disk(self) -> None:
         """Reconcile in-memory state from disk under lock after indeterminate commit outcome."""
@@ -1393,6 +1465,7 @@ class DurableTrustStore:
                 "used_attestation_ids": sorted(list(self.used_attestation_ids)),
                 "used_attestations": getattr(self, "used_attestations", {}),
                 "used_operation_ids": self.used_operation_ids,
+                "identity_conflict_events": getattr(self, "identity_conflict_events", []),
             }
             dir_name = os.path.dirname(os.path.abspath(self.store_path))
             os.makedirs(dir_name, mode=0o700, exist_ok=True)
@@ -1404,6 +1477,10 @@ class DurableTrustStore:
                     flags |= os.O_NOFOLLOW
                 fd = os.open(tmp_path, flags, 0o600)
                 try:
+                    try:
+                        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    except OSError:
+                        pass
                     with os.fdopen(fd, "w", encoding="utf-8") as f:
                         json.dump(payload, f, indent=2)
                         f.flush()
@@ -1560,8 +1637,11 @@ class DurableTrustStore:
         key_store: Optional["CaptureKeyStore"] = None,
         current_time_ns: Optional[int] = None,
         operation_id: Optional[str] = None,
+        require_operation_id: bool = False,
     ) -> TrustConsumptionResult:
         """Atomic trust-consumption contract eliminating check-then-record race conditions."""
+        if require_operation_id and (operation_id is None or not str(operation_id).strip()):
+            raise MissingIdentityFieldError("operation_id is required for durable attestation consumption")
         if operation_id is not None:
             validate_operation_id(operation_id)
         with self._file_lock():
@@ -1729,6 +1809,18 @@ class DurableTrustStore:
             self.load()
             if oid in self.used_operation_ids:
                 prev = self.used_operation_ids[oid]
+                prev_st = prev.get("state")
+                if prev_st in (
+                    OperationLifecycleState.CREATED.value,
+                    OperationLifecycleState.VALIDATED.value,
+                    OperationLifecycleState.RESERVED.value,
+                    OperationLifecycleState.FAILED.value,
+                    OperationLifecycleState.CANCELLED.value,
+                    OperationLifecycleState.ABORTED_ON_RESTART.value,
+                ):
+                    raise InvalidStateTransitionError(
+                        f"Operation '{oid}' is currently in state {prev_st} and cannot be directly marked COMMITTED; must transition through EXECUTING"
+                    )
                 if prev.get("session_id") != str(session_id):
                     raise ValueError(f"Receipt replay across sessions rejected for operation '{oid}'")
                 if prev.get("pid") is not None and int(prev["pid"]) != int(pid):
@@ -1753,6 +1845,27 @@ class DurableTrustStore:
                     raise ValueError(f"Receipt replay across hosts rejected for operation '{oid}': host mismatch ({p_host} vs {m_host})")
 
                 if metadata:
+                    p_canon = prev.get("canonical_digest")
+                    m_canon = metadata.get("canonical_digest")
+                    if p_canon and m_canon and str(p_canon) != str(m_canon):
+                        conflict_event = {
+                            "operation_id": oid,
+                            "field_name": "canonical_digest",
+                            "existing_value": str(p_canon),
+                            "attempted_value": str(m_canon),
+                            "detected_at": datetime.now(timezone.utc).isoformat(),
+                        }
+                        if not hasattr(self, "identity_conflict_events"):
+                            self.identity_conflict_events = []
+                        self.identity_conflict_events.append(conflict_event)
+                        try:
+                            self.save()
+                        except Exception:
+                            pass
+                        raise IdentityConflictError(
+                            f"Conflicting canonical identity digest for operation '{oid}': {p_canon} vs {m_canon}"
+                        )
+
                     for id_field in (
                         "build_id",
                         "process_identity",
@@ -1776,6 +1889,10 @@ class DurableTrustStore:
                             if not hasattr(self, "identity_conflict_events"):
                                 self.identity_conflict_events = []
                             self.identity_conflict_events.append(conflict_event)
+                            try:
+                                self.save()
+                            except Exception:
+                                pass
                             raise IdentityConflictError(
                                 f"Conflicting target identity or metadata '{id_field}' for operation '{oid}': {p_val} vs {m_val}"
                             )
@@ -1869,9 +1986,9 @@ class DurableTrustStore:
 
     def get_operation_lifecycle_state(self, op_id: str) -> Optional[OperationLifecycleState]:
         """Get the current lifecycle state of an operation, if recorded."""
+        oid = validate_operation_id(op_id)
         with self._file_lock():
             self.load()
-            oid = str(op_id)
             rec = self.used_operation_ids.get(oid)
             if not rec:
                 return None
@@ -1920,6 +2037,46 @@ class DurableTrustStore:
                 return
 
             rec = self.used_operation_ids[oid]
+            # Bind lifecycle identity: reject cross-session or cross-PID transitions
+            prev_sess = rec.get("session_id")
+            prev_pid = rec.get("pid")
+            if prev_sess is not None and str(prev_sess) != str(session_id):
+                conflict_event = {
+                    "operation_id": oid,
+                    "field_name": "session_id",
+                    "existing_value": str(prev_sess),
+                    "attempted_value": str(session_id),
+                    "detected_at": datetime.now(timezone.utc).isoformat(),
+                }
+                if not hasattr(self, "identity_conflict_events"):
+                    self.identity_conflict_events = []
+                self.identity_conflict_events.append(conflict_event)
+                try:
+                    self.save()
+                except Exception:
+                    pass
+                raise IdentityConflictError(
+                    f"Cross-session lifecycle transition rejected for operation '{oid}': {prev_sess} vs {session_id}"
+                )
+            if prev_pid is not None and int(prev_pid) != int(pid):
+                conflict_event = {
+                    "operation_id": oid,
+                    "field_name": "pid",
+                    "existing_value": str(prev_pid),
+                    "attempted_value": str(pid),
+                    "detected_at": datetime.now(timezone.utc).isoformat(),
+                }
+                if not hasattr(self, "identity_conflict_events"):
+                    self.identity_conflict_events = []
+                self.identity_conflict_events.append(conflict_event)
+                try:
+                    self.save()
+                except Exception:
+                    pass
+                raise IdentityConflictError(
+                    f"Cross-PID lifecycle transition rejected for operation '{oid}': {prev_pid} vs {pid}"
+                )
+
             curr_state_val = rec.get("state", OperationLifecycleState.CREATED.value)
             try:
                 curr_state = OperationLifecycleState(curr_state_val)
@@ -1990,9 +2147,9 @@ class DurableTrustStore:
 
     def bind_operation_receipt(self, op_id: str, receipt_id: str) -> None:
         """Atomically bind an issued receipt ID to a committed operation in trust store."""
+        oid = validate_operation_id(op_id)
         with self._file_lock():
             self.load()
-            oid = str(op_id)
             rid = str(receipt_id)
             if oid not in self.used_operation_ids:
                 raise ValueError(f"Operation '{oid}' not recorded in trust store")
@@ -2029,9 +2186,9 @@ class DurableTrustStore:
         parent_evidence_digest: Optional[str] = None,
     ) -> None:
         """Atomically bind an evidence ID to a committed operation in trust store."""
+        oid = validate_operation_id(op_id)
         with self._file_lock():
             self.load()
-            oid = str(op_id)
             eid = str(evidence_id)
             if oid not in self.used_operation_ids:
                 raise ValueError(f"Operation '{oid}' not recorded in trust store")
@@ -2076,9 +2233,10 @@ class DurableTrustStore:
                         )
 
     def is_operation_used(self, op_id: str) -> bool:
+        oid = validate_operation_id(op_id)
         with self._file_lock():
             self.load()
-            return str(op_id) in self.used_operation_ids
+            return oid in self.used_operation_ids
 
     def resolve_key(self, key_id: str) -> str:
         with self._file_lock():

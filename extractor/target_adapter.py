@@ -675,6 +675,39 @@ class TargetExecutionAdapter(ABC):
         self._active_transactions[tx.transaction_id] = tx
         self._active_by_scope[(str(th), str(session_id), int(pid))] = tx
 
+        # P0-5: Advance lifecycle DAG CREATED -> VALIDATED -> RESERVED -> EXECUTING
+        from .capture_backend import get_default_trust_store, OperationLifecycleState
+        eff_ts = getattr(self, "trust_store", None) or get_default_trust_store()
+        if eff_ts and hasattr(eff_ts, "transition_operation_lifecycle"):
+            try:
+                eff_ts.transition_operation_lifecycle(
+                    op_id=tx.transaction_id,
+                    session_id=str(session_id),
+                    pid=int(pid),
+                    target_state=OperationLifecycleState.CREATED,
+                    metadata={"target_host": str(th), "operation_type": str(operation_type)},
+                )
+                eff_ts.transition_operation_lifecycle(
+                    op_id=tx.transaction_id,
+                    session_id=str(session_id),
+                    pid=int(pid),
+                    target_state=OperationLifecycleState.VALIDATED,
+                )
+                eff_ts.transition_operation_lifecycle(
+                    op_id=tx.transaction_id,
+                    session_id=str(session_id),
+                    pid=int(pid),
+                    target_state=OperationLifecycleState.RESERVED,
+                )
+                eff_ts.transition_operation_lifecycle(
+                    op_id=tx.transaction_id,
+                    session_id=str(session_id),
+                    pid=int(pid),
+                    target_state=OperationLifecycleState.EXECUTING,
+                )
+            except Exception:
+                pass
+
         cur_stack = _tx_stack.get(None) or []
         new_stack = list(cur_stack) + [tx]
         _tx_stack.set(new_stack)
@@ -818,6 +851,19 @@ class TargetExecutionAdapter(ABC):
         if target_tx:
             target_tx.aborted = True
             target_tx.abort_reason = reason or "Capture transaction rolled back"
+            from .capture_backend import get_default_trust_store, OperationLifecycleState
+            eff_ts = getattr(self, "trust_store", None) or get_default_trust_store()
+            if eff_ts and hasattr(eff_ts, "transition_operation_lifecycle"):
+                try:
+                    eff_ts.transition_operation_lifecycle(
+                        op_id=target_tx.transaction_id,
+                        session_id=str(target_tx.session_id),
+                        pid=int(target_tx.pid),
+                        target_state=OperationLifecycleState.FAILED,
+                        metadata={"abort_reason": str(target_tx.abort_reason)},
+                    )
+                except Exception:
+                    pass
             self._active_transactions.pop(target_tx.transaction_id, None)
             self._active_by_scope.pop((str(target_tx.target_host), str(target_tx.session_id), int(target_tx.pid)), None)
             cur_stack = _tx_stack.get(None) or []
