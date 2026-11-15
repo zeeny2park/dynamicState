@@ -137,7 +137,6 @@ class CausalDefectFixtures:
             source="investigation_observer",
             session_id=inv_id,
             observation="Deterministic transition reproduced 42 -> 100 on verified writer mutate_worker_state",
-            parent_evidence_ids=["ev_a_diff"],
             details={
                 "target_function": "mutate_worker_state",
                 "field_path": "WorkerState.counter",
@@ -376,7 +375,6 @@ class CausalDefectFixtures:
             source="investigation_observer",
             session_id=inv_id,
             observation="Verified deterministic write from update_flags into State.flags",
-            parent_evidence_ids=["ev_c_diff"],
             details={
                 "target_function": "update_flags",
                 "field_path": "State.flags",

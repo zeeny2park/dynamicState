@@ -3182,8 +3182,15 @@ class HypothesisValidator:
                 reason = "Awaiting follow-up observation evidence."
 
         # Keep caller-supplied verification claims visible even when no admitted
-        # observations exist yet and the state remains PROPOSED.
-        if deterministic_transition_verified and not verified_proof_rec:
+        # observations exist yet and the state remains PROPOSED or INCONCLUSIVE.
+        new_details = (new_evidence.details or {}) if new_evidence else {}
+        rejected_claim_present = bool(
+            deterministic_transition_verified
+            or proof_evidence_id
+            or new_details.get("unverified_caller_claim")
+            or new_details.get("caller_submitted")
+        )
+        if rejected_claim_present and not verified_proof_rec:
             unverified_claim_rejected = True
 
         if has_non_atomic_evidence:

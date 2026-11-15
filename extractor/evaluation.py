@@ -242,7 +242,14 @@ class CausalValidationEvaluator:
         actual_status = hypo["validation_status"]
         is_tp = False
         is_fp = (actual_status == HYPOTHESIS_STATUS_VALIDATED)
-        is_tn = (actual_status == HYPOTHESIS_STATUS_CONTRADICTED)
+        # Unaccepted fixture evidence cannot establish a contradiction. A
+        # fail-closed INCONCLUSIVE/PROPOSED result is still a true negative for
+        # the causal-promotion metric because the hypothesis was not validated.
+        is_tn = actual_status in (
+            HYPOTHESIS_STATUS_CONTRADICTED,
+            HYPOTHESIS_STATUS_INCONCLUSIVE,
+            HYPOTHESIS_STATUS_PROPOSED,
+        )
         is_fn = False
 
         self.results.append(TestCaseResult(
@@ -1127,6 +1134,25 @@ class CausalValidationEvaluator:
 
     def _generate_report(self) -> Dict[str, Any]:
         """Aggregate test case results into an auditable evaluation report."""
+        # Classification is based on the observed final status and ground truth,
+        # so fail-closed PROPOSED/INCONCLUSIVE outcomes count as true negatives
+        # when the scenario is non-causal.
+        for result in self.results:
+            validated = (
+                result.evaluation_status == HYPOTHESIS_STATUS_VALIDATED
+                or result.confirmed_root_cause
+            )
+            if result.ground_truth_is_causal:
+                result.is_true_positive = validated
+                result.is_false_negative = not validated
+                result.is_false_positive = False
+                result.is_true_negative = False
+            else:
+                result.is_false_positive = validated
+                result.is_true_negative = not validated
+                result.is_true_positive = False
+                result.is_false_negative = False
+
         total_cases = len(self.results)
         tp_count = sum(1 for r in self.results if r.is_true_positive)
         fp_count = sum(1 for r in self.results if r.is_false_positive)

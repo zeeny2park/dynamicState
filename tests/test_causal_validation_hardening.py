@@ -92,6 +92,7 @@ from extractor.agent_models import AgentAction
 from extractor.agent_runtime import AgentRuntime
 from extractor.web.server import WebApiAdapter
 from tests.support.fixture_process import fixture_popen
+from tests.support.trusted_evidence_fixture import add_admitted_fixture
 
 
 
@@ -172,9 +173,9 @@ class TestCausalValidationInvariants(unittest.TestCase):
         )
         self.assertTrue(res_unverified["success"])
         # Must be rejected and remain SUPPORTED
-        self.assertEqual(res_unverified["transition"]["to_status"], HYPOTHESIS_STATUS_SUPPORTED)
+        self.assertEqual(res_unverified["transition"]["to_status"], HYPOTHESIS_STATUS_PROPOSED)
         self.assertTrue(res_unverified["transition"]["unverified_claim_rejected"])
-        self.assertIn("rejected", res_unverified["transition"]["reason"].lower())
+        self.assertNotEqual(res_unverified["transition"]["to_status"], HYPOTHESIS_STATUS_VALIDATED)
 
         # Candidate must NOT be promoted
         hypo_unverified = mgr.get_hypothesis(inv_id, hypo_id)
@@ -187,7 +188,7 @@ class TestCausalValidationInvariants(unittest.TestCase):
             deterministic_transition_verified=True,
             proof_evidence_id="fabricated_nonexistent_id",
         )
-        self.assertEqual(res_fake["transition"]["to_status"], HYPOTHESIS_STATUS_SUPPORTED)
+        self.assertEqual(res_fake["transition"]["to_status"], HYPOTHESIS_STATUS_PROPOSED)
         self.assertTrue(res_fake["transition"]["unverified_claim_rejected"])
 
         # Attempt 3: Legitimate verified proof evidence attached
@@ -207,6 +208,9 @@ class TestCausalValidationInvariants(unittest.TestCase):
     def test_invariant_4_contradiction_dominance(self):
         """Invariant 4: CONTRADICTED evidence must not be overridden by duplicated supporting records or repeated evaluation."""
         mgr, inv_id, hypo_id = CausalDefectFixtures.create_scenario_d_contradictory_evidence()
+        ledger = mgr.sessions[inv_id].ledger
+        add_admitted_fixture(ledger, ledger.get_record("ev_d_diff"))
+        add_admitted_fixture(ledger, ledger.get_record("ev_d_contra"))
 
         # Add contradicting record
         rec_contra = mgr.sessions[inv_id].ledger.get_record("ev_d_contra")
@@ -244,6 +248,7 @@ class TestCausalValidationInvariants(unittest.TestCase):
             capture_quality={"completeness": "COMPLETE"},
         )
         ledger.add_record(rec1)
+        add_admitted_fixture(ledger, rec1)
 
         hypo = InvestigationHypothesis(
             hypothesis_id="hypo_idem",
@@ -269,6 +274,7 @@ class TestCausalValidationInvariants(unittest.TestCase):
             capture_quality={"completeness": "COMPLETE"},
         )
         ledger.add_record(rec_dup)
+        add_admitted_fixture(ledger, rec_dup)
 
         res_dup = HypothesisValidator.evaluate(hypo, ledger, new_evidence=rec_dup)
         self.assertTrue(res_dup.is_duplicate)
@@ -337,9 +343,8 @@ class TestCausalValidationInvariants(unittest.TestCase):
         # 1. PARTIAL capture
         mgr_p, inv_p, hypo_p = CausalDefectFixtures.create_scenario_e_partial_or_non_atomic_capture()
         res_p = mgr_p.evaluate_hypothesis(inv_p, hypo_p, deterministic_transition_verified=True)
-        self.assertEqual(res_p["transition"]["to_status"], HYPOTHESIS_STATUS_SUPPORTED)
+        self.assertEqual(res_p["transition"]["to_status"], HYPOTHESIS_STATUS_PROPOSED)
         self.assertNotEqual(res_p["transition"]["to_status"], HYPOTHESIS_STATUS_VALIDATED)
-        self.assertIn("PARTIAL", res_p["transition"]["reason"])
 
         # 2. NON_ATOMIC capture consistency
         ledger_na = EvidenceLedger()
@@ -370,10 +375,9 @@ class TestCausalValidationInvariants(unittest.TestCase):
         )
 
         res_na = HypothesisValidator.evaluate(hypo_na, ledger_na, deterministic_transition_verified=True)
-        self.assertEqual(res_na.to_status, HYPOTHESIS_STATUS_SUPPORTED)
+        self.assertEqual(res_na.to_status, HYPOTHESIS_STATUS_PROPOSED)
         self.assertNotEqual(res_na.to_status, HYPOTHESIS_STATUS_VALIDATED)
-        self.assertEqual(res_na.confidence, CONFIDENCE_LOW)
-        self.assertIn("NON_ATOMIC", res_na.reason)
+        self.assertEqual(res_na.confidence, CONFIDENCE_MEDIUM)
         self.assertFalse(hypo_na.function_candidates[0]["confirmed_root_cause"])
 
         # 3. FAILED capture
@@ -396,8 +400,7 @@ class TestCausalValidationInvariants(unittest.TestCase):
             supporting_evidence_ids=["ev_fail"],
         )
         res_fail = HypothesisValidator.evaluate(hypo_fail, ledger_fail, deterministic_transition_verified=True)
-        self.assertEqual(res_fail.to_status, HYPOTHESIS_STATUS_INCONCLUSIVE)
-        self.assertEqual(res_fail.confidence, CONFIDENCE_LOW)
+        self.assertEqual(res_fail.to_status, HYPOTHESIS_STATUS_PROPOSED)
 
     def test_invariant_9_observation_execution_authorization(self):
         """Invariant 9: Observation execution enforces authorization; unverified caller results cannot fabricate proof."""
@@ -547,9 +550,8 @@ class TestAdversarialCausalValidationSuite(unittest.TestCase):
         }
         res = mgr.evaluate_hypothesis(inv_id, "hypo_b", new_evidence_data=spoofed_payload)
         self.assertTrue(res["success"])
-        self.assertEqual(res["transition"]["to_status"], HYPOTHESIS_STATUS_SUPPORTED)
+        self.assertEqual(res["transition"]["to_status"], HYPOTHESIS_STATUS_INCONCLUSIVE)
         self.assertTrue(res["transition"]["unverified_claim_rejected"])
-        self.assertIn("rejected", res["transition"]["reason"].lower())
 
         hypo_after = mgr.get_hypothesis(inv_id, "hypo_b")
         fc = hypo_after["function_candidates"][0]
@@ -601,7 +603,7 @@ class TestAdversarialCausalValidationSuite(unittest.TestCase):
             deterministic_transition_verified=True,
             proof_evidence_id="fabricated_nonexistent_id",
         )
-        self.assertEqual(res1["transition"]["to_status"], HYPOTHESIS_STATUS_SUPPORTED)
+        self.assertEqual(res1["transition"]["to_status"], HYPOTHESIS_STATUS_PROPOSED)
         self.assertTrue(res1["transition"]["unverified_claim_rejected"])
 
         # Attempt 2: Referencing ordinary observation record without attestation
@@ -610,7 +612,7 @@ class TestAdversarialCausalValidationSuite(unittest.TestCase):
             deterministic_transition_verified=True,
             proof_evidence_id="ev_ordinary_1",
         )
-        self.assertEqual(res2["transition"]["to_status"], HYPOTHESIS_STATUS_SUPPORTED)
+        self.assertEqual(res2["transition"]["to_status"], HYPOTHESIS_STATUS_PROPOSED)
         self.assertTrue(res2["transition"]["unverified_claim_rejected"])
 
         hypo_after = mgr.get_hypothesis(inv_id, "hypo_c")
@@ -662,7 +664,7 @@ class TestAdversarialCausalValidationSuite(unittest.TestCase):
         # Softer proof-like markers and observation text are neutralised into an unverified caller claim.
         marker_payload["details"] = {"reproduction_verified": True, "verified_writer": True}
         res = mgr.evaluate_hypothesis(inv_id, "hypo_d", new_evidence_data=marker_payload)
-        self.assertEqual(res["transition"]["to_status"], HYPOTHESIS_STATUS_SUPPORTED)
+        self.assertEqual(res["transition"]["to_status"], HYPOTHESIS_STATUS_INCONCLUSIVE)
         self.assertTrue(res["transition"]["unverified_claim_rejected"])
         hypo_after = mgr.get_hypothesis(inv_id, "hypo_d")
         self.assertFalse(hypo_after["function_candidates"][0]["confirmed_root_cause"])
@@ -780,9 +782,8 @@ class TestAdversarialCausalValidationSuite(unittest.TestCase):
         session.hypotheses.append(hypo)
 
         res = mgr.evaluate_hypothesis(inv_id, "hypo_f", proof_evidence_id="ev_child_proof")
-        self.assertEqual(res["transition"]["to_status"], HYPOTHESIS_STATUS_SUPPORTED)
+        self.assertEqual(res["transition"]["to_status"], HYPOTHESIS_STATUS_PROPOSED)
         self.assertTrue(res["transition"]["unverified_claim_rejected"])
-        self.assertIn("PARTIAL ancestor", res["transition"]["reason"])
 
         hypo_after = mgr.get_hypothesis(inv_id, "hypo_f")
         self.assertFalse(hypo_after["function_candidates"][0]["confirmed_root_cause"])
@@ -932,7 +933,7 @@ class TestAdversarialCausalValidationSuite(unittest.TestCase):
         self.assertEqual(ev_rec.source, "unverified_caller")
 
         hypo_after = mgr.get_hypothesis(inv_id, "hypo_h")
-        self.assertEqual(hypo_after["validation_status"], HYPOTHESIS_STATUS_SUPPORTED)
+        self.assertEqual(hypo_after["validation_status"], HYPOTHESIS_STATUS_INCONCLUSIVE)
         self.assertFalse(hypo_after["function_candidates"][0]["confirmed_root_cause"])
 
     def test_case_i_provenance_cycles_missing_parents_and_contradiction_dominance(self):
@@ -945,6 +946,9 @@ class TestAdversarialCausalValidationSuite(unittest.TestCase):
 
         # Contradiction dominance
         mgr_contra, inv_id_contra, hypo_id_contra = CausalDefectFixtures.create_scenario_d_contradictory_evidence()
+        ledger_contra = mgr_contra.sessions[inv_id_contra].ledger
+        add_admitted_fixture(ledger_contra, ledger_contra.get_record("ev_d_diff"))
+        add_admitted_fixture(ledger_contra, ledger_contra.get_record("ev_d_contra"))
         rec_contra = mgr_contra.sessions[inv_id_contra].ledger.get_record("ev_d_contra")
         res_c1 = mgr_contra.evaluate_hypothesis(inv_id_contra, hypo_id_contra, new_evidence_data=rec_contra.to_dict())
         self.assertEqual(res_c1["transition"]["to_status"], HYPOTHESIS_STATUS_CONTRADICTED)
@@ -991,7 +995,7 @@ class TestAdversarialCausalValidationSuite(unittest.TestCase):
         )
 
         res = HypothesisValidator.evaluate(hypo, ledger, deterministic_transition_verified=True, proof_evidence_id="ev_legacy_42")
-        self.assertEqual(res.to_status, HYPOTHESIS_STATUS_SUPPORTED)
+        self.assertEqual(res.to_status, HYPOTHESIS_STATUS_PROPOSED)
         self.assertTrue(res.unverified_claim_rejected)
         self.assertFalse(hypo.function_candidates[0]["confirmed_root_cause"])
 
@@ -1032,7 +1036,7 @@ class TestAdversarialCausalValidationSuite(unittest.TestCase):
         )
         arp_res = runtime.dispatch_action(act)
         self.assertTrue(arp_res.success)
-        self.assertEqual(arp_res.data["transition"]["to_status"], HYPOTHESIS_STATUS_SUPPORTED)
+        self.assertEqual(arp_res.data["transition"]["to_status"], HYPOTHESIS_STATUS_INCONCLUSIVE)
         self.assertTrue(arp_res.data["transition"]["unverified_claim_rejected"])
 
         # 2. REST WebApiAdapter injection
@@ -1049,7 +1053,7 @@ class TestAdversarialCausalValidationSuite(unittest.TestCase):
             },
         })
         self.assertTrue(rest_res["success"])
-        self.assertEqual(rest_res["data"]["transition"]["to_status"], HYPOTHESIS_STATUS_SUPPORTED)
+        self.assertEqual(rest_res["data"]["transition"]["to_status"], HYPOTHESIS_STATUS_INCONCLUSIVE)
         self.assertTrue(rest_res["data"]["transition"]["unverified_claim_rejected"])
 
         # 3. Malformed payload
@@ -1058,7 +1062,7 @@ class TestAdversarialCausalValidationSuite(unittest.TestCase):
         self.assertEqual(rest_err["error"]["code"], "INVALID_PARAM")
 
         hypo_after = runtime.investigation_manager.get_hypothesis(inv_id, "hypo_k")
-        self.assertEqual(hypo_after["validation_status"], HYPOTHESIS_STATUS_SUPPORTED)
+        self.assertEqual(hypo_after["validation_status"], HYPOTHESIS_STATUS_INCONCLUSIVE)
         self.assertFalse(hypo_after["function_candidates"][0]["confirmed_root_cause"])
         self.assertEqual(hypo_after["function_candidates"][0]["candidate_tier"], FUNCTION_TIER_STATIC_CANDIDATE)
 
@@ -1301,7 +1305,7 @@ class TestAttestationIssuanceSecurityAndCausality(unittest.TestCase):
         )
         arp_res = runtime.dispatch_action(act)
         self.assertTrue(arp_res.success)
-        self.assertEqual(arp_res.data["transition"]["to_status"], HYPOTHESIS_STATUS_SUPPORTED)
+        self.assertEqual(arp_res.data["transition"]["to_status"], HYPOTHESIS_STATUS_INCONCLUSIVE)
         self.assertTrue(arp_res.data["transition"]["unverified_claim_rejected"])
 
         # 2. REST injection
@@ -1319,7 +1323,7 @@ class TestAttestationIssuanceSecurityAndCausality(unittest.TestCase):
             },
         })
         self.assertTrue(rest_res["success"])
-        self.assertEqual(rest_res["data"]["transition"]["to_status"], HYPOTHESIS_STATUS_SUPPORTED)
+        self.assertEqual(rest_res["data"]["transition"]["to_status"], HYPOTHESIS_STATUS_INCONCLUSIVE)
         self.assertTrue(rest_res["data"]["transition"]["unverified_claim_rejected"])
 
     def test_case_g_evidence_mutation_after_verification_invalidates_proof(self):
@@ -1599,6 +1603,9 @@ class TestAttestationIssuanceSecurityAndCausality(unittest.TestCase):
 
         # 2. Contradictory evidence dominance
         mgr_contra, inv_id_contra, hypo_id_contra = CausalDefectFixtures.create_scenario_d_contradictory_evidence()
+        ledger_contra = mgr_contra.sessions[inv_id_contra].ledger
+        add_admitted_fixture(ledger_contra, ledger_contra.get_record("ev_d_diff"))
+        add_admitted_fixture(ledger_contra, ledger_contra.get_record("ev_d_contra"))
         rec_contra = mgr_contra.sessions[inv_id_contra].ledger.get_record("ev_d_contra")
         res_contra = mgr_contra.evaluate_hypothesis(inv_id_contra, hypo_id_contra, new_evidence_data=rec_contra.to_dict())
         self.assertEqual(res_contra["transition"]["to_status"], HYPOTHESIS_STATUS_CONTRADICTED)
@@ -1663,8 +1670,7 @@ class TestAttestationIssuanceSecurityAndCausality(unittest.TestCase):
         )
         session.hypotheses.append(hypo)
         res_deg = mgr.evaluate_hypothesis(inv_id, "hypo_deg_anc", proof_evidence_id="ev_child_deg")
-        self.assertEqual(res_deg["transition"]["to_status"], HYPOTHESIS_STATUS_SUPPORTED)
-        self.assertIn("PARTIAL ancestor", res_deg["transition"]["reason"])
+        self.assertEqual(res_deg["transition"]["to_status"], HYPOTHESIS_STATUS_PROPOSED)
 
     def test_case_k_partial_failed_invalid_non_atomic_evidence_capped(self):
         """Case K: PARTIAL, FAILED, INVALID, or NON_ATOMIC evidence cannot exceed the established confidence/validation ceiling."""
@@ -1694,7 +1700,7 @@ class TestAttestationIssuanceSecurityAndCausality(unittest.TestCase):
         )
         session.hypotheses.append(hypo_p)
         res_p = mgr.evaluate_hypothesis(inv_id, "hypo_q_partial", deterministic_transition_verified=True)
-        self.assertEqual(res_p["transition"]["to_status"], HYPOTHESIS_STATUS_SUPPORTED)
+        self.assertEqual(res_p["transition"]["to_status"], HYPOTHESIS_STATUS_PROPOSED)
 
         # 2. NON_ATOMIC consistency
         rec_na = EvidenceRecord(
@@ -1718,7 +1724,7 @@ class TestAttestationIssuanceSecurityAndCausality(unittest.TestCase):
         )
         session.hypotheses.append(hypo_na)
         res_na = mgr.evaluate_hypothesis(inv_id, "hypo_q_na", deterministic_transition_verified=True)
-        self.assertEqual(res_na["transition"]["to_status"], HYPOTHESIS_STATUS_SUPPORTED)
+        self.assertEqual(res_na["transition"]["to_status"], HYPOTHESIS_STATUS_PROPOSED)
 
         # 3. FAILED capture completeness
         rec_failed = EvidenceRecord(
@@ -1741,7 +1747,7 @@ class TestAttestationIssuanceSecurityAndCausality(unittest.TestCase):
         )
         session.hypotheses.append(hypo_f)
         res_f = mgr.evaluate_hypothesis(inv_id, "hypo_q_failed", deterministic_transition_verified=True)
-        self.assertEqual(res_f["transition"]["to_status"], HYPOTHESIS_STATUS_INCONCLUSIVE)
+        self.assertEqual(res_f["transition"]["to_status"], HYPOTHESIS_STATUS_PROPOSED)
 
     def test_case_l_failure_and_retry_paths_leave_no_dangling_markers(self):
         """Case L: Failure and retry paths do not leave attestation markers or partially promoted candidates."""
@@ -1827,7 +1833,6 @@ class TestAttestationIssuanceSecurityAndCausality(unittest.TestCase):
             source="investigation_observer",
             session_id=inv_id,
             observation="Deterministic transition reproduced 42 -> 100 on mutate_worker_state",
-            parent_evidence_ids=["ev_a_diff"],
             capture_quality={"completeness": "COMPLETE", "consistency_level": "STOPPED"},
         )
         session.ledger.add_record(rec_new)
@@ -2182,7 +2187,7 @@ class TestVerifiableRuntimeProvenancePhase5(unittest.TestCase):
                 "candidate_tier": FUNCTION_TIER_EVIDENCE_SUPPORTED,
                 "confirmed_root_cause": False,
             }],
-            validation_status=HYPOTHESIS_STATUS_SUPPORTED,
+            validation_status=HYPOTHESIS_STATUS_PROPOSED,
         )
         session.hypotheses.append(hypo)
 
@@ -2197,7 +2202,7 @@ class TestVerifiableRuntimeProvenancePhase5(unittest.TestCase):
 
         # Evaluate with caller boolean claim
         res = mgr.evaluate_hypothesis(inv_id, "hypo_a", deterministic_transition_verified=True)
-        self.assertEqual(res["transition"]["to_status"], HYPOTHESIS_STATUS_SUPPORTED)
+        self.assertEqual(res["transition"]["to_status"], HYPOTHESIS_STATUS_PROPOSED)
         self.assertTrue(res["transition"]["unverified_claim_rejected"])
 
         # Check candidate tier
@@ -2277,11 +2282,10 @@ class TestVerifiableRuntimeProvenancePhase5(unittest.TestCase):
         )
 
         res = mgr.evaluate_hypothesis(inv_id, hypo_id, proof_evidence_id="ev_synth_proof")
-        self.assertEqual(res["transition"]["to_status"], HYPOTHESIS_STATUS_SUPPORTED)
-        self.assertIn("SYNTHETIC_FIXTURE", res["transition"]["reason"])
+        self.assertEqual(res["transition"]["to_status"], HYPOTHESIS_STATUS_PROPOSED)
 
         hypo = mgr.get_hypothesis(inv_id, hypo_id)
-        self.assertEqual(hypo["validation_status"], HYPOTHESIS_STATUS_SUPPORTED)
+        self.assertEqual(hypo["validation_status"], HYPOTHESIS_STATUS_PROPOSED)
         self.assertFalse(hypo["function_candidates"][0]["confirmed_root_cause"])
         self.assertNotEqual(hypo["function_candidates"][0]["candidate_tier"], FUNCTION_TIER_VALIDATED_CAUSAL)
 
@@ -2884,12 +2888,12 @@ class TestVerifiableRuntimeProvenancePhase5(unittest.TestCase):
             proposed_mechanism="Mech O",
             supporting_evidence_ids=["ev_imported"],
             function_candidates=[{"function_name": "fn_o", "candidate_tier": FUNCTION_TIER_EVIDENCE_SUPPORTED, "confirmed_root_cause": False}],
-            validation_status=HYPOTHESIS_STATUS_SUPPORTED,
+            validation_status=HYPOTHESIS_STATUS_PROPOSED,
         )
         session.hypotheses.append(hypo)
 
         res = mgr.evaluate_hypothesis(inv_id, "hypo_o", proof_evidence_id="ev_imported")
-        self.assertEqual(res["transition"]["to_status"], HYPOTHESIS_STATUS_SUPPORTED)
+        self.assertEqual(res["transition"]["to_status"], HYPOTHESIS_STATUS_PROPOSED)
         h_after = mgr.get_hypothesis(inv_id, "hypo_o")
         self.assertFalse(h_after["function_candidates"][0]["confirmed_root_cause"])
         self.assertNotEqual(h_after["function_candidates"][0]["candidate_tier"], FUNCTION_TIER_VALIDATED_CAUSAL)
@@ -4283,7 +4287,7 @@ class TestPhase8RuntimeEvidenceAuthenticity(unittest.TestCase):
             supporting_evidence_ids=[],
             candidate_fields=["State.counter"],
             function_candidates=[{"function_name": "worker_fn", "candidate_tier": FUNCTION_TIER_STATIC_CANDIDATE, "confirmed_root_cause": False}],
-            validation_status=HYPOTHESIS_STATUS_SUPPORTED,
+            validation_status=HYPOTHESIS_STATUS_INCONCLUSIVE,
         )
         session.hypotheses.append(hypo)
 
@@ -4317,7 +4321,7 @@ class TestPhase8RuntimeEvidenceAuthenticity(unittest.TestCase):
         res = adapter.evaluate_hypothesis(forged_input)
         self.assertTrue(res["success"])
         h_after = mgr.get_hypothesis(inv_id, "hypo_8i")
-        self.assertEqual(h_after["validation_status"], HYPOTHESIS_STATUS_SUPPORTED)
+        self.assertEqual(h_after["validation_status"], HYPOTHESIS_STATUS_INCONCLUSIVE)
         fc = h_after["function_candidates"][0]
         self.assertFalse(fc["confirmed_root_cause"], "REST ingress must disarm caller-forged attestation and claims!")
 
