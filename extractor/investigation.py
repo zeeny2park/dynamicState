@@ -3356,6 +3356,16 @@ class InvestigationManager:
             new_evidence=ev_record,
         )
 
+        # Fail-closed trust boundary (Phase 2.0-A.3.6): Observation results without authoritative
+        # admission in session ledger cannot promote hypothesis to SUPPORTED or VALIDATED.
+        has_auth_support = any(
+            session.ledger.get_authoritative_record(eid) is not None
+            for eid in target_hypo.supporting_evidence_ids
+        )
+        if not has_auth_support and target_hypo.validation_status in (HYPOTHESIS_STATUS_SUPPORTED, HYPOTHESIS_STATUS_VALIDATED):
+            target_hypo.validation_status = HYPOTHESIS_STATUS_INCONCLUSIVE
+            target_hypo.confidence = CONFIDENCE_LOW
+
         # Sync finding
         for f in session.findings:
             if f.finding_id == f"fnd_{target_hypo.hypothesis_id}":
