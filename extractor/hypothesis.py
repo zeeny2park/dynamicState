@@ -3213,10 +3213,14 @@ class HypothesisValidator:
                     new_status = HYPOTHESIS_STATUS_INCONCLUSIVE
                     new_conf = CONFIDENCE_LOW
                 elif not has_auth_support:
-                    if new_evidence is None and deterministic_transition_verified:
+                    if new_evidence and (new_evidence.details or {}).get("unverified_caller_claim"):
+                        new_status = HYPOTHESIS_STATUS_INCONCLUSIVE
+                        new_conf = CONFIDENCE_LOW
+                        reason = "Caller-supplied evidence claim lacks authoritative verifier attestation; transitioned to INCONCLUSIVE."
+                    elif deterministic_transition_verified or proof_evidence_id:
                         new_status = old_status if old_status in (HYPOTHESIS_STATUS_PROPOSED, "CREATED") else HYPOTHESIS_STATUS_PROPOSED
                         new_conf = old_conf
-                        reason = "Caller-supplied verification rejected without authoritative causal attestation; remains PROPOSED."
+                        reason = "Causal proof / verification rejected; remains PROPOSED."
                     else:
                         new_status = HYPOTHESIS_STATUS_INCONCLUSIVE
                         new_conf = CONFIDENCE_LOW
