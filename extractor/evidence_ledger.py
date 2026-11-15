@@ -1428,12 +1428,31 @@ class EvidenceLedger:
                         if (record.details or {}).get("parent_evidence_digest"):
                             op_meta["parent_evidence_digest"] = str(record.details["parent_evidence_digest"])
 
+                        # The receipt operation must already have passed the production capture
+                        # transaction. Reuse that durable JCS identity for idempotent evidence binding;
+                        # never create a committed operation from a receipt-side caller.
+                        op_record_getter = getattr(self.trust_store, "get_operation_record", None)
+                        op_record = op_record_getter(str(op_id)) if callable(op_record_getter) else None
+                        if (not isinstance(op_record, dict)
+                                or op_record.get("state") != "COMMITTED"
+                                or not op_record.get("canonical_identity")
+                                or not op_record.get("canonical_digest")):
+                            raise ValueError(
+                                f"Receipt operation '{op_id}' is missing a committed canonical replay identity"
+                            )
+                        op_meta.update({
+                            "canonical_identity": op_record["canonical_identity"],
+                            "canonical_digest": op_record["canonical_digest"],
+                            "operation_type": op_record.get("operation_type"),
+                        })
+
                         self.trust_store.record_used_operation(
                             op_id=str(op_id),
                             session_id=record.session_id or self.session_id,
                             pid=eff_pid,
                             metadata=op_meta,
                             allow_idempotent=True,
+                            require_canonical_replay_identity=True,
                         )
                         if hasattr(self.trust_store, "bind_operation_evidence"):
                             self.trust_store.bind_operation_evidence(

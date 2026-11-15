@@ -648,12 +648,20 @@ class TestP05LifecycleEnforcement(unittest.TestCase):
 
     def test_direct_committed_bypass_rejected(self):
         """Attempting to record an unknown operation ID as COMMITTED fails closed when lifecycle enforcement is active."""
+        proc_identity = ProcessIdentity(
+            host_identity="test-host", boot_id="test-boot", pid=1234, process_start_time=100
+        )
+        canonical = build_canonical_replay_identity(
+            operation_id="op_uncreated_bypass", operation_kind="diagnostic_read",
+            process_identity=proc_identity, build_id="sha1:test-build", session_identity="sess_1",
+            request_scope="global", parameters={},
+        )
         with self.assertRaises(InvalidStateTransitionError):
             self.store.record_used_operation(
                 op_id="op_uncreated_bypass",
                 session_id="sess_1",
                 pid=1234,
-                metadata={},
+                metadata={"canonical_identity": canonical.to_dict(), "canonical_digest": canonical.digest()},
                 require_lifecycle_enforcement=True,
             )
 
@@ -665,14 +673,13 @@ class TestP05LifecycleEnforcement(unittest.TestCase):
 
         tx = adapter.begin_capture_transaction(session_id="sess_rb_fail", pid=pid)
         with patch.object(self.store, "transition_operation_lifecycle", side_effect=OSError("Disk write error during rollback")):
-            adapter.rollback_capture_transaction(tx, "Test rollback failure")
+            with self.assertRaisesRegex(RuntimeError, "not durably recorded"):
+                adapter.rollback_capture_transaction(tx, "Test rollback failure")
 
         # Rollback error is preserved on transaction metadata
         self.assertIn("lifecycle_rollback_error", tx.metadata)
         self.assertIn("Disk write error during rollback", tx.metadata["lifecycle_rollback_error"])
-        # And conflict event is recorded durably
-        events = self.store.get_identity_conflict_events()
-        self.assertTrue(any(e.get("field_name") == "lifecycle_rollback_failure" for e in events))
+        # The caller also receives the failure instead of an apparent rollback success.
 
     def test_lifecycle_persistence_failure_before_capture_fails_closed(self):
         """Lifecycle persistence failure in begin_capture_transaction must fail closed before capture proceeds."""

@@ -615,10 +615,11 @@ class CompetingHypothesis:
     def is_viable(self) -> bool:
         return self.status in (VERDICT_CONFIRMED, VERDICT_LIKELY, VERDICT_SUPPORTED, VERDICT_INCONCLUSIVE)
 
-    @staticmethod
-    def _lookup_record_in_ledger(ledger: Any, evidence_id: Optional[str]) -> Optional[Any]:
+    def _lookup_record_in_ledger(self, ledger: Any, evidence_id: Optional[str]) -> Optional[Any]:
         if ledger is None or not evidence_id or not isinstance(evidence_id, str):
             return None
+        # This is a forensic lookup only: _validate_evidence_record_authority immediately
+        # checks admission, provenance, identity, and parent lineage before any scoring.
         if hasattr(ledger, "get_record"):
             return ledger.get_record(evidence_id)
         if hasattr(ledger, "records"):

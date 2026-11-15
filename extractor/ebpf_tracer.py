@@ -17,6 +17,7 @@ from abc import ABC, abstractmethod
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 import json
+import math
 import logging
 import os
 import platform
@@ -36,6 +37,8 @@ from .debug_image import BinaryIdentity, inspect_elf
 from .dwarf_indexer import DwarfIndex, DwarfIndexer, DwarfSubprogram
 
 logger = logging.getLogger("dynamicstate.ebpf_tracer")
+MAX_TRACE_EVENTS = 500
+MAX_TRACE_DURATION_S = 10.0
 
 
 def _safe_repr(obj: Any, max_len: int = 100) -> str:
@@ -55,6 +58,81 @@ def _safe_repr(obj: Any, max_len: int = 100) -> str:
 def _is_strict_int(val: Any) -> bool:
     """Return True if and only if val is a genuine int (not bool, float, str, or custom __int__)."""
     return isinstance(val, int) and not isinstance(val, bool)
+
+
+def capture_target_identity(pid: int) -> Dict[str, Any]:
+    """Capture stable host/process/executable identity for pre-attach and post-detach checks."""
+    if not _is_strict_int(pid) or pid <= 1:
+        raise ValueError("target PID must be an integer greater than 1")
+    with open("/proc/sys/kernel/random/boot_id", "r", encoding="ascii") as fh:
+        boot_id = fh.read().strip()
+    with open(f"/proc/{pid}/stat", "r", encoding="utf-8", errors="replace") as fh:
+        stat_line = fh.read().strip()
+    close = stat_line.rfind(")")
+    if close < 0:
+        raise ValueError("malformed /proc/<pid>/stat")
+    fields = stat_line[close + 1:].strip().split()
+    if len(fields) <= 19 or not fields[19].isdigit():
+        raise ValueError("process start time is unavailable")
+    exe_path = os.path.realpath(f"/proc/{pid}/exe")
+    exe_stat = os.stat(f"/proc/{pid}/exe")
+    exe_info = inspect_elf(f"/proc/{pid}/exe")
+    return {
+        "host_identity": platform.node(),
+        "boot_id": boot_id,
+        "pid": pid,
+        "process_start_time": int(fields[19]),
+        "executable_path": exe_path,
+        "executable_device": int(exe_stat.st_dev),
+        "executable_inode": int(exe_stat.st_ino),
+        "build_id": exe_info.build_id,
+    }
+
+
+def target_identity_matches(before: Dict[str, Any], after: Dict[str, Any]) -> bool:
+    required = ("host_identity", "boot_id", "pid", "process_start_time", "executable_device",
+                "executable_inode", "build_id")
+    return bool(all(before.get(k) not in (None, "") and after.get(k) not in (None, "")
+                    and str(before.get(k)) == str(after.get(k)) for k in required)
+                and os.path.realpath(str(before.get("executable_path") or "")) ==
+                os.path.realpath(str(after.get("executable_path") or "")))
+
+
+def runtime_to_elf_address(addr: int, binary_path: str, elf_info: BinaryIdentity,
+                           maps_text: str) -> Optional[int]:
+    """Translate a mapped runtime PC into its ELF virtual address, including PIE load bias."""
+    matched = []
+    for line in maps_text.splitlines():
+        parts = line.split(None, 5)
+        if len(parts) < 6:
+            continue
+        map_path = parts[5].removesuffix(" (deleted)")
+        if os.path.realpath(map_path) != os.path.realpath(binary_path):
+            continue
+        try:
+            lo_s, hi_s = parts[0].split("-", 1)
+            lo, hi = int(lo_s, 16), int(hi_s, 16)
+            map_offset = int(parts[2], 16)
+        except (ValueError, IndexError):
+            continue
+        if lo <= addr < hi:
+            matched.append((lo, map_offset, parts[1]))
+    if not matched:
+        return None
+    if elf_info.elf_type != "ET_DYN":
+        return addr
+    page = os.sysconf("SC_PAGE_SIZE")
+    for map_start, map_offset, perms in matched:
+        if "x" not in perms:
+            continue
+        for seg in elf_info.pt_loads:
+            seg_offset = int(seg.get("p_offset", -1)) & ~(page - 1)
+            seg_vaddr = int(seg.get("p_vaddr", -1)) & ~(page - 1)
+            if map_offset == seg_offset:
+                elf_addr = addr - (map_start - seg_vaddr)
+                if elf_addr >= 0:
+                    return elf_addr
+    return None
 
 
 # -----------------------------------------------------------------------------
@@ -169,6 +247,12 @@ class TraceObservationSession:
     total_events: int = 0
     lost_events: int = 0
     malformed_records: int = 0
+    reported_events: int = 0
+    collected_events: int = 0
+    truncated_events: int = 0
+    event_cap_reached: bool = False
+    target_identity: Dict[str, Any] = field(default_factory=dict)
+    identity_status: str = "VERIFIED"
     overhead_stats: Dict[str, Any] = field(default_factory=dict)
     consistency_level: str = "PROBE_POINT_EVENT"   # Strictly distinguished from CONSISTENT or LOW_IMPACT snapshots!
     status: str = "SUCCESS"                        # SUCCESS, PARTIAL, UNSUPPORTED_ENVIRONMENT, PERMISSION_DENIED, FAILED
@@ -193,6 +277,12 @@ class TraceObservationSession:
             "total_events": self.total_events,
             "lost_events": self.lost_events,
             "malformed_records": self.malformed_records,
+            "reported_events": self.reported_events,
+            "collected_events": self.collected_events,
+            "truncated_events": self.truncated_events,
+            "event_cap_reached": self.event_cap_reached,
+            "target_identity": dict(self.target_identity),
+            "identity_status": self.identity_status,
             "overhead_stats": self.overhead_stats,
             "events": [e.to_dict() for e in self.events],
         }
@@ -1744,10 +1834,23 @@ class EbpfTracer:
         duration_s: float = 3.0,
         entry_only: bool = False,
         verify_build_id: bool = True,
+        max_events: int = MAX_TRACE_EVENTS,
+        deadline: Optional[float] = None,
     ) -> TraceObservationSession:
         """Trace function execution using eBPF uprobe/uretprobe."""
         t_start_iso = datetime.now(timezone.utc).isoformat()
         t0 = time.monotonic()
+        if (isinstance(duration_s, bool) or not isinstance(duration_s, (int, float)) or
+                not math.isfinite(float(duration_s)) or duration_s <= 0 or duration_s > MAX_TRACE_DURATION_S):
+            raise ValueError(f"duration_s must be finite and between 0 and {MAX_TRACE_DURATION_S}")
+        if not _is_strict_int(max_events) or not 1 <= max_events <= MAX_TRACE_EVENTS:
+            raise ValueError(f"max_events must be an integer between 1 and {MAX_TRACE_EVENTS}")
+        if not verify_build_id:
+            raise ValueError("Build ID verification cannot be disabled for production tracing")
+        if not isinstance(function_name, str) or not function_name or len(function_name) > 512 or any(
+                ord(ch) < 32 or ord(ch) == 127 for ch in function_name):
+            raise ValueError("function_name must be a non-empty printable symbol or offset")
+        session_deadline = min(deadline, t0 + float(duration_s)) if deadline is not None else t0 + float(duration_s)
         session_id = f"trace_ebpf_{uuid.uuid4().hex[:12]}"
 
         # 1. Validate target process PID and accessibility
@@ -1790,6 +1893,18 @@ class EbpfTracer:
             # PID exists, but cannot signal without root/sudo
             pass
 
+        try:
+            initial_identity = capture_target_identity(pid)
+        except Exception as exc:
+            return TraceObservationSession(
+                session_id=session_id, target_pid=pid, target_binary=os.path.abspath(binary_path or ""),
+                target_build_id=None, build_id_status="UNAVAILABLE", function_name=function_name,
+                probe_offset=None, architecture=platform.machine(), backend_name="none", start_time=t_start_iso,
+                end_time=datetime.now(timezone.utc).isoformat(), status="FAILED",
+                error_message=f"Unable to establish target identity: {type(exc).__name__}: {exc}",
+                identity_status="UNAVAILABLE",
+            )
+
         # 2. Inspect target binary ELF & Build ID
         abs_binary = os.path.abspath(binary_path)
         if not os.path.exists(abs_binary):
@@ -1812,6 +1927,24 @@ class EbpfTracer:
         elf_info: BinaryIdentity = inspect_elf(abs_binary)
         target_build_id = elf_info.build_id
         arch = elf_info.architecture
+        if not target_build_id or not initial_identity.get("build_id"):
+            return TraceObservationSession(
+                session_id=session_id, target_pid=pid, target_binary=abs_binary,
+                target_build_id=target_build_id, build_id_status="UNAVAILABLE", function_name=function_name,
+                probe_offset=None, architecture=arch, backend_name="none", start_time=t_start_iso,
+                end_time=datetime.now(timezone.utc).isoformat(), status="FAILED",
+                error_message="Build ID is required for target and requested binary identity verification",
+                target_identity=initial_identity, identity_status="UNAVAILABLE",
+            )
+        if initial_identity["build_id"] != target_build_id:
+            return TraceObservationSession(
+                session_id=session_id, target_pid=pid, target_binary=abs_binary,
+                target_build_id=target_build_id, build_id_status="MISMATCHED", function_name=function_name,
+                probe_offset=None, architecture=arch, backend_name="none", start_time=t_start_iso,
+                end_time=datetime.now(timezone.utc).isoformat(), status="FAILED",
+                error_message="Running executable Build ID does not match the requested binary",
+                target_identity=initial_identity, identity_status="MISMATCHED",
+            )
 
         # 3. Validate running process identity (/proc/<pid>/exe)
         proc_exe_path = f"/proc/{pid}/exe"
@@ -1849,11 +1982,9 @@ class EbpfTracer:
 
         # 4. Validate Build ID & external debug image
         build_id_status = "UNAVAILABLE"
-        if not verify_build_id:
-            build_id_status = "EXPLICITLY_UNCHECKED"
-        else:
-            if debug_image:
-                abs_dbg = os.path.abspath(debug_image)
+        effective_debug_image = debug_image or abs_binary
+        if effective_debug_image:
+                abs_dbg = os.path.abspath(effective_debug_image)
                 if not os.path.exists(abs_dbg):
                     return TraceObservationSession(
                         session_id=session_id,
@@ -1889,8 +2020,17 @@ class EbpfTracer:
                             f"Architecture mismatch: binary '{elf_info.architecture}' != debug image '{dbg_info.architecture}'"
                         ),
                     )
-                if target_build_id and dbg_info.build_id:
-                    if target_build_id != dbg_info.build_id:
+                if not dbg_info.build_id:
+                    return TraceObservationSession(
+                        session_id=session_id, target_pid=pid, target_binary=abs_binary,
+                        target_build_id=target_build_id, build_id_status="UNAVAILABLE",
+                        function_name=function_name, probe_offset=None, architecture=arch,
+                        backend_name="none", start_time=t_start_iso,
+                        end_time=datetime.now(timezone.utc).isoformat(), status="FAILED",
+                        error_message="Debug image Build ID is unavailable",
+                        target_identity=initial_identity, identity_status="VERIFIED",
+                    )
+                if target_build_id != dbg_info.build_id:
                         return TraceObservationSession(
                             session_id=session_id,
                             target_pid=pid,
@@ -1907,15 +2047,9 @@ class EbpfTracer:
                             error_message=(
                                 f"Build ID mismatch: binary '{target_build_id}' != debug image '{dbg_info.build_id}'"
                             ),
+                            target_identity=initial_identity, identity_status="MISMATCHED",
                         )
-                    build_id_status = "VERIFIED"
-                else:
-                    build_id_status = "UNAVAILABLE"
-            else:
-                if target_build_id:
-                    build_id_status = "VERIFIED"
-                else:
-                    build_id_status = "UNAVAILABLE"
+                build_id_status = "VERIFIED"
 
         # 5. Check environment prerequisites
         cap = EbpfEnvironmentChecker.check_prerequisites()
@@ -2030,20 +2164,18 @@ class EbpfTracer:
             if elf_info.elf_type == "ET_DYN":
                 try:
                     with open(f"/proc/{pid}/maps", "r") as mf:
-                        for mline in mf:
-                            parts = mline.strip().split()
-                            if len(parts) >= 6 and (os.path.basename(abs_binary) in parts[5] or parts[5] == abs_binary):
-                                if parts[2] == "00000000" or "x" in parts[1]:
-                                    addr_range = parts[0]
-                                    start_vaddr = int(addr_range.split("-")[0], 16)
-                                    map_offset = int(parts[2], 16)
-                                    seg_vaddr = 0
-                                    for seg in elf_info.pt_loads:
-                                        if seg.get("p_offset") == map_offset:
-                                            seg_vaddr = seg.get("p_vaddr", 0)
-                                            break
-                                    load_bias = start_vaddr - seg_vaddr
-                                    break
+                        maps_text = mf.read()
+                    for mline in maps_text.splitlines():
+                        parts = mline.split(None, 5)
+                        if len(parts) < 6 or os.path.realpath(parts[5].removesuffix(" (deleted)")) != os.path.realpath(abs_binary):
+                            continue
+                        if "x" not in parts[1]:
+                            continue
+                        start_vaddr = int(parts[0].split("-", 1)[0], 16)
+                        elf_start = runtime_to_elf_address(start_vaddr, abs_binary, elf_info, maps_text)
+                        if elf_start is not None:
+                            load_bias = start_vaddr - elf_start
+                            break
                 except Exception:
                     pass
 
@@ -2084,11 +2216,48 @@ class EbpfTracer:
         )
 
         events: List[TraceEvent] = []
+        truncated_events = 0
         attach_latency_ms = 0.0
         script_file = None
         proc: Optional[subprocess.Popen] = None
         stderr_lines: List[str] = []
         target_alive = True
+        timeout_exceeded = False
+        attach_error: Optional[str] = None
+        final_identity: Dict[str, Any] = {}
+
+        try:
+            pre_attach_identity = capture_target_identity(pid)
+        except Exception as exc:
+            return TraceObservationSession(
+                session_id=session_id, target_pid=pid, target_binary=abs_binary,
+                target_build_id=target_build_id, build_id_status=build_id_status,
+                function_name=function_name, probe_offset=probe_offset_str, architecture=arch,
+                backend_name=cap.backend, start_time=t_start_iso,
+                end_time=datetime.now(timezone.utc).isoformat(), status="IDENTITY_CHANGED",
+                error_message=f"Target identity unavailable before attach: {type(exc).__name__}: {exc}",
+                target_identity=initial_identity, identity_status="IDENTITY_CHANGED",
+            )
+        if not target_identity_matches(initial_identity, pre_attach_identity):
+            return TraceObservationSession(
+                session_id=session_id, target_pid=pid, target_binary=abs_binary,
+                target_build_id=target_build_id, build_id_status=build_id_status,
+                function_name=function_name, probe_offset=probe_offset_str, architecture=arch,
+                backend_name=cap.backend, start_time=t_start_iso,
+                end_time=datetime.now(timezone.utc).isoformat(), status="IDENTITY_CHANGED",
+                error_message="Target identity changed before tracing attach",
+                target_identity=initial_identity, identity_status="IDENTITY_CHANGED",
+            )
+        if time.monotonic() >= session_deadline:
+            return TraceObservationSession(
+                session_id=session_id, target_pid=pid, target_binary=abs_binary,
+                target_build_id=target_build_id, build_id_status=build_id_status,
+                function_name=function_name, probe_offset=probe_offset_str, architecture=arch,
+                backend_name=cap.backend, start_time=t_start_iso,
+                end_time=datetime.now(timezone.utc).isoformat(), status="PARTIAL",
+                error_message="Total tracing deadline exceeded before attach",
+                target_identity=initial_identity, identity_status="VERIFIED",
+            )
 
         try:
             with tempfile.NamedTemporaryFile("w", suffix=".bt", delete=False) as f:
@@ -2112,7 +2281,7 @@ class EbpfTracer:
             )
 
             # Wait for attach confirmation ("Attaching ...") while draining stderr to prevent deadlock
-            timeout_attach = time.monotonic() + 5.0
+            timeout_attach = min(session_deadline, time.monotonic() + 5.0)
             attached = False
             while time.monotonic() < timeout_attach:
                 if proc.poll() is not None:
@@ -2139,25 +2308,10 @@ class EbpfTracer:
                 except Exception:
                     pass
                 err_msg = "\n".join(stderr_lines).strip()
-                return TraceObservationSession(
-                    session_id=session_id,
-                    target_pid=pid,
-                    target_binary=abs_binary,
-                    target_build_id=target_build_id,
-                    build_id_status=build_id_status,
-                    function_name=function_name,
-                    probe_offset=probe_offset_str,
-                    architecture=arch,
-                    backend_name="bpftrace",
-                    start_time=t_start_iso,
-                    end_time=datetime.now(timezone.utc).isoformat(),
-                    status="FAILED",
-                    error_message=f"bpftrace process terminated prematurely: {err_msg}",
-                )
+                attach_error = f"bpftrace process terminated before attach: {err_msg}"
 
             # Collect events for the specified duration
-            end_deadline = time.monotonic() + duration_s
-            max_events = 10000
+            end_deadline = min(session_deadline, time.monotonic() + float(duration_s))
             while time.monotonic() < end_deadline:
                 if proc.poll() is not None:
                     break
@@ -2185,6 +2339,8 @@ class EbpfTracer:
 
                 if len(events) >= max_events:
                     break
+            timeout_exceeded = (time.monotonic() >= session_deadline and
+                                len(events) < max_events and target_alive and proc.poll() is None)
 
         finally:
             # Reliable attach/detach cleanup (hardened against mock/untracked PIDs, PGID=0/1, and missing `--` in kill)
@@ -2208,7 +2364,7 @@ class EbpfTracer:
                                 subprocess.run(
                                     ["sudo", "-n", "kill", "-INT", "--", f"-{child_pid}"],
                                     capture_output=True,
-                                    timeout=2.0,
+                                    timeout=max(0.05, min(1.0, session_deadline - time.monotonic())),
                                     check=False,
                                 )
                             else:
@@ -2223,14 +2379,15 @@ class EbpfTracer:
                                 pass
 
                         try:
-                            proc.wait(timeout=2.0)
+                            cleanup_wait = max(0.05, min(2.0, session_deadline - time.monotonic()))
+                            proc.wait(timeout=cleanup_wait)
                         except subprocess.TimeoutExpired:
                             if valid_session_leader:
                                 if self.use_sudo and os.geteuid() != 0:
                                     subprocess.run(
                                         ["sudo", "-n", "kill", "-KILL", "--", f"-{child_pid}"],
                                         capture_output=True,
-                                        timeout=2.0,
+                                        timeout=1.0,
                                         check=False,
                                     )
                                 else:
@@ -2244,7 +2401,7 @@ class EbpfTracer:
                                 except Exception:
                                     pass
                             try:
-                                proc.wait(timeout=1.0)
+                                proc.wait(timeout=0.2)
                             except Exception:
                                 pass
                     if proc.stdout:
@@ -2252,7 +2409,10 @@ class EbpfTracer:
                             for rem in proc.stdout.readlines():
                                 ev = decoder.decode_line(rem)
                                 if ev is not None:
-                                    events.append(ev)
+                                    if len(events) < max_events:
+                                        events.append(ev)
+                                    else:
+                                        truncated_events += 1
                         except Exception:
                             pass
                         try:
@@ -2273,12 +2433,26 @@ class EbpfTracer:
                 except Exception:
                     pass
 
+            try:
+                final_identity = capture_target_identity(pid)
+            except Exception:
+                final_identity = {}
+
         t_end = time.monotonic()
         total_duration_ms = round((t_end - t0) * 1000, 2)
 
         status = "SUCCESS"
         error_msg = None
-        if not target_alive:
+        if not target_identity_matches(initial_identity, final_identity):
+            status = "IDENTITY_CHANGED"
+            error_msg = "Target host/process/executable identity changed or became unavailable during tracing"
+        elif attach_error:
+            status = "FAILED"
+            error_msg = attach_error
+        elif timeout_exceeded:
+            status = "PARTIAL"
+            error_msg = "Total tracing deadline exceeded"
+        elif not target_alive:
             if len(events) > 0:
                 status = "PARTIAL"
                 error_msg = f"Target process PID {pid} exited during trace; {len(events)} events captured"
@@ -2299,6 +2473,9 @@ class EbpfTracer:
         elif len(events) == 0:
             status = "PARTIAL"
             error_msg = "Attached successfully, but 0 events were captured during trace duration (function was not invoked)"
+        elif len(events) >= max_events or truncated_events:
+            status = "PARTIAL"
+            error_msg = f"Trace reached max_events={max_events}; collection may be truncated"
 
         return TraceObservationSession(
             session_id=session_id,
@@ -2325,6 +2502,12 @@ class EbpfTracer:
             consistency_level="PROBE_POINT_EVENT",
             status=status,
             error_message=error_msg,
+            reported_events=len(events) + decoder.lost_count + decoder.malformed_count + truncated_events,
+            collected_events=len(events),
+            truncated_events=truncated_events,
+            event_cap_reached=len(events) >= max_events,
+            target_identity=initial_identity,
+            identity_status="VERIFIED" if target_identity_matches(initial_identity, final_identity) else "IDENTITY_CHANGED",
         )
 
     def _resolve_probe_target(

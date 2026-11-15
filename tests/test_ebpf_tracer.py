@@ -808,6 +808,11 @@ class TestEbpfTracerUnit(unittest.TestCase):
                 build_id="bbbb33334444", stripped=False, has_debug_info=True,
             )
             with patch("extractor.ebpf_tracer.inspect_elf", side_effect=[ident1, ident2]), \
+                 patch("extractor.ebpf_tracer.capture_target_identity", return_value={
+                     "host_identity": "host", "boot_id": "boot", "pid": os.getpid(),
+                     "process_start_time": 1, "executable_path": f1.name,
+                     "executable_device": 1, "executable_inode": 1, "build_id": ident1.build_id,
+                 }), \
                  patch("os.path.exists", return_value=True), \
                  patch("os.path.realpath", return_value=f1.name), \
                  patch("os.kill"):
@@ -822,8 +827,8 @@ class TestEbpfTracerUnit(unittest.TestCase):
                 self.assertEqual(session.build_id_status, "MISMATCHED")
                 self.assertIn("Build ID mismatch", session.error_message)
 
-    def test_16_build_id_explicitly_unchecked(self):
-        """Verify --no-verify-build-id explicitly records EXPLICITLY_UNCHECKED."""
+    def test_16_build_id_verification_cannot_be_disabled(self):
+        """Production tracing must reject any attempt to disable Build ID verification."""
         tracer = EbpfTracer(use_sudo=False)
         with tempfile.NamedTemporaryFile("wb", suffix=".bin") as f1:
             ident1 = BinaryIdentity(
@@ -834,18 +839,9 @@ class TestEbpfTracerUnit(unittest.TestCase):
                 supported=False, backend="bpftrace", architecture="x86_64", kernel_version="6.0",
                 is_privileged=False, unprivileged_bpf_disabled=0, has_bpf_fs=True, reasons=["mock unprivileged"],
             )
-            with patch("extractor.ebpf_tracer.inspect_elf", return_value=ident1), \
-                 patch("extractor.ebpf_tracer.EbpfEnvironmentChecker.check_prerequisites", return_value=cap_mock), \
-                 patch("os.path.exists", return_value=True), \
-                 patch("os.path.realpath", return_value=f1.name), \
-                 patch("os.kill"):
-                session = tracer.trace(
-                    pid=os.getpid(),
-                    binary_path=f1.name,
-                    function_name="target_func",
-                    verify_build_id=False,
-                )
-                self.assertEqual(session.build_id_status, "EXPLICITLY_UNCHECKED")
+            with self.assertRaisesRegex(ValueError, "cannot be disabled"):
+                tracer.trace(pid=os.getpid(), binary_path=f1.name,
+                             function_name="target_func", verify_build_id=False)
 
     def test_17_probe_resolution_stripped_binary_without_debug_image(self):
         """Verify stripped binary without debug image returns a clear diagnostic."""
@@ -1974,9 +1970,10 @@ class TestEbpfTracerUnit(unittest.TestCase):
             sess_unavail = tracer.trace(pid=100, binary_path="/bin/no_bid", function_name="f", duration_s=0.01, verify_build_id=True)
             self.assertEqual(sess_unavail.build_id_status, "UNAVAILABLE")
 
-            # 2. verify_build_id=False -> EXPLICITLY_UNCHECKED
-            sess_unchecked = tracer.trace(pid=100, binary_path="/bin/no_bid", function_name="f", duration_s=0.01, verify_build_id=False)
-            self.assertEqual(sess_unchecked.build_id_status, "EXPLICITLY_UNCHECKED")
+            # 2. Production tracing refuses a request to bypass Build ID verification.
+            with self.assertRaisesRegex(ValueError, "cannot be disabled"):
+                tracer.trace(pid=100, binary_path="/bin/no_bid", function_name="f",
+                             duration_s=0.01, verify_build_id=False)
 
     def test_47_pc_bounds_and_malformed_values_handling(self):
         """Verify malformed, non-numeric, 0, negative, and out-of-range PC values are treated as None."""
@@ -5260,7 +5257,7 @@ class TestEbpfTracerUnit(unittest.TestCase):
              patch("os.kill", return_value=None), \
              patch("os.geteuid", return_value=1000), \
              patch("os.getpgid", side_effect=ProcessLookupError("No such process")), \
-             patch("select.select", return_value=([mock_proc_unverified.stdout], [], [])), \
+             patch("select.select", side_effect=RuntimeError("injected select failure")), \
              patch("extractor.ebpf_tracer.EbpfEnvironmentChecker.check_prerequisites") as mock_cap, \
              patch("subprocess.Popen", return_value=mock_proc_unverified), \
              patch("subprocess.run") as mock_subproc_run, \
@@ -5276,12 +5273,13 @@ class TestEbpfTracerUnit(unittest.TestCase):
                 has_bpf_fs=True,
             )
 
-            tracer.trace(
-                pid=os.getpid(),
-                binary_path="/bin/echo",
-                function_name="0x400500",
-                duration_s=0.01,
-            )
+            with self.assertRaisesRegex(RuntimeError, "injected select failure"):
+                tracer.trace(
+                    pid=os.getpid(),
+                    binary_path="/bin/echo",
+                    function_name="0x400500",
+                    duration_s=0.01,
+                )
 
             # Must NOT have invoked `sudo -n kill ...` or `os.killpg` because 1936537 was not a verified session leader
             mock_subproc_run.assert_not_called()

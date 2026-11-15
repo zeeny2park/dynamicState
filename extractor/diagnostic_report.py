@@ -341,6 +341,36 @@ class DiagnosticReport:
     section_i_final_conclusions: Optional[FinalConclusionsSection] = None
     section_j_reproducibility: Optional[ReproducibilitySection] = None
 
+    def validate_evidence_references(self) -> None:
+        """Ensure user-facing findings resolve only to accepted evidence index entries."""
+        from .evidence_ledger import TRUSTED_PROVENANCE_CLASSES
+
+        sec_g = self.section_g_evidence_and_provenance
+        entries = sec_g.evidence_records if sec_g else []
+        eligible = {e.evidence_id for e in entries
+                    if e.authority_status == "VERIFIED" and e.provenance_class in TRUSTED_PROVENANCE_CLASSES}
+        errors = []
+        if self.section_e_findings_and_root_cause:
+            findings = (self.section_e_findings_and_root_cause.confirmed_root_causes
+                        + self.section_e_findings_and_root_cause.probable_causes
+                        + self.section_e_findings_and_root_cause.anomalies
+                        + self.section_e_findings_and_root_cause.observed_symptoms
+                        + self.section_e_findings_and_root_cause.derived_evidence)
+            for finding in findings:
+                for evidence_id in (finding.supporting_evidence_ids + finding.contradicting_evidence_ids):
+                    if evidence_id and evidence_id not in eligible:
+                        errors.append(f"finding {finding.finding_id} references missing or unaccepted evidence {evidence_id}")
+        for entry in entries:
+            if entry.authority_status != "VERIFIED":
+                errors.append(f"evidence index contains non-authoritative record {entry.evidence_id}")
+            elif entry.provenance_class not in TRUSTED_PROVENANCE_CLASSES:
+                errors.append(f"evidence index contains untrusted provenance for {entry.evidence_id}")
+            for parent_id in entry.parent_evidence_ids:
+                if parent_id not in eligible:
+                    errors.append(f"evidence {entry.evidence_id} references missing or unaccepted parent {parent_id}")
+        if errors:
+            raise ValueError("Invalid diagnostic report evidence references: " + "; ".join(errors))
+
     def build_epistemic_hierarchy(self) -> Dict[str, List[Dict[str, Any]]]:
         """Explicitly separates the 5 epistemic classes required by Part E1:
         1. observation
@@ -493,6 +523,7 @@ class DiagnosticReport:
         }
 
     def to_dict(self) -> Dict[str, Any]:
+        self.validate_evidence_references()
         return {
             "schema_version": self.schema_version,
             "report_id": self.report_id,
@@ -547,6 +578,7 @@ class DiagnosticReport:
         return json.dumps(self.to_dict(), indent=indent, default=_fallback)
 
     def to_markdown(self, language: str = "en") -> str:
+        self.validate_evidence_references()
         sec_a = self.section_a_executive_summary
         sec_b = self.section_b_target_context
         sec_c = self.section_c_diagnostic_strategy
@@ -897,6 +929,7 @@ class DiagnosticReport:
 
     def to_html(self, language: str = "en") -> str:
         """Renders complete, standalone, HTML-escaped engineering diagnostic report without truncation."""
+        self.validate_evidence_references()
         sec_a = self.section_a_executive_summary
         sec_b = self.section_b_target_context
         sec_c = self.section_c_diagnostic_strategy

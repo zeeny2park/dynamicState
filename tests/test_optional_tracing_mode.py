@@ -139,7 +139,7 @@ class TestLocationDistinction(unittest.TestCase):
         ]
         with patch("extractor.tracing_mode.check_tracing_support", return_value=(True, "", None)), \
              patch("extractor.tracing_mode.EbpfTracer") as tracer_cls:
-            tracer_cls.return_value.run.side_effect = sessions
+            tracer_cls.return_value.trace.side_effect = sessions
             trace = SelectiveTracingSession(123, "/bin/true", max_events=10).run_trace(["free", "malloc"])
 
         self.assertEqual(trace["status"], "PARTIAL")
@@ -158,9 +158,58 @@ class TestLocationDistinction(unittest.TestCase):
                                   lost_events=0, malformed_records=0, error_message="kernel unsupported")
         with patch("extractor.tracing_mode.check_tracing_support", return_value=(True, "", None)), \
              patch("extractor.tracing_mode.EbpfTracer") as tracer_cls:
-            tracer_cls.return_value.run.return_value = session
+            tracer_cls.return_value.trace.return_value = session
             trace = SelectiveTracingSession(123, "/bin/true").run_trace(["free"])
         self.assertEqual(trace["status"], "UNSUPPORTED_ENVIRONMENT")
+
+    def test_event_cap_is_absolute_and_function_inputs_are_validated(self):
+        with self.assertRaises(ValueError):
+            SelectiveTracingSession(123, "/bin/true", max_events=501)
+        with patch("extractor.tracing_mode.check_tracing_support", return_value=(True, "", None)):
+            with self.assertRaises(ValueError):
+                SelectiveTracingSession(123, "/bin/true").run_trace(["free\n/evil"])
+
+    def test_one_deadline_is_shared_by_every_function(self):
+        session = SimpleNamespace(status="PARTIAL", events=[], total_events=0, lost_events=0,
+                                  malformed_records=0, error_message="no events", session_id="s1")
+        with patch("extractor.tracing_mode.check_tracing_support", return_value=(True, "", None)), \
+             patch("extractor.tracing_mode.EbpfTracer") as tracer_cls:
+            tracer_cls.return_value.trace.side_effect = [session, session]
+            SelectiveTracingSession(123, "/bin/true", duration_s=1.0).run_trace(["free", "malloc"])
+        calls = tracer_cls.return_value.trace.call_args_list
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[0].kwargs["deadline"], calls[1].kwargs["deadline"])
+        self.assertLessEqual(calls[0].kwargs["duration_s"], 1.0)
+        self.assertLessEqual(calls[1].kwargs["duration_s"], 1.0)
+
+    def test_total_deadline_exceeded_marks_partial_and_stops_next_function(self):
+        import time
+        session = SimpleNamespace(status="OBSERVED", events=[], total_events=0, lost_events=0,
+                                  malformed_records=0, error_message=None, session_id="slow")
+        with patch("extractor.tracing_mode.check_tracing_support", return_value=(True, "", None)), \
+             patch("extractor.tracing_mode.EbpfTracer") as tracer_cls:
+            def overrun(**_kwargs):
+                time.sleep(0.03)
+                return session
+            tracer_cls.return_value.trace.side_effect = overrun
+            result = SelectiveTracingSession(123, "/bin/true", duration_s=0.01).run_trace(["free", "malloc"])
+        self.assertEqual(result["status"], "PARTIAL")
+        self.assertEqual(tracer_cls.return_value.trace.call_count, 1)
+        self.assertTrue(any("deadline exceeded" in item for item in result["errors"]))
+
+    def test_event_cap_truncation_marks_partial_and_preserves_counts(self):
+        event = SimpleNamespace(to_dict=lambda: {"kind": "event"})
+        session = SimpleNamespace(status="OBSERVED", events=[event, event], total_events=2,
+                                  reported_events=2, collected_events=2, lost_events=0,
+                                  malformed_records=0, truncated_events=0, event_cap_reached=False,
+                                  error_message=None, session_id="over-cap")
+        with patch("extractor.tracing_mode.check_tracing_support", return_value=(True, "", None)), \
+             patch("extractor.tracing_mode.EbpfTracer") as tracer_cls:
+            tracer_cls.return_value.trace.return_value = session
+            result = SelectiveTracingSession(123, "/bin/true", max_events=1).run_trace(["free"])
+        self.assertEqual(result["status"], "PARTIAL")
+        self.assertEqual(result["events_count"], 1)
+        self.assertEqual(result["events_truncated"], 1)
 
 
 class TestDiagnoseIntegrationWithTracing(unittest.TestCase):

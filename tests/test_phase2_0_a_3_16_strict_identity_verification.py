@@ -225,7 +225,7 @@ class TestPhase20A316StrictIdentityVerification(unittest.TestCase):
 
         ok, reason = att_tampered.verify(key_store=self.authority.key_store)
         self.assertFalse(ok)
-        self.assertIn("CORRUPT_ATTESTATION", reason)
+        self.assertIn("CANONICAL_DIGEST_MISMATCH", reason)
 
     # 5. Tampered serialized identity attributes cause verification failure
     def test_05_tampered_serialized_identity_attributes_rejected(self):
@@ -244,31 +244,31 @@ class TestPhase20A316StrictIdentityVerification(unittest.TestCase):
         t_pid.target_identity["pid"] = 9999
         ok, reason = t_pid.verify(key_store=self.authority.key_store)
         self.assertFalse(ok)
-        self.assertIn("CORRUPT_ATTESTATION", reason)
+        self.assertIn("CANONICAL_DIGEST_MISMATCH", reason)
 
         # Tamper process_identity
         t_proc = CausalAttestation.from_dict(att.to_dict())
         t_proc.target_identity["process_identity"] = "forged:process:ident"
         ok, reason = t_proc.verify(key_store=self.authority.key_store)
         self.assertFalse(ok)
-        self.assertIn("CORRUPT_ATTESTATION", reason)
+        self.assertIn("CANONICAL_DIGEST_MISMATCH", reason)
 
         # Tamper build_id
         t_bid = CausalAttestation.from_dict(att.to_dict())
         t_bid.target_identity["build_id"] = "sha1:forged_build_id"
         ok, reason = t_bid.verify(key_store=self.authority.key_store)
         self.assertFalse(ok)
-        self.assertIn("CORRUPT_ATTESTATION", reason)
+        self.assertIn("CANONICAL_DIGEST_MISMATCH", reason)
 
         # Tamper operation_id
         t_op = CausalAttestation.from_dict(att.to_dict())
         t_op.operation_id = "ctx_tampered_op_99"
         ok, reason = t_op.verify(key_store=self.authority.key_store)
         self.assertFalse(ok)
-        self.assertIn("CORRUPT_ATTESTATION", reason)
+        self.assertIn("CANONICAL_DIGEST_MISMATCH", reason)
 
-    # 6. Backward compatibility preserved for legacy attestations
-    def test_06_backward_compatibility_for_legacy_attestations(self):
+    # 6. Legacy signature compatibility requires a complete current canonical digest
+    def test_06_legacy_attestation_signature_requires_complete_canonical_digest(self):
         ident_no_host = dict(self.valid_ident)
         ident_no_host.pop("target_host", None)
         active_kid, active_sec = self.authority.key_store.get_active_signing_key()
@@ -292,6 +292,7 @@ class TestPhase20A316StrictIdentityVerification(unittest.TestCase):
         )
         import hashlib
         import hmac
+        att.canonical_digest = hashlib.sha256(att.canonical_bytes()).hexdigest()
         att.signature = hmac.new(active_sec.encode("utf-8"), att.canonical_bytes_legacy(), hashlib.sha256).hexdigest()
 
         # Legacy attestation verifies successfully when expected_target_host is not queried

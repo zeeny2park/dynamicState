@@ -950,10 +950,11 @@ class ProcessIdentity:
             raise MissingIdentityFieldError("host_identity must be a non-empty string")
         if not self.boot_id or not isinstance(self.boot_id, str):
             raise MissingIdentityFieldError("boot_id must be a non-empty string")
-        if self.pid is None or not isinstance(self.pid, int) or self.pid <= 0:
-            raise MissingIdentityFieldError("pid must be a positive integer")
-        if self.process_start_time is None or not isinstance(self.process_start_time, int):
-            raise MissingIdentityFieldError("process_start_time must be an integer")
+        if self.pid is None or isinstance(self.pid, bool) or not isinstance(self.pid, int) or self.pid <= 1:
+            raise MissingIdentityFieldError("pid must be an integer greater than 1")
+        if (self.process_start_time is None or isinstance(self.process_start_time, bool)
+                or not isinstance(self.process_start_time, int) or self.process_start_time <= 0):
+            raise MissingIdentityFieldError("process_start_time must be a positive integer")
 
     def matches(self, other: Any) -> bool:
         if not isinstance(other, ProcessIdentity):
@@ -1880,10 +1881,19 @@ class DurableTrustStore:
             self.load()
 
             # Canonical Replay Identity & Digest Verification
+            # Compatibility journal entries may remain non-replay records only when they carry
+            # no capture/lifecycle authority. Capture and lifecycle operations require JCS
+            # identity even if a caller forgets the explicit option.
             requires_canon = (
                 require_canonical_replay_identity
                 or getattr(self, "require_canonical_replay_identity", False)
                 or (metadata is not None and bool(metadata.get("require_canonical_replay_identity")))
+                or require_lifecycle_enforcement
+                or (metadata is not None and (
+                    bool(metadata.get("require_lifecycle_enforcement"))
+                    or bool(metadata.get("require_lifecycle_persistence"))
+                    or metadata.get("operation_type") in ("diagnostic", "probe")
+                ))
             )
             has_canon_ident = bool(metadata and "canonical_identity" in metadata)
             has_canon_dig = bool(metadata and "canonical_digest" in metadata)
@@ -2208,6 +2218,14 @@ class DurableTrustStore:
                 return OperationLifecycleState(st)
             except ValueError:
                 return None
+
+    def get_operation_record(self, op_id: str) -> Optional[Dict[str, Any]]:
+        """Return a detached copy of a durable operation record for receipt/evidence binding."""
+        oid = validate_operation_id(op_id)
+        with self._file_lock():
+            self.load()
+            rec = self.used_operation_ids.get(oid)
+            return dict(rec) if isinstance(rec, dict) else None
 
     def transition_operation_lifecycle(
         self,
@@ -2668,6 +2686,7 @@ class CausalAttestation:
     signature: str = ""
     revoked: bool = False
     authority_level: str = "PRODUCTION"
+    canonical_digest: str = ""
 
     def canonical_bytes(self) -> bytes:
         payload = {
@@ -2685,13 +2704,16 @@ class CausalAttestation:
             "postcondition_evidence_id": str(self.postcondition_evidence_id),
             "claimed_transition": dict(self.claimed_transition or {}),
             "intervention_details": dict(self.intervention_details or {}),
-            "issued_at_ns": int(self.issued_at_ns),
-            "expires_at_ns": int(self.expires_at_ns),
+            # Nanosecond clocks exceed JCS/IEEE-754's exact integer range. Encode them
+            # as decimal strings so RFC 8785 preserves the exact signed identity.
+            "issued_at_ns": str(int(self.issued_at_ns)),
+            "expires_at_ns": str(int(self.expires_at_ns)),
             "verifier_identity": str(self.verifier_identity),
             "key_id": str(self.key_id),
             "authority_level": str(self.authority_level),
         }
-        return json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        from .canonical_json import rfc8785_canonical_json
+        return rfc8785_canonical_json(payload)
 
     def canonical_bytes_legacy(self) -> bytes:
         payload = {
@@ -2719,7 +2741,9 @@ class CausalAttestation:
     def sign(self, secret: str) -> None:
         if not secret:
             raise ValueError("Cannot sign CausalAttestation: missing secret")
-        self.signature = hmac.new(secret.encode("utf-8"), self.canonical_bytes(), hashlib.sha256).hexdigest()
+        canonical = self.canonical_bytes()
+        self.canonical_digest = hashlib.sha256(canonical).hexdigest()
+        self.signature = hmac.new(secret.encode("utf-8"), canonical, hashlib.sha256).hexdigest()
 
     def verify(
         self,
@@ -2761,6 +2785,12 @@ class CausalAttestation:
                 return False, "MISSING_EXECUTABLE_IDENTITY: Attestation missing executable_identity"
             if not self.target_identity.get("build_id") or not str(self.target_identity["build_id"]).strip():
                 return False, "MISSING_BUILD_ID: Attestation missing build_id"
+
+        if not self.canonical_digest or not isinstance(self.canonical_digest, str):
+            return False, "MISSING_CANONICAL_DIGEST: Attestation is missing its RFC 8785 identity digest"
+        recomputed_digest = hashlib.sha256(self.canonical_bytes()).hexdigest()
+        if not hmac.compare_digest(self.canonical_digest, recomputed_digest):
+            return False, "CANONICAL_DIGEST_MISMATCH: Attestation identity digest does not match its RFC 8785 payload"
 
         # Expected checks: never silently skip when attestation field is absent!
         if expected_session_id is not None:
@@ -2863,6 +2893,7 @@ class CausalAttestation:
             "signature": self.signature,
             "revoked": self.revoked,
             "authority_level": self.authority_level,
+            "canonical_digest": self.canonical_digest,
         }
 
     @classmethod
@@ -2885,6 +2916,7 @@ class CausalAttestation:
             signature=str(data.get("signature", "")),
             revoked=bool(data.get("revoked", False)),
             authority_level=str(data.get("authority_level", "PRODUCTION")),
+            canonical_digest=str(data.get("canonical_digest", "")),
         )
 
 

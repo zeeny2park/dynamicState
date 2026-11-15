@@ -12,7 +12,9 @@ Provides an optional, explicit runtime event tracing subsystem for DynamicState:
 from __future__ import annotations
 
 import logging
+import math
 import os
+import re
 import shutil
 import subprocess
 import threading
@@ -27,7 +29,9 @@ from .ebpf_tracer import (
     EbpfCapabilityResult,
     EbpfEnvironmentChecker,
     EbpfTracer,
+    runtime_to_elf_address,
 )
+from .debug_image import inspect_elf
 
 logger = logging.getLogger("dynamicstate.tracing_mode")
 
@@ -35,6 +39,23 @@ ENV_ENABLE_TRACING = "DYNAMICSTATE_ENABLE_TRACING"
 DEFAULT_TRACING_DURATION_S = 1.5
 MAX_TRACING_DURATION_S = 10.0
 MAX_EVENTS_CAP = 500
+
+
+def _mapping_matches_binary(map_path: str, binary_path: str) -> bool:
+    cleaned = map_path.removesuffix(" (deleted)")
+    try:
+        return os.path.realpath(cleaned) == os.path.realpath(binary_path)
+    except OSError:
+        return cleaned == binary_path
+
+
+def _runtime_to_elf_address(addr: int, binary_path: str, maps_text: str) -> Optional[int]:
+    """Convert a runtime instruction address to an ELF virtual address using PT_LOAD map bias."""
+    try:
+        elf = inspect_elf(binary_path)
+    except Exception:
+        return None
+    return runtime_to_elf_address(addr, binary_path, elf, maps_text)
 
 
 def is_tracing_enabled(explicit_flag: Optional[bool] = None) -> bool:
@@ -72,7 +93,12 @@ class SelectiveTracingSession:
         self.pid = pid
         self.binary_path = os.path.realpath(binary_path) if binary_path else ""
         self.debug_image = os.path.realpath(debug_image) if debug_image else self.binary_path
-        self.duration_s = min(max(duration_s, 0.5), MAX_TRACING_DURATION_S)
+        if (isinstance(duration_s, bool) or not isinstance(duration_s, (int, float)) or
+                not math.isfinite(float(duration_s)) or duration_s <= 0):
+            raise ValueError("duration_s must be a finite positive number")
+        if isinstance(max_events, bool) or not isinstance(max_events, int) or not 1 <= max_events <= MAX_EVENTS_CAP:
+            raise ValueError(f"max_events must be an integer between 1 and {MAX_EVENTS_CAP}")
+        self.duration_s = min(float(duration_s), MAX_TRACING_DURATION_S)
         self.max_events = max_events
         self.collected_events: List[Dict[str, Any]] = []
         self.is_supported, self.unsupported_reason, self.capability_result = check_tracing_support()
@@ -93,6 +119,12 @@ class SelectiveTracingSession:
 
         if not target_functions:
             target_functions = ["free", "malloc"]
+        if (not isinstance(target_functions, list) or
+                any(not isinstance(fn, str) or not fn or len(fn) > 512 or
+                    any(ord(ch) < 32 or ord(ch) == 127 for ch in fn) for fn in target_functions)):
+            raise ValueError("target_functions must be a list of non-empty printable symbol names")
+        if len(set(target_functions)) != len(target_functions):
+            target_functions = list(dict.fromkeys(target_functions))
 
         events_out: List[Dict[str, Any]] = []
         locations_out: List[Dict[str, Any]] = []
@@ -103,20 +135,25 @@ class SelectiveTracingSession:
         malformed_records = 0
         truncated_events = 0
 
-        # Trace each function briefly within time budget
-        per_fn_duration = max(0.5, self.duration_s / max(len(target_functions), 1))
+        # One monotonic deadline covers every function, including attach time and cleanup.
+        total_deadline = time.monotonic() + self.duration_s
         for fn in target_functions:
+            remaining_time = total_deadline - time.monotonic()
+            if remaining_time <= 0:
+                failures.append("total tracing deadline exceeded before all functions completed")
+                break
             try:
-                tracer = EbpfTracer(
+                tracer = EbpfTracer()
+                session = tracer.trace(
                     pid=self.pid,
                     binary_path=self.binary_path,
-                    target_function=fn,
-                    debug_image_path=self.debug_image,
-                    verify_build_id=False,  # Allow running test fixtures
-                    timeout=per_fn_duration,
-                    max_events=self.max_events,
+                    function_name=fn,
+                    debug_image=self.debug_image,
+                    duration_s=remaining_time,
+                    verify_build_id=True,
+                    max_events=max(1, self.max_events - len(events_out)),
+                    deadline=total_deadline,
                 )
-                session = tracer.run()
                 if session is None:
                     failures.append(f"{fn}: tracer returned no session")
                     session_summaries.append({"function": fn, "status": "FAILED",
@@ -130,7 +167,9 @@ class SelectiveTracingSession:
                 session_total = max(len(session_events), int(getattr(session, "total_events", 0) or 0))
                 lost_events += session_lost
                 malformed_records += session_malformed
-                reported_events += session_total
+                session_truncated = max(0, int(getattr(session, "truncated_events", 0) or 0))
+                truncated_events += session_truncated
+                reported_events += max(session_total, int(getattr(session, "reported_events", 0) or 0))
                 session_summary = {
                     "function": fn,
                     "session_id": getattr(session, "session_id", None),
@@ -138,12 +177,18 @@ class SelectiveTracingSession:
                     "total_events": session_total,
                     "lost_events": session_lost,
                     "malformed_records": session_malformed,
+                    "reported_events": max(0, int(getattr(session, "reported_events", session_total) or 0)),
+                    "collected_events": max(0, int(getattr(session, "collected_events", len(session_events)) or 0)),
+                    "truncated_events": session_truncated,
+                    "event_cap_reached": bool(getattr(session, "event_cap_reached", False)),
                     "error_message": getattr(session, "error_message", None),
                     "target_pid": getattr(session, "target_pid", self.pid),
                     "target_binary": getattr(session, "target_binary", self.binary_path),
                     "target_build_id": getattr(session, "target_build_id", None),
                     "build_id_status": getattr(session, "build_id_status", None),
                     "consistency_level": getattr(session, "consistency_level", None),
+                    "target_identity": dict(getattr(session, "target_identity", {}) or {}),
+                    "identity_status": getattr(session, "identity_status", None),
                 }
                 session_summaries.append(session_summary)
                 if session_status not in ("SUCCESS", "OBSERVED"):
@@ -161,6 +206,10 @@ class SelectiveTracingSession:
                     loc_entry = self._extract_call_location(ed, fn)
                     if loc_entry:
                         locations_out.append(loc_entry)
+                if len(events_out) >= self.max_events:
+                    if fn != target_functions[-1]:
+                        failures.append("global max_events cap reached before all target functions were traced")
+                    break
             except Exception as exc:
                 logger.debug("eBPF tracing for %s encountered non-fatal error: %s", fn, exc)
                 failures.append(f"{fn}: {type(exc).__name__}: {exc}")
@@ -169,7 +218,8 @@ class SelectiveTracingSession:
                 continue
 
         self.collected_events = events_out
-        incomplete = bool(failures or lost_events or malformed_records or truncated_events)
+        incomplete = bool(failures or lost_events or malformed_records or truncated_events or
+                          any(s.get("event_cap_reached") for s in session_summaries))
         session_statuses = [str(item.get("status") or "UNKNOWN") for item in session_summaries]
         if session_statuses and all(value == "UNSUPPORTED_ENVIRONMENT" for value in session_statuses):
             status = "UNSUPPORTED_ENVIRONMENT"
@@ -187,6 +237,7 @@ class SelectiveTracingSession:
             "status": status,
             "events_count": len(events_out),
             "reported_events_count": reported_events,
+            "collected_events_count": len(events_out),
             "lost_events": lost_events,
             "malformed_records": malformed_records,
             "events_truncated": truncated_events,
@@ -241,15 +292,20 @@ class SelectiveTracingSession:
         if not target_img or not os.path.exists(target_img):
             return None
         try:
-            cmd = ["addr2line", "-e", target_img, "-f", "-C", hex(addr)]
+            with open(f"/proc/{self.pid}/maps", "r", encoding="utf-8", errors="replace") as fh:
+                maps_text = fh.read()
+            elf_addr = _runtime_to_elf_address(addr, self.binary_path, maps_text)
+            if elf_addr is None:
+                return None
+            cmd = ["addr2line", "-e", target_img, "-f", "-C", hex(elf_addr)]
             res = subprocess.run(cmd, capture_output=True, text=True, timeout=2.0)
             if res.returncode == 0:
                 lines = [ln.strip() for ln in res.stdout.strip().splitlines() if ln.strip()]
                 # addr2line output is usually function_name \n file:line
-                if len(lines) >= 2 and "?" not in lines[1]:
-                    return lines[1]
-                if lines and "?" not in lines[0] and ":" in lines[0]:
-                    return lines[0]
+                candidate = lines[1] if len(lines) >= 2 else (lines[0] if lines else "")
+                match = re.match(r"^(.+):(\d+)(?: \(discriminator \d+\))?$", candidate)
+                if match and match.group(1) not in ("??", "") and int(match.group(2)) > 0:
+                    return f"{match.group(1)}:{match.group(2)}"
         except Exception:
             pass
         return None
@@ -266,6 +322,8 @@ def format_traced_locations_for_finding(
     details = {
         "collection_status": collection_status,
         "events_count": int(summary.get("events_count") or 0),
+        "reported_events_count": int(summary.get("reported_events_count") or 0),
+        "collected_events_count": int(summary.get("collected_events_count") or 0),
         "lost_events": int(summary.get("lost_events") or 0),
         "malformed_records": int(summary.get("malformed_records") or 0),
         "events_truncated": int(summary.get("events_truncated") or 0),

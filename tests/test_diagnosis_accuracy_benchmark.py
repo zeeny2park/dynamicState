@@ -279,15 +279,72 @@ class TestBenchmarkProvenance(unittest.TestCase):
         self.assertEqual(perfect["rate"], 1.0)
         self.assertLess(perfect["ci95"][0], 1.0)
         self.assertEqual(perfect["ci95"][1], 1.0)
+        clean_env = {"commit": "abc", "dirty": False, "dirty_check_ok": True}
         report = {"schema_version": rb.SCHEMA_VERSION,
-                  "environment": {"commit": "abc", "dirty": False},
-                  "environment_start": {"commit": "abc", "dirty": False},
+                  "scope": "FULL_SUITE", "selected_target_ids": ["case"], "expected_target_ids": ["case"],
+                  "environment": dict(clean_env),
+                  "environment_start": dict(clean_env),
                   "authority": "AUTHORITATIVE", "authority_reasons": [],
-                  "dataset": {"version": "sha256:abc"}, "rows": [{"build": {"build_id": "id"}}]}
+                  "dataset": {"version": "sha256:abc"},
+                  "rows": [{"id": "case", "build": {"build_id": "id"}}]}
         self.assertEqual(rb.validate_benchmark_report(report), [])
         del report["rows"][0]["build"]
         self.assertTrue(any("missing build provenance" in error
                             for error in rb.validate_benchmark_report(report)))
+
+    def test_authoritative_gate_rejects_dirty_or_changing_source_and_incomplete_rows(self):
+        clean = {"commit": "abc", "dirty": False, "dirty_check_ok": True}
+        report = {"schema_version": rb.SCHEMA_VERSION,
+                  "scope": "FULL_SUITE", "selected_target_ids": ["one", "two"],
+                  "expected_target_ids": ["one", "two"],
+                  "environment": dict(clean), "environment_start": dict(clean),
+                  "authority": "AUTHORITATIVE", "authority_reasons": [],
+                  "dataset": {"version": "sha256:abc"},
+                  "rows": [{"id": "one", "build": {"build_id": "id"}},
+                           {"id": "two", "build": {"build_id": "id"}}]}
+        self.assertEqual(rb.validate_benchmark_report(report), [])
+        report["environment"]["dirty"] = True
+        self.assertTrue(any("verified clean end source tree" in error
+                            for error in rb.validate_benchmark_report(report)))
+        report["environment"]["dirty"] = False
+        report["environment"]["commit"] = "def"
+        self.assertTrue(any("same source commit" in error
+                            for error in rb.validate_benchmark_report(report)))
+        report["environment"]["commit"] = "abc"
+        report["rows"].pop()
+        self.assertTrue(any("cover every selected target ID" in error
+                            for error in rb.validate_benchmark_report(report)))
+
+    def test_single_target_report_cannot_be_authoritative_or_pass_quality_gate(self):
+        report = {"schema_version": rb.SCHEMA_VERSION,
+                  "scope": "SINGLE_TARGET", "selected_target_ids": ["one"], "expected_target_ids": ["one", "two"],
+                  "environment": {"commit": "abc", "dirty": False, "dirty_check_ok": True},
+                  "environment_start": {"commit": "abc", "dirty": False, "dirty_check_ok": True},
+                  "authority": "AUTHORITATIVE", "authority_reasons": [],
+                  "dataset": {"version": "sha256:abc"}, "rows": [{"id": "one", "build": {"build_id": "id"}}]}
+        errors = rb.validate_benchmark_report(report)
+        self.assertTrue(any("only FULL_SUITE" in error for error in errors))
+
+    def test_run_all_marks_one_target_as_development_subset(self):
+        target = GT[0]
+        clean = {"commit": "abc", "dirty": False, "dirty_check_ok": True, "dirty_check_error": None,
+                 "arch": "x86_64", "kernel": "test", "glibc": "test"}
+        row = rb.score_result(target, _wrong_result(target))
+        row["build"] = {"build_id": "abc", "compiler": "gcc"}
+        row.update({"diagnose_s": 0.0, "checks": [], "wall_s": 0.0})
+        with patch.object(rb, "environment", side_effect=[dict(clean), dict(clean)]), \
+             patch.object(rb, "run_target", return_value=row):
+            report = rb.run_all([target], environment_start=dict(clean))
+        self.assertEqual(report["scope"], "SINGLE_TARGET")
+        self.assertEqual(report["selected_target_ids"], [target["id"]])
+        self.assertEqual(report["expected_target_ids"], [g["id"] for g in GT])
+        self.assertEqual(report["authority"], "NON_AUTHORITATIVE")
+        self.assertTrue(any("SINGLE_TARGET scope" in reason for reason in report["authority_reasons"]))
+
+    def test_cli_rejects_non_positive_repeat_count(self):
+        with self.assertRaises(SystemExit) as exc:
+            rb.main(["--repeat", "0", "--list"])
+        self.assertEqual(exc.exception.code, 2)
 
     def test_confidence_calibration_reports_accuracy_and_abstention_sample_sizes(self):
         calibration = rb._confidence_calibration([

@@ -685,41 +685,63 @@ class TargetExecutionAdapter(ABC):
             if require_lifecycle_persistence is not None
             else getattr(self, "require_lifecycle_persistence", isinstance(self, LocalTargetAdapter))
         )
+        tx.require_lifecycle_persistence = bool(should_persist)
         if should_persist:
             tx.metadata["require_lifecycle_persistence"] = True
             from .capture_backend import get_default_trust_store, OperationLifecycleState
             eff_ts = getattr(self, "trust_store", None) or get_default_trust_store()
-            if eff_ts and hasattr(eff_ts, "transition_operation_lifecycle"):
-                try:
-                    eff_ts.transition_operation_lifecycle(
-                        op_id=tx.transaction_id,
-                        session_id=str(session_id),
-                        pid=int(pid),
-                        target_state=OperationLifecycleState.CREATED,
-                        metadata={"target_host": str(th), "operation_type": str(operation_type)},
-                    )
-                    eff_ts.transition_operation_lifecycle(
-                        op_id=tx.transaction_id,
-                        session_id=str(session_id),
-                        pid=int(pid),
-                        target_state=OperationLifecycleState.VALIDATED,
-                    )
-                    eff_ts.transition_operation_lifecycle(
-                        op_id=tx.transaction_id,
-                        session_id=str(session_id),
-                        pid=int(pid),
-                        target_state=OperationLifecycleState.RESERVED,
-                    )
-                    eff_ts.transition_operation_lifecycle(
-                        op_id=tx.transaction_id,
-                        session_id=str(session_id),
-                        pid=int(pid),
-                        target_state=OperationLifecycleState.EXECUTING,
-                    )
-                except Exception:
-                    self._active_transactions.pop(tx.transaction_id, None)
-                    self._active_by_scope.pop((str(th), str(session_id), int(pid)), None)
-                    raise
+            if not eff_ts or not callable(getattr(eff_ts, "transition_operation_lifecycle", None)):
+                self._active_transactions.pop(tx.transaction_id, None)
+                self._active_by_scope.pop((str(th), str(session_id), int(pid)), None)
+                raise RuntimeError("Capture transaction requires durable lifecycle persistence, but no lifecycle trust store is available")
+            lifecycle_state = None
+            try:
+                eff_ts.transition_operation_lifecycle(
+                    op_id=tx.transaction_id,
+                    session_id=str(session_id),
+                    pid=int(pid),
+                    target_state=OperationLifecycleState.CREATED,
+                    metadata={"target_host": str(th), "operation_type": str(operation_type)},
+                )
+                lifecycle_state = OperationLifecycleState.CREATED
+                eff_ts.transition_operation_lifecycle(
+                    op_id=tx.transaction_id,
+                    session_id=str(session_id),
+                    pid=int(pid),
+                    target_state=OperationLifecycleState.VALIDATED,
+                )
+                lifecycle_state = OperationLifecycleState.VALIDATED
+                eff_ts.transition_operation_lifecycle(
+                    op_id=tx.transaction_id,
+                    session_id=str(session_id),
+                    pid=int(pid),
+                    target_state=OperationLifecycleState.RESERVED,
+                )
+                lifecycle_state = OperationLifecycleState.RESERVED
+                eff_ts.transition_operation_lifecycle(
+                    op_id=tx.transaction_id,
+                    session_id=str(session_id),
+                    pid=int(pid),
+                    target_state=OperationLifecycleState.EXECUTING,
+                )
+                lifecycle_state = OperationLifecycleState.EXECUTING
+            except Exception as lifecycle_exc:
+                self._active_transactions.pop(tx.transaction_id, None)
+                self._active_by_scope.pop((str(th), str(session_id), int(pid)), None)
+                if lifecycle_state is not None:
+                    terminal = (OperationLifecycleState.REJECTED if lifecycle_state == OperationLifecycleState.CREATED
+                                else OperationLifecycleState.FAILED)
+                    try:
+                        eff_ts.transition_operation_lifecycle(
+                            op_id=tx.transaction_id, session_id=str(session_id), pid=int(pid),
+                            target_state=terminal,
+                            metadata={"lifecycle_transition_error": str(lifecycle_exc)},
+                        )
+                    except Exception as terminal_exc:
+                        raise RuntimeError(
+                            f"Capture lifecycle transition failed ({lifecycle_exc}); terminal failure state also failed ({terminal_exc})"
+                        ) from lifecycle_exc
+                raise
 
         cur_stack = _tx_stack.get(None) or []
         new_stack = list(cur_stack) + [tx]
@@ -819,6 +841,10 @@ class TargetExecutionAdapter(ABC):
             MissingIdentityFieldError,
         )
         eff_ts = getattr(self, "trust_store", None) or get_default_trust_store()
+        lifecycle_required = bool(target_tx.metadata.get("require_lifecycle_persistence"))
+        if lifecycle_required and (not eff_ts or not callable(getattr(eff_ts, "record_used_operation", None))):
+            self.rollback_capture_transaction(target_tx, "Required durable trust store unavailable at capture commit")
+            raise RuntimeError("Capture transaction cannot commit without its required durable trust store")
         if eff_ts:
             cur_boot = cur_ident.get("boot_id")
             if not cur_boot:
@@ -882,7 +908,7 @@ class TargetExecutionAdapter(ABC):
                     metadata=op_meta,
                     allow_idempotent=False,
                     require_canonical_replay_identity=True,
-                    require_lifecycle_enforcement=bool(target_tx.metadata.get("require_lifecycle_persistence")),
+                    require_lifecycle_enforcement=lifecycle_required,
                 )
             except Exception as e:
                 self.rollback_capture_transaction(target_tx, f"Trust store persistence failed: {e}")
@@ -908,6 +934,7 @@ class TargetExecutionAdapter(ABC):
         self,
         tx: Optional[CaptureTransaction] = None,
         reason: str = "",
+        terminal_state: Optional[Any] = None,
     ) -> None:
         """Roll back an in-flight capture transaction."""
         self._ensure_tracking_state()
@@ -918,14 +945,18 @@ class TargetExecutionAdapter(ABC):
             target_tx.aborted = True
             target_tx.abort_reason = reason or "Capture transaction rolled back"
             from .capture_backend import get_default_trust_store, OperationLifecycleState
+            terminal_state = terminal_state or OperationLifecycleState.FAILED
             eff_ts = getattr(self, "trust_store", None) or get_default_trust_store()
-            if eff_ts and hasattr(eff_ts, "transition_operation_lifecycle") and (target_tx.metadata.get("require_lifecycle_persistence") or getattr(self, "require_lifecycle_persistence", True)):
+            lifecycle_required = bool(target_tx.metadata.get("require_lifecycle_persistence"))
+            if lifecycle_required and (not eff_ts or not callable(getattr(eff_ts, "transition_operation_lifecycle", None))):
+                target_tx.metadata["lifecycle_rollback_error"] = "durable lifecycle trust store unavailable"
+            elif eff_ts and hasattr(eff_ts, "transition_operation_lifecycle") and lifecycle_required:
                 try:
                     eff_ts.transition_operation_lifecycle(
                         op_id=target_tx.transaction_id,
                         session_id=str(target_tx.session_id),
                         pid=int(target_tx.pid),
-                        target_state=OperationLifecycleState.FAILED,
+                        target_state=terminal_state,
                         metadata={"abort_reason": str(target_tx.abort_reason)},
                     )
                 except Exception as rb_err:
@@ -942,10 +973,12 @@ class TargetExecutionAdapter(ABC):
                     if not hasattr(eff_ts, "identity_conflict_events"):
                         eff_ts.identity_conflict_events = []
                     eff_ts.identity_conflict_events.append(conflict_event)
-                    try:
-                        eff_ts.save()
-                    except Exception:
-                        pass
+                    # Lifecycle persistence failure is retained on the transaction and must be surfaced.
+                    lifecycle_error = RuntimeError(f"Failed to persist terminal capture lifecycle state: {rb_err}")
+                else:
+                    lifecycle_error = None
+            else:
+                lifecycle_error = None
             self._active_transactions.pop(target_tx.transaction_id, None)
             self._active_by_scope.pop((str(target_tx.target_host), str(target_tx.session_id), int(target_tx.pid)), None)
             cur_stack = _tx_stack.get(None) or []
@@ -953,6 +986,12 @@ class TargetExecutionAdapter(ABC):
                 new_stack = [t for t in cur_stack if t.transaction_id != target_tx.transaction_id]
                 _tx_stack.set(new_stack)
                 _current_capture_tx.set(new_stack[-1] if new_stack else None)
+            if target_tx.metadata.get("lifecycle_rollback_error"):
+                lifecycle_error = RuntimeError(
+                    "Capture rollback was not durably recorded: " + str(target_tx.metadata["lifecycle_rollback_error"])
+                )
+            if lifecycle_error:
+                raise lifecycle_error
 
     @contextlib.contextmanager
     def capture_transaction(
@@ -970,7 +1009,11 @@ class TargetExecutionAdapter(ABC):
                 self.commit_capture_transaction(tx)
         except BaseException as exc:
             if not tx.aborted and not tx.committed:
-                self.rollback_capture_transaction(tx, str(exc))
+                from .capture_backend import OperationLifecycleState
+                terminal = (OperationLifecycleState.CANCELLED
+                            if type(exc).__name__ in ("CancelledError", "CancellationError")
+                            else OperationLifecycleState.FAILED)
+                self.rollback_capture_transaction(tx, str(exc), terminal_state=terminal)
             raise
 
     def measure_read_latency(

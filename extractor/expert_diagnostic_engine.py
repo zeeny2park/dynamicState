@@ -2135,15 +2135,15 @@ class AdaptiveInvestigationSession:
         # Open transaction on self.adapter for live process if supported
         step_tx = None
         if self.pid and self.pid > 0 and hasattr(self.adapter, "begin_capture_transaction"):
-            try:
-                step_tx = self.adapter.begin_capture_transaction(
-                    session_id=self.ledger.session_id,
-                    pid=int(self.pid),
-                    operation_type="diagnostic",
-                    snapshot_binding=f"snap_{self.investigation_id}_{step.step_id}",
-                )
-            except Exception:
-                step_tx = None
+            # A failed mandatory transaction must stop collection. Continuing here would turn
+            # a lifecycle persistence failure into an apparently successful unscoped diagnosis.
+            step_tx = self.adapter.begin_capture_transaction(
+                session_id=self.ledger.session_id,
+                pid=int(self.pid),
+                operation_type="diagnostic",
+                snapshot_binding=f"snap_{self.investigation_id}_{step.step_id}",
+                require_lifecycle_persistence=True,
+            )
 
         # Perform actual live runtime evidence acquisition via RuntimeEvidenceProvider
         _t0_collect = time.monotonic()
@@ -2158,26 +2158,48 @@ class AdaptiveInvestigationSession:
                 session_id=self.investigation_id,
                 epoch_id=cur_epoch,
             )
-        finally:
-            step_rcpt = None
+        except BaseException as collect_err:
             if step_tx is not None:
+                from .capture_backend import OperationLifecycleState
+                terminal = (OperationLifecycleState.CANCELLED
+                            if type(collect_err).__name__ in ("CancelledError", "KeyboardInterrupt", "InterruptedError")
+                            else OperationLifecycleState.FAILED)
                 try:
-                    committed_tx = self.adapter.commit_capture_transaction(step_tx)
-                    if committed_tx.physical_bytes_read > 0:
-                        bid = getattr(self.target_assessment, "build_id", None)
-                        step_rcpt = self.adapter.issue_live_receipt_for_session(
-                            session_id=self.ledger.session_id,
-                            pid=int(self.pid),
-                            snapshot_binding=committed_tx.snapshot_binding,
-                            companion_build_id=bid,
-                            transaction=committed_tx,
-                        )
-                except Exception as tx_err:
-                    try:
-                        self.adapter.rollback_capture_transaction(step_tx, str(tx_err))
-                    except Exception:
-                        pass
-                    step_rcpt = None
+                    self.adapter.rollback_capture_transaction(
+                        step_tx, f"Collection {terminal.value.lower()}: {collect_err}", terminal_state=terminal
+                    )
+                except Exception as rollback_err:
+                    raise RuntimeError(
+                        f"Collection failed and mandatory lifecycle rollback failed: {rollback_err}"
+                    ) from collect_err
+            raise
+
+        step_rcpt = None
+        if step_tx is not None:
+            try:
+                committed_tx = self.adapter.commit_capture_transaction(step_tx)
+                if committed_tx.physical_bytes_read > 0:
+                    bid = getattr(self.target_assessment, "build_id", None)
+                    step_rcpt = self.adapter.issue_live_receipt_for_session(
+                        session_id=self.ledger.session_id,
+                        pid=int(self.pid),
+                        snapshot_binding=committed_tx.snapshot_binding,
+                        companion_build_id=bid,
+                        transaction=committed_tx,
+                    )
+            except Exception as tx_err:
+                try:
+                    self.adapter.rollback_capture_transaction(step_tx, str(tx_err))
+                except Exception as rollback_err:
+                    if getattr(step_tx, "require_lifecycle_persistence", False):
+                        raise RuntimeError(
+                            f"Mandatory capture transaction failed and rollback persistence failed: {rollback_err}"
+                        ) from tx_err
+                step_rcpt = None
+                if getattr(step_tx, "require_lifecycle_persistence", False):
+                    raise RuntimeError(
+                        f"Mandatory capture transaction failed; evidence will not be treated as a successful collection: {tx_err}"
+                    ) from tx_err
 
         _collect_dur_sec = round(max(0.0001, time.monotonic() - _t0_collect), 6)
         for _er in ev_records:
@@ -3388,6 +3410,19 @@ class AdaptiveInvestigationSession:
         if not self.conclusion:
             self._finalize_conclusion("EXPORT_REQUESTED", "Diagnostic report requested prior to terminal state.")
 
+        eligible_records = self.ledger.get_eligible_evidence() if self.ledger else []
+        eligible_evidence_ids = {r.evidence_id for r in eligible_records}
+        for hypothesis in self.active_hypotheses:
+            if hypothesis.status == "CONFIRMED":
+                missing_authority = sorted(set(hypothesis.supporting_evidence_ids) - eligible_evidence_ids)
+                if missing_authority:
+                    raise ValueError(
+                        "Refusing to report a confirmed hypothesis with missing or unaccepted evidence: "
+                        + ", ".join(missing_authority)
+                    )
+        report_evidence_records = [r for r in self.collected_evidence_records
+                                   if r.evidence_id in eligible_evidence_ids]
+
         all_checks = self._build_all_planned_and_executed_checks()
 
         # Count check statuses
@@ -3410,7 +3445,7 @@ class AdaptiveInvestigationSession:
             rejected_hypotheses=self.rejected_hypotheses,
             limitations=[lim for lim in (self.target_assessment.limitations if self.target_assessment else [])],
             target_assessment=self.target_assessment,
-            evidence_records=self.collected_evidence_records,
+            evidence_records=report_evidence_records,
         )
         if self.conclusion:
             self.conclusion.overall_verdict = agg_verdict.overall_result
@@ -3445,7 +3480,7 @@ class AdaptiveInvestigationSession:
         if self.budget_tracker and hasattr(self.budget_tracker, "metrics"):
             measured_stop_ms = float(getattr(self.budget_tracker.metrics, "target_stop_duration_ms", 0.0) or 0.0)
         if measured_stop_ms == 0.0:
-            for rec in self.collected_evidence_records:
+            for rec in report_evidence_records:
                 if isinstance(rec.raw_details, dict):
                     measured_stop_ms += float(rec.raw_details.get("target_stop_ms") or rec.raw_details.get("stop_duration_ms") or 0.0)
         actual_collection_mode = getattr(self, "collection_mode", None) or (
@@ -3570,7 +3605,7 @@ class AdaptiveInvestigationSession:
                 ))
 
         for ev in self.collected_evidence:
-            if ev.get("finding"):
+            if ev.get("finding") and ev.get("evidence_id") in eligible_evidence_ids:
                 findings_sec.observed_symptoms.append(FindingRecord(
                     finding_id=f"SYM_{ev.get('evidence_id')}",
                     severity="LOW",
@@ -3633,14 +3668,14 @@ class AdaptiveInvestigationSession:
 
         # Section G: Evidence & Provenance Index
         ev_entries = []
-        for rec in self.collected_evidence_records:
+        for rec in report_evidence_records:
             corr = next((e.get("correlation") for e in self.collected_evidence if e.get("evidence_id") == rec.evidence_id), None)
             assoc_checks = [c.check_id for c in self.checks if rec.evidence_id in c.supporting_evidence_ids or rec.evidence_id in c.contradicting_evidence_ids]
             assoc_hyps = [h.hypothesis_id for h in all_hyps if rec.evidence_id in h.supporting_evidence_ids or rec.evidence_id in h.contradicting_evidence_ids]
             rec_dur = 0.001
             if isinstance(rec.raw_details, dict) and isinstance(rec.raw_details.get("duration_sec"), (int, float)):
                 rec_dur = float(rec.raw_details["duration_sec"])
-            l_rec = self.ledger.get_record(rec.evidence_id) if (self.ledger and hasattr(self.ledger, "get_record")) else None
+            l_rec = self.ledger.get_authoritative_record(rec.evidence_id) if self.ledger else None
             p_ids = list(getattr(l_rec, "parent_evidence_ids", [])) if l_rec else list(dep_graph_union.get(rec.evidence_id, []))
             if not indep_roots_union and l_rec and not p_ids and rec.provenance_class in ("LIVE_RUNTIME_CAPTURE", "CONTROLLED_RUNTIME_REPRODUCTION"):
                 indep_roots_union.add(rec.evidence_id)
@@ -3659,16 +3694,18 @@ class AdaptiveInvestigationSession:
                 associated_hypotheses=assoc_hyps,
                 parent_evidence_ids=p_ids,
                 epistemic_level="derived_evidence" if p_ids else "observation",
-                authority_status="UNVERIFIED" if rec.evidence_id in rej_ev_map else (
-                    "VERIFIED" if rec.provenance_class in ("LIVE_RUNTIME_CAPTURE", "CONTROLLED_RUNTIME_REPRODUCTION") else "UNVERIFIED"
-                ),
+                authority_status="VERIFIED" if l_rec is not None else "UNVERIFIED",
             ))
         sec_g = EvidenceAndProvenanceSection(
             evidence_count=len(ev_entries),
             evidence_records=ev_entries,
             independent_root_sources=sorted(indep_roots_union),
             dependency_graph=dep_graph_union,
-            rejected_or_unverified_evidence=rej_ev_map,
+            rejected_or_unverified_evidence={
+                rec.evidence_id: (rec.admission_reason or getattr(rec.admission_state, "value", str(rec.admission_state)))
+                for rec in (self.ledger.get_audit_trail() if self.ledger else [])
+                if rec.evidence_id not in eligible_evidence_ids
+            } | rej_ev_map,
         )
 
         # Section H: Limitations & Unverified Areas
@@ -3731,13 +3768,15 @@ class AdaptiveInvestigationSession:
             return report.to_json()
 
         res = report.to_dict()
+        accepted_ids = {r.evidence_id for r in (self.ledger.get_eligible_evidence() if self.ledger else [])}
+        accepted_observations = [r for r in self.collected_evidence_records if r.evidence_id in accepted_ids]
         res["report_13_points"] = {
             "1_problem_description": self.raw_problem_statement,
             "2_target_information": res.get("section_b_target_context", {}),
             "3_initial_classification": res.get("section_c_diagnostic_strategy", {}),
             "4_investigation_scope": {"targeted_recipes": [s.recipe_id for s in self.plan.steps] if self.plan else []},
             "5_executed_diagnostic_procedures": [c for c in res.get("section_d_detailed_inspection_results", {}).get("checks", []) if c.get("status") not in ("NOT_EXECUTED", "SKIPPED")],
-            "6_actual_observations": [r.to_dict() for r in self.collected_evidence_records],
+            "6_actual_observations": [r.to_dict() for r in accepted_observations],
             "7_confirmed_findings": [h.to_dict() for h in self.active_hypotheses if h.status == "CONFIRMED"],
             "7_findings_detail": res.get("section_e_findings_and_root_cause", {}),
             "8_probable_causes": [h.problem_statement for h in self.active_hypotheses if h.status in ("CONFIRMED", "LIKELY")],

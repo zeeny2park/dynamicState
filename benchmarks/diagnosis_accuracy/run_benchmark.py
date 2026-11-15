@@ -43,7 +43,7 @@ HELDOUT_GT_DIR = os.path.join(HERE, "heldout", "ground_truth")
 SUITES = {"main": GT_DIR, "heldout": HELDOUT_GT_DIR}
 RESULTS_DIR = os.path.join(HERE, "results")
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 LINE_TOLERANCE = 3
 READY_TIMEOUT_S = 20.0
 DIAGNOSE_TIMEOUT_S = 90.0
@@ -364,13 +364,69 @@ def validate_benchmark_report(report: Dict[str, Any]) -> List[str]:
     """Validate required provenance and row shape before a result can be authoritative."""
     errors = []
     for key in ("schema_version", "environment", "environment_start", "authority", "authority_reasons",
-                "dataset", "rows"):
+                "dataset", "rows", "scope", "selected_target_ids", "expected_target_ids"):
         if key not in report:
             errors.append(f"missing report field: {key}")
     if report.get("schema_version") != SCHEMA_VERSION:
         errors.append(f"schema_version must be {SCHEMA_VERSION}")
     if report.get("authority") not in ("AUTHORITATIVE", "NON_AUTHORITATIVE"):
         errors.append("authority must be AUTHORITATIVE or NON_AUTHORITATIVE")
+    if report.get("scope") not in ("FULL_SUITE", "SUBSET", "SINGLE_TARGET"):
+        errors.append("scope must be FULL_SUITE, SUBSET, or SINGLE_TARGET")
+    selected = report.get("selected_target_ids")
+    expected = report.get("expected_target_ids")
+    if not isinstance(selected, list) or not isinstance(expected, list) or not selected or not expected:
+        errors.append("selected_target_ids and expected_target_ids must be non-empty lists")
+    elif report.get("scope") == "FULL_SUITE" and set(selected) != set(expected):
+        errors.append("FULL_SUITE scope does not cover exactly the expected target IDs")
+    elif report.get("scope") == "SINGLE_TARGET" and len(selected) != 1:
+        errors.append("SINGLE_TARGET scope must contain exactly one selected target")
+    elif report.get("scope") == "SUBSET" and (len(selected) < 2 or set(selected) == set(expected)):
+        errors.append("SUBSET scope must contain at least two but fewer than all expected targets")
+    if report.get("authority") == "AUTHORITATIVE" and report.get("scope") != "FULL_SUITE":
+        errors.append("only FULL_SUITE scope may be authoritative for a quality result")
+    if report.get("authority") == "AUTHORITATIVE":
+        start = report.get("environment_start") if isinstance(report.get("environment_start"), dict) else {}
+        end = report.get("environment") if isinstance(report.get("environment"), dict) else {}
+        for label, env in (("start", start), ("end", end)):
+            if env.get("dirty") is not False or env.get("dirty_check_ok") is not True:
+                errors.append(f"authoritative result requires a verified clean {label} source tree")
+            if not env.get("commit") or env.get("commit") == "unknown":
+                errors.append(f"authoritative result requires a known {label} source commit")
+        if start.get("commit") != end.get("commit"):
+            errors.append("authoritative result requires the same source commit at start and end")
+        if report.get("authority_reasons"):
+            errors.append("authoritative result cannot contain authority_reasons")
+        if isinstance(selected, list) and isinstance(report.get("rows"), list):
+            suite_name = (report.get("dataset") or {}).get("suite") if isinstance(report.get("dataset"), dict) else None
+            rows = report["rows"]
+            if suite_name == "adversarial_healthy":
+                observed_programs = {row.get("program") for row in rows if isinstance(row, dict)}
+                observed_pairs = [(row.get("program"), row.get("symptom_kind"))
+                                  for row in rows if isinstance(row, dict)]
+                try:
+                    from tests.support import adversarial_healthy as adv
+                    expected_pairs = {(program, symptom) for program in selected
+                                      for symptom in adv.SYMPTOM_KINDS}
+                except Exception:
+                    expected_pairs = set()
+                if (len(observed_pairs) != len(rows) or len(observed_pairs) != len(set(observed_pairs))
+                        or observed_programs != set(selected) or set(observed_pairs) != expected_pairs):
+                    errors.append("authoritative adversarial rows must cover every selected program and symptom exactly once")
+            else:
+                row_ids = [row.get("id") for row in rows if isinstance(row, dict)]
+                if len(row_ids) != len(rows) or len(row_ids) != len(set(row_ids)) or set(row_ids) != set(selected):
+                    errors.append("authoritative result rows must cover every selected target ID exactly once")
+        adversarial = report.get("adversarial_healthy")
+        if isinstance(adversarial, dict):
+            if adversarial.get("scope") != "FULL_SUITE":
+                errors.append("authoritative result requires a FULL_SUITE adversarial scope when adversarial results are present")
+            if (not isinstance(adversarial.get("selected_target_ids"), list)
+                    or not isinstance(adversarial.get("expected_target_ids"), list)
+                    or set(adversarial.get("selected_target_ids") or []) != set(adversarial.get("expected_target_ids") or [])):
+                errors.append("adversarial target IDs do not cover the expected suite")
+            if adversarial.get("errors"):
+                errors.append("authoritative result cannot contain adversarial suite errors")
     env = report.get("environment") if isinstance(report.get("environment"), dict) else {}
     if not env.get("commit") or env.get("dirty") not in (True, False, None):
         errors.append("environment commit/dirty provenance is malformed")
@@ -811,6 +867,13 @@ def run_all(targets: List[Dict[str, Any]], diagnose_fn: Callable = _default_diag
         shutil.rmtree(tmp, ignore_errors=True)
     env_end = environment()
     is_authoritative, authority_reasons = _authoritative_run(env_start, env_end)
+    expected_targets = load_ground_truth(SUITES.get(suite, GT_DIR))
+    expected_ids = [g["id"] for g in expected_targets]
+    selected_ids = [g["id"] for g in targets]
+    scope = ("FULL_SUITE" if len(selected_ids) == len(expected_ids) and set(selected_ids) == set(expected_ids)
+             else "SINGLE_TARGET" if len(selected_ids) == 1 else "SUBSET")
+    if scope != "FULL_SUITE":
+        authority_reasons.append(f"{scope} scope cannot authorize a full-suite quality result")
     authority_reasons.extend(_target_provenance_reasons(rows))
     source_overlaps = find_dataset_source_overlaps()
     if source_overlaps:
@@ -819,6 +882,9 @@ def run_all(targets: List[Dict[str, Any]], diagnose_fn: Callable = _default_diag
     suite_root = os.path.dirname(SUITES.get(suite, GT_DIR))
     report = {
         "schema_version": SCHEMA_VERSION,
+        "scope": scope,
+        "selected_target_ids": selected_ids,
+        "expected_target_ids": expected_ids,
         "environment": env_end,
         "environment_start": env_start,
         "authority": "AUTHORITATIVE" if is_authoritative else "NON_AUTHORITATIVE",
@@ -876,9 +942,13 @@ def run_adversarial(diagnose_fn: Callable = _adversarial_diagnose,
                 continue
             source = adv.source_of(name)
             compiler = "g++" if source.endswith(".cpp") else "gcc"
-            build_meta = target_build_metadata({"build": {"compiler": compiler, "opt": "-O0",
-                                                          "flags": ["-g", "-fno-omit-frame-pointer", "-pthread"]}},
-                                               binary)
+            adv_build_target = {
+                "source": source,
+                "sources": [source],
+                "build": {"compiler": compiler, "opt": "-O0",
+                          "flags": ["-g", "-fno-omit-frame-pointer", "-pthread"]},
+            }
+            build_meta = target_build_metadata(adv_build_target, binary)
             # adv.build selects gcc/g++ based on the source extension; record that exact command.
             build_meta["command"] = [build_meta["compiler"], "-g", "-O0", "-fno-omit-frame-pointer",
                                      "-pthread", source, "-o", "<benchmark-output>"]
@@ -906,8 +976,15 @@ def run_adversarial(diagnose_fn: Callable = _adversarial_diagnose,
     ok_rows = [r for r in rows if "error" not in r]
     target_builds = {name: next((r["build"] for r in rows if r.get("program") == name and r.get("build")),
                                 None) for name in sorted({r["program"] for r in rows})}
+    selected_programs = sorted({r["program"] for r in rows})
+    expected_programs = sorted(adv.programs())
+    adv_scope = ("FULL_SUITE" if selected_programs == expected_programs else
+                 "SINGLE_TARGET" if len(selected_programs) == 1 else "SUBSET")
     return {
-        "programs": sorted({r["program"] for r in rows}),
+        "scope": adv_scope,
+        "selected_target_ids": selected_programs,
+        "expected_target_ids": expected_programs,
+        "programs": selected_programs,
         "runs": len(ok_rows),
         "false_positives": sum(1 for r in ok_rows if r["false_positive"]),
         "fault_verdicts": sum(1 for r in ok_rows if r.get("verdict") in adv.FAULT_VERDICTS),
@@ -1017,6 +1094,10 @@ def main(argv: Optional[List[str]] = None) -> int:
                     help="the separately reported adversarial-healthy suite (tests/fixtures/adversarial_healthy): "
                          "on (default, after the targets), off, or only")
     args = ap.parse_args(argv)
+    if args.repeat < 1:
+        ap.error("--repeat must be a positive integer")
+    if args.adversarial == "only" and args.only:
+        ap.error("--only cannot be combined with --adversarial only")
     targets = load_ground_truth(SUITES[args.suite])
     if args.list:
         for gt in targets:
@@ -1059,7 +1140,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         if adv_report.get("errors"):
             authority_reasons.append(f"adversarial suite had {adv_report['errors']} failed run(s)")
         is_authoritative = not authority_reasons
-        adv_report.update({"schema_version": SCHEMA_VERSION, "environment": env_end,
+        adv_report.update({"schema_version": SCHEMA_VERSION,
+                           "environment": env_end,
                            "environment_start": env_start,
                            "dataset": {"version": dataset_fingerprint(os.path.join(REPO_ROOT, "tests", "fixtures"),
                                                                          ("adversarial_healthy",)),
@@ -1081,13 +1163,15 @@ def main(argv: Optional[List[str]] = None) -> int:
               (f" ({'; '.join(authority_reasons)})" if authority_reasons else ""))
         print(f"results written to {out}")
         return 2 if args.require_clean and not is_authoritative else 0
-    report = run_all(targets, symptom_mode=args.symptom, repeat=max(1, args.repeat), suite=args.suite,
+    report = run_all(targets, symptom_mode=args.symptom, repeat=args.repeat, suite=args.suite,
                      environment_start=env_start)
     if args.adversarial == "on" and not args.only:
         report["adversarial_healthy"] = run_adversarial()
     env_end = environment()
     _, source_reasons = _authoritative_run(env_start, env_end)
     authority_reasons = source_reasons + _target_provenance_reasons(report["rows"])
+    if report.get("scope") != "FULL_SUITE":
+        authority_reasons.append(f"{report.get('scope')} scope cannot authorize a full-suite quality result")
     if report.get("dataset", {}).get("source_overlaps_with_other_suite"):
         overlap_count = len(report["dataset"]["source_overlaps_with_other_suite"])
         authority_reasons.append(f"main/held-out contain {overlap_count} exact source duplicate(s)")
@@ -1098,6 +1182,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         authority_reasons.extend(_target_provenance_reasons(adv_build_rows))
         if adversarial.get("errors"):
             authority_reasons.append(f"adversarial suite had {adversarial['errors']} failed run(s)")
+        if adversarial.get("scope") != "FULL_SUITE":
+            authority_reasons.append(f"adversarial {adversarial.get('scope')} scope is not a complete suite")
     authority_reasons.extend(f"schema: {error}" for error in validate_benchmark_report(report))
     report["environment"] = env_end
     report["authority_reasons"] = authority_reasons

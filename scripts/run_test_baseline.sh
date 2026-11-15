@@ -15,7 +15,7 @@ set -uo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${REPO_ROOT}"
 OUT="${1:-docs/test_baseline}"
-CPU_COUNT="$(python3 -c 'import os; print(max(1, len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else (os.cpu_count() or 1))')"
+CPU_COUNT="$(python3 -c 'import os; print(max(1, len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else (os.cpu_count() or 1)))')"
 DEFAULT_JOBS=2
 if (( CPU_COUNT < DEFAULT_JOBS )); then DEFAULT_JOBS="${CPU_COUNT}"; fi
 JOBS="${BASELINE_JOBS:-${DEFAULT_JOBS}}"

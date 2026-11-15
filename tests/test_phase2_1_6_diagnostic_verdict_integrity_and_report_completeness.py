@@ -134,6 +134,7 @@ class TestPhase216DiagnosticVerdictIntegrity(unittest.TestCase):
         # Record only EV_001
         ledger.record(source="heap_inspector", observation="Chunk corrupted")
         existing_ev_id = ledger.records[0].evidence_id
+        ledger.accept_record(existing_ev_id)
 
         hyp = CompetingHypothesis(
             hypothesis_id="HYP_C",

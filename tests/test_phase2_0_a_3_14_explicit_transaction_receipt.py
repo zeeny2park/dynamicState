@@ -11,15 +11,18 @@ Verifies:
 """
 
 import os
+import tempfile
 import unittest
 from unittest.mock import patch
 
 from extractor.target_adapter import LocalTargetAdapter, RemoteSshTargetAdapter
-from extractor.capture_backend import LiveCaptureReceipt
+from extractor.capture_backend import LiveCaptureReceipt, DurableTrustStore
 
 
 class TestPhase20A314ExplicitTransactionReceipt(unittest.TestCase):
     def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self._trust_store = DurableTrustStore(os.path.join(self._tmp.name, "trust.json"))
         self.session_id = "sess_a314_exp"
         self.pid = 4001
         self.process_identity = f"{self.pid}:123456:boot_uuid"
@@ -38,7 +41,11 @@ class TestPhase20A314ExplicitTransactionReceipt(unittest.TestCase):
 
     def _make_adapter(self, adapter_id="ad_test"):
         adapter = LocalTargetAdapter(adapter_id=adapter_id)
+        adapter.trust_store = self._trust_store
         return adapter
+
+    def tearDown(self):
+        self._tmp.cleanup()
 
     # 1. Calling without transaction reference raises ValueError even with 1 candidate
     def test_01_single_candidate_automatic_selection_rejected(self):

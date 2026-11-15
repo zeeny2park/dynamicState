@@ -2022,6 +2022,11 @@ def compose(result: Dict[str, Any], report: Optional[Dict[str, Any]] = None, lan
         raise ValueError(f"lang must be one of {SUPPORTED_LANGS}, got {lang!r}")
     res = dict(result or {})
     report = report if isinstance(report, dict) else (res.get("report") if isinstance(res.get("report"), dict) else None)
+    if report and isinstance(report.get("section_g_evidence_and_provenance"), dict):
+        # Validate a detached canonical report model before rendering. The renderer never
+        # promotes an evidence reference absent from the accepted evidence index.
+        from .diagnostic_report import DiagnosticReport
+        DiagnosticReport.from_dict(report).validate_evidence_references()
     ctx = _Ctx(lang)
     ctx.extra = dict(method_extra or {})
     if repro is None:

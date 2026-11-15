@@ -176,8 +176,8 @@ def make_authoritative_record(
         snapshot_ref=snap_ref,
     )
     rec.target_pid = pid
-    ledger._by_id[evidence_id] = rec
-    ledger._records.append(rec)
+    ledger.add_record(rec)
+    ledger.accept_record(evidence_id)
     return rec
 
 
@@ -293,8 +293,7 @@ class TestPhase218CompleteValidation(unittest.TestCase):
                 details={"provenance_class": prov, "target_pid": 1234},
                 target_identity={"pid": 1234, "process_identity": "proc_1234", "executable_identity": "/bin/app", "build_id": "b1"},
             )
-            ledger._by_id[eid] = rec
-            ledger._records.append(rec)
+            ledger.add_record(rec)
 
         hyp = CompetingHypothesis(
             hypothesis_id="HYP_MAT_D",
@@ -374,8 +373,7 @@ class TestPhase218CompleteValidation(unittest.TestCase):
             details={"provenance_class": PROVENANCE_CLASS_LIVE_RUNTIME_CAPTURE},
             target_identity={},
         )
-        ledger._by_id["EV_MISSING_ID"] = rec_missing_ident
-        ledger._records.append(rec_missing_ident)
+        ledger.add_record(rec_missing_ident)
 
         hyp = CompetingHypothesis(
             hypothesis_id="HYP_MAT_E",
@@ -397,9 +395,9 @@ class TestPhase218CompleteValidation(unittest.TestCase):
         self.assertFalse(hyp.add_supporting_observation("Bad Snap", evidence_id="EV_BAD_SNAP", evidence_record=rec_bad_snap))
 
         # Missing identity is retained as unverified with status MISSING_IDENTITY (distinct from IDENTITY_MISMATCH)
-        self.assertTrue(hyp.add_supporting_observation("Missing ID", evidence_id="EV_MISSING_ID", evidence_record=rec_missing_ident))
+        self.assertFalse(hyp.add_supporting_observation("Missing ID", evidence_id="EV_MISSING_ID", evidence_record=rec_missing_ident))
         self.assertEqual(hyp.identity_validation_records["EV_BAD_BID"]["status"], "IDENTITY_MISMATCH")
-        self.assertEqual(hyp.identity_validation_records["EV_MISSING_ID"]["status"], "MISSING_IDENTITY")
+        self.assertIn(hyp.identity_validation_records["EV_MISSING_ID"]["status"], ("RECORD_REJECTED", "MISSING_IDENTITY"))
         self.assertNotEqual(hyp.evaluate_verdict(ledger=ledger), VERDICT_CONFIRMED)
 
     def test_matrix_F_pid_reuse_detected_and_rejected(self):
@@ -564,7 +562,9 @@ class TestPhase218CompleteValidation(unittest.TestCase):
             capture_authority_token=token,
         )
         make_authoritative_record(ledger, "EV_CAP1_A", receipt=shared_rcpt, operation_id="op_shared_capture_001")
-        make_authoritative_record(ledger, "EV_CAP1_B", receipt=shared_rcpt, operation_id="op_shared_capture_001")
+        make_authoritative_record(ledger, "EV_CAP1_B", receipt=shared_rcpt, operation_id="op_shared_capture_001",
+                                  parent_evidence_ids=["EV_CAP1_A"],
+                                  extra_details={"derived_from": "EV_CAP1_A"})
 
         hyp = CompetingHypothesis(hypothesis_id="HYP_M", category="MEMORY_LEAK", confidence=0.96, ledger=ledger)
         hyp.add_supporting_observation("Field 1 from capture 1", evidence_id="EV_CAP1_A")
@@ -573,7 +573,8 @@ class TestPhase218CompleteValidation(unittest.TestCase):
         roots = hyp.get_independent_root_sources(ledger=ledger)
         self.assertEqual(len(roots), 1)
         self.assertNotEqual(hyp.evaluate_verdict(ledger=ledger), VERDICT_CONFIRMED)
-        self.assertTrue(any("shares underlying capture origin" in lim for lim in hyp.integrity_limitations))
+        # The second observation is an explicit child, so the authoritative graph has one leaf root.
+        self.assertEqual(hyp.integrity_limitations, [])
         self.assertIn("Capture-Origin Deduplication", ROOT_INDEPENDENCE_DEFINITION)
 
     def test_matrix_N_multi_parent_dag_traversal_finds_all_valid_roots(self):

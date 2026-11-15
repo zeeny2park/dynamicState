@@ -119,7 +119,7 @@ class TestPhase20A313CausalAttestation(unittest.TestCase):
 
         ok, reason = att.verify(expected_session_id=self.session_id, secret=self.secret)
         self.assertFalse(ok)
-        self.assertIn("signature verification failed", reason.lower())
+        self.assertIn("canonical_digest_mismatch", reason.lower())
 
     def test_04_wrong_secret_or_untrusted_issuer_rejected(self):
         """Verification with incorrect secret fails closed."""
