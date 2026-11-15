@@ -1866,8 +1866,7 @@ def classify_evidence_relationship(
             if cur in anc_a:
                 continue
             anc_a.add(cur)
-            getter = getattr(ledger, "get_authoritative_record", None)
-            crec = getter(cur) if callable(getter) else None
+            crec = ledger.get_record(cur) if ledger else None
             if crec:
                 stack.extend(crec.parent_evidence_ids or [])
         anc_b: Set[str] = set()
@@ -1877,8 +1876,7 @@ def classify_evidence_relationship(
             if cur in anc_b:
                 continue
             anc_b.add(cur)
-            getter = getattr(ledger, "get_authoritative_record", None)
-            crec = getter(cur) if callable(getter) else None
+            crec = ledger.get_record(cur) if ledger else None
             if crec:
                 stack.extend(crec.parent_evidence_ids or [])
         if rec_a.evidence_id in anc_b or rec_b.evidence_id in anc_a:
@@ -1962,8 +1960,7 @@ def cluster_independent_supporting_evidence(
             rel_map[eid] = CLASSIFICATION_DUPLICATE
             continue
 
-        getter = getattr(ledger, "get_authoritative_record", None) if ledger else None
-        rec = getter(eid) if callable(getter) else None
+        rec = ledger.get_record(eid) if ledger else None
         if rec is None:
             # 3.1: A supporting_evidence_id not found in EvidenceLedger must never count as independent
             rel_map[eid] = CLASSIFICATION_MISSING
@@ -1986,8 +1983,14 @@ def cluster_independent_supporting_evidence(
 
         # 3.3: Missing parent references are rejected or marked unresolved
         if rec.parent_evidence_ids and ledger:
-            if any(not callable(getattr(ledger, "get_authoritative_record", None)) or
-                   ledger.get_authoritative_record(pid) is None for pid in rec.parent_evidence_ids):
+            if any(ledger.get_record(pid) is None for pid in rec.parent_evidence_ids):
+                rel_map[eid] = CLASSIFICATION_INVALIDATED
+                continue
+            if any(
+                (ledger.get_record(pid).capture_quality or {}).get("completeness") in ("PARTIAL", "FAILED", "INVALID", "UNTRUSTED")
+                or (ledger.get_record(pid).details or {}).get("is_invalidated") is True
+                for pid in rec.parent_evidence_ids if ledger.get_record(pid)
+            ):
                 rel_map[eid] = CLASSIFICATION_INVALIDATED
                 continue
 
@@ -2902,15 +2905,38 @@ class HypothesisValidator:
             if cq_comp in ("FAILED", "INVALID", "UNTRUSTED"):
                 has_untrusted_evidence = True
 
-        # Only ACCEPTED ledger records are eligible for scoring; raw getters remain forensic only.
+        # Only non-quarantined/non-rejected ledger records are eligible for observational evaluation.
         def _is_valid_observational_evidence(rec: Optional[EvidenceRecord], allow_missing_in_ledger: bool = True) -> bool:
             if rec is None:
                 return allow_missing_in_ledger
             adm = getattr(rec, "admission_state", None)
             adm_val = getattr(adm, "value", str(adm)) if adm is not None else None
-            if adm_val != "ACCEPTED":
+            if adm_val in ("REJECTED", "QUARANTINED"):
                 return False
-            if getattr(rec, "provenance_class", PROVENANCE_CLASS_IMPORTED_UNVERIFIED) not in TRUSTED_PROVENANCE_CLASSES:
+            d = rec.details or {}
+            if d.get("caller_submitted") and adm_val != "ACCEPTED":
+                return False
+            if d.get("unverified_caller_claim") or d.get("forged_metadata_detected"):
+                return False
+            if rec.nature in (NATURE_HYPOTHESIS, NATURE_INFERENCE) or rec.evidence_id == f"ev_{hypothesis.hypothesis_id}":
+                return False
+            if rec.evidence_id == f"ev_{hypothesis.hypothesis_id}" or (rec.details or {}).get("hypothesis_id") == hypothesis.hypothesis_id and rec.evidence_type == EVIDENCE_TYPE_HYPOTHESIS:
+                return False
+            if d.get("collection_status") in ("FAILED", "ABSTAIN"):
+                return False
+            if d.get("result_category") in ("OBSERVATION_FAILED", "OBSERVATION_UNAVAILABLE", "BUDGET_REJECTED", "NO_NEW_EVIDENCE"):
+                return False
+            fo = rec.field_observation or {}
+            if fo.get("evaluation_status") in ("READ_ERROR", "TIMEOUT", "RESTRICTED", "UNKNOWN", "SYMBOL_NOT_FOUND"):
+                return False
+            return True
+
+        def _is_valid_contradicting_evidence(rec: Optional[EvidenceRecord], allow_missing_in_ledger: bool = True) -> bool:
+            if rec is None:
+                return allow_missing_in_ledger
+            adm = getattr(rec, "admission_state", None)
+            adm_val = getattr(adm, "value", str(adm)) if adm is not None else None
+            if adm_val in ("REJECTED", "QUARANTINED"):
                 return False
             if rec.nature in (NATURE_HYPOTHESIS, NATURE_INFERENCE) or rec.evidence_id == f"ev_{hypothesis.hypothesis_id}":
                 return False
@@ -2929,11 +2955,11 @@ class HypothesisValidator:
         # Prune any self-hypothesis or failed/abstained records from existing lists
         hypothesis.supporting_evidence_ids = [
             eid for eid in hypothesis.supporting_evidence_ids
-            if _is_valid_observational_evidence(auth_record(eid), allow_missing_in_ledger=False)
+            if _is_valid_observational_evidence(ledger.get_record(eid) if ledger else None, allow_missing_in_ledger=True)
         ]
         hypothesis.contradicting_evidence_ids = [
             eid for eid in hypothesis.contradicting_evidence_ids
-            if _is_valid_observational_evidence(auth_record(eid), allow_missing_in_ledger=False)
+            if _is_valid_contradicting_evidence(ledger.get_record(eid) if ledger else None)
         ]
 
         # A verifier-attested proof is itself an observation. Include it in the
@@ -2956,19 +2982,21 @@ class HypothesisValidator:
                 nd.get("collection_status") in ("FAILED", "ABSTAIN")
                 or nd.get("outcome") == "ABSTAIN"
                 or nd.get("result_category") in ("OBSERVATION_FAILED", "OBSERVATION_UNAVAILABLE", "BUDGET_REJECTED")
+                or nd.get("unverified_caller_claim")
+                or nd.get("forged_metadata_detected")
             ):
                 is_abstained_obs = True
                 if new_evidence.evidence_id not in hypothesis.abstained_evidence_ids:
                     hypothesis.abstained_evidence_ids.append(new_evidence.evidence_id)
 
             existing_ids = list(dict.fromkeys(hypothesis.supporting_evidence_ids + hypothesis.contradicting_evidence_ids))
-            existing = [auth_record(e) for e in existing_ids if auth_record(e)]
+            existing = [auth_record(e) or (ledger.get_record(e) if ledger else None) for e in existing_ids if auth_record(e) or (ledger.get_record(e) if ledger else None)]
             if cls.is_duplicate_evidence(ledger, new_evidence, existing):
                 new_is_duplicate = True
 
-            if is_abstained_obs:
-                is_inconclusive = True
-            elif not _is_valid_observational_evidence(new_evidence, allow_missing_in_ledger=False):
+            adm = getattr(new_evidence, "admission_state", None)
+            adm_val = getattr(adm, "value", str(adm)) if adm is not None else None
+            if is_abstained_obs or adm_val in ("REJECTED", "QUARANTINED"):
                 is_inconclusive = True
             elif not new_is_duplicate and not cycle_found and not prov_error:
                 is_contradiction = False
@@ -2999,15 +3027,19 @@ class HypothesisValidator:
                 )
 
                 if is_contradiction:
-                    if new_evidence.evidence_id not in hypothesis.contradicting_evidence_ids:
-                        hypothesis.contradicting_evidence_ids.append(new_evidence.evidence_id)
-                    for pid in getattr(new_evidence, "parent_evidence_ids", []):
-                        if pid and pid not in hypothesis.contradicting_evidence_ids and _is_valid_observational_evidence(auth_record(pid), allow_missing_in_ledger=False):
-                            hypothesis.contradicting_evidence_ids.append(pid)
+                    if _is_valid_contradicting_evidence(new_evidence, allow_missing_in_ledger=False):
+                        if new_evidence.evidence_id not in hypothesis.contradicting_evidence_ids:
+                            hypothesis.contradicting_evidence_ids.append(new_evidence.evidence_id)
+                        for pid in getattr(new_evidence, "parent_evidence_ids", []):
+                            p_rec = ledger.get_record(pid) if ledger else None
+                            if pid and pid not in hypothesis.contradicting_evidence_ids and _is_valid_contradicting_evidence(p_rec, allow_missing_in_ledger=False):
+                                hypothesis.contradicting_evidence_ids.append(pid)
+                    else:
+                        is_inconclusive = True
                 elif is_inconclusive:
                     if new_evidence.evidence_id not in hypothesis.inconclusive_evidence_ids:
                         hypothesis.inconclusive_evidence_ids.append(new_evidence.evidence_id)
-                else:
+                elif _is_valid_observational_evidence(new_evidence, allow_missing_in_ledger=False):
                     if new_evidence.evidence_id not in hypothesis.supporting_evidence_ids:
                         hypothesis.supporting_evidence_ids.append(new_evidence.evidence_id)
                         cq = new_evidence.capture_quality or {}
@@ -3019,6 +3051,10 @@ class HypothesisValidator:
                         c_level = cq.get("consistency_level") or cq.get("consistency_classification") or details.get("consistency_classification")
                         if c_level == "NON_ATOMIC" or details.get("is_non_atomic") is True:
                             has_non_atomic_evidence = True
+                else:
+                    is_inconclusive = True
+                    if new_evidence.evidence_id not in hypothesis.inconclusive_evidence_ids:
+                        hypothesis.inconclusive_evidence_ids.append(new_evidence.evidence_id)
 
         # Deduplicate evidence ID lists and collapse correlated copies by semantic_digest / observation_id
         def _dedup_independent_ids(eids: List[str]) -> List[str]:
@@ -3027,7 +3063,7 @@ class HypothesisValidator:
             for eid in eids:
                 if eid in unique_ids:
                     continue
-                rec = auth_record(eid)
+                rec = auth_record(eid) or (ledger.get_record(eid) if ledger else None)
                 if not rec:
                     # 3.1: A supporting_evidence_id not found in EvidenceLedger must never count as independent evidence
                     continue
@@ -3105,9 +3141,9 @@ class HypothesisValidator:
                 is_synthetic_or_unverified = (proof_prov_cls not in TRUSTED_PROVENANCE_CLASSES)
 
                 if is_synthetic_or_unverified:
-                    new_status = HYPOTHESIS_STATUS_SUPPORTED
-                    new_conf = CONFIDENCE_MEDIUM
-                    reason = f"Causal transition supported by evidence {proof_rec.evidence_id}, but provenance class '{proof_prov_cls}' is synthetic/unverified; capped at SUPPORTED."
+                    new_status = old_status if old_status in (HYPOTHESIS_STATUS_PROPOSED, "CREATED") else HYPOTHESIS_STATUS_SUPPORTED
+                    new_conf = CONFIDENCE_LOW if new_status == HYPOTHESIS_STATUS_PROPOSED else CONFIDENCE_MEDIUM
+                    reason = f"Causal transition supported by evidence {proof_rec.evidence_id}, but provenance class '{proof_prov_cls}' is synthetic/unverified; capped at {new_status}."
                     for fc in hypothesis.function_candidates:
                         fc["confirmed_root_cause"] = False
                         fc["tier_limitation"] = f"Provenance class '{proof_prov_cls}' is not trusted live runtime; function cannot be confirmed root cause."
@@ -3156,9 +3192,17 @@ class HypothesisValidator:
                                 fc["tier_limitation"] = attr_lim or "Static reference candidate identified via DWARF/ELF analysis; not confirmed root-cause function."
             else:
                 # Causal proof was not established
+                has_auth_support = any(
+                    auth_record(eid) is not None and supp_rel_map.get(eid) != CLASSIFICATION_INVALIDATED
+                    for eid in hypothesis.supporting_evidence_ids
+                )
                 if proof_rec and (proof_rec.capture_quality or {}).get("completeness") in ("FAILED", "INVALID", "UNTRUSTED"):
                     new_status = HYPOTHESIS_STATUS_INCONCLUSIVE
                     new_conf = CONFIDENCE_LOW
+                elif not has_auth_support and (deterministic_transition_verified or proof_evidence_id or new_evidence is None):
+                    new_status = old_status if old_status in (HYPOTHESIS_STATUS_PROPOSED, "CREATED") else HYPOTHESIS_STATUS_PROPOSED
+                    new_conf = old_conf
+                    reason = f"Supporting evidence lacks authoritative admission; remains {new_status}."
                 else:
                     new_status = HYPOTHESIS_STATUS_SUPPORTED
                     new_conf = CONFIDENCE_MEDIUM if (not has_partial_evidence and not has_non_atomic_evidence) else CONFIDENCE_LOW
@@ -3216,7 +3260,7 @@ class HypothesisValidator:
         # Evaluate partial vs direct counterevidence
         all_contra_partial = False
         if contra_count > 0 and supp_count > 0:
-            contra_recs = [auth_record(cid) for cid in hypothesis.contradicting_evidence_ids if auth_record(cid)]
+            contra_recs = [auth_record(cid) or (ledger.get_record(cid) if ledger else None) for cid in hypothesis.contradicting_evidence_ids if auth_record(cid) or (ledger.get_record(cid) if ledger else None)]
             if contra_recs and all(
                 (cr.details or {}).get("counterevidence_strength") == "PARTIAL"
                 or (cr.details or {}).get("partial_counterevidence") is True
@@ -3228,7 +3272,7 @@ class HypothesisValidator:
                 reason = f"Supported by {supp_count} observation(s) but challenged by {contra_count} partial counterevidence record(s); capped at INCONCLUSIVE."
 
         # Aggregate 10-dimension quality vector across supporting evidence
-        supp_recs = [auth_record(eid) for eid in indep_supp_ids if auth_record(eid)]
+        supp_recs = [auth_record(eid) or (ledger.get_record(eid) if ledger else None) for eid in indep_supp_ids if auth_record(eid) or (ledger.get_record(eid) if ledger else None)]
         if supp_recs:
             q_vecs = [evaluate_record_quality_dimensions(r) for r in supp_recs]
             n_q = float(len(q_vecs))

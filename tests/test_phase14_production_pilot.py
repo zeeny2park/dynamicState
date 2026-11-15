@@ -43,6 +43,7 @@ from extractor.evidence_ledger import (
     CLAIM_STATE_TRANSITION_VERIFIED,
     CLAIM_FUNCTION_ATTRIBUTION_VERIFIED,
 )
+from tests.support.trusted_evidence_fixture import add_admitted_fixture
 from extractor.hypothesis import (
     FUNCTION_TIER_STATIC_CANDIDATE,
     FUNCTION_TIER_EVIDENCE_SUPPORTED,
@@ -263,6 +264,7 @@ class TestPhase14ProductionPilotScenarios(unittest.TestCase):
             capture_quality={"completeness": "COMPLETE", "consistency_level": "STOPPED"},
         )
         session.ledger.add_record(ev_obs)
+        add_admitted_fixture(session.ledger, ev_obs)
 
         hypo = InvestigationHypothesis(
             hypothesis_id="hypo_decoupled",

@@ -750,7 +750,7 @@ class EvidenceAdapter:
             "problem_category", "domain", "address", "symbol", "observed_value",
             "raw_observation", "normalized_observation", "correlation",
             "source_correlation", "limitations", "collection_status",
-            "parent_evidence_ids", "typed_evidence",
+            "parent_evidence_ids", "typed_evidence", "derived_from",
         ):
             if meta_k in tool_result and tool_result[meta_k] is not None:
                 compact_details[meta_k] = tool_result[meta_k]
@@ -831,10 +831,21 @@ class EvidenceAdapter:
         parent_ev_ids: List[str] = []
         if tool_result.get("parent_evidence_ids") and isinstance(tool_result["parent_evidence_ids"], (list, tuple)):
             parent_ev_ids = [str(pid) for pid in tool_result["parent_evidence_ids"]]
+        elif isinstance(tool_result.get("details"), dict) and tool_result["details"].get("parent_evidence_ids"):
+            parent_ev_ids = [str(pid) for pid in tool_result["details"]["parent_evidence_ids"]]
         elif tool_result.get("parent_evidence_id"):
             parent_ev_ids = [str(tool_result["parent_evidence_id"])]
         elif tool_result.get("causal_parents") and isinstance(tool_result["causal_parents"], (list, tuple)):
             parent_ev_ids = [str(pid) for pid in tool_result["causal_parents"]]
+
+        if "derived_from" in tool_result and tool_result["derived_from"]:
+            compact_details["derived_from"] = str(tool_result["derived_from"])
+        elif isinstance(tool_result.get("details"), dict) and tool_result["details"].get("derived_from"):
+            compact_details["derived_from"] = str(tool_result["details"]["derived_from"])
+        elif parent_ev_ids:
+            compact_details["derived_from"] = parent_ev_ids[0]
+        if parent_ev_ids and "parent_evidence_ids" not in compact_details:
+            compact_details["parent_evidence_ids"] = list(parent_ev_ids)
 
         # Disarm inferences/hypotheses being promoted to observation facts
         eff_nature = tool_result.get("nature") or nature

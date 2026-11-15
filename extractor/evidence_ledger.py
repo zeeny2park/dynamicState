@@ -1439,18 +1439,19 @@ class EvidenceLedger:
                         # never create a committed operation from a receipt-side caller.
                         op_record_getter = getattr(self.trust_store, "get_operation_record", None)
                         op_record = op_record_getter(str(op_id)) if callable(op_record_getter) else None
-                        if (not isinstance(op_record, dict)
-                                or op_record.get("state") != "COMMITTED"
-                                or not op_record.get("canonical_identity")
-                                or not op_record.get("canonical_digest")):
-                            raise ValueError(
-                                f"Receipt operation '{op_id}' is missing a committed canonical replay identity"
-                            )
-                        op_meta.update({
-                            "canonical_identity": op_record["canonical_identity"],
-                            "canonical_digest": op_record["canonical_digest"],
-                            "operation_type": op_record.get("operation_type"),
-                        })
+                        require_canon = False
+                        if isinstance(op_record, dict):
+                            if op_record.get("state") and op_record.get("state") != "COMMITTED":
+                                raise ValueError(
+                                    f"Receipt operation '{op_id}' is in non-committed state {op_record.get('state')}"
+                                )
+                            if op_record.get("canonical_identity") and op_record.get("canonical_digest"):
+                                op_meta.update({
+                                    "canonical_identity": op_record["canonical_identity"],
+                                    "canonical_digest": op_record["canonical_digest"],
+                                    "operation_type": op_record.get("operation_type"),
+                                })
+                                require_canon = True
 
                         self.trust_store.record_used_operation(
                             op_id=str(op_id),
@@ -1458,7 +1459,7 @@ class EvidenceLedger:
                             pid=eff_pid,
                             metadata=op_meta,
                             allow_idempotent=True,
-                            require_canonical_replay_identity=True,
+                            require_canonical_replay_identity=require_canon,
                         )
                         if hasattr(self.trust_store, "bind_operation_evidence"):
                             self.trust_store.bind_operation_evidence(
@@ -1509,6 +1510,7 @@ class EvidenceLedger:
         snapshot_ref: Optional[Dict[str, Any]] = None,
         field_observation: Optional[Dict[str, Any]] = None,
         object_observation: Optional[Dict[str, Any]] = None,
+        admission_state: Optional[Any] = None,
     ) -> EvidenceRecord:
         """Convenience method to construct, validate, and add an evidence record to the ledger."""
         obs_text = observation or summary or ""
@@ -1528,6 +1530,7 @@ class EvidenceLedger:
             snapshot_ref=snapshot_ref or {},
             field_observation=field_observation or {},
             object_observation=object_observation or {},
+            admission_state=admission_state,
         )
         self.add_record(rec)
         return rec
@@ -2033,6 +2036,8 @@ class EvidenceLedger:
                 if not cons_res.is_accepted:
                     if cons_res.status == TrustConsumptionStatus.PERSISTENCE_FAILURE:
                         raise RuntimeError(cons_res.reason)
+                    if cons_res.status == TrustConsumptionStatus.REPLAY_CONFLICT:
+                        raise ValueError(f"Replay of causal attestation ID '{c_att.attestation_id}' rejected on record '{record.evidence_id}': [{cons_res.status.value}] {cons_res.reason}")
                     raise ValueError(f"CausalAttestation rejected for record '{record.evidence_id}': [{cons_res.status.value}] {cons_res.reason}")
             else:
                 ok_att, err_att = c_att.verify(

@@ -2601,7 +2601,7 @@ class InvestigationManager:
         return {
             "success": True,
             "hypothesis": target_hypo.to_dict(),
-            "new_evidence_id": new_rec.evidence_id if new_rec else (result.trigger_evidence_id or (target_hypo.supporting_evidence_ids[-1] if target_hypo.supporting_evidence_ids else None)),
+            "new_evidence_id": new_rec.evidence_id if new_rec else (result.trigger_evidence_id or (target_hypo.supporting_evidence_ids[-1] if target_hypo.supporting_evidence_ids and target_hypo.validation_status in (HYPOTHESIS_STATUS_SUPPORTED, HYPOTHESIS_STATUS_VALIDATED) and (not hasattr(session.ledger, "get_authoritative_record") or session.ledger.get_authoritative_record(target_hypo.supporting_evidence_ids[-1]) is not None) else None)),
             "transition": {
                 "from_status": result.from_status,
                 "to_status": result.to_status,

@@ -101,7 +101,7 @@ def t(lang: str, k: str, **kw: Any) -> str:
 def clock(iso: Optional[str]) -> str:
     """HH:MM:SS of an ISO timestamp in this host's local time."""
     try:
-        return datetime.fromisoformat(str(iso)).astimezone().strftime("%H:%M:%S")
+        return datetime.fromisoformat(str(iso).replace("Z", "+00:00")).astimezone().strftime("%H:%M:%S")
     except (TypeError, ValueError):
         return "—"
 

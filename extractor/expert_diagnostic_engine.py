@@ -1261,6 +1261,12 @@ class AdaptiveInvestigationSession:
         self._investigations_dir = os.path.join(self.corpus_dir, "investigations")
         os.makedirs(self._investigations_dir, exist_ok=True)
         self.adapter = adapter or LocalTargetAdapter()
+        from .capture_backend import get_default_trust_store, DurableTrustStore
+        eff_ts = getattr(self.adapter, "trust_store", None) or get_default_trust_store()
+        if eff_ts is None:
+            ts_path = os.path.join(self.corpus_dir, "trust_store.json")
+            eff_ts = DurableTrustStore(ts_path)
+            self.adapter.trust_store = eff_ts
         self.expert_overrides = expert_overrides or []
         self.manual_invariants = manual_invariants or []
         self.observation_interval = observation_interval or 0.05
@@ -1284,6 +1290,8 @@ class AdaptiveInvestigationSession:
         self.planner = InvestigationPlanner(self.recipe_registry)
         self.correlator = EvidenceToSourceCorrelator(companion_elf, self.adapter)
         self.ledger = EvidenceLedger(session_id=self.investigation_id)
+        if hasattr(self.ledger, "trust_store") and getattr(self.ledger, "trust_store", None) is None:
+            self.ledger.trust_store = eff_ts
         self.evidence_adapter = EvidenceAdapter()
         self.evidence_provider = RuntimeEvidenceProvider(
             adapter=self.adapter,
@@ -1995,6 +2003,7 @@ class AdaptiveInvestigationSession:
                     eff_nature = NATURE_OBSERVATION
 
             # Canonical adaptation through EvidenceAdapter
+            eff_epoch = getattr(rcpt_obj, "capture_epoch", None) if rcpt_raw else (getattr(self.adapter, "capture_epoch", None) or (getattr(self.plan, "current_step_index", 0) if self.plan else 0))
             rec_obj = self.evidence_adapter.adapt_generic_tool_output(
                 tool_name=recipe_id,
                 tool_result=tool_result,
@@ -2003,7 +2012,7 @@ class AdaptiveInvestigationSession:
                 target_identity=t_ident,
                 session_id=self.ledger.session_id,
                 ledger=self.ledger,
-                epoch=getattr(self.plan, "current_step_index", 0) if self.plan else 0,
+                epoch=eff_epoch,
                 evidence_id=ev_id,
                 observation=observation_text,
             )
@@ -2018,6 +2027,12 @@ class AdaptiveInvestigationSession:
                 if dup is not None:
                     return f"DUPLICATE: {dup.evidence_id}"
                 return "FAILED: Record was not admitted by ledger"
+
+            if prov_class in ("LIVE_RUNTIME_CAPTURE", "CONTROLLED_RUNTIME_REPRODUCTION") and hasattr(self.ledger, "accept_record"):
+                try:
+                    self.ledger.accept_record(ev_id)
+                except Exception:
+                    pass
 
             return "RECORDED"
         except Exception as le:
@@ -2176,9 +2191,9 @@ class AdaptiveInvestigationSession:
 
         step_rcpt = None
         if step_tx is not None:
-            try:
-                committed_tx = self.adapter.commit_capture_transaction(step_tx)
-                if committed_tx.physical_bytes_read > 0:
+            if step_tx.physical_bytes_read > 0:
+                try:
+                    committed_tx = self.adapter.commit_capture_transaction(step_tx)
                     bid = getattr(self.target_assessment, "build_id", None)
                     step_rcpt = self.adapter.issue_live_receipt_for_session(
                         session_id=self.ledger.session_id,
@@ -2187,19 +2202,25 @@ class AdaptiveInvestigationSession:
                         companion_build_id=bid,
                         transaction=committed_tx,
                     )
-            except Exception as tx_err:
-                try:
-                    self.adapter.rollback_capture_transaction(step_tx, str(tx_err))
-                except Exception as rollback_err:
+                except Exception as tx_err:
+                    try:
+                        self.adapter.rollback_capture_transaction(step_tx, str(tx_err))
+                    except Exception as rollback_err:
+                        if getattr(step_tx, "require_lifecycle_persistence", False):
+                            raise RuntimeError(
+                                f"Mandatory capture transaction failed and rollback persistence failed: {rollback_err}"
+                            ) from tx_err
+                    step_rcpt = None
                     if getattr(step_tx, "require_lifecycle_persistence", False):
                         raise RuntimeError(
-                            f"Mandatory capture transaction failed and rollback persistence failed: {rollback_err}"
+                            f"Mandatory capture transaction failed; evidence will not be treated as a successful collection: {tx_err}"
                         ) from tx_err
+            else:
+                try:
+                    self.adapter.rollback_capture_transaction(step_tx, "No physical memory reads performed during recipe step")
+                except Exception:
+                    pass
                 step_rcpt = None
-                if getattr(step_tx, "require_lifecycle_persistence", False):
-                    raise RuntimeError(
-                        f"Mandatory capture transaction failed; evidence will not be treated as a successful collection: {tx_err}"
-                    ) from tx_err
 
         _collect_dur_sec = round(max(0.0001, time.monotonic() - _t0_collect), 6)
         for _er in ev_records:
@@ -2248,6 +2269,7 @@ class AdaptiveInvestigationSession:
         rcpt_dict_payload = step_rcpt.to_dict() if step_rcpt is not None else None
 
         # Enrich and correlate evidence records (Section 7: 1:1 finding-to-evidence relationship)
+        primary_step_ev_id: Optional[str] = None
         for i, fact in enumerate(eval_result.supporting_facts):
             obs_actual_val = obs_data.get("observed_value") if obs_data.get("observed_value") is not None else (
                 obs_data.get("value") if obs_data.get("value") is not None else (
@@ -2275,7 +2297,17 @@ class AdaptiveInvestigationSession:
                 )
                 self.collected_evidence_records.append(matching_rec)
 
+            if i == 0:
+                primary_step_ev_id = ev_id
+            elif primary_step_ev_id:
+                matching_rec.parent_evidence_ids = [primary_step_ev_id]
+                if isinstance(matching_rec.raw_details, dict):
+                    matching_rec.raw_details["derived_from"] = primary_step_ev_id
+
             consumed_step_ev_ids.append(ev_id)
+            step_ev_details = dict(eval_result.details)
+            if i > 0 and primary_step_ev_id:
+                step_ev_details["derived_from"] = primary_step_ev_id
             ev_payload = {
                 "evidence_id": ev_id,
                 # The observed rule decides the category (e.g. a runaway thread is PROCESS_INSTABILITY, not a
@@ -2286,13 +2318,14 @@ class AdaptiveInvestigationSession:
                 "finding": fact,
                 "finding_classification": "OBSERVED_FACT",
                 "status": "SUPPORTED",
-                "details": eval_result.details,
+                "details": step_ev_details,
                 "address": obs_data.get("address") or obs_data.get("faulting_address"),
                 "symbol": obs_data.get("pointer_name") or obs_data.get("variable_name"),
                 "observed_value": obs_actual_val,
                 "raw_observation": obs_data,
                 "normalized_observation": obs_actual_val,
                 "provenance_class": prov_class,
+                **({"parent_evidence_ids": [primary_step_ev_id]} if (i > 0 and primary_step_ev_id) else {}),
                 **({"live_capture_receipt": rcpt_dict_payload} if rcpt_dict_payload else {}),
             }
             correlated = self.correlator.correlate(ev_payload, target_pid=self.pid)
@@ -2314,6 +2347,13 @@ class AdaptiveInvestigationSession:
             obs_contra_val = obs_data.get("observed_value") if obs_data.get("observed_value") is not None else (
                 obs_data.get("value") if obs_data.get("value") is not None else None
             )
+            contra_details = dict(eval_result.details)
+            if primary_step_ev_id:
+                contra_details["derived_from"] = primary_step_ev_id
+            elif j == 0:
+                primary_step_ev_id = contra_ev_id
+            elif primary_step_ev_id:
+                contra_details["derived_from"] = primary_step_ev_id
             ev_payload = {
                 "evidence_id": contra_ev_id,
                 "problem_category": recipe.problem_category,
@@ -2322,12 +2362,13 @@ class AdaptiveInvestigationSession:
                 "counter_indicator": fact,
                 "finding_classification": "OBSERVED_FACT",
                 "status": "CONTRADICTED",
-                "details": eval_result.details,
+                "details": contra_details,
                 "address": obs_data.get("address"),
                 "observed_value": obs_contra_val,
                 "raw_observation": obs_data,
                 "normalized_observation": obs_contra_val,
                 "provenance_class": eff_step_prov,
+                **({"parent_evidence_ids": [primary_step_ev_id]} if primary_step_ev_id and primary_step_ev_id != contra_ev_id else {}),
                 **({"live_capture_receipt": rcpt_dict_payload} if rcpt_dict_payload else {}),
             }
             correlated = self.correlator.correlate(ev_payload, target_pid=self.pid)

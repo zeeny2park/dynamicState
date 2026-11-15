@@ -1380,7 +1380,7 @@ class DurableTrustStore:
                     if not isinstance(up_at, str):
                         raise ValueError(f"Invalid updated_at in trust store: {up_at!r}")
                     try:
-                        datetime.fromisoformat(up_at)
+                        datetime.fromisoformat(up_at.replace("Z", "+00:00"))
                     except Exception as iso_err:
                         raise ValueError(f"Invalid updated_at ISO 8601 timestamp in trust store: {up_at!r}") from iso_err
 
@@ -1400,7 +1400,7 @@ class DurableTrustStore:
                         if "revoked_at" not in v or not isinstance(v["revoked_at"], str):
                             raise ValueError(f"revoked_keys entry '{k}' missing valid 'revoked_at'")
                         try:
-                            datetime.fromisoformat(v["revoked_at"])
+                            datetime.fromisoformat(v["revoked_at"].replace("Z", "+00:00"))
                         except Exception as iso_err:
                             raise ValueError(f"revoked_keys entry '{k}' has invalid revoked_at timestamp") from iso_err
 
@@ -1430,7 +1430,7 @@ class DurableTrustStore:
                             if not isinstance(r_at, str):
                                 raise ValueError(f"used_attestations entry '{aid}' has non-string recorded_at")
                             try:
-                                datetime.fromisoformat(r_at)
+                                datetime.fromisoformat(r_at.replace("Z", "+00:00"))
                             except Exception as iso_err:
                                 raise ValueError(f"used_attestations entry '{aid}' invalid recorded_at timestamp: {r_at!r}") from iso_err
 
@@ -1449,7 +1449,7 @@ class DurableTrustStore:
                             if not isinstance(r_at, str):
                                 raise ValueError(f"used_operation_ids entry '{op_id}' has non-string recorded_at")
                             try:
-                                datetime.fromisoformat(r_at)
+                                datetime.fromisoformat(r_at.replace("Z", "+00:00"))
                             except Exception as iso_err:
                                 raise ValueError(f"used_operation_ids entry '{op_id}' invalid recorded_at timestamp: {r_at!r}") from iso_err
                         if "evidence_ids" in op_rec:

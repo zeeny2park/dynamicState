@@ -680,16 +680,20 @@ class TargetExecutionAdapter(ABC):
         self._active_by_scope[(str(th), str(session_id), int(pid))] = tx
 
         # P0-5: If lifecycle persistence is required, advance lifecycle DAG CREATED -> VALIDATED -> RESERVED -> EXECUTING
-        should_persist = (
-            require_lifecycle_persistence
-            if require_lifecycle_persistence is not None
-            else getattr(self, "require_lifecycle_persistence", isinstance(self, LocalTargetAdapter))
-        )
+        from .capture_backend import get_default_trust_store, OperationLifecycleState
+        eff_ts = getattr(self, "trust_store", None) or get_default_trust_store()
+        if require_lifecycle_persistence is True:
+            should_persist = True
+        elif require_lifecycle_persistence is False:
+            should_persist = False
+        else:
+            should_persist = getattr(self, "require_lifecycle_persistence", None)
+            if should_persist is None:
+                should_persist = bool(eff_ts and isinstance(self, LocalTargetAdapter))
+
         tx.require_lifecycle_persistence = bool(should_persist)
         if should_persist:
             tx.metadata["require_lifecycle_persistence"] = True
-            from .capture_backend import get_default_trust_store, OperationLifecycleState
-            eff_ts = getattr(self, "trust_store", None) or get_default_trust_store()
             if not eff_ts or not callable(getattr(eff_ts, "transition_operation_lifecycle", None)):
                 self._active_transactions.pop(tx.transaction_id, None)
                 self._active_by_scope.pop((str(th), str(session_id), int(pid)), None)
@@ -868,7 +872,7 @@ class TargetExecutionAdapter(ABC):
                 raise MissingIdentityFieldError(f"process_start_time must be a positive integer on target {target_tx.pid}")
 
             proc_id = ProcessIdentity(
-                host_identity=str(th),
+                host_identity=str(th or "localhost"),
                 boot_id=str(cur_boot),
                 pid=int(target_tx.pid),
                 process_start_time=int(p_start),
@@ -942,6 +946,8 @@ class TargetExecutionAdapter(ABC):
         if not target_tx and len(self._active_transactions) == 1:
             target_tx = next(iter(self._active_transactions.values()))
         if target_tx:
+            if target_tx.aborted:
+                return
             target_tx.aborted = True
             target_tx.abort_reason = reason or "Capture transaction rolled back"
             from .capture_backend import get_default_trust_store, OperationLifecycleState

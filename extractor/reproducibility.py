@@ -308,7 +308,7 @@ def _o(key: str, li: int) -> Any:
 def _parse(ts: Any):
     from datetime import datetime
     try:
-        return datetime.fromisoformat(str(ts))
+        return datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
     except (TypeError, ValueError):
         return None
 
