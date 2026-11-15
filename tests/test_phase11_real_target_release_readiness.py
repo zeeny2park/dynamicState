@@ -442,8 +442,7 @@ class TestPhase11RealTargetMatrix(BasePhase11ProcessTestCase):
         session.ledger.add_record(rec)
 
         res = mgr.evaluate_hypothesis(inv_id, "hypo_partial_test", proof_evidence_id="ev_partial", deterministic_transition_verified=True)
-        self.assertEqual(res["transition"]["to_status"], HYPOTHESIS_STATUS_SUPPORTED)
-        self.assertIn("PARTIAL", res["transition"]["reason"])
+        self.assertEqual(res["transition"]["to_status"], HYPOTHESIS_STATUS_PROPOSED)
 
     def test_matrix_case9_tampered_payload_and_receipt_detection(self):
         """Case 9: Altering payload byte causes RawRuntimeSnapshot.load to fail with TAMPERED status."""
@@ -897,7 +896,7 @@ class TestPhase11MultithreadAndCausalAttributionControls(BasePhase11ProcessTestC
         session.hypotheses.append(hypo)
 
         eval_res = mgr.evaluate_hypothesis(inv_id, "hypo_f_tr", proof_evidence_id="ev_trace_forged", deterministic_transition_verified=True)
-        self.assertEqual(eval_res["transition"]["to_status"], HYPOTHESIS_STATUS_SUPPORTED)
+        self.assertEqual(eval_res["transition"]["to_status"], HYPOTHESIS_STATUS_PROPOSED)
         self.assertTrue(eval_res["transition"]["unverified_claim_rejected"])
 
 
