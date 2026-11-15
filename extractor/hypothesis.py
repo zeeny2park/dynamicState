@@ -2894,10 +2894,15 @@ class HypothesisValidator:
             if cq_comp in ("FAILED", "INVALID", "UNTRUSTED"):
                 has_untrusted_evidence = True
 
-        # Rule: A hypothesis is not evidence for itself, and failed/abstained observations cannot support or refute
+        # Rule: A hypothesis is not evidence for itself, failed/abstained observations cannot support or refute,
+        # and unadmitted (REJECTED or QUARANTINED) records are strictly excluded from hypothesis evaluation.
         def _is_valid_observational_evidence(rec: Optional[EvidenceRecord], allow_missing_in_ledger: bool = True) -> bool:
             if rec is None:
                 return allow_missing_in_ledger
+            adm = getattr(rec, "admission_state", None)
+            adm_val = getattr(adm, "value", str(adm)) if adm is not None else None
+            if adm_val in ("REJECTED", "QUARANTINED"):
+                return False
             if rec.nature in (NATURE_HYPOTHESIS, NATURE_INFERENCE) or rec.evidence_id == f"ev_{hypothesis.hypothesis_id}":
                 return False
             if rec.evidence_id == f"ev_{hypothesis.hypothesis_id}" or (rec.details or {}).get("hypothesis_id") == hypothesis.hypothesis_id and rec.evidence_type == EVIDENCE_TYPE_HYPOTHESIS:

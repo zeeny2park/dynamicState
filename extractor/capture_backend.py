@@ -896,6 +896,11 @@ class SecurityViolationError(RuntimeError):
     pass
 
 
+class ConflictAuditPersistenceError(RuntimeError):
+    """Raised when persisting an identity conflict audit event to durable storage fails."""
+    pass
+
+
 class OperationLifecycleState(str, Enum):
     """Explicit operation lifecycle states with strict validated one-way transitions."""
     CREATED = "CREATED"
@@ -1006,6 +1011,12 @@ class CanonicalOperationIdentity:
             raise MissingIdentityFieldError("request_scope is required")
         if self.normalized_parameters is None or not isinstance(self.normalized_parameters, dict):
             raise MissingIdentityFieldError("normalized_parameters must be a dict")
+        # Validate that all dictionary keys, numbers, and types strictly comply with RFC 8785 JCS
+        from .canonical_json import rfc8785_canonical_json
+        try:
+            rfc8785_canonical_json(self.to_dict())
+        except (ValueError, TypeError) as e:
+            raise ValueError(f"CanonicalOperationIdentity violates RFC 8785 canonical constraints: {e}") from e
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -1020,12 +1031,14 @@ class CanonicalOperationIdentity:
         }
 
     def to_canonical_json(self) -> str:
-        """Deterministic RFC 8785-compliant JSON representation with key-sorting and compact separators."""
-        return json.dumps(self.to_dict(), sort_keys=True, separators=(",", ":"))
+        """Deterministic RFC 8785-compliant JSON representation using extractor.canonical_json."""
+        from .canonical_json import rfc8785_canonical_str
+        return rfc8785_canonical_str(self.to_dict())
 
     def digest(self) -> str:
-        """Generate SHA-256 hex digest of the canonical JSON representation."""
-        return hashlib.sha256(self.to_canonical_json().encode("utf-8")).hexdigest()
+        """Generate SHA-256 hex digest of the RFC 8785 canonical JSON representation."""
+        from .canonical_json import rfc8785_canonical_json
+        return hashlib.sha256(rfc8785_canonical_json(self.to_dict())).hexdigest()
 
 
 def build_canonical_replay_identity(
@@ -1038,7 +1051,7 @@ def build_canonical_replay_identity(
     parameters: Optional[Dict[str, Any]] = None,
     schema_version: str = "1.0",
 ) -> CanonicalOperationIdentity:
-    """Build normalized, key-sorted CanonicalOperationIdentity."""
+    """Build normalized, key-sorted CanonicalOperationIdentity compliant with RFC 8785."""
     norm_params = _normalize_canonical_value(parameters or {})
     if not isinstance(norm_params, dict):
         norm_params = {}
@@ -1219,16 +1232,31 @@ class DurableTrustStore:
                     except OSError:
                         pass
 
-    def _verify_path_security(self, path: str) -> None:
+    def _verify_path_security(self, path: str, operation: str = "access") -> None:
         """Verify filesystem security constraints: no symlinks, correct ownership, secure permissions."""
         if not path:
             return
+        prep = "to" if operation == "save" else "from"
         if os.path.islink(path):
-            raise SecurityViolationError(f"Refusing to access trust store through symlink: '{path}'")
+            raise SecurityViolationError(f"Refusing to {operation} trust store {prep} symlink: '{path}'")
 
-        dir_name = os.path.dirname(os.path.abspath(path))
-        if os.path.islink(dir_name):
-            raise SecurityViolationError(f"Refusing to access trust store directory through symlink: '{dir_name}'")
+        abs_path = os.path.abspath(path)
+        dir_name = os.path.dirname(abs_path)
+
+        # Verify all path ancestors up to root
+        curr = dir_name
+        while curr and curr != "/":
+            if os.path.islink(curr):
+                raise SecurityViolationError(f"Trust store ancestor is a symlink: '{curr}'")
+            if os.path.exists(curr):
+                dst = os.lstat(curr)
+                if stat.S_ISLNK(dst.st_mode):
+                    raise SecurityViolationError(f"Trust store ancestor is a symlink: '{curr}'")
+            parent = os.path.dirname(curr)
+            if parent == curr:
+                break
+            curr = parent
+
         if os.path.exists(dir_name):
             dst = os.lstat(dir_name)
             if stat.S_ISLNK(dst.st_mode):
@@ -1239,9 +1267,13 @@ class DurableTrustStore:
         if os.path.lexists(path):
             st = os.lstat(path)
             if stat.S_ISLNK(st.st_mode):
-                raise SecurityViolationError(f"Trust store file is a symlink: '{path}'")
+                raise SecurityViolationError(f"Refusing to {operation} trust store {prep} symlink: '{path}'")
             if not stat.S_ISREG(st.st_mode):
                 raise SecurityViolationError(f"Trust store path is not a regular file: '{path}'")
+            if st.st_nlink > 1:
+                raise SecurityViolationError(
+                    f"Trust store file '{path}' has hard links (nlink={st.st_nlink}), rejecting due to hard-link replacement risk"
+                )
             if hasattr(os, "getuid") and st.st_uid != os.getuid():
                 raise SecurityViolationError(f"Trust store file owned by UID {st.st_uid}, expected {os.getuid()}")
             # Ensure permissions are not broader than 0600
@@ -1294,12 +1326,12 @@ class DurableTrustStore:
     def load(self, reconcile_crashes: Optional[bool] = None) -> None:
         """Load state from persistent trust store file. Fails closed if corrupted."""
         with self._lock:
-            if not self.store_path:
+            if not self.store_path or not os.path.exists(self.store_path):
                 return
-            self._verify_path_security(self.store_path)
+            if os.path.islink(self.store_path):
+                raise SecurityViolationError(f"Refusing to load trust store from symlink: '{self.store_path}'")
+            self._verify_path_security(self.store_path, operation="load")
             self._cleanup_stale_temp_files()
-            if not os.path.exists(self.store_path):
-                return
             try:
                 flags = os.O_RDONLY
                 if hasattr(os, "O_NOFOLLOW"):
@@ -1455,7 +1487,7 @@ class DurableTrustStore:
         with self._file_lock():
             if not self.store_path:
                 return DurableCommitOutcome.COMMITTED
-            self._verify_path_security(self.store_path)
+            self._verify_path_security(self.store_path, operation="save")
             payload = {
                 "schema_version": "1.1.0",
                 "updated_at": datetime.now(timezone.utc).isoformat(),
@@ -1479,8 +1511,8 @@ class DurableTrustStore:
                 try:
                     try:
                         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                    except OSError:
-                        pass
+                    except (BlockingIOError, OSError) as flock_err:
+                        raise SecurityViolationError(f"Failed to acquire exclusive lock on temporary trust store '{tmp_path}': {flock_err}") from flock_err
                     with os.fdopen(fd, "w", encoding="utf-8") as f:
                         json.dump(payload, f, indent=2)
                         f.flush()
@@ -1637,13 +1669,16 @@ class DurableTrustStore:
         key_store: Optional["CaptureKeyStore"] = None,
         current_time_ns: Optional[int] = None,
         operation_id: Optional[str] = None,
-        require_operation_id: bool = False,
+        require_operation_id: bool = True,
     ) -> TrustConsumptionResult:
         """Atomic trust-consumption contract eliminating check-then-record race conditions."""
-        if require_operation_id and (operation_id is None or not str(operation_id).strip()):
-            raise MissingIdentityFieldError("operation_id is required for durable attestation consumption")
-        if operation_id is not None:
-            validate_operation_id(operation_id)
+        eff_op_id = operation_id if (operation_id is not None and str(operation_id).strip()) else getattr(attestation, "operation_id", None)
+        if require_operation_id:
+            if eff_op_id is None or not str(eff_op_id).strip():
+                raise MissingIdentityFieldError("operation_id is mandatory for durable attestation consumption")
+            validate_operation_id(str(eff_op_id))
+        elif eff_op_id is not None:
+            validate_operation_id(str(eff_op_id))
         with self._file_lock():
             self.load()
             att_id = str(attestation.attestation_id)
@@ -1807,6 +1842,50 @@ class DurableTrustStore:
         oid = validate_operation_id(op_id)
         with self._file_lock():
             self.load()
+
+            # Canonical Replay Identity & Digest Verification
+            if metadata:
+                has_canon_ident = "canonical_identity" in metadata
+                has_canon_dig = "canonical_digest" in metadata
+                if has_canon_ident or has_canon_dig:
+                    if not (has_canon_ident and has_canon_dig):
+                        raise MissingIdentityFieldError(
+                            f"Both 'canonical_identity' and 'canonical_digest' must be provided together for operation '{oid}'"
+                        )
+                    c_ident_raw = metadata["canonical_identity"]
+                    c_dig_supplied = str(metadata["canonical_digest"])
+                    if isinstance(c_ident_raw, CanonicalOperationIdentity):
+                        c_ident_obj = c_ident_raw
+                    elif isinstance(c_ident_raw, dict):
+                        p_ident_raw = c_ident_raw.get("process_identity")
+                        if not isinstance(p_ident_raw, dict):
+                            raise MissingIdentityFieldError("canonical_identity missing valid process_identity dict")
+                        proc_id = ProcessIdentity(
+                            host_identity=str(p_ident_raw.get("host_identity", "")),
+                            boot_id=str(p_ident_raw.get("boot_id", "")),
+                            pid=int(p_ident_raw.get("pid", 0)),
+                            process_start_time=int(p_ident_raw.get("process_start_time", 0)),
+                        )
+                        c_ident_obj = CanonicalOperationIdentity(
+                            operation_id=str(c_ident_raw.get("operation_id", "")),
+                            operation_kind=str(c_ident_raw.get("operation_kind", "")),
+                            process_identity=proc_id,
+                            build_id=str(c_ident_raw.get("build_id", "")),
+                            session_identity=str(c_ident_raw.get("session_identity", "")),
+                            request_scope=str(c_ident_raw.get("request_scope", "")),
+                            normalized_parameters=c_ident_raw.get("normalized_parameters", {}),
+                            schema_version=str(c_ident_raw.get("schema_version", "1.0")),
+                        )
+                    else:
+                        raise MissingIdentityFieldError("canonical_identity must be a dict or CanonicalOperationIdentity")
+
+                    # Verify caller-provided digest against recomputed RFC 8785 digest
+                    recomputed_dig = c_ident_obj.digest()
+                    if not hmac.compare_digest(c_dig_supplied, recomputed_dig):
+                        raise SecurityViolationError(
+                            f"Caller-provided canonical_digest '{c_dig_supplied}' does not match recomputed RFC 8785 digest '{recomputed_dig}' for operation '{oid}'"
+                        )
+
             if oid in self.used_operation_ids:
                 prev = self.used_operation_ids[oid]
                 prev_st = prev.get("state")
@@ -1842,7 +1921,7 @@ class DurableTrustStore:
                 p_host = prev.get("host_identity") or prev.get("target_host")
                 m_host = (metadata.get("host_identity") or metadata.get("target_host")) if metadata else None
                 if p_host and m_host and str(p_host) != str(m_host):
-                    raise ValueError(f"Receipt replay across hosts rejected for operation '{oid}': host mismatch ({p_host} vs {m_host})")
+                    raise ValueError(f"Receipt replay across hosts rejected for operation '{oid}': target_host mismatch ({p_host} vs {m_host})")
 
                 if metadata:
                     p_canon = prev.get("canonical_digest")
@@ -1860,8 +1939,11 @@ class DurableTrustStore:
                         self.identity_conflict_events.append(conflict_event)
                         try:
                             self.save()
-                        except Exception:
-                            pass
+                        except Exception as save_err:
+                            self.identity_conflict_events.pop()
+                            raise ConflictAuditPersistenceError(
+                                f"Failed to persist identity conflict audit event for operation '{oid}': {save_err}"
+                            ) from save_err
                         raise IdentityConflictError(
                             f"Conflicting canonical identity digest for operation '{oid}': {p_canon} vs {m_canon}"
                         )
@@ -1891,8 +1973,11 @@ class DurableTrustStore:
                             self.identity_conflict_events.append(conflict_event)
                             try:
                                 self.save()
-                            except Exception:
-                                pass
+                            except Exception as save_err:
+                                self.identity_conflict_events.pop()
+                                raise ConflictAuditPersistenceError(
+                                    f"Failed to persist identity conflict audit event for operation '{oid}': {save_err}"
+                                ) from save_err
                             raise IdentityConflictError(
                                 f"Conflicting target identity or metadata '{id_field}' for operation '{oid}': {p_val} vs {m_val}"
                             )
@@ -1915,6 +2000,34 @@ class DurableTrustStore:
                                 f"Operation '{oid}' is already bound to primary evidence '{bound_eid}'. "
                                 f"Secondary evidence '{incoming_eid}' requires verifiable derivation from primary observation."
                             )
+
+                if prev_st == OperationLifecycleState.EXECUTING.value:
+                    # Valid lifecycle progression: transition from EXECUTING to COMMITTED
+                    orig_prev = dict(prev)
+                    prev["state"] = OperationLifecycleState.COMMITTED.value
+                    prev["committed_at"] = datetime.now(timezone.utc).isoformat()
+                    if metadata:
+                        for k, v in metadata.items():
+                            if v is not None and v != "":
+                                prev[k] = v
+                    if metadata and metadata.get("evidence_id"):
+                        e_list = prev.setdefault("evidence_ids", [])
+                        if metadata["evidence_id"] not in e_list:
+                            e_list.append(metadata["evidence_id"])
+                    try:
+                        self.save()
+                    except DurableCommitError as dce:
+                        if dce.outcome == DurableCommitOutcome.COMMIT_UNKNOWN:
+                            self.reconcile_from_disk()
+                            raise
+                        prev.clear()
+                        prev.update(orig_prev)
+                        raise
+                    except Exception:
+                        prev.clear()
+                        prev.update(orig_prev)
+                        raise
+                    return
 
                 if allow_idempotent:
                     if metadata:
@@ -2053,8 +2166,11 @@ class DurableTrustStore:
                 self.identity_conflict_events.append(conflict_event)
                 try:
                     self.save()
-                except Exception:
-                    pass
+                except Exception as save_err:
+                    self.identity_conflict_events.pop()
+                    raise ConflictAuditPersistenceError(
+                        f"Failed to persist identity conflict audit event for operation '{oid}': {save_err}"
+                    ) from save_err
                 raise IdentityConflictError(
                     f"Cross-session lifecycle transition rejected for operation '{oid}': {prev_sess} vs {session_id}"
                 )
@@ -2071,8 +2187,11 @@ class DurableTrustStore:
                 self.identity_conflict_events.append(conflict_event)
                 try:
                     self.save()
-                except Exception:
-                    pass
+                except Exception as save_err:
+                    self.identity_conflict_events.pop()
+                    raise ConflictAuditPersistenceError(
+                        f"Failed to persist identity conflict audit event for operation '{oid}': {save_err}"
+                    ) from save_err
                 raise IdentityConflictError(
                     f"Cross-PID lifecycle transition rejected for operation '{oid}': {prev_pid} vs {pid}"
                 )

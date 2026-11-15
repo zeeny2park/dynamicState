@@ -244,7 +244,8 @@ class DiagnosticVerdictAggregator:
     def _does_required_fail_satisfy_confirmation(
         c: DiagnosticCheck,
         active_hypotheses: List[Any],
-        evidence_records: Optional[List[Any]],
+        evidence_records: Optional[List[Any]] = None,
+        ledger: Optional[Any] = None,
     ) -> bool:
         """Determines whether a required FAIL check satisfies defined confirmation criteria (Part B3).
         
@@ -263,11 +264,38 @@ class DiagnosticVerdictAggregator:
             if getattr(h, "category", "") not in ("HEALTHY_PROCESS", "HEALTHY")
         ]
         confirmed_hyps = [h for h in non_healthy_hyps if getattr(h, "status", "") == "CONFIRMED"]
-        if confirmed_hyps:
+        valid_confirmed_hyps = []
+        ev_map = {getattr(r, "evidence_id", str(r)): r for r in (evidence_records or [])}
+        for ch in confirmed_hyps:
+            supp_ids = getattr(ch, "supporting_evidence_ids", [])
+            if not supp_ids:
+                continue
+            if ledger or ev_map:
+                from .evidence_ledger import EvidenceAdmissionState
+                is_valid = True
+                has_accepted = False
+                for eid in supp_ids:
+                    rec = ledger.get_record(eid) if ledger else ev_map.get(eid)
+                    if not rec:
+                        is_valid = False
+                        break
+                    adm = getattr(rec, "admission_state", None)
+                    adm_val = getattr(adm, "value", str(adm)) if adm is not None else "ACCEPTED"
+                    if adm_val in ("REJECTED", "QUARANTINED"):
+                        is_valid = False
+                        break
+                    if adm_val == "ACCEPTED":
+                        has_accepted = True
+                if is_valid and has_accepted:
+                    valid_confirmed_hyps.append(ch)
+            else:
+                valid_confirmed_hyps.append(ch)
+
+        if valid_confirmed_hyps:
             return True
-        if non_healthy_hyps and not confirmed_hyps:
-            # Hypotheses were evaluated for this investigation and none reached CONFIRMED
-            # (e.g., evidence was unverified or lacked independent roots). Do not let check status bypass hypothesis authority!
+        if non_healthy_hyps:
+            # Hypotheses were evaluated for this investigation and none reached valid CONFIRMED
+            # (e.g., evidence was unverified, quarantined, or lacked independent roots). Do not let check status bypass hypothesis authority!
             return False
 
         # 3. If evidence_records list was explicitly provided, require that the check's evidence_ids
@@ -312,10 +340,13 @@ class DiagnosticVerdictAggregator:
         target_assessment: Optional[Any] = None,
         evidence_records: Optional[List[Any]] = None,
         required_scope: Optional[List[str]] = None,
+        ledger: Optional[Any] = None,
     ) -> AggregatedVerdict:
         rej_hyps = rejected_hypotheses or []
         lim_items = list(limitations or [])
         lims = [limitation_text(x) for x in lim_items]
+        eff_ledger = ledger or getattr(target_assessment, "ledger", None)
+        ev_map = {getattr(r, "evidence_id", str(r)): r for r in (evidence_records or [])}
 
         # Categorize required vs optional checks
         required_checks: List[DiagnosticCheck] = []
@@ -425,13 +456,42 @@ class DiagnosticVerdictAggregator:
                         h.evaluate_verdict()
                         h_stat = h.status
                 if h_stat == "CONFIRMED":
-                    confirmed_problems.append(h_stmt)
-                    problem_categories.append((h_stmt, h_cat))
-                    determining_hypotheses.append(h_id)
-                    contributing_factors.append(
-                        f"Confirmed fault [{h_id}]: {h_stmt} ({h_basis or 'verified by deterministic criteria'})"
-                    )
-                    continue
+                    # Verify that CONFIRMED hypothesis is backed by authoritative ACCEPTED evidence in ledger
+                    is_admitted = True
+                    supp_ids = getattr(h, "supporting_evidence_ids", [])
+                    if (eff_ledger or ev_map) and supp_ids:
+                        has_acc = False
+                        for eid in supp_ids:
+                            rec = eff_ledger.get_record(eid) if eff_ledger else ev_map.get(eid)
+                            if not rec:
+                                is_admitted = False
+                                break
+                            adm = getattr(rec, "admission_state", None)
+                            adm_val = getattr(adm, "value", str(adm)) if adm is not None else "ACCEPTED"
+                            if adm_val in ("REJECTED", "QUARANTINED"):
+                                is_admitted = False
+                                break
+                            if adm_val == "ACCEPTED":
+                                has_acc = True
+                        if not has_acc:
+                            is_admitted = False
+
+                    if is_admitted:
+                        confirmed_problems.append(h_stmt)
+                        problem_categories.append((h_stmt, h_cat))
+                        determining_hypotheses.append(h_id)
+                        contributing_factors.append(
+                            f"Confirmed fault [{h_id}]: {h_stmt} ({h_basis or 'verified by deterministic criteria'})"
+                        )
+                        continue
+                    else:
+                        # Demote from CONFIRMED: backed only by non-authoritative / quarantined / rejected evidence!
+                        probable_problems.append(h_stmt)
+                        problem_categories.append((h_stmt, h_cat))
+                        limiting_factors.append(
+                            f"Hypothesis [{h_id}] claims CONFIRMED but is backed by non-authoritative/quarantined evidence."
+                        )
+                        continue
 
             if h_stat in ("LIKELY", "PROPOSED", "SUPPORTED"):
                 probable_problems.append(h_stmt)
@@ -448,7 +508,7 @@ class DiagnosticVerdictAggregator:
             determining_checks.append(c.check_id)
             f_msg = f"Check failed: {c.name or c.check_id} ({c.technical_interpretation or 'decision criteria violated'})"
             problem_categories.append((f_msg, _check_category(c)))
-            if DiagnosticVerdictAggregator._does_required_fail_satisfy_confirmation(c, active_hypotheses, evidence_records):
+            if DiagnosticVerdictAggregator._does_required_fail_satisfy_confirmation(c, active_hypotheses, evidence_records, eff_ledger):
                 if f_msg not in confirmed_problems:
                     confirmed_problems.append(f_msg)
                 contributing_factors.append(f"Confirmed required check failure [{c.check_id}]: {c.description or c.name}")

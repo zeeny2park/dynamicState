@@ -402,6 +402,8 @@ class CaptureTransaction:
     aborted: bool = False
     abort_reason: Optional[str] = None
     receipt_issued: bool = False
+    require_lifecycle_persistence: bool = False
+    metadata: Dict[str, Any] = field(default_factory=dict)
 
     @property
     def observation_digest(self) -> str:
@@ -643,6 +645,7 @@ class TargetExecutionAdapter(ABC):
         pid: int,
         operation_type: str = "diagnostic",
         snapshot_binding: Optional[str] = None,
+        require_lifecycle_persistence: bool = False,
     ) -> CaptureTransaction:
         """Begin a scoped capture transaction for target process memory operations."""
         self._ensure_tracking_state()
@@ -675,11 +678,13 @@ class TargetExecutionAdapter(ABC):
         self._active_transactions[tx.transaction_id] = tx
         self._active_by_scope[(str(th), str(session_id), int(pid))] = tx
 
-        # P0-5: Advance lifecycle DAG CREATED -> VALIDATED -> RESERVED -> EXECUTING
-        from .capture_backend import get_default_trust_store, OperationLifecycleState
-        eff_ts = getattr(self, "trust_store", None) or get_default_trust_store()
-        if eff_ts and hasattr(eff_ts, "transition_operation_lifecycle"):
-            try:
+        # P0-5: If lifecycle persistence is required, advance lifecycle DAG CREATED -> VALIDATED -> RESERVED -> EXECUTING
+        should_persist = require_lifecycle_persistence or getattr(self, "require_lifecycle_persistence", False)
+        if should_persist:
+            tx.metadata["require_lifecycle_persistence"] = True
+            from .capture_backend import get_default_trust_store, OperationLifecycleState
+            eff_ts = getattr(self, "trust_store", None) or get_default_trust_store()
+            if eff_ts and hasattr(eff_ts, "transition_operation_lifecycle"):
                 eff_ts.transition_operation_lifecycle(
                     op_id=tx.transaction_id,
                     session_id=str(session_id),
@@ -705,8 +710,6 @@ class TargetExecutionAdapter(ABC):
                     pid=int(pid),
                     target_state=OperationLifecycleState.EXECUTING,
                 )
-            except Exception:
-                pass
 
         cur_stack = _tx_stack.get(None) or []
         new_stack = list(cur_stack) + [tx]
@@ -796,10 +799,38 @@ class TargetExecutionAdapter(ABC):
                 f"Capture transaction '{target_tx.transaction_id}' committed with 0 physical bytes read"
             )
 
-        # P0-2: Integrate DurableTrustStore.record_used_operation() before committing transaction
-        from .capture_backend import get_default_trust_store
+        # P0-1 & P0-2: Integrate Canonical Replay Identity & DurableTrustStore.record_used_operation() before committing transaction
+        from .capture_backend import (
+            get_default_trust_store,
+            ProcessIdentity,
+            build_canonical_replay_identity,
+            resolve_current_boot_id,
+        )
         eff_ts = getattr(self, "trust_store", None) or get_default_trust_store()
         if eff_ts:
+            try:
+                cur_boot = str(cur_ident.get("boot_id") or resolve_current_boot_id())
+            except Exception:
+                cur_boot = "boot_id_unavailable"
+            proc_id = ProcessIdentity(
+                host_identity=str(th),
+                boot_id=cur_boot,
+                pid=int(target_tx.pid),
+                process_start_time=int(cur_ident.get("start_time", 0)),
+            )
+            canon_ident = build_canonical_replay_identity(
+                operation_id=target_tx.transaction_id,
+                operation_kind=str(target_tx.operation_type),
+                process_identity=proc_id,
+                build_id=str(cur_ident.get("build_id", "") or "default_build_id"),
+                session_identity=str(target_tx.session_id),
+                request_scope=f"{th}:{target_tx.pid}",
+                parameters={
+                    "adapter_id": str(self.adapter_id),
+                    "physical_bytes_read": int(target_tx.physical_bytes_read),
+                    "physical_reads_count": int(target_tx.physical_reads_count),
+                },
+            )
             op_meta = {
                 "process_identity": str(cur_ident.get("process_identity", "")),
                 "executable_identity": str(cur_ident.get("executable_identity") or cur_ident.get("executable", "")),
@@ -809,6 +840,8 @@ class TargetExecutionAdapter(ABC):
                 "physical_bytes_read": int(target_tx.physical_bytes_read),
                 "physical_reads_count": int(target_tx.physical_reads_count),
                 "adapter_id": str(self.adapter_id),
+                "canonical_identity": canon_ident.to_dict(),
+                "canonical_digest": canon_ident.digest(),
             }
             try:
                 eff_ts.record_used_operation(
@@ -853,7 +886,7 @@ class TargetExecutionAdapter(ABC):
             target_tx.abort_reason = reason or "Capture transaction rolled back"
             from .capture_backend import get_default_trust_store, OperationLifecycleState
             eff_ts = getattr(self, "trust_store", None) or get_default_trust_store()
-            if eff_ts and hasattr(eff_ts, "transition_operation_lifecycle"):
+            if eff_ts and hasattr(eff_ts, "transition_operation_lifecycle") and (target_tx.metadata.get("require_lifecycle_persistence") or getattr(self, "require_lifecycle_persistence", False)):
                 try:
                     eff_ts.transition_operation_lifecycle(
                         op_id=target_tx.transaction_id,
@@ -862,8 +895,9 @@ class TargetExecutionAdapter(ABC):
                         target_state=OperationLifecycleState.FAILED,
                         metadata={"abort_reason": str(target_tx.abort_reason)},
                     )
-                except Exception:
-                    pass
+                except Exception as rb_err:
+                    if hasattr(target_tx, "metadata") and isinstance(target_tx.metadata, dict):
+                        target_tx.metadata["lifecycle_rollback_error"] = str(rb_err)
             self._active_transactions.pop(target_tx.transaction_id, None)
             self._active_by_scope.pop((str(target_tx.target_host), str(target_tx.session_id), int(target_tx.pid)), None)
             cur_stack = _tx_stack.get(None) or []

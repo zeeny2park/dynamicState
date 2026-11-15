@@ -2166,8 +2166,20 @@ class EvidenceLedger:
         return rec
 
     def get_record(self, evidence_id: str) -> Optional[EvidenceRecord]:
-        """Look up record by unique ID."""
+        """Look up record by unique ID (raw/forensic access)."""
         return self._by_id.get(evidence_id)
+
+    def get_authoritative_record(self, evidence_id: str) -> Optional[EvidenceRecord]:
+        """Look up record by unique ID, returning it ONLY if its admission_state is ACCEPTED."""
+        with self._lock:
+            rec = self._by_id.get(evidence_id)
+            if rec is None:
+                return None
+            adm = getattr(rec, "admission_state", None)
+            adm_val = getattr(adm, "value", str(adm)) if adm is not None else None
+            if adm_val == EvidenceAdmissionState.ACCEPTED.value:
+                return rec
+            return None
 
     def has(self, evidence_id: str) -> bool:
         """Checks if evidence record exists in ledger."""
@@ -2231,6 +2243,12 @@ class EvidenceLedger:
                     f"cryptographic or identity verification failed: {rec.admission_reason}"
                 )
             if rec.admission_state == EvidenceAdmissionState.QUARANTINED:
+                prov = rec.provenance or {}
+                prov_class = prov.get("provenance_class") or (rec.details or {}).get("provenance_class")
+                if not prov_class or prov_class not in TRUSTED_PROVENANCE_CLASSES:
+                    raise SecurityViolationError(
+                        f"Cannot promote QUARANTINED record '{evidence_id}': missing or untrusted provenance class '{prov_class}'"
+                    )
                 if rec.parent_evidence_ids:
                     missing_parents = [pid for pid in rec.parent_evidence_ids if pid not in self._by_id]
                     if missing_parents:
@@ -2245,6 +2263,12 @@ class EvidenceLedger:
                         raise ValueError(
                             f"Cannot promote QUARANTINED record '{evidence_id}': parents not in ACCEPTED state: {unaccepted_parents}"
                         )
+                else:
+                    if rec.admission_reason and ("missing" in str(rec.admission_reason).lower() or "dangling" in str(rec.admission_reason).lower()):
+                        if not prov.get("live_capture_receipt") and not prov.get("causal_attestation"):
+                            raise SecurityViolationError(
+                                f"Cannot promote QUARANTINED record '{evidence_id}': unresolved lineage/provenance ({rec.admission_reason})"
+                            )
             rec.admission_state = EvidenceAdmissionState.ACCEPTED
             rec.admission_reason = None
 
