@@ -46,7 +46,7 @@ strip -s -o /tmp/real_runtime_app_prod.stripped /tmp/real_runtime_app_debug.elf
 run_one() {
     local f="$1" n rc
     n="$(basename "$f" .py)"
-    timeout -k 10 "${TMO}" python3 -m unittest "$f" >"${LOGS}/${n}.log" 2>&1
+    timeout -k 10 "${TMO}" python3 scripts/run_unittest.py "$f" >"${LOGS}/${n}.log" 2>&1
     rc=$?
     printf '%s\t%s\t%s\t%s\n' "$n" "$rc" \
         "$(grep -E '^Ran [0-9]+ tests?' "${LOGS}/${n}.log" | tail -1 | awk '{print $2}')" \

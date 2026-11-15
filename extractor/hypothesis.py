@@ -2910,6 +2910,8 @@ class HypothesisValidator:
             adm_val = getattr(adm, "value", str(adm)) if adm is not None else None
             if adm_val != "ACCEPTED":
                 return False
+            if getattr(rec, "provenance_class", PROVENANCE_CLASS_IMPORTED_UNVERIFIED) not in TRUSTED_PROVENANCE_CLASSES:
+                return False
             if rec.nature in (NATURE_HYPOTHESIS, NATURE_INFERENCE) or rec.evidence_id == f"ev_{hypothesis.hypothesis_id}":
                 return False
             if rec.evidence_id == f"ev_{hypothesis.hypothesis_id}" or (rec.details or {}).get("hypothesis_id") == hypothesis.hypothesis_id and rec.evidence_type == EVIDENCE_TYPE_HYPOTHESIS:
@@ -2933,6 +2935,14 @@ class HypothesisValidator:
             eid for eid in hypothesis.contradicting_evidence_ids
             if _is_valid_observational_evidence(auth_record(eid), allow_missing_in_ledger=False)
         ]
+
+        # A verifier-attested proof is itself an observation. Include it in the
+        # support set only after it crosses the authoritative admission boundary;
+        # the causal proof verifier below still checks its signature and scope.
+        if proof_evidence_id and _is_valid_observational_evidence(
+            auth_record(proof_evidence_id), allow_missing_in_ledger=False
+        ) and proof_evidence_id not in hypothesis.supporting_evidence_ids:
+            hypothesis.supporting_evidence_ids.append(proof_evidence_id)
 
         # Process newly attached evidence
         new_is_duplicate = False
@@ -3170,6 +3180,11 @@ class HypothesisValidator:
             else:
                 new_status = HYPOTHESIS_STATUS_PROPOSED
                 reason = "Awaiting follow-up observation evidence."
+
+        # Keep caller-supplied verification claims visible even when no admitted
+        # observations exist yet and the state remains PROPOSED.
+        if deterministic_transition_verified and not verified_proof_rec:
+            unverified_claim_rejected = True
 
         if has_non_atomic_evidence:
             if new_conf in (CONFIDENCE_HIGH, CONFIDENCE_VERY_HIGH, CONFIDENCE_MEDIUM):

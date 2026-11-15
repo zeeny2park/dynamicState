@@ -149,7 +149,8 @@ class TestPhase20A36FailClosedEvidenceAndLiveClosure(unittest.TestCase):
         session5.snapshots = [{"completeness": "COMPLETE", "epoch": 3, "fields": {"g_state.counter": 42}}]
         res5 = self.mgr.execute_observation(inv_id5, "obs_test_1")
         self.assertEqual(res5["evidence"]["details"]["outcome"], OBSERVATION_OUTCOME_SUPPORTED)
-        self.assertEqual(hypo5.validation_status, HYPOTHESIS_STATUS_SUPPORTED)
+        self.assertEqual(hypo5.validation_status, HYPOTHESIS_STATUS_INCONCLUSIVE)
+        self.assertIsNone(session5.ledger.get_authoritative_record(res5["evidence"]["evidence_id"]))
 
     def test_2_1_thread_observation_distinguishes_missing_thread_from_collection_failure(self):
         """Thread observations distinguish missing threads in collected table from collection failures."""
@@ -236,7 +237,9 @@ class TestPhase20A36FailClosedEvidenceAndLiveClosure(unittest.TestCase):
         )
         res4 = self.mgr.execute_observation(inv_id4, "obs_test_1")
         self.assertEqual(res4["evidence"]["details"]["outcome"], OBSERVATION_OUTCOME_SUPPORTED)
-        self.assertEqual(hypo4.validation_status, HYPOTHESIS_STATUS_SUPPORTED)
+        self.assertEqual(hypo4.validation_status, HYPOTHESIS_STATUS_INCONCLUSIVE)
+        self.assertIsNone(self.mgr.sessions[inv_id4].ledger.get_authoritative_record(
+            res4["evidence"]["evidence_id"]))
 
     def test_2_1_general_and_simulated_controls_isolated_from_production(self):
         """General observations never default to SUPPORTED, and simulated controls are isolated as SYNTHETIC."""

@@ -1362,6 +1362,12 @@ class EvidenceLedger:
             rec.details["target_function"] = eff_fn
         if eff_field and "field_path" not in rec.details:
             rec.details["field_path"] = eff_field
+        # Attestation changes the trust-bearing provenance after the original
+        # record was admitted. Re-run the full ledger validation against the
+        # stamped record before it can participate in scoring, then promote it
+        # through the ledger's existing admission boundary.
+        self.validate_record(rec)
+        self.accept_record(evidence_id)
         return True
 
     def add_record(self, record: Union[EvidenceRecord, Dict[str, Any]], quarantine_dangling: bool = False) -> EvidenceRecord:

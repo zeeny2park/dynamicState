@@ -389,7 +389,7 @@ class TestCppE2EInvestigation(unittest.TestCase):
             deterministic_transition_verified=True,
         )
         self.assertTrue(unverified_eval["success"])
-        self.assertEqual(unverified_eval["transition"]["to_status"], "SUPPORTED")
+        self.assertEqual(unverified_eval["transition"]["to_status"], "PROPOSED")
         self.assertTrue(unverified_eval["transition"]["unverified_claim_rejected"])
 
         # Legitimate validation with verified diff comparison evidence

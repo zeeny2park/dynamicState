@@ -145,7 +145,7 @@ class TestCIWorkflowParity(unittest.TestCase):
             "Run Phase 20 Benchmark Demonstration Script",
             "Run Phase 21 Watch Session and Temporal Memory Explorer Foundation Tests",
             "Run Phase 22 Zero-Configuration Live Capture and UX Tests",
-            "Run All Remaining Tests",
+            "Record per-file test baseline",
             "Run CI Workflow Parity Tests",
             "Run Performance Benchmark Smoke Test",
         ]
@@ -154,27 +154,28 @@ class TestCIWorkflowParity(unittest.TestCase):
 
         # Verify command invocations in steps
         all_run_commands = "\n".join(s.get("run", "") for s in steps if isinstance(s, dict))
-        self.assertIn("python3 -m unittest tests/test_capture_safety_and_diff_accuracy.py", all_run_commands)
-        self.assertIn("python3 -m unittest tests/test_capture_lifecycle_seam.py", all_run_commands)
-        self.assertIn("python3 -m unittest tests/test_real_runtime_validation.py", all_run_commands)
-        self.assertIn("python3 -m unittest tests/test_cpp_e2e_investigation.py", all_run_commands)
-        self.assertIn("python3 -m unittest tests/test_causal_validation_hardening.py", all_run_commands)
-        self.assertIn("python3 -m unittest tests/test_phase10_ci_security_gates.py", all_run_commands)
-        self.assertIn("python3 -m unittest tests/test_phase11_real_target_release_readiness.py", all_run_commands)
-        self.assertIn("python3 -m unittest tests/test_phase12_investigation_loop.py", all_run_commands)
-        self.assertIn("python3 -m unittest tests/test_phase13_operational_acceptance.py", all_run_commands)
+        self.assertIn("python3 scripts/run_unittest.py tests/test_capture_safety_and_diff_accuracy.py", all_run_commands)
+        self.assertIn("python3 scripts/run_unittest.py tests/test_capture_lifecycle_seam.py", all_run_commands)
+        self.assertIn("python3 scripts/run_unittest.py tests/test_real_runtime_validation.py", all_run_commands)
+        self.assertIn("python3 scripts/run_unittest.py tests/test_cpp_e2e_investigation.py", all_run_commands)
+        self.assertIn("python3 scripts/run_unittest.py tests/test_causal_validation_hardening.py", all_run_commands)
+        self.assertIn("python3 scripts/run_unittest.py tests/test_phase10_ci_security_gates.py", all_run_commands)
+        self.assertIn("python3 scripts/run_unittest.py tests/test_phase11_real_target_release_readiness.py", all_run_commands)
+        self.assertIn("python3 scripts/run_unittest.py tests/test_phase12_investigation_loop.py", all_run_commands)
+        self.assertIn("python3 scripts/run_unittest.py tests/test_phase13_operational_acceptance.py", all_run_commands)
         self.assertIn("python3 scripts/run_e2e_operational_acceptance.py", all_run_commands)
-        self.assertIn("python3 -m unittest tests/test_phase14_production_pilot.py", all_run_commands)
+        self.assertIn("python3 scripts/run_unittest.py tests/test_phase14_production_pilot.py", all_run_commands)
         self.assertIn("python3 scripts/run_production_pilot.py --smoke", all_run_commands)
-        self.assertIn("python3 -m unittest tests/test_phase15_conversational_llm.py", all_run_commands)
-        self.assertIn("python3 -m unittest tests/test_phase16_cli_security_and_truthfulness.py", all_run_commands)
-        self.assertIn("python3 -m unittest tests/test_phase17_process_isolation_regression.py", all_run_commands)
-        self.assertIn("python3 -m unittest tests/test_investigation_quality_benchmark.py", all_run_commands)
+        self.assertIn("python3 scripts/run_unittest.py tests/test_phase15_conversational_llm.py", all_run_commands)
+        self.assertIn("python3 scripts/run_unittest.py tests/test_phase16_cli_security_and_truthfulness.py", all_run_commands)
+        self.assertIn("python3 scripts/run_unittest.py tests/test_phase17_process_isolation_regression.py", all_run_commands)
+        self.assertIn("python3 scripts/run_unittest.py tests/test_investigation_quality_benchmark.py", all_run_commands)
         self.assertIn("python3 benchmarks/investigation_quality/run_benchmark.py --smoke", all_run_commands)
-        self.assertIn("python3 -m unittest tests/test_phase21_watch_session.py", all_run_commands)
-        self.assertIn("python3 -m unittest tests/test_phase22_zero_config_live_capture.py", all_run_commands)
-        self.assertIn("python3 -m unittest discover tests", all_run_commands)
-        self.assertIn("python3 -m unittest tests/test_ci_workflow_parity.py", all_run_commands)
+        self.assertIn("python3 scripts/run_unittest.py tests/test_phase21_watch_session.py", all_run_commands)
+        self.assertIn("python3 scripts/run_unittest.py tests/test_phase22_zero_config_live_capture.py", all_run_commands)
+        self.assertIn("scripts/run_test_baseline.sh", all_run_commands)
+        self.assertIn("scripts/run_test_baseline.sh", all_run_commands)
+        self.assertIn("python3 scripts/run_unittest.py tests/test_ci_workflow_parity.py", all_run_commands)
         self.assertIn("python3 -m benchmarks.capture_benchmark --smoke", all_run_commands)
 
     def test_gdb92_workflow_yaml_syntax_and_schema(self):

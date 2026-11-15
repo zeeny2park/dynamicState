@@ -61,6 +61,7 @@ from extractor.investigation import (
     TrustedCausalVerifier,
 )
 from extractor.web.server import WebApiAdapter
+from tests.support.trusted_evidence_fixture import add_admitted_fixture
 
 
 class TestHypothesisModels(unittest.TestCase):
@@ -327,7 +328,7 @@ class TestHypothesisValidator(unittest.TestCase):
             observation="Field X was 100",
             capture_quality={"completeness": "COMPLETE"},
         )
-        self.ledger.add_record(rec_supp)
+        add_admitted_fixture(self.ledger, rec_supp)
 
         # Add contradicting evidence
         rec_contra = EvidenceRecord(
@@ -339,7 +340,7 @@ class TestHypothesisValidator(unittest.TestCase):
             details={"outcome": "CONTRADICTED"},
             capture_quality={"completeness": "COMPLETE"},
         )
-        self.ledger.add_record(rec_contra)
+        add_admitted_fixture(self.ledger, rec_contra)
 
         res = HypothesisValidator.evaluate(hypo, self.ledger, new_evidence=rec_contra)
         self.assertEqual(res.to_status, HYPOTHESIS_STATUS_CONTRADICTED)
@@ -404,7 +405,7 @@ class TestHypothesisValidator(unittest.TestCase):
             details={"val": 42},
             capture_quality={"completeness": "COMPLETE"},
         )
-        self.ledger.add_record(rec1)
+        add_admitted_fixture(self.ledger, rec1)
 
         hypo = InvestigationHypothesis(
             hypothesis_id="hypo_dup",
@@ -426,7 +427,7 @@ class TestHypothesisValidator(unittest.TestCase):
             details={"val": 42},
             capture_quality={"completeness": "COMPLETE"},
         )
-        self.ledger.add_record(rec2)
+        add_admitted_fixture(self.ledger, rec2)
 
         res = HypothesisValidator.evaluate(hypo, self.ledger, new_evidence=rec2)
         self.assertTrue(res.is_duplicate)
@@ -447,7 +448,7 @@ class TestHypothesisValidator(unittest.TestCase):
             },
             capture_quality={"completeness": "COMPLETE", "consistency_level": "STOPPED"},
         )
-        self.ledger.add_record(rec_supp)
+        add_admitted_fixture(self.ledger, rec_supp)
         rcpt_temp = ControlledExecutionResult(
             execution_id="exec_det_1",
             investigation_id=self.ledger.session_id,
@@ -524,7 +525,7 @@ class TestHypothesisValidator(unittest.TestCase):
             observation="Partial transition observed",
             capture_quality={"completeness": "PARTIAL"},
         )
-        self.ledger.add_record(rec_partial)
+        add_admitted_fixture(self.ledger, rec_partial)
 
         hypo = InvestigationHypothesis(
             hypothesis_id="hypo_part",
@@ -632,7 +633,7 @@ class TestInvestigationManagerHypothesisIntegration(unittest.TestCase):
 
         # Re-fetch hypothesis: should now be SUPPORTED
         updated_hypo = self.manager.get_hypothesis(inv_id, hypo_id)
-        self.assertEqual(updated_hypo["validation_status"], HYPOTHESIS_STATUS_SUPPORTED)
+        self.assertEqual(updated_hypo["validation_status"], HYPOTHESIS_STATUS_INCONCLUSIVE)
 
         # 6a. Attempt evaluation with caller-supplied boolean alone (Invariant 3: rejected!)
         unverified_eval = self.manager.evaluate_hypothesis(
@@ -641,7 +642,7 @@ class TestInvestigationManagerHypothesisIntegration(unittest.TestCase):
             deterministic_transition_verified=True,
         )
         self.assertTrue(unverified_eval["success"])
-        self.assertEqual(unverified_eval["transition"]["to_status"], HYPOTHESIS_STATUS_SUPPORTED)
+        self.assertEqual(unverified_eval["transition"]["to_status"], HYPOTHESIS_STATUS_PROPOSED)
         self.assertTrue(unverified_eval["transition"]["unverified_claim_rejected"])
 
         # 6b. Evaluate with verifiable deterministic transition proof evidence
@@ -823,7 +824,7 @@ class TestAgentRuntimeAndWebAdapterHypothesisEndpoints(unittest.TestCase):
             "deterministic_transition_verified": True,
         })
         self.assertTrue(eval_res_bool["success"])
-        self.assertEqual(eval_res_bool["data"]["transition"]["to_status"], HYPOTHESIS_STATUS_SUPPORTED)
+        self.assertEqual(eval_res_bool["data"]["transition"]["to_status"], HYPOTHESIS_STATUS_PROPOSED)
         self.assertTrue(eval_res_bool["data"]["transition"]["unverified_claim_rejected"])
 
         # 5b. EVALUATE_HYPOTHESIS with unverified caller new_evidence is disarmed and rejected
@@ -842,7 +843,7 @@ class TestAgentRuntimeAndWebAdapterHypothesisEndpoints(unittest.TestCase):
             "deterministic_transition_verified": True,
         })
         self.assertTrue(eval_res_injected["success"])
-        self.assertEqual(eval_res_injected["data"]["transition"]["to_status"], HYPOTHESIS_STATUS_SUPPORTED)
+        self.assertEqual(eval_res_injected["data"]["transition"]["to_status"], HYPOTHESIS_STATUS_INCONCLUSIVE)
         self.assertTrue(eval_res_injected["data"]["transition"]["unverified_claim_rejected"])
 
         # 5c. EVALUATE_HYPOTHESIS with authentic internal verifier attested proof succeeds
