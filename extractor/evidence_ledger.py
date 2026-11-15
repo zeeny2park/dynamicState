@@ -1400,6 +1400,7 @@ class EvidenceLedger:
                     p_prov = record.provenance or {}
                     p_details = record.details or {}
                     raw_causal = p_prov.get("causal_attestation") or p_details.get("causal_attestation")
+                    lcr = p_prov.get("live_capture_receipt") or p_details.get("live_capture_receipt")
                     if raw_causal and not hasattr(self.trust_store, "consume_attestation"):
                         c_id = getattr(raw_causal, "attestation_id", None) or (raw_causal.get("attestation_id") if isinstance(raw_causal, dict) else None)
                         if c_id:
@@ -1407,12 +1408,10 @@ class EvidenceLedger:
 
                     # P0-2: Bind operation in trust store
                     op_id = (record.details or {}).get("operation_id")
-                    if not op_id and record.provenance:
-                        lcr = record.provenance.get("live_capture_receipt")
-                        if lcr:
-                            op_id = lcr.get("operation_id") if isinstance(lcr, dict) else getattr(lcr, "operation_id", None)
-                        if not op_id and raw_causal:
-                            op_id = raw_causal.get("operation_id") if isinstance(raw_causal, dict) else getattr(raw_causal, "operation_id", None)
+                    if not op_id and lcr:
+                        op_id = lcr.get("operation_id") if isinstance(lcr, dict) else getattr(lcr, "operation_id", None)
+                    if not op_id and raw_causal:
+                        op_id = raw_causal.get("operation_id") if isinstance(raw_causal, dict) else getattr(raw_causal, "operation_id", None)
                     if op_id:
                         t_ident = record.target_identity or {}
                         pid_val = t_ident.get("pid")
@@ -1439,19 +1438,49 @@ class EvidenceLedger:
                         # never create a committed operation from a receipt-side caller.
                         op_record_getter = getattr(self.trust_store, "get_operation_record", None)
                         op_record = op_record_getter(str(op_id)) if callable(op_record_getter) else None
-                        require_canon = False
-                        if isinstance(op_record, dict):
+
+                        is_mandatory_capture_op = bool(
+                            (record.details or {}).get("require_canonical_replay_identity")
+                            or (record.provenance or {}).get("require_canonical_replay_identity")
+                            or (record.details or {}).get("require_lifecycle_persistence")
+                            or (record.provenance or {}).get("require_lifecycle_persistence")
+                            or (isinstance(op_record, dict) and (
+                                op_record.get("require_canonical_replay_identity")
+                                or op_record.get("canonical_identity")
+                                or op_record.get("operation_type") in ("capture", "lifecycle")
+                            ))
+                        )
+
+                        if op_record is None or not isinstance(op_record, dict):
+                            if is_mandatory_capture_op:
+                                raise ValueError(
+                                    f"Mandatory capture/lifecycle operation '{op_id}' is missing canonical operation record in trust store"
+                                )
+                            require_canon = False
+                            if (record.details or {}).get("canonical_identity") and (record.details or {}).get("canonical_digest"):
+                                op_meta["canonical_identity"] = record.details["canonical_identity"]
+                                op_meta["canonical_digest"] = record.details["canonical_digest"]
+                                op_meta["require_canonical_replay_identity"] = True
+                                require_canon = True
+                        else:
                             if op_record.get("state") and op_record.get("state") != "COMMITTED":
                                 raise ValueError(
                                     f"Receipt operation '{op_id}' is in non-committed state {op_record.get('state')}"
                                 )
-                            if op_record.get("canonical_identity") and op_record.get("canonical_digest"):
+                            if is_mandatory_capture_op or op_record.get("canonical_identity"):
+                                if not op_record.get("canonical_identity") or not op_record.get("canonical_digest"):
+                                    raise ValueError(
+                                        f"Mandatory capture/lifecycle operation '{op_id}' lacks canonical_identity or canonical_digest in trust store"
+                                    )
                                 op_meta.update({
                                     "canonical_identity": op_record["canonical_identity"],
                                     "canonical_digest": op_record["canonical_digest"],
-                                    "operation_type": op_record.get("operation_type"),
+                                    "operation_type": op_record.get("operation_type") or "capture",
+                                    "require_canonical_replay_identity": True,
                                 })
                                 require_canon = True
+                            else:
+                                require_canon = False
 
                         self.trust_store.record_used_operation(
                             op_id=str(op_id),

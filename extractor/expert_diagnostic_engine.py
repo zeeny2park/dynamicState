@@ -126,6 +126,7 @@ from .evidence_ledger import (
     EVIDENCE_TYPE_FIELD_OBSERVATION,
     EVIDENCE_TYPE_OBJECT_STATE,
     EVIDENCE_TYPE_RUNTIME_IDENTITY,
+    EvidenceAdmissionState,
     EvidenceLedger,
     EvidenceRecord,
     NATURE_HYPOTHESIS,
@@ -2028,11 +2029,13 @@ class AdaptiveInvestigationSession:
                     return f"DUPLICATE: {dup.evidence_id}"
                 return "FAILED: Record was not admitted by ledger"
 
+            rec_in_ledger = self.ledger.get_record(ev_id) if hasattr(self.ledger, "get_record") else None
+            if rec_in_ledger and getattr(rec_in_ledger, "admission_state", None) == EvidenceAdmissionState.QUARANTINED:
+                return f"QUARANTINED: {rec_in_ledger.admission_reason or 'Record quarantined due to dangling lineage or unverified provenance'}"
+
             if prov_class in ("LIVE_RUNTIME_CAPTURE", "CONTROLLED_RUNTIME_REPRODUCTION") and hasattr(self.ledger, "accept_record"):
-                try:
-                    self.ledger.accept_record(ev_id)
-                except Exception:
-                    pass
+                self.ledger.accept_record(ev_id)
+                return "ACCEPTED"
 
             return "RECORDED"
         except Exception as le:
@@ -2649,8 +2652,16 @@ class AdaptiveInvestigationSession:
 
         hyp_counter = 1
         for cat, ev_list in cat_evidence.items():
-            supp_ev = [e for e in ev_list if e.get("status") == "SUPPORTED"]
-            contra_ev = [e for e in ev_list if e.get("status") == "CONTRADICTED"]
+            supp_ev = [
+                e for e in ev_list
+                if e.get("status") == "SUPPORTED"
+                and not str(e.get("ledger_status", "")).startswith(("FAILED", "QUARANTINED"))
+            ]
+            contra_ev = [
+                e for e in ev_list
+                if e.get("status") == "CONTRADICTED"
+                and not str(e.get("ledger_status", "")).startswith(("FAILED", "QUARANTINED"))
+            ]
 
             # Build executable verification criteria for this problem category
             criteria = self._build_verification_criteria_for_category(cat)
@@ -2990,9 +3001,17 @@ class AdaptiveInvestigationSession:
                                         + "; ".join(dict.fromkeys(str(e["details"].get("certainty_cap_reason", ""))
                                                                   for e in capped)))
             elif has_fail and has_primary_supp and not has_pass:
-                hyp.status = "CONFIRMED"
-                hyp.confidence = max(hyp.confidence, 0.92)
-                hyp.confidence_basis = f"Executable criteria verified fault: {'; '.join(r['rationale'] for r in results if r['result'] == 'FAIL')}"
+                eligible_records = self.ledger.get_eligible_evidence() if self.ledger else []
+                eligible_evidence_ids = {r.evidence_id for r in eligible_records}
+                missing_auth = [eid for eid in hyp.supporting_evidence_ids if eid not in eligible_evidence_ids] if self.ledger else []
+                if missing_auth:
+                    hyp.status = "INCONCLUSIVE"
+                    hyp.confidence = min(hyp.confidence, 0.40)
+                    hyp.confidence_basis = f"Observed fault criteria met, but supporting evidence lacks authoritative admission: {', '.join(missing_auth)}"
+                else:
+                    hyp.status = "CONFIRMED"
+                    hyp.confidence = max(hyp.confidence, 0.92)
+                    hyp.confidence_basis = f"Executable criteria verified fault: {'; '.join(r['rationale'] for r in results if r['result'] == 'FAIL')}"
             elif has_fail and has_primary_supp and has_pass:
                 hyp.status = "LIKELY"
                 hyp.confidence = min(max(hyp.confidence, 0.70), 0.80)

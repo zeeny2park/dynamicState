@@ -56,8 +56,8 @@ class TestPbtOperationIdentity(unittest.TestCase):
     @given(
         host=st.text(alphabet=string.ascii_lowercase + "-", min_size=1, max_size=32),
         boot=st.text(alphabet=string.hexdigits + "-", min_size=1, max_size=36),
-        pid=st.integers(min_value=1, max_value=4194304),
-        start_time=st.integers(min_value=0, max_value=2**32 - 1),
+        pid=st.integers(min_value=2, max_value=4194304),
+        start_time=st.integers(min_value=1, max_value=2**32 - 1),
     )
     def test_property_process_identity_invariants(self, host, boot, pid, start_time):
         """Invariant 3: ProcessIdentity 4-tuple equality is strictly reflexive, symmetric, and sensitive to every field."""

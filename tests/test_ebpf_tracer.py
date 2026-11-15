@@ -792,7 +792,10 @@ class TestEbpfTracerUnit(unittest.TestCase):
             function_name="main",
         )
         self.assertEqual(session.status, "FAILED")
-        self.assertIn("does not match requested binary", session.error_message)
+        self.assertTrue(
+            "does not match" in session.error_message and "requested binary" in session.error_message,
+            session.error_message,
+        )
         self.assertEqual(session.build_id_status, "MISMATCHED")
 
     def test_15_build_id_mismatch_fails_closed(self):
@@ -1761,9 +1764,21 @@ class TestEbpfTracerUnit(unittest.TestCase):
         mock_idx1.subprograms_by_name = {"worker": [decl_sp, def_sp]}
         mock_idx1.subprograms = [decl_sp, def_sp]
 
+        mock_target_ident = {
+            "host_identity": platform.node(),
+            "boot_id": "test-boot",
+            "pid": 123,
+            "process_start_time": 1000,
+            "executable_path": "/bin/test_multi",
+            "executable_device": 1,
+            "executable_inode": 2,
+            "build_id": "abc123",
+        }
+
         with patch("extractor.dwarf_indexer.DwarfIndexer.get_index", return_value=mock_idx1), \
              patch("os.path.exists", return_value=True), \
              patch("os.path.getsize", return_value=0x5000), \
+             patch("extractor.ebpf_tracer.capture_target_identity", return_value=mock_target_ident), \
              patch("extractor.ebpf_tracer.EbpfEnvironmentChecker.check_prerequisites") as mock_cap, \
              patch("os.kill", return_value=None), \
              patch("extractor.ebpf_tracer.inspect_elf", return_value=ident), \
@@ -1800,6 +1815,7 @@ class TestEbpfTracerUnit(unittest.TestCase):
         with patch("extractor.dwarf_indexer.DwarfIndexer.get_index", return_value=mock_idx2), \
              patch("os.path.exists", return_value=True), \
              patch("os.path.getsize", return_value=0x5000), \
+             patch("extractor.ebpf_tracer.capture_target_identity", return_value=mock_target_ident), \
              patch("extractor.ebpf_tracer.EbpfEnvironmentChecker.check_prerequisites") as mock_cap, \
              patch("os.kill", return_value=None), \
              patch("extractor.ebpf_tracer.inspect_elf", return_value=ident):

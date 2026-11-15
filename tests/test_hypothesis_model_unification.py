@@ -20,13 +20,52 @@ from extractor.competing_hypotheses import (
     CompetingHypothesisManager,
     candidate_verdict_source,
 )
-from extractor.expert_diagnostic_engine import AdaptiveInvestigationSession, TargetAssessmentResult
+from extractor.capture_backend import get_trusted_capture_authority_token, issue_live_capture_receipt
+from extractor.evidence_ledger import EvidenceRecord, EvidenceAdmissionState, PROVENANCE_CLASS_LIVE_RUNTIME_CAPTURE
+from extractor.expert_diagnostic_engine import AdaptiveInvestigationSession, TargetAssessmentResult, RuntimeEvidenceRecord
 from tests.test_typed_evidence import _evidence_from_recipe
 
 
 def _session(tmp, evidence, symptom_category):
     s = AdaptiveInvestigationSession(investigation_id="inv_unify_test", problem_statement="test", corpus_dir=tmp)
     s.collected_evidence = evidence
+    token = get_trusted_capture_authority_token()
+    pid = 1234
+    for e in evidence:
+        eid = e.get("evidence_id")
+        if eid:
+            rcpt = issue_live_capture_receipt(
+                session_id=s.ledger.session_id,
+                pid=pid,
+                process_identity=f"proc_{pid}",
+                executable_identity=f"/proc/{pid}/exe",
+                build_id="sha1:testbuildid12345",
+                snapshot_binding="snap_1",
+                capture_authority_token=token,
+            )
+            rec = EvidenceRecord(
+                evidence_id=eid,
+                session_id=s.ledger.session_id,
+                evidence_type="DIAGNOSTIC",
+                nature="observation",
+                observation=str(e.get("finding") or e.get("observation") or "test observation"),
+                provenance={"provenance_class": PROVENANCE_CLASS_LIVE_RUNTIME_CAPTURE, "live_capture_receipt": rcpt.to_dict()},
+                details={"provenance_class": PROVENANCE_CLASS_LIVE_RUNTIME_CAPTURE, "live_capture_receipt": rcpt.to_dict(), "target_pid": pid},
+                target_identity={"pid": pid, "process_identity": f"proc_{pid}", "executable_identity": f"/proc/{pid}/exe", "build_id": "sha1:testbuildid12345"},
+                admission_state=EvidenceAdmissionState.ACCEPTED,
+            )
+            if not s.ledger.has(eid):
+                s.ledger.add_record(rec)
+            r_rec = RuntimeEvidenceRecord(
+                evidence_id=eid,
+                collection_method=e.get("recipe_id", "RECIPE_TEST"),
+                target_pid=pid,
+                observed_value=e.get("normalized_observation"),
+                raw_observation=e.get("raw_observation"),
+                normalized_observation=e.get("normalized_observation"),
+                provenance_class=PROVENANCE_CLASS_LIVE_RUNTIME_CAPTURE,
+            )
+            s.collected_evidence_records.append(r_rec)
     s.target_assessment = TargetAssessmentResult(
         pid=None, accessible=True, thread_count=1, memory_regions_count=1, rss_kb=1, companion_elf_path=None,
         companion_elf_valid=False, dwarf_available=False, capabilities=[], limitations=[], prerequisites_met=True,

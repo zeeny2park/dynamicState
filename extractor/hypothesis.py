@@ -1885,6 +1885,19 @@ def classify_evidence_relationship(
             return "correlated"
 
     # Check correlated:
+    # 0. Shared capture receipt or operation: multiple records from the same capture batch or operation are correlated, never independent
+    rcpt_a = (rec_a.provenance or {}).get("live_capture_receipt") or da.get("live_capture_receipt") or (rec_a.provenance or {}).get("receipt_id") or da.get("receipt_id")
+    rcpt_b = (rec_b.provenance or {}).get("live_capture_receipt") or db.get("live_capture_receipt") or (rec_b.provenance or {}).get("receipt_id") or db.get("receipt_id")
+    rcpt_id_a = getattr(rcpt_a, "receipt_id", None) or (rcpt_a.get("receipt_id") if isinstance(rcpt_a, dict) else str(rcpt_a) if rcpt_a else None)
+    rcpt_id_b = getattr(rcpt_b, "receipt_id", None) or (rcpt_b.get("receipt_id") if isinstance(rcpt_b, dict) else str(rcpt_b) if rcpt_b else None)
+    if rcpt_id_a and rcpt_id_b and rcpt_id_a == rcpt_id_b:
+        return "correlated"
+
+    op_a = (rec_a.provenance or {}).get("operation_id") or da.get("operation_id") or getattr(rcpt_a, "operation_id", None) or (rcpt_a.get("operation_id") if isinstance(rcpt_a, dict) else None)
+    op_b = (rec_b.provenance or {}).get("operation_id") or db.get("operation_id") or getattr(rcpt_b, "operation_id", None) or (rcpt_b.get("operation_id") if isinstance(rcpt_b, dict) else None)
+    if op_a and op_b and str(op_a) == str(op_b):
+        return "correlated"
+
     # 1. Multiple fields from the same underlying observation (same observation_id or batch_id)
     obs_id_a = da.get("observation_id") or da.get("root_observation_id") or da.get("batch_id")
     obs_id_b = db.get("observation_id") or db.get("root_observation_id") or db.get("batch_id")
@@ -3107,10 +3120,10 @@ class HypothesisValidator:
             new_status = HYPOTHESIS_STATUS_CONTRADICTED
             new_conf = CONFIDENCE_HIGH
             reason = f"Contradicted by {contra_count} independent observation(s)."
-        elif has_untrusted_evidence:
+        elif has_untrusted_evidence or any(supp_rel_map.get(eid) == CLASSIFICATION_MISSING for eid in raw_supp_ids):
             new_status = HYPOTHESIS_STATUS_INCONCLUSIVE
             new_conf = CONFIDENCE_LOW
-            reason = "Supporting evidence originates from FAILED, INVALID, or missing capture quality; cannot support hypothesis."
+            reason = "Supporting evidence originates from missing or unverified evidence; cannot support hypothesis."
         elif new_evidence and is_inconclusive and (new_evidence.details or {}).get("stage") == "FOLLOW_UP" and supp_count <= 1:
             new_status = HYPOTHESIS_STATUS_INCONCLUSIVE
             new_conf = CONFIDENCE_LOW
@@ -3192,17 +3205,22 @@ class HypothesisValidator:
                                 fc["tier_limitation"] = attr_lim or "Static reference candidate identified via DWARF/ELF analysis; not confirmed root-cause function."
             else:
                 # Causal proof was not established
-                has_auth_support = any(
-                    auth_record(eid) is not None and supp_rel_map.get(eid) != CLASSIFICATION_INVALIDATED
-                    for eid in hypothesis.supporting_evidence_ids
+                has_auth_support = bool(raw_supp_ids) and all(
+                    auth_record(eid) is not None and supp_rel_map.get(eid) not in (CLASSIFICATION_INVALIDATED, CLASSIFICATION_MISSING)
+                    for eid in raw_supp_ids
                 )
                 if proof_rec and (proof_rec.capture_quality or {}).get("completeness") in ("FAILED", "INVALID", "UNTRUSTED"):
                     new_status = HYPOTHESIS_STATUS_INCONCLUSIVE
                     new_conf = CONFIDENCE_LOW
-                elif not has_auth_support and (deterministic_transition_verified or proof_evidence_id or new_evidence is None):
-                    new_status = old_status if old_status in (HYPOTHESIS_STATUS_PROPOSED, "CREATED") else HYPOTHESIS_STATUS_PROPOSED
-                    new_conf = old_conf
-                    reason = f"Supporting evidence lacks authoritative admission; remains {new_status}."
+                elif not has_auth_support:
+                    if new_evidence is None and deterministic_transition_verified:
+                        new_status = old_status if old_status in (HYPOTHESIS_STATUS_PROPOSED, "CREATED") else HYPOTHESIS_STATUS_PROPOSED
+                        new_conf = old_conf
+                        reason = "Caller-supplied verification rejected without authoritative causal attestation; remains PROPOSED."
+                    else:
+                        new_status = HYPOTHESIS_STATUS_INCONCLUSIVE
+                        new_conf = CONFIDENCE_LOW
+                        reason = "Supporting evidence lacks authoritative admission; remains INCONCLUSIVE."
                 else:
                     new_status = HYPOTHESIS_STATUS_SUPPORTED
                     new_conf = CONFIDENCE_MEDIUM if (not has_partial_evidence and not has_non_atomic_evidence) else CONFIDENCE_LOW

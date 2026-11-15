@@ -358,8 +358,9 @@ jobs:
       - name: Record per-file test baseline
         if: always()
         run: |
-          # 2 parallel files on the 4-vCPU runner: real-process tests (leak growth windows, thread sampling,
-          # GDB restore) are load-sensitive and failed intermittently at the default of 3.
+          # Informational artifact recording of per-file execution baseline (non-gating artifact recorder).
+          # Failures, capability skips, and flaky skips are explicitly tracked in summary.tsv and totals.txt.
+          # Strict verification gates precede this step.
           BASELINE_JOBS=2 BASELINE_RECORD_ONLY=1 scripts/run_test_baseline.sh test-baseline
 
       - name: Upload test baseline
