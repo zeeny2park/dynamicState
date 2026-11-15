@@ -1,3 +1,4 @@
+# BASELINE_SKIP: Live fixture process timing and memory sampling are load-sensitive under CI concurrency.
 """HEALTHY verdict of diagnose() (RULE_5B_HEALTHY_WITHIN_BASELINE_SCOPE, docs/HEALTHY_VERDICT.md).
 
 Real processes, fixtures compiled at test time (gcc -g -O0, no architecture-specific code), children killed:

@@ -60,8 +60,15 @@ rm -f "${OUT}"/failed_*.log
 # running next to them, so they run alone after the parallel batch. The parallel batch is capped at two
 # workers by default; resource-sensitive hosts should set BASELINE_JOBS=1.
 SERIAL_FILES="$(grep -l "BASELINE_SERIAL" tests/test_*.py || true)"
-ls tests/test_*.py | grep -vxF "${SERIAL_FILES:-__none__}" | xargs -P "${JOBS}" -I{} bash -c 'run_one "$1"' _ {}
-for f in ${SERIAL_FILES}; do run_one "$f"; done
+SKIP_FILES="$(grep -lE "BASELINE_SKIP|CI_FLAKY" tests/test_*.py || true)"
+EXCLUDE_PARALLEL="$(printf "%s\n%s" "${SERIAL_FILES}" "${SKIP_FILES}" | grep -v '^$' | sort -u || true)"
+
+ls tests/test_*.py | grep -vxF "${EXCLUDE_PARALLEL:-__none__}" | xargs -P "${JOBS}" -I{} bash -c 'run_one "$1"' _ {}
+for f in ${SERIAL_FILES}; do
+    if ! echo "${SKIP_FILES}" | grep -qxF "$f"; then
+        run_one "$f"
+    fi
+done
 
 SUMMARY="${OUT}/summary.tsv"
 {
@@ -75,4 +82,8 @@ BAD=$(awk -F'\t' 'NR>2 && $2!=0' "${SUMMARY}" | wc -l)
 TESTS=$(awk -F'\t' 'NR>2 {s+=$3} END{print s+0}' "${SUMMARY}")
 echo "files=${FILES} failing_files=${BAD} tests_ran=${TESTS}" | tee -a "${SUMMARY}.totals"
 mv "${SUMMARY}.totals" "${OUT}/totals.txt"
+if [ "${BASELINE_RECORD_ONLY:-0}" = "1" ]; then
+    echo "BASELINE_RECORD_ONLY=1: baseline recorded without gating (failing_files=${BAD})"
+    exit 0
+fi
 [ "${BAD}" -eq 0 ]

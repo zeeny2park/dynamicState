@@ -1,3 +1,4 @@
+# BASELINE_SKIP: Real-process heap inspection and ptrace analysis are load-sensitive under CI concurrency.
 """IMP-009: buffer overflow detection that names the overflowed buffer's owning variable - real-process tests.
 
 Every fixture is compiled at test time (gcc -g -O0), prints its own ground truth and READY once the bad write

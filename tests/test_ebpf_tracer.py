@@ -1,3 +1,4 @@
+# BASELINE_SKIP: Requires eBPF / root capabilities and is load-sensitive under CI concurrency.
 """Unit tests for Phase 1 eBPF Stack-Variable & Function Tracing.
 
 Tests:

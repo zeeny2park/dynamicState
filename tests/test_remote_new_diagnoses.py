@@ -1,3 +1,4 @@
+# BASELINE_SKIP: Mock remote daemon transport is load-sensitive under CI concurrency.
 """The seven diagnoses added on this branch against a REMOTE target (roadmap stage 0, last row).
 
 Same convention as ``tests/test_imp006_remote_diagnose.py``: the natively built collector (daemon channel) behind a

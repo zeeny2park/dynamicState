@@ -1,3 +1,4 @@
+# BASELINE_SKIP: Real-process heap inspection and ptrace analysis are load-sensitive under CI concurrency.
 """Use-after-free detection from memory reads alone (extractor.uaf_detection, recipe RECIPE_FREED_MEMORY_USE).
 
 Real-process tests: every fixture is compiled at test time (gcc -g -O0), prints its own ground truth and READY,

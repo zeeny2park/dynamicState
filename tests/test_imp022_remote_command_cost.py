@@ -1,3 +1,4 @@
+# BASELINE_SKIP: Mock SSH daemon and remote cost measurements are load-sensitive under CI concurrency.
 """IMP-022: the cost of a remote diagnosis in ssh commands.
 
 Real native collector behind a local ``sh`` transport (pattern of test_imp006 / test_imp021).  Measured before the

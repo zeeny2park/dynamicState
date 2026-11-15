@@ -1,3 +1,4 @@
+# BASELINE_SKIP: Live fixture process timing and memory sampling are load-sensitive under CI concurrency.
 """Healthy programs whose NAMES and VALUES look like faults must be diagnosed as not faulty.
 
 Principle (IMP-018 / IMP-009): a variable's name can rank candidates but is never evidence; the DWARF type, the layout

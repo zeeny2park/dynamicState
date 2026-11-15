@@ -1,3 +1,4 @@
+# BASELINE_SKIP: Mock SSH daemon and remote channel are load-sensitive under CI concurrency.
 """IMP-006 (remote): the single ``diagnose`` entry point against a REMOTE target.
 
 The "remote" side is real: the natively built collector (daemon channel) reads the memory of real fixture

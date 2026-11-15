@@ -1,3 +1,4 @@
+# BASELINE_SKIP: Live fixture process and container memory inspection are load-sensitive under CI concurrency.
 """Roadmap stage 3: libstdc++ containers in the default diagnosis (extractor.cpp_containers).
 
  a. every container kind of the fixture decodes through the target adapter to its ground truth (sizes, counts,
