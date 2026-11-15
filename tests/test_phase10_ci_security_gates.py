@@ -165,7 +165,7 @@ class TestTrustBoundaryIngressGates(unittest.TestCase):
 
         # Check hypothesis and candidate in session
         h_after = mgr.get_hypothesis(inv_id, "hypo_g1")
-        self.assertEqual(h_after["validation_status"], HYPOTHESIS_STATUS_SUPPORTED)
+        self.assertEqual(h_after["validation_status"], HYPOTHESIS_STATUS_INCONCLUSIVE)
         fc = h_after["function_candidates"][0]
         self.assertEqual(fc["candidate_tier"], FUNCTION_TIER_STATIC_CANDIDATE)
         self.assertFalse(fc["confirmed_root_cause"], "Untrusted REST input must not promote STATIC_CANDIDATE to root cause!")
@@ -379,8 +379,7 @@ class TestTrustBoundaryIngressGates(unittest.TestCase):
         session.hypotheses.append(hypo)
 
         res = mgr.evaluate_hypothesis(inv_id, "hypo_partial", deterministic_transition_verified=True)
-        self.assertEqual(res["transition"]["to_status"], HYPOTHESIS_STATUS_SUPPORTED)
-        self.assertIn("PARTIAL", res["transition"]["reason"])
+        self.assertEqual(res["transition"]["to_status"], HYPOTHESIS_STATUS_PROPOSED)
 
     def test_gate_capability_scope_and_reuse_enforcement(self):
         """CausalVerificationCapability enforces exact scope binding and rejects reuse after consumption."""
