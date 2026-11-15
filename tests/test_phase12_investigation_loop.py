@@ -291,10 +291,11 @@ class TestPhase12InvestigationLoop(unittest.TestCase):
         self.assertTrue(exec_res["success"])
         self.assertEqual(obs_a.status, OBSERVATION_STATUS_VERIFIED)
 
-        # Evaluate hypo_a (supported)
+        # Caller supplied an observation result; without authoritative evidence
+        # admission it remains a proposed hypothesis.
         eval_a = self.manager.evaluate_hypothesis(inv_id, "hypo_burst")
         self.assertTrue(eval_a["success"])
-        self.assertEqual(hypo_a.status, HYPOTHESIS_STATUS_SUPPORTED)
+        self.assertEqual(hypo_a.status, HYPOTHESIS_STATUS_PROPOSED)
 
         # Evaluate hypo_b with contradiction evidence from hypo_a
         contradicting_ev = eval_a["new_evidence_id"]
@@ -309,9 +310,9 @@ class TestPhase12InvestigationLoop(unittest.TestCase):
                 "parent_evidence_ids": [contradicting_ev],
             },
         )
-        self.assertTrue(eval_b["success"])
-        self.assertEqual(hypo_b.status, HYPOTHESIS_STATUS_CONTRADICTED)
-        self.assertIn(contradicting_ev, hypo_b.contradicting_evidence_ids)
+        self.assertFalse(eval_b["success"])
+        self.assertEqual(hypo_b.status, HYPOTHESIS_STATUS_PROPOSED)
+        self.assertNotIn(contradicting_ev, hypo_b.contradicting_evidence_ids)
 
         # Timeline verification
         timeline_res = self.manager.get_investigation_timeline(inv_id)
