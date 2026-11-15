@@ -7,6 +7,7 @@ strictly distinguishing direct observations from speculative inferences.
 
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
+from enum import Enum
 import hashlib
 import hmac
 import json
@@ -812,6 +813,15 @@ NATURE_HYPOTHESIS = "hypothesis"
 VALID_NATURES = {NATURE_OBSERVATION, NATURE_INFERENCE, NATURE_HYPOTHESIS}
 
 
+class EvidenceAdmissionState(str, Enum):
+    """Explicit trust and admission state for evidence records."""
+    ACCEPTED = "ACCEPTED"
+    REJECTED = "REJECTED"
+    QUARANTINED = "QUARANTINED"
+    NOT_COVERED = "NOT_COVERED"
+    PARTIAL = "PARTIAL"
+
+
 @dataclass
 class EvidenceRecord:
     """Individual machine-readable evidence entry with full provenance."""
@@ -828,6 +838,11 @@ class EvidenceRecord:
     # Provenance details
     provenance: Dict[str, Any] = field(default_factory=dict)
 
+    # Admission state and lineage
+    admission_state: Any = None
+    admission_reason: Optional[str] = None
+    provenance_lineage: Optional[Dict[str, Any]] = None
+
     # Specific evidence categories (all optional for schema flexibility and backward compatibility)
     target_identity: Optional[Dict[str, Any]] = None
     snapshot_ref: Optional[Dict[str, Any]] = None
@@ -841,6 +856,13 @@ class EvidenceRecord:
     schema_version: str = EVIDENCE_SCHEMA_VERSION
 
     def __post_init__(self):
+        if self.admission_state is None:
+            self.admission_state = EvidenceAdmissionState.NOT_COVERED
+        elif isinstance(self.admission_state, str):
+            try:
+                self.admission_state = EvidenceAdmissionState(self.admission_state)
+            except ValueError:
+                pass
         if self.evidence_id is not None:
             if not isinstance(self.evidence_id, str) or not self.evidence_id.strip():
                 raise ValueError("evidence_id must be a non-empty string")
@@ -932,6 +954,12 @@ class EvidenceRecord:
             data["target_identity"] = self.target_identity
         if self.snapshot_ref is not None:
             data["snapshot_ref"] = self.snapshot_ref
+        if self.admission_state is not None:
+            data["admission_state"] = getattr(self.admission_state, "value", str(self.admission_state))
+        if self.admission_reason is not None:
+            data["admission_reason"] = self.admission_reason
+        if self.provenance_lineage is not None:
+            data["provenance_lineage"] = self.provenance_lineage
         if self.capture_quality is not None:
             data["capture_quality"] = self.capture_quality
         if self.object_observation is not None:
@@ -1014,6 +1042,9 @@ class EvidenceRecord:
             comparison_observation=data.get("comparison_observation"),
             uncertainty=data.get("uncertainty"),
             details=details_val,
+            admission_state=data.get("admission_state"),
+            admission_reason=data.get("admission_reason"),
+            provenance_lineage=data.get("provenance_lineage"),
             schema_version=data.get("schema_version", EVIDENCE_SCHEMA_VERSION),
         )
 
@@ -1332,13 +1363,15 @@ class EvidenceLedger:
             rec.details["field_path"] = eff_field
         return True
 
-    def add_record(self, record: Union[EvidenceRecord, Dict[str, Any]]) -> EvidenceRecord:
+    def add_record(self, record: Union[EvidenceRecord, Dict[str, Any]], quarantine_dangling: bool = False) -> EvidenceRecord:
         """Add an evidence record to the ledger, rejecting duplicate IDs."""
         with self._lock:
             if isinstance(record, dict):
                 record = EvidenceRecord.from_dict(record)
             if not record.session_id:
                 record.session_id = self.session_id
+            if quarantine_dangling:
+                record.admission_state = EvidenceAdmissionState.QUARANTINED
 
             _orig_causal = set(getattr(self, "_used_causal_attestation_ids", set()))
             _orig_causal_to_eid = dict(getattr(self, "_causal_attestation_to_evidence_id", {}))
@@ -1409,6 +1442,12 @@ class EvidenceLedger:
                                 parent_evidence_ids=record.parent_evidence_ids,
                                 parent_evidence_digest=(record.details or {}).get("parent_evidence_digest"),
                             )
+
+                if record.parent_evidence_ids:
+                    dangling = [pid for pid in record.parent_evidence_ids if pid not in self._by_id]
+                    if dangling:
+                        record.admission_state = EvidenceAdmissionState.QUARANTINED
+                        record.admission_reason = f"Dangling parent evidence reference: missing {dangling}"
 
                 self._records.append(record)
                 self._by_id[record.evidence_id] = record
@@ -1507,6 +1546,10 @@ class EvidenceLedger:
             if not isinstance(pid, str) or not pid.strip():
                 raise ValueError(f"Invalid parent_evidence_id '{pid}' in parent_evidence_ids: must be a non-empty string")
             if pid not in self._by_id:
+                if record.admission_state == EvidenceAdmissionState.QUARANTINED:
+                    if not record.admission_reason:
+                        record.admission_reason = f"Dangling parent evidence reference: parent record '{pid}' not in ledger"
+                    continue
                 raise ValueError(f"EvidenceRecord '{record.evidence_id}' references nonexistent parent record '{pid}'")
             # Graph cycle detection
             visited = set()
@@ -1769,9 +1812,13 @@ class EvidenceLedger:
         if record.parent_evidence_ids:
             for p_id in record.parent_evidence_ids:
                 if p_id not in self._by_id:
-                    raise ValueError(
-                        f"Referenced parent evidence '{p_id}' for record '{record.evidence_id}' does not exist in ledger"
-                    )
+                    if record.admission_state != EvidenceAdmissionState.QUARANTINED:
+                        raise ValueError(
+                            f"Referenced parent evidence '{p_id}' for record '{record.evidence_id}' does not exist in ledger"
+                        )
+                    if not record.admission_reason:
+                        record.admission_reason = f"Referenced parent evidence '{p_id}' for record '{record.evidence_id}' does not exist in ledger"
+                    continue
                 p_rec = self._by_id[p_id]
                 if p_rec.session_id != (record.session_id or self.session_id):
                     raise ValueError(
@@ -2135,6 +2182,49 @@ class EvidenceLedger:
     def get_records(self) -> List[EvidenceRecord]:
         """Returns a snapshot copy of all admitted evidence records."""
         return list(self._records)
+
+    def get_eligible_evidence(self) -> List[EvidenceRecord]:
+        """Return only authoritative, admitted (ACCEPTED) evidence records.
+
+        Strictly excludes REJECTED, QUARANTINED, NOT_COVERED, and PARTIAL records
+        from downstream hypothesis evaluation and diagnostic verdict pipelines.
+        """
+        with self._lock:
+            target_val = EvidenceAdmissionState.ACCEPTED.value
+            return [
+                r for r in self._records
+                if (r.admission_state == EvidenceAdmissionState.ACCEPTED or
+                    getattr(r.admission_state, "value", str(r.admission_state)) == target_val)
+            ]
+
+    def get_audit_trail(self) -> List[EvidenceRecord]:
+        """Return all evidence records including rejected and quarantined items for forensics and audit."""
+        with self._lock:
+            return list(self._records)
+
+    def quarantine_record(self, evidence_id: str, reason: str = "") -> None:
+        """Quarantine a record due to missing provenance or dangling parent reference."""
+        with self._lock:
+            rec = self._by_id.get(evidence_id)
+            if rec:
+                rec.admission_state = EvidenceAdmissionState.QUARANTINED
+                rec.admission_reason = reason
+
+    def reject_record(self, evidence_id: str, reason: str = "") -> None:
+        """Reject a record due to failed integrity verification or cryptographic check."""
+        with self._lock:
+            rec = self._by_id.get(evidence_id)
+            if rec:
+                rec.admission_state = EvidenceAdmissionState.REJECTED
+                rec.admission_reason = reason
+
+    def accept_record(self, evidence_id: str) -> None:
+        """Promote an evidence record to authoritative ACCEPTED status."""
+        with self._lock:
+            rec = self._by_id.get(evidence_id)
+            if rec:
+                rec.admission_state = EvidenceAdmissionState.ACCEPTED
+                rec.admission_reason = None
 
     def find_by_semantic_digest(self, semantic_digest: str) -> Optional[EvidenceRecord]:
         """Look up existing record by semantic digest for deduplication."""

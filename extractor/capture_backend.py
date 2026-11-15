@@ -21,7 +21,10 @@ import hmac
 import json
 import os
 import platform
+import re
 import signal
+import socket
+import stat
 import threading
 import time
 from typing import Any, Dict, List, Optional, Set, Tuple, Union
@@ -849,6 +852,237 @@ class DurableCommitError(RuntimeError):
         self.cause = cause
 
 
+# ==============================================================================
+# Operation Identity, Replay Defense & Lifecycle Trust Boundaries (Unit 1)
+# ==============================================================================
+
+class InvalidOperationIdError(ValueError):
+    """Raised when an operation identifier fails whitelist validation or format constraints."""
+    pass
+
+
+class ProcessIdentityMismatchError(ValueError):
+    """Raised when target Process Identity (host, boot_id, pid, process_start_time) mismatches."""
+    pass
+
+
+class ProcessIdentityUnavailableError(RuntimeError):
+    """Raised when target process start time or kernel boot identity cannot be reliably resolved."""
+    pass
+
+
+class MissingIdentityFieldError(ValueError):
+    """Raised when a mandatory identity field is missing, None, or empty."""
+    pass
+
+
+class IdentityConflictError(ValueError):
+    """Raised when incoming identity metadata conflicts with previously established valid identity."""
+    pass
+
+
+class InvalidStateTransitionError(ValueError):
+    """Raised when an illegal or backward operation lifecycle transition is attempted."""
+    pass
+
+
+class LockTimeoutError(TimeoutError):
+    """Raised when acquiring the trust store mutual exclusion lock times out."""
+    pass
+
+
+class SecurityViolationError(RuntimeError):
+    """Raised when a filesystem security constraint (permissions, ownership, symlink) is violated."""
+    pass
+
+
+class OperationLifecycleState(str, Enum):
+    """Explicit operation lifecycle states with strict validated one-way transitions."""
+    CREATED = "CREATED"
+    VALIDATED = "VALIDATED"
+    RESERVED = "RESERVED"
+    EXECUTING = "EXECUTING"
+    COMMITTED = "COMMITTED"
+    REJECTED = "REJECTED"
+    FAILED = "FAILED"
+    CANCELLED = "CANCELLED"
+    PARTIAL = "PARTIAL"
+    ABORTED_ON_RESTART = "ABORTED_ON_RESTART"
+
+
+_OPERATION_ID_REGEX = re.compile(r"^[a-zA-Z0-9_.:-]{1,128}\Z")
+
+
+def validate_operation_id(operation_id: Any) -> str:
+    """Validate operation ID against strict whitelist with no silent trimming.
+    
+    Invariant: Length 1~128, whitelist ^[a-zA-Z0-9_.:-]+$, no None/empty/whitespace/unicode.
+    """
+    if not isinstance(operation_id, str):
+        raise InvalidOperationIdError(f"Operation ID must be str, got {type(operation_id).__name__}")
+    n = len(operation_id)
+    if n < 1 or n > 128:
+        raise InvalidOperationIdError(f"Operation ID length must be between 1 and 128, got {n}")
+    if any(c in " \t\r\n\x0b\x0c" for c in (operation_id[0], operation_id[-1])):
+        raise InvalidOperationIdError("Operation ID must not contain leading or trailing whitespace (no trim)")
+    if any(c.isspace() for c in operation_id):
+        raise InvalidOperationIdError("Operation ID must not contain whitespace characters")
+    if not _OPERATION_ID_REGEX.match(operation_id):
+        raise InvalidOperationIdError(f"Operation ID '{operation_id}' contains invalid characters")
+    return operation_id
+
+
+@dataclass(frozen=True)
+class ProcessIdentity:
+    """OS-level Process Identity 4-tuple providing single source of truth for process uniqueness."""
+    host_identity: str
+    boot_id: str
+    pid: int
+    process_start_time: int
+
+    def __post_init__(self):
+        if not self.host_identity or not isinstance(self.host_identity, str):
+            raise MissingIdentityFieldError("host_identity must be a non-empty string")
+        if not self.boot_id or not isinstance(self.boot_id, str):
+            raise MissingIdentityFieldError("boot_id must be a non-empty string")
+        if self.pid is None or not isinstance(self.pid, int) or self.pid <= 0:
+            raise MissingIdentityFieldError("pid must be a positive integer")
+        if self.process_start_time is None or not isinstance(self.process_start_time, int):
+            raise MissingIdentityFieldError("process_start_time must be an integer")
+
+    def matches(self, other: Any) -> bool:
+        if not isinstance(other, ProcessIdentity):
+            return False
+        return (
+            self.host_identity == other.host_identity
+            and self.boot_id == other.boot_id
+            and int(self.pid) == int(other.pid)
+            and int(self.process_start_time) == int(other.process_start_time)
+        )
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "host_identity": self.host_identity,
+            "boot_id": self.boot_id,
+            "pid": self.pid,
+            "process_start_time": self.process_start_time,
+        }
+
+
+@dataclass(frozen=True)
+class CanonicalOperationIdentity:
+    """Complete Canonical Operation Identity for Replay Defense and auditability."""
+    operation_id: str
+    operation_kind: str
+    process_identity: ProcessIdentity
+    build_id: str
+    session_identity: str
+    request_scope: str
+    normalized_parameters: Dict[str, Any]
+    schema_version: str = "1.0"
+
+    def __post_init__(self):
+        if not self.operation_id:
+            raise MissingIdentityFieldError("operation_id is required")
+        validate_operation_id(self.operation_id)
+        if not self.operation_kind:
+            raise MissingIdentityFieldError("operation_kind is required")
+        if not self.process_identity or not isinstance(self.process_identity, ProcessIdentity):
+            raise MissingIdentityFieldError("process_identity must be a valid ProcessIdentity")
+        if not self.build_id:
+            raise MissingIdentityFieldError("build_id is required")
+        if not self.session_identity:
+            raise MissingIdentityFieldError("session_identity is required")
+        if not self.request_scope:
+            raise MissingIdentityFieldError("request_scope is required")
+        if self.normalized_parameters is None or not isinstance(self.normalized_parameters, dict):
+            raise MissingIdentityFieldError("normalized_parameters must be a dict")
+
+
+def build_canonical_replay_identity(
+    operation_id: str,
+    operation_kind: str,
+    process_identity: ProcessIdentity,
+    build_id: str,
+    session_identity: str,
+    request_scope: str,
+    parameters: Optional[Dict[str, Any]] = None,
+    schema_version: str = "1.0",
+) -> CanonicalOperationIdentity:
+    """Build normalized, key-sorted CanonicalOperationIdentity."""
+    norm_params = dict(sorted((parameters or {}).items()))
+    return CanonicalOperationIdentity(
+        operation_id=validate_operation_id(operation_id),
+        operation_kind=str(operation_kind),
+        process_identity=process_identity,
+        build_id=str(build_id),
+        session_identity=str(session_identity),
+        request_scope=str(request_scope),
+        normalized_parameters=norm_params,
+        schema_version=str(schema_version),
+    )
+
+
+_CURRENT_BOOT_ID_CACHE: Optional[str] = None
+_CURRENT_MACHINE_ID_CACHE: Optional[str] = None
+
+
+def resolve_current_boot_id() -> str:
+    """Resolve OS kernel boot ID with caching."""
+    global _CURRENT_BOOT_ID_CACHE
+    if _CURRENT_BOOT_ID_CACHE:
+        return _CURRENT_BOOT_ID_CACHE
+    try:
+        if os.path.exists("/proc/sys/kernel/random/boot_id"):
+            with open("/proc/sys/kernel/random/boot_id", "r", encoding="utf-8") as f:
+                _CURRENT_BOOT_ID_CACHE = f.read().strip()
+                if _CURRENT_BOOT_ID_CACHE:
+                    return _CURRENT_BOOT_ID_CACHE
+    except Exception:
+        pass
+    _CURRENT_BOOT_ID_CACHE = "boot-default"
+    return _CURRENT_BOOT_ID_CACHE
+
+
+def resolve_machine_id() -> str:
+    """Resolve host machine ID from systemd or dbus files, fallback to hostname."""
+    global _CURRENT_MACHINE_ID_CACHE
+    if _CURRENT_MACHINE_ID_CACHE:
+        return _CURRENT_MACHINE_ID_CACHE
+    for path in ("/etc/machine-id", "/var/lib/dbus/machine-id"):
+        try:
+            if os.path.exists(path):
+                with open(path, "r", encoding="utf-8") as f:
+                    content = f.read().strip()
+                    if content:
+                        _CURRENT_MACHINE_ID_CACHE = content
+                        return _CURRENT_MACHINE_ID_CACHE
+        except Exception:
+            pass
+    _CURRENT_MACHINE_ID_CACHE = socket.gethostname() or "localhost"
+    return _CURRENT_MACHINE_ID_CACHE
+
+
+def resolve_process_start_time(pid: int) -> int:
+    """Extract starttime (field 22, clock ticks since boot) from /proc/<pid>/stat.
+    
+    Fails closed with ProcessIdentityUnavailableError if process not found or unreadable.
+    """
+    stat_path = f"/proc/{pid}/stat"
+    try:
+        with open(stat_path, "r", encoding="utf-8") as f:
+            content = f.read()
+        rparen = content.rfind(")")
+        if rparen != -1:
+            rest = content[rparen + 1:].strip().split()
+            # rest[0] is state (field 3), rest[19] is starttime (field 22)
+            if len(rest) >= 20:
+                return int(rest[19])
+    except Exception as e:
+        raise ProcessIdentityUnavailableError(f"Cannot resolve process start time for PID {pid}: {e}") from e
+    raise ProcessIdentityUnavailableError(f"Cannot parse starttime from {stat_path}")
+
+
 class DurableTrustStore:
     """Persistent durable trust store for causal verifier keys, revocations, and anti-replay state.
 
@@ -878,12 +1112,14 @@ class DurableTrustStore:
         self.used_attestation_ids: Set[str] = set()
         self.used_attestations: Dict[str, Dict[str, Any]] = {}
         self.used_operation_ids: Dict[str, Dict[str, Any]] = {}
+        self.identity_conflict_events: List[Dict[str, Any]] = []
+        self._startup_reconciled: bool = False
         if self.store_path:
             self.load()
 
     @contextlib.contextmanager
-    def _file_lock(self):
-        """Cross-process and cross-thread re-entrant mutual exclusion context."""
+    def _file_lock(self, timeout: float = 5.0):
+        """Cross-process and cross-thread re-entrant mutual exclusion context with 5.0s timeout."""
         with self._lock:
             if not self.store_path:
                 yield
@@ -898,7 +1134,24 @@ class DurableTrustStore:
                     flags |= os.O_NOFOLLOW
                 fd = os.open(lock_path, flags, 0o600)
                 try:
-                    fcntl.flock(fd, fcntl.LOCK_EX)
+                    t_start = time.perf_counter()
+                    backoff = 0.001
+                    locked = False
+                    while time.perf_counter() - t_start < timeout:
+                        try:
+                            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                            locked = True
+                            break
+                        except (BlockingIOError, OSError) as e:
+                            if e.errno in (errno.EACCES, errno.EAGAIN, errno.EWOULDBLOCK):
+                                time.sleep(backoff)
+                                backoff = min(backoff * 1.5, 0.05)
+                            else:
+                                raise
+                    if not locked:
+                        raise LockTimeoutError(
+                            f"Durable trust store lock acquisition timed out after {timeout}s on '{lock_path}'"
+                        )
                     self._lock_fd = fd
                 except BaseException:
                     os.close(fd)
@@ -920,13 +1173,67 @@ class DurableTrustStore:
                     except OSError:
                         pass
 
-    def load(self) -> None:
+    def _verify_path_security(self, path: str) -> None:
+        """Verify filesystem security constraints: no symlinks, correct ownership, secure permissions."""
+        if not path:
+            return
+        if os.path.islink(path):
+            raise SecurityViolationError(f"Refusing to access trust store through symlink: '{path}'")
+
+        dir_name = os.path.dirname(os.path.abspath(path))
+        if os.path.islink(dir_name):
+            raise SecurityViolationError(f"Refusing to access trust store directory through symlink: '{dir_name}'")
+        if os.path.exists(dir_name):
+            dst = os.lstat(dir_name)
+            if stat.S_ISLNK(dst.st_mode):
+                raise SecurityViolationError(f"Trust store parent directory is a symlink: '{dir_name}'")
+            if hasattr(os, "getuid") and dst.st_uid != os.getuid():
+                raise SecurityViolationError(f"Trust store parent directory owned by UID {dst.st_uid}, expected {os.getuid()}")
+
+        if os.path.lexists(path):
+            st = os.lstat(path)
+            if stat.S_ISLNK(st.st_mode):
+                raise SecurityViolationError(f"Trust store file is a symlink: '{path}'")
+            if not stat.S_ISREG(st.st_mode):
+                raise SecurityViolationError(f"Trust store path is not a regular file: '{path}'")
+            if hasattr(os, "getuid") and st.st_uid != os.getuid():
+                raise SecurityViolationError(f"Trust store file owned by UID {st.st_uid}, expected {os.getuid()}")
+            # Ensure permissions are not broader than 0600
+            current_mode = stat.S_IMODE(st.st_mode)
+            if (current_mode & 0o077) != 0:
+                try:
+                    os.chmod(path, 0o600)
+                except OSError as e:
+                    raise SecurityViolationError(f"Failed to secure trust store permissions to 0600: {e}") from e
+
+    def _cleanup_stale_temp_files(self) -> None:
+        """Scan and remove abandoned .trust_tmp_* files in trust store directory."""
+        if not self.store_path:
+            return
+        dir_name = os.path.dirname(os.path.abspath(self.store_path))
+        if not os.path.exists(dir_name) or os.path.islink(dir_name):
+            return
+        try:
+            for fname in os.listdir(dir_name):
+                if fname.startswith(".trust_tmp_"):
+                    fpath = os.path.join(dir_name, fname)
+                    try:
+                        if not os.path.islink(fpath) and os.path.isfile(fpath):
+                            os.remove(fpath)
+                    except OSError:
+                        pass
+        except OSError:
+            pass
+
+    def load(self, reconcile_crashes: Optional[bool] = None) -> None:
         """Load state from persistent trust store file. Fails closed if corrupted."""
         with self._lock:
-            if not self.store_path or not os.path.exists(self.store_path):
+            if not self.store_path:
                 return
-            if os.path.islink(self.store_path):
-                raise RuntimeError(f"Refusing to load trust store from symlink: '{self.store_path}'")
+            self._verify_path_security(self.store_path)
+            self._cleanup_stale_temp_files()
+            if not os.path.exists(self.store_path):
+                return
             try:
                 flags = os.O_RDONLY
                 if hasattr(os, "O_NOFOLLOW"):
@@ -1045,6 +1352,24 @@ class DurableTrustStore:
                 for aid in self.used_attestations.keys():
                     self.used_attestation_ids.add(aid)
                 self.used_operation_ids = dict(data.get("used_operation_ids", {}))
+                # Eager Crash Recovery: reconcile uncommitted operations (RESERVED / EXECUTING) to ABORTED_ON_RESTART
+                should_reconcile = reconcile_crashes if reconcile_crashes is not None else (not self._startup_reconciled)
+                if should_reconcile:
+                    reconciled_count = 0
+                    now_iso = datetime.now(timezone.utc).isoformat()
+                    for op_id, op_rec in self.used_operation_ids.items():
+                        curr_st = op_rec.get("state")
+                        if curr_st in (OperationLifecycleState.RESERVED.value, OperationLifecycleState.EXECUTING.value):
+                            op_rec["state"] = OperationLifecycleState.ABORTED_ON_RESTART.value
+                            op_rec["aborted_at"] = now_iso
+                            op_rec["abort_reason"] = "Process terminated abnormally before completion (crash recovery reconciliation)"
+                            reconciled_count += 1
+                    self._startup_reconciled = True
+                    if reconciled_count > 0:
+                        try:
+                            self.save()
+                        except Exception:
+                            pass
             except Exception as e:
                 raise RuntimeError(f"Durable trust store at '{self.store_path}' is corrupted or unreadable: {e}") from e
 
@@ -1058,8 +1383,7 @@ class DurableTrustStore:
         with self._file_lock():
             if not self.store_path:
                 return DurableCommitOutcome.COMMITTED
-            if os.path.islink(self.store_path):
-                raise RuntimeError(f"Refusing to save trust store to symlink: '{self.store_path}'")
+            self._verify_path_security(self.store_path)
             payload = {
                 "schema_version": "1.1.0",
                 "updated_at": datetime.now(timezone.utc).isoformat(),
@@ -1235,8 +1559,11 @@ class DurableTrustStore:
         secret: Optional[str] = None,
         key_store: Optional["CaptureKeyStore"] = None,
         current_time_ns: Optional[int] = None,
+        operation_id: Optional[str] = None,
     ) -> TrustConsumptionResult:
         """Atomic trust-consumption contract eliminating check-then-record race conditions."""
+        if operation_id is not None:
+            validate_operation_id(operation_id)
         with self._file_lock():
             self.load()
             att_id = str(attestation.attestation_id)
@@ -1397,9 +1724,9 @@ class DurableTrustStore:
         metadata: Optional[Dict[str, Any]] = None,
         allow_idempotent: bool = False,
     ) -> None:
+        oid = validate_operation_id(op_id)
         with self._file_lock():
             self.load()
-            oid = str(op_id)
             if oid in self.used_operation_ids:
                 prev = self.used_operation_ids[oid]
                 if prev.get("session_id") != str(session_id):
@@ -1407,20 +1734,49 @@ class DurableTrustStore:
                 if prev.get("pid") is not None and int(prev["pid"]) != int(pid):
                     raise ValueError(f"Receipt replay across PIDs rejected for operation '{oid}'")
 
+                # Replay protection across boot sessions
+                p_boot = prev.get("boot_id")
+                m_boot = metadata.get("boot_id") if metadata else None
+                if p_boot and m_boot and str(p_boot) != str(m_boot):
+                    raise ValueError(f"Receipt replay across boot sessions rejected for operation '{oid}': boot_id mismatch ({p_boot} vs {m_boot})")
+
+                # PID reuse defense across process start times
+                p_start = prev.get("process_start_time")
+                m_start = metadata.get("process_start_time") if metadata else None
+                if p_start is not None and m_start is not None and int(p_start) != int(m_start):
+                    raise ValueError(f"Receipt replay across process start times (PID reuse) rejected for operation '{oid}': start time mismatch ({p_start} vs {m_start})")
+
+                # Replay protection across hosts
+                p_host = prev.get("host_identity") or prev.get("target_host")
+                m_host = (metadata.get("host_identity") or metadata.get("target_host")) if metadata else None
+                if p_host and m_host and str(p_host) != str(m_host):
+                    raise ValueError(f"Receipt replay across hosts rejected for operation '{oid}': host mismatch ({p_host} vs {m_host})")
+
                 if metadata:
                     for id_field in (
+                        "build_id",
                         "process_identity",
                         "executable_identity",
-                        "build_id",
                         "target_host",
+                        "host_identity",
                         "receipt_id",
                         "observation_digest",
                         "operation_type",
                     ):
                         p_val = prev.get(id_field)
                         m_val = metadata.get(id_field)
-                        if p_val and m_val and str(p_val) != str(m_val):
-                            raise ValueError(
+                        if p_val is not None and p_val != "" and m_val is not None and m_val != "" and str(p_val) != str(m_val):
+                            conflict_event = {
+                                "operation_id": oid,
+                                "field_name": id_field,
+                                "existing_value": str(p_val),
+                                "attempted_value": str(m_val),
+                                "detected_at": datetime.now(timezone.utc).isoformat(),
+                            }
+                            if not hasattr(self, "identity_conflict_events"):
+                                self.identity_conflict_events = []
+                            self.identity_conflict_events.append(conflict_event)
+                            raise IdentityConflictError(
                                 f"Conflicting target identity or metadata '{id_field}' for operation '{oid}': {p_val} vs {m_val}"
                             )
 
@@ -1448,7 +1804,12 @@ class DurableTrustStore:
                         orig_prev = dict(prev)
                         orig_eids = list(prev.get("evidence_ids", []))
                         for k, v in metadata.items():
+                            # Monotonicity: never overwrite established non-empty values with None/empty
+                            if v is None or v == "":
+                                continue
                             if k == "evidence_id" and "evidence_id" in prev and prev["evidence_id"] != v:
+                                continue
+                            if k == "state" and prev.get("state") == OperationLifecycleState.COMMITTED.value:
                                 continue
                             prev[k] = v
                         if metadata.get("evidence_id"):
@@ -1483,9 +1844,12 @@ class DurableTrustStore:
                 "session_id": str(session_id),
                 "pid": int(pid),
                 "recorded_at": datetime.now(timezone.utc).isoformat(),
+                "state": OperationLifecycleState.COMMITTED.value,
             }
             if metadata:
-                rec.update(metadata)
+                for k, v in metadata.items():
+                    if v is not None and v != "":
+                        rec[k] = v
             if metadata and metadata.get("evidence_id"):
                 rec["evidence_ids"] = [metadata["evidence_id"]]
 
@@ -1499,6 +1863,127 @@ class DurableTrustStore:
                     raise
                 self.used_operation_ids = orig_ops
                 raise
+            except Exception:
+                self.used_operation_ids = orig_ops
+                raise
+
+    def get_operation_lifecycle_state(self, op_id: str) -> Optional[OperationLifecycleState]:
+        """Get the current lifecycle state of an operation, if recorded."""
+        with self._file_lock():
+            self.load()
+            oid = str(op_id)
+            rec = self.used_operation_ids.get(oid)
+            if not rec:
+                return None
+            st = rec.get("state")
+            if not st:
+                return None
+            try:
+                return OperationLifecycleState(st)
+            except ValueError:
+                return None
+
+    def transition_operation_lifecycle(
+        self,
+        op_id: str,
+        session_id: str,
+        pid: int,
+        target_state: OperationLifecycleState,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Enforce strict validated one-way transitions on operation lifecycle."""
+        oid = validate_operation_id(op_id)
+        with self._file_lock():
+            self.load()
+            if oid not in self.used_operation_ids:
+                if target_state != OperationLifecycleState.CREATED:
+                    raise InvalidStateTransitionError(
+                        f"Initial operation state must be CREATED, got {target_state.value}"
+                    )
+                rec = {
+                    "session_id": str(session_id),
+                    "pid": int(pid),
+                    "recorded_at": datetime.now(timezone.utc).isoformat(),
+                    "state": target_state.value,
+                }
+                if metadata:
+                    for k, v in metadata.items():
+                        if v is not None and v != "":
+                            rec[k] = v
+                orig_ops = dict(self.used_operation_ids)
+                self.used_operation_ids[oid] = rec
+                try:
+                    self.save()
+                except Exception:
+                    self.used_operation_ids = orig_ops
+                    raise
+                return
+
+            rec = self.used_operation_ids[oid]
+            curr_state_val = rec.get("state", OperationLifecycleState.CREATED.value)
+            try:
+                curr_state = OperationLifecycleState(curr_state_val)
+            except ValueError:
+                curr_state = OperationLifecycleState.CREATED
+
+            # COMMITTED is strictly terminal
+            if curr_state == OperationLifecycleState.COMMITTED:
+                raise InvalidStateTransitionError(
+                    f"Operation '{oid}' is already COMMITTED (terminal) and cannot transition to {target_state.value}"
+                )
+
+            # Terminal states cannot transition
+            terminal_states = (
+                OperationLifecycleState.REJECTED,
+                OperationLifecycleState.FAILED,
+                OperationLifecycleState.CANCELLED,
+                OperationLifecycleState.ABORTED_ON_RESTART,
+            )
+            if curr_state in terminal_states:
+                raise InvalidStateTransitionError(
+                    f"Operation '{oid}' is in terminal state {curr_state.value} and cannot transition to {target_state.value}"
+                )
+
+            # Valid transitions mapping
+            valid_next = {
+                OperationLifecycleState.CREATED: (
+                    OperationLifecycleState.VALIDATED,
+                    OperationLifecycleState.REJECTED,
+                ),
+                OperationLifecycleState.VALIDATED: (
+                    OperationLifecycleState.RESERVED,
+                    OperationLifecycleState.REJECTED,
+                    OperationLifecycleState.FAILED,
+                ),
+                OperationLifecycleState.RESERVED: (
+                    OperationLifecycleState.EXECUTING,
+                    OperationLifecycleState.FAILED,
+                    OperationLifecycleState.ABORTED_ON_RESTART,
+                ),
+                OperationLifecycleState.EXECUTING: (
+                    OperationLifecycleState.COMMITTED,
+                    OperationLifecycleState.FAILED,
+                    OperationLifecycleState.CANCELLED,
+                    OperationLifecycleState.PARTIAL,
+                    OperationLifecycleState.ABORTED_ON_RESTART,
+                ),
+            }
+
+            allowed = valid_next.get(curr_state, ())
+            if target_state not in allowed:
+                raise InvalidStateTransitionError(
+                    f"Invalid state transition for operation '{oid}': {curr_state.value} -> {target_state.value}. Allowed: {[s.value for s in allowed]}"
+                )
+
+            orig_ops = dict(self.used_operation_ids)
+            rec["state"] = target_state.value
+            rec["updated_at"] = datetime.now(timezone.utc).isoformat()
+            if metadata:
+                for k, v in metadata.items():
+                    if v is not None and v != "":
+                        rec[k] = v
+            try:
+                self.save()
             except Exception:
                 self.used_operation_ids = orig_ops
                 raise

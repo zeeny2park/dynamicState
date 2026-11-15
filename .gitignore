@@ -37,3 +37,10 @@ reports/
 # Packaging
 *.egg-info/
 dist/
+
+# Agent and harness worktrees / temporary archives
+.claude/worktrees/
+.claude.zip
+.agents/
+.mcp.json
+

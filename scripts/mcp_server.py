@@ -3129,6 +3129,59 @@ def runtime_export_incident_report(
 
 
 @server.tool()
+def runtime_explain_process_behavior(
+    report_path: Optional[str] = None,
+    report_data: Optional[Dict[str, Any]] = None,
+    pid: Optional[int] = None,
+    debug_image: Optional[str] = None,
+    language: str = "ko",
+    remote_host: Optional[str] = None,
+    ssh_user: Optional[str] = None,
+    ssh_port: int = 22,
+    ssh_key: Optional[str] = None,
+    ssh_proxy_jump: Optional[str] = None,
+) -> str:
+    """Explains what software a process is, its overarching goals, and what each thread is doing
+    based on a collected diagnosis report or live process profile.
+
+    Especially useful for healthy, normally operating processes where users want to understand
+    thread-level roles, wait points, and proof of normal operation, as well as faulty processes.
+
+    Args:
+        report_path: Path to a collected diagnostic report JSON or .json.gz file.
+        report_data: In-memory report dictionary.
+        pid: Target process PID if profiling live.
+        debug_image: Path to matching unstripped ELF with DWARF symbols (if pid is provided).
+        language: Language of the explanation: 'ko' (default) or 'en'.
+        remote_host: Remote SSH host (if target process is remote).
+        ssh_user: Remote SSH username.
+        ssh_port: Remote SSH port (default 22).
+        ssh_key: Path to SSH private key.
+        ssh_proxy_jump: Optional SSH bastion/jump host.
+    """
+    try:
+        from extractor.process_explainer import explain_process_behavior
+        remote_target = None
+        if remote_host and str(remote_host).strip():
+            remote_target = {
+                "remote_host": remote_host, "ssh_user": ssh_user, "ssh_port": ssh_port,
+                "ssh_key": ssh_key, "ssh_proxy_jump": ssh_proxy_jump
+            }
+        res = explain_process_behavior(
+            report_dict=report_data,
+            report_path=report_path,
+            pid=pid,
+            debug_image=debug_image,
+            language=language,
+            target=remote_target,
+            engine=runtime.expert_diagnostic_engine,
+        )
+        return _format_watch_result(res)
+    except Exception as e:
+        return _format_watch_result({"success": False, "error": str(e), "error_code": type(e).__name__})
+
+
+@server.tool()
 def runtime_get_playbook() -> str:
     """Returns the diagnosis playbook (the same text as the server instructions and the diagnose-process
     agent skill): when to diagnose, required inputs, how to read the result, follow-up per verdict, hard rules.
