@@ -18,6 +18,7 @@ import base64
 import contextlib
 import contextvars
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 import errno
 import hashlib
 import json
@@ -645,7 +646,7 @@ class TargetExecutionAdapter(ABC):
         pid: int,
         operation_type: str = "diagnostic",
         snapshot_binding: Optional[str] = None,
-        require_lifecycle_persistence: bool = False,
+        require_lifecycle_persistence: Optional[bool] = None,
     ) -> CaptureTransaction:
         """Begin a scoped capture transaction for target process memory operations."""
         self._ensure_tracking_state()
@@ -679,37 +680,46 @@ class TargetExecutionAdapter(ABC):
         self._active_by_scope[(str(th), str(session_id), int(pid))] = tx
 
         # P0-5: If lifecycle persistence is required, advance lifecycle DAG CREATED -> VALIDATED -> RESERVED -> EXECUTING
-        should_persist = require_lifecycle_persistence or getattr(self, "require_lifecycle_persistence", False)
+        should_persist = (
+            require_lifecycle_persistence
+            if require_lifecycle_persistence is not None
+            else getattr(self, "require_lifecycle_persistence", isinstance(self, LocalTargetAdapter))
+        )
         if should_persist:
             tx.metadata["require_lifecycle_persistence"] = True
             from .capture_backend import get_default_trust_store, OperationLifecycleState
             eff_ts = getattr(self, "trust_store", None) or get_default_trust_store()
             if eff_ts and hasattr(eff_ts, "transition_operation_lifecycle"):
-                eff_ts.transition_operation_lifecycle(
-                    op_id=tx.transaction_id,
-                    session_id=str(session_id),
-                    pid=int(pid),
-                    target_state=OperationLifecycleState.CREATED,
-                    metadata={"target_host": str(th), "operation_type": str(operation_type)},
-                )
-                eff_ts.transition_operation_lifecycle(
-                    op_id=tx.transaction_id,
-                    session_id=str(session_id),
-                    pid=int(pid),
-                    target_state=OperationLifecycleState.VALIDATED,
-                )
-                eff_ts.transition_operation_lifecycle(
-                    op_id=tx.transaction_id,
-                    session_id=str(session_id),
-                    pid=int(pid),
-                    target_state=OperationLifecycleState.RESERVED,
-                )
-                eff_ts.transition_operation_lifecycle(
-                    op_id=tx.transaction_id,
-                    session_id=str(session_id),
-                    pid=int(pid),
-                    target_state=OperationLifecycleState.EXECUTING,
-                )
+                try:
+                    eff_ts.transition_operation_lifecycle(
+                        op_id=tx.transaction_id,
+                        session_id=str(session_id),
+                        pid=int(pid),
+                        target_state=OperationLifecycleState.CREATED,
+                        metadata={"target_host": str(th), "operation_type": str(operation_type)},
+                    )
+                    eff_ts.transition_operation_lifecycle(
+                        op_id=tx.transaction_id,
+                        session_id=str(session_id),
+                        pid=int(pid),
+                        target_state=OperationLifecycleState.VALIDATED,
+                    )
+                    eff_ts.transition_operation_lifecycle(
+                        op_id=tx.transaction_id,
+                        session_id=str(session_id),
+                        pid=int(pid),
+                        target_state=OperationLifecycleState.RESERVED,
+                    )
+                    eff_ts.transition_operation_lifecycle(
+                        op_id=tx.transaction_id,
+                        session_id=str(session_id),
+                        pid=int(pid),
+                        target_state=OperationLifecycleState.EXECUTING,
+                    )
+                except Exception:
+                    self._active_transactions.pop(tx.transaction_id, None)
+                    self._active_by_scope.pop((str(th), str(session_id), int(pid)), None)
+                    raise
 
         cur_stack = _tx_stack.get(None) or []
         new_stack = list(cur_stack) + [tx]
@@ -805,24 +815,43 @@ class TargetExecutionAdapter(ABC):
             ProcessIdentity,
             build_canonical_replay_identity,
             resolve_current_boot_id,
+            ProcessIdentityUnavailableError,
+            MissingIdentityFieldError,
         )
         eff_ts = getattr(self, "trust_store", None) or get_default_trust_store()
         if eff_ts:
+            cur_boot = cur_ident.get("boot_id")
+            if not cur_boot:
+                cur_boot = resolve_current_boot_id()
+            if not cur_boot or cur_boot == "boot_id_unavailable":
+                self.rollback_capture_transaction(target_tx, "Kernel boot_id missing or unavailable")
+                raise ProcessIdentityUnavailableError(f"Kernel boot_id is missing or unavailable on target {target_tx.pid}")
+
+            cur_bid = cur_ident.get("build_id")
+            if not cur_bid or cur_bid == "default_build_id":
+                self.rollback_capture_transaction(target_tx, "Target build_id missing or unavailable")
+                raise MissingIdentityFieldError(f"Mandatory build_id is missing or unavailable on target {target_tx.pid}")
+
+            p_start_raw = cur_ident.get("start_time")
             try:
-                cur_boot = str(cur_ident.get("boot_id") or resolve_current_boot_id())
-            except Exception:
-                cur_boot = "boot_id_unavailable"
+                p_start = int(p_start_raw) if p_start_raw is not None and not isinstance(p_start_raw, bool) else None
+            except (ValueError, TypeError):
+                p_start = None
+            if p_start is None or p_start <= 0:
+                self.rollback_capture_transaction(target_tx, "Target start_time missing or invalid")
+                raise MissingIdentityFieldError(f"process_start_time must be a positive integer on target {target_tx.pid}")
+
             proc_id = ProcessIdentity(
                 host_identity=str(th),
-                boot_id=cur_boot,
+                boot_id=str(cur_boot),
                 pid=int(target_tx.pid),
-                process_start_time=int(cur_ident.get("start_time", 0)),
+                process_start_time=int(p_start),
             )
             canon_ident = build_canonical_replay_identity(
                 operation_id=target_tx.transaction_id,
                 operation_kind=str(target_tx.operation_type),
                 process_identity=proc_id,
-                build_id=str(cur_ident.get("build_id", "") or "default_build_id"),
+                build_id=str(cur_bid),
                 session_identity=str(target_tx.session_id),
                 request_scope=f"{th}:{target_tx.pid}",
                 parameters={
@@ -834,8 +863,10 @@ class TargetExecutionAdapter(ABC):
             op_meta = {
                 "process_identity": str(cur_ident.get("process_identity", "")),
                 "executable_identity": str(cur_ident.get("executable_identity") or cur_ident.get("executable", "")),
-                "build_id": str(cur_ident.get("build_id", "")),
+                "build_id": str(cur_bid),
                 "target_host": str(th),
+                "boot_id": str(cur_boot),
+                "process_start_time": int(p_start),
                 "operation_type": str(target_tx.operation_type),
                 "physical_bytes_read": int(target_tx.physical_bytes_read),
                 "physical_reads_count": int(target_tx.physical_reads_count),
@@ -850,6 +881,8 @@ class TargetExecutionAdapter(ABC):
                     pid=target_tx.pid,
                     metadata=op_meta,
                     allow_idempotent=False,
+                    require_canonical_replay_identity=True,
+                    require_lifecycle_enforcement=bool(target_tx.metadata.get("require_lifecycle_persistence")),
                 )
             except Exception as e:
                 self.rollback_capture_transaction(target_tx, f"Trust store persistence failed: {e}")
@@ -886,7 +919,7 @@ class TargetExecutionAdapter(ABC):
             target_tx.abort_reason = reason or "Capture transaction rolled back"
             from .capture_backend import get_default_trust_store, OperationLifecycleState
             eff_ts = getattr(self, "trust_store", None) or get_default_trust_store()
-            if eff_ts and hasattr(eff_ts, "transition_operation_lifecycle") and (target_tx.metadata.get("require_lifecycle_persistence") or getattr(self, "require_lifecycle_persistence", False)):
+            if eff_ts and hasattr(eff_ts, "transition_operation_lifecycle") and (target_tx.metadata.get("require_lifecycle_persistence") or getattr(self, "require_lifecycle_persistence", True)):
                 try:
                     eff_ts.transition_operation_lifecycle(
                         op_id=target_tx.transaction_id,
@@ -898,6 +931,21 @@ class TargetExecutionAdapter(ABC):
                 except Exception as rb_err:
                     if hasattr(target_tx, "metadata") and isinstance(target_tx.metadata, dict):
                         target_tx.metadata["lifecycle_rollback_error"] = str(rb_err)
+                    conflict_event = {
+                        "operation_id": target_tx.transaction_id,
+                        "field_name": "lifecycle_rollback_failure",
+                        "existing_value": "EXECUTING",
+                        "attempted_value": "FAILED",
+                        "error": str(rb_err),
+                        "detected_at": datetime.now(timezone.utc).isoformat(),
+                    }
+                    if not hasattr(eff_ts, "identity_conflict_events"):
+                        eff_ts.identity_conflict_events = []
+                    eff_ts.identity_conflict_events.append(conflict_event)
+                    try:
+                        eff_ts.save()
+                    except Exception:
+                        pass
             self._active_transactions.pop(target_tx.transaction_id, None)
             self._active_by_scope.pop((str(target_tx.target_host), str(target_tx.session_id), int(target_tx.pid)), None)
             cur_stack = _tx_stack.get(None) or []

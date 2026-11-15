@@ -148,6 +148,92 @@ class TestP01CanonicalReplayIdentity(unittest.TestCase):
                 metadata={"canonical_digest": canon.digest()},
             )
 
+    def test_both_canonical_identity_fields_absent_rejected(self):
+        """When replay protection is required, omitting both canonical identity and digest must fail closed."""
+        with self.assertRaises(MissingIdentityFieldError):
+            self.store.record_used_operation(
+                op_id="op_missing_canon_both",
+                session_id="sess_1",
+                pid=123,
+                metadata={},
+                require_canonical_replay_identity=True,
+            )
+
+    def test_canonical_identity_fields_mismatch_with_method_args(self):
+        """Canonical identity fields differing from method arguments must raise SecurityViolationError."""
+        proc_ident = ProcessIdentity(
+            host_identity="test_host",
+            boot_id="test_boot",
+            pid=123,
+            process_start_time=100,
+        )
+        canon = build_canonical_replay_identity(
+            operation_id="op_canon_1",
+            operation_kind="read",
+            process_identity=proc_ident,
+            build_id="b1",
+            session_identity="sess_actual",
+            request_scope="scope1",
+        )
+        # 1. operation_id mismatch
+        with self.assertRaises(SecurityViolationError):
+            self.store.record_used_operation(
+                op_id="op_different_from_canon",
+                session_id="sess_actual",
+                pid=123,
+                metadata={"canonical_identity": canon.to_dict(), "canonical_digest": canon.digest()},
+            )
+        # 2. session_id mismatch
+        with self.assertRaises(SecurityViolationError):
+            self.store.record_used_operation(
+                op_id="op_canon_1",
+                session_id="sess_DIFFERENT",
+                pid=123,
+                metadata={"canonical_identity": canon.to_dict(), "canonical_digest": canon.digest()},
+            )
+        # 3. PID mismatch
+        with self.assertRaises(SecurityViolationError):
+            self.store.record_used_operation(
+                op_id="op_canon_1",
+                session_id="sess_actual",
+                pid=9999,  # different PID
+                metadata={"canonical_identity": canon.to_dict(), "canonical_digest": canon.digest()},
+            )
+
+    def test_missing_boot_id_and_missing_build_id_fail_closed(self):
+        """Missing boot_id or missing build_id must fail closed with MissingIdentityFieldError / ProcessIdentityUnavailableError."""
+        # 1. ProcessIdentity with missing boot_id must fail closed
+        with self.assertRaises(MissingIdentityFieldError):
+            ProcessIdentity(
+                host_identity="test_host",
+                boot_id="",
+                pid=123,
+                process_start_time=100,
+            )
+
+        # 2. CanonicalOperationIdentity with missing build_id must fail closed
+        proc_valid = ProcessIdentity(
+            host_identity="test_host",
+            boot_id="boot_valid",
+            pid=123,
+            process_start_time=100,
+        )
+        with self.assertRaises(MissingIdentityFieldError):
+            build_canonical_replay_identity(
+                operation_id="op_missing_bid",
+                operation_kind="read",
+                process_identity=proc_valid,
+                build_id="",
+                session_identity="s1",
+                request_scope="scope1",
+            )
+
+        # 3. Kernel boot_id resolution fails closed when file unavailable
+        with patch("os.path.exists", return_value=False):
+            with patch("extractor.capture_backend._CURRENT_BOOT_ID_CACHE", None):
+                with self.assertRaises(ProcessIdentityUnavailableError):
+                    resolve_current_boot_id()
+
     def test_digest_inconsistent_with_identity_rejected(self):
         """Caller-supplied digest inconsistent with recomputed canonical digest must raise SecurityViolationError."""
         proc_ident = ProcessIdentity(
@@ -375,6 +461,56 @@ class TestP03EvidenceAdmission(unittest.TestCase):
         with self.assertRaises(SecurityViolationError):
             self.ledger.accept_record(rec.evidence_id)
 
+    def test_confirmed_hypothesis_with_no_evidence_ids(self):
+        """A CONFIRMED hypothesis with no evidence IDs must not yield CONFIRMED_FAULT."""
+        mock_hyp = MagicMock()
+        mock_hyp.hypothesis_id = "hyp_no_evidence"
+        mock_hyp.status = "CONFIRMED"
+        mock_hyp.category = "MEMORY_CORRUPTION"
+        mock_hyp.supporting_evidence_ids = []  # Empty supporting evidence IDs
+
+        chk = DiagnosticCheck(
+            check_id="chk_req",
+            name="Check",
+            status="FAIL",
+            is_required=True,
+            supporting_evidence_ids=[],
+        )
+        agg = DiagnosticVerdictAggregator()
+        verdict = agg.aggregate(
+            lifecycle_state="COMPLETED",
+            stop_reason=None,
+            checks=[chk],
+            active_hypotheses=[mock_hyp],
+            ledger=self.ledger,
+        )
+        self.assertNotEqual(verdict.verdict, VERDICT_CONFIRMED_FAULT)
+
+    def test_confirmed_hypothesis_with_missing_evidence_records(self):
+        """A CONFIRMED hypothesis with missing evidence records in ledger must not yield CONFIRMED_FAULT."""
+        mock_hyp = MagicMock()
+        mock_hyp.hypothesis_id = "hyp_missing_evidence"
+        mock_hyp.status = "CONFIRMED"
+        mock_hyp.category = "MEMORY_CORRUPTION"
+        mock_hyp.supporting_evidence_ids = ["ev_ghost_record_nonexistent"]
+
+        chk = DiagnosticCheck(
+            check_id="chk_req",
+            name="Check",
+            status="FAIL",
+            is_required=True,
+            supporting_evidence_ids=["ev_ghost_record_nonexistent"],
+        )
+        agg = DiagnosticVerdictAggregator()
+        verdict = agg.aggregate(
+            lifecycle_state="COMPLETED",
+            stop_reason=None,
+            checks=[chk],
+            active_hypotheses=[mock_hyp],
+            ledger=self.ledger,
+        )
+        self.assertNotEqual(verdict.verdict, VERDICT_CONFIRMED_FAULT)
+
 
 class TestP04TrustStoreFilesystemSecurity(unittest.TestCase):
     """P0-4: TrustStore Filesystem Security & Hardening."""
@@ -427,6 +563,43 @@ class TestP04TrustStoreFilesystemSecurity(unittest.TestCase):
         finally:
             os.close(active_fd)
 
+    def test_dangling_trust_store_symlink_rejected(self):
+        """A dangling symlink as trust store path must be rejected with SecurityViolationError."""
+        dangling_path = os.path.join(self.temp_dir.name, "dangling_link.json")
+        target_path = os.path.join(self.temp_dir.name, "non_existent_file.json")
+        os.symlink(target_path, dangling_path)
+        dangling_store = DurableTrustStore(dangling_path)
+        with self.assertRaises(SecurityViolationError) as ctx_save:
+            dangling_store.save()
+        self.assertIn("refusing to save trust store to symlink", str(ctx_save.exception).lower())
+
+        # If target file is subsequently created, load() also rejects the symlink
+        with open(target_path, "w") as f:
+            f.write("{}")
+        with self.assertRaises(SecurityViolationError) as ctx_load:
+            dangling_store.load()
+        self.assertIn("refusing to load trust store from symlink", str(ctx_load.exception).lower())
+
+    def test_symlink_swap_toctou_attack_simulation(self):
+        """Simulate symlink swap after initial check: opening with O_NOFOLLOW must fail closed with SecurityViolationError."""
+        swap_path = os.path.join(self.temp_dir.name, "swap_store.json")
+        real_target = os.path.join(self.temp_dir.name, "secret_file.json")
+        with open(real_target, "w") as f:
+            f.write("sensitive data")
+
+        # Create regular file first
+        with open(swap_path, "w") as f:
+            f.write("{}")
+
+        swap_store = DurableTrustStore(swap_path)
+
+        # Now replace with symlink to secret_file
+        os.remove(swap_path)
+        os.symlink(real_target, swap_path)
+
+        with self.assertRaises(SecurityViolationError):
+            swap_store.load()
+
 
 class TestP05LifecycleEnforcement(unittest.TestCase):
     """P0-5: Lifecycle Enforcement & Fail-Closed Behavior."""
@@ -438,6 +611,68 @@ class TestP05LifecycleEnforcement(unittest.TestCase):
 
     def tearDown(self):
         self.temp_dir.cleanup()
+
+    def test_default_capture_lifecycle_enforcement(self):
+        """Normal capture transaction without explicit flags records complete CREATED -> VALIDATED -> RESERVED -> EXECUTING -> COMMITTED sequence."""
+        adapter = LocalTargetAdapter()
+        adapter.trust_store = self.store
+        pid = os.getpid()
+        session_id = f"sess_{uuid.uuid4().hex[:8]}"
+
+        tx = adapter.begin_capture_transaction(session_id=session_id, pid=pid)
+        self.assertEqual(
+            self.store.get_operation_lifecycle_state(tx.transaction_id),
+            OperationLifecycleState.EXECUTING,
+        )
+        tx.physical_bytes_read = 128
+        tx.physical_reads_count = 1
+        adapter.commit_capture_transaction(tx)
+        self.assertEqual(
+            self.store.get_operation_lifecycle_state(tx.transaction_id),
+            OperationLifecycleState.COMMITTED,
+        )
+
+    def test_lifecycle_persistence_failure_leaves_no_active_transaction(self):
+        """Lifecycle persistence failure in begin_capture_transaction leaves no active transaction and propagates failure."""
+        adapter = LocalTargetAdapter()
+        adapter.trust_store = self.store
+        pid = os.getpid()
+
+        with patch.object(self.store, "transition_operation_lifecycle", side_effect=OSError("Disk failure")):
+            with self.assertRaises(OSError):
+                adapter.begin_capture_transaction(session_id="sess_fail_cleanup", pid=pid)
+
+        # Active transactions and scope mapping must be completely empty
+        self.assertEqual(len(adapter._active_transactions), 0)
+        self.assertEqual(len(adapter._active_by_scope), 0)
+
+    def test_direct_committed_bypass_rejected(self):
+        """Attempting to record an unknown operation ID as COMMITTED fails closed when lifecycle enforcement is active."""
+        with self.assertRaises(InvalidStateTransitionError):
+            self.store.record_used_operation(
+                op_id="op_uncreated_bypass",
+                session_id="sess_1",
+                pid=1234,
+                metadata={},
+                require_lifecycle_enforcement=True,
+            )
+
+    def test_rollback_persistence_failure_surfaced_or_durably_recorded(self):
+        """Rollback persistence failure must be recorded in transaction metadata and conflict events."""
+        adapter = LocalTargetAdapter()
+        adapter.trust_store = self.store
+        pid = os.getpid()
+
+        tx = adapter.begin_capture_transaction(session_id="sess_rb_fail", pid=pid)
+        with patch.object(self.store, "transition_operation_lifecycle", side_effect=OSError("Disk write error during rollback")):
+            adapter.rollback_capture_transaction(tx, "Test rollback failure")
+
+        # Rollback error is preserved on transaction metadata
+        self.assertIn("lifecycle_rollback_error", tx.metadata)
+        self.assertIn("Disk write error during rollback", tx.metadata["lifecycle_rollback_error"])
+        # And conflict event is recorded durably
+        events = self.store.get_identity_conflict_events()
+        self.assertTrue(any(e.get("field_name") == "lifecycle_rollback_failure" for e in events))
 
     def test_lifecycle_persistence_failure_before_capture_fails_closed(self):
         """Lifecycle persistence failure in begin_capture_transaction must fail closed before capture proceeds."""

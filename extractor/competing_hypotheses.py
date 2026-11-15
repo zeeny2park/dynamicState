@@ -921,13 +921,14 @@ class CompetingHypothesis:
 
         adm_state = getattr(auth_rec, "admission_state", None)
         adm_val = getattr(adm_state, "value", str(adm_state)) if adm_state is not None else None
-        if adm_val in ("REJECTED", "QUARANTINED"):
-            reason_str = f"Evidence record '{evidence_id}' is {adm_val} in ledger: {getattr(auth_rec, 'admission_reason', '')}"
+        if adm_val != "ACCEPTED":
+            state_label = adm_val or "UNADMITTED"
+            reason_str = f"Evidence record '{evidence_id}' has admission state {state_label} in ledger (requires ACCEPTED): {getattr(auth_rec, 'admission_reason', '')}"
             if hasattr(self, "_permanently_rejected_reasons"):
                 self._permanently_rejected_reasons[eid_key] = reason_str
             return {
                 "is_authoritative": False,
-                "status": f"RECORD_{adm_val}",
+                "status": f"RECORD_{state_label}",
                 "reason": reason_str,
                 "missing_fields": missing_fields,
                 "mismatches": [reason_str],

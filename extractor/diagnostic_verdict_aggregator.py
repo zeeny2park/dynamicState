@@ -263,32 +263,39 @@ class DiagnosticVerdictAggregator:
             h for h in active_hypotheses
             if getattr(h, "category", "") not in ("HEALTHY_PROCESS", "HEALTHY")
         ]
-        confirmed_hyps = [h for h in non_healthy_hyps if getattr(h, "status", "") == "CONFIRMED"]
+        confirmed_hyps = [
+            h for h in non_healthy_hyps
+            if getattr(h, "status", "") in ("CONFIRMED", "VALIDATED")
+            or getattr(h, "validation_status", "") in ("CONFIRMED", "VALIDATED")
+        ]
         valid_confirmed_hyps = []
         ev_map = {getattr(r, "evidence_id", str(r)): r for r in (evidence_records or [])}
         for ch in confirmed_hyps:
             supp_ids = getattr(ch, "supporting_evidence_ids", [])
+            # Invariant: CONFIRMED fault requires non-empty supporting evidence IDs!
             if not supp_ids:
                 continue
-            if ledger or ev_map:
-                from .evidence_ledger import EvidenceAdmissionState
-                is_valid = True
-                has_accepted = False
-                for eid in supp_ids:
-                    rec = ledger.get_record(eid) if ledger else ev_map.get(eid)
-                    if not rec:
-                        is_valid = False
-                        break
-                    adm = getattr(rec, "admission_state", None)
-                    adm_val = getattr(adm, "value", str(adm)) if adm is not None else "ACCEPTED"
-                    if adm_val in ("REJECTED", "QUARANTINED"):
-                        is_valid = False
-                        break
-                    if adm_val == "ACCEPTED":
-                        has_accepted = True
-                if is_valid and has_accepted:
-                    valid_confirmed_hyps.append(ch)
-            else:
+            # Every supporting evidence ID must resolve to an authoritative record,
+            # and every required supporting record must be ACCEPTED.
+            # Missing ledger or missing evidence must never imply ACCEPTED.
+            if not ledger and not ev_map:
+                continue
+            is_valid = True
+            for eid in supp_ids:
+                if ledger and hasattr(ledger, "get_authoritative_record"):
+                    rec = ledger.get_authoritative_record(eid)
+                else:
+                    raw_rec = ev_map.get(eid)
+                    if raw_rec:
+                        adm = getattr(raw_rec, "admission_state", None)
+                        adm_val = getattr(adm, "value", str(adm)) if adm is not None else None
+                        rec = raw_rec if adm_val == "ACCEPTED" else None
+                    else:
+                        rec = None
+                if not rec:
+                    is_valid = False
+                    break
+            if is_valid:
                 valid_confirmed_hyps.append(ch)
 
         if valid_confirmed_hyps:
@@ -312,10 +319,9 @@ class DiagnosticVerdictAggregator:
                     continue
                 # Enforce fail-closed admission: rejected or quarantined evidence can NEVER satisfy confirmation
                 adm_state = getattr(r, "admission_state", None)
-                if adm_state is not None:
-                    state_val = getattr(adm_state, "value", adm_state)
-                    if state_val != "ACCEPTED":
-                        continue
+                adm_val = getattr(adm_state, "value", str(adm_state)) if adm_state is not None else None
+                if adm_val != "ACCEPTED":
+                    continue
                 eid = getattr(r, "evidence_id", None)
                 if eid:
                     trusted_ids.add(eid)
@@ -457,24 +463,24 @@ class DiagnosticVerdictAggregator:
                         h_stat = h.status
                 if h_stat == "CONFIRMED":
                     # Verify that CONFIRMED hypothesis is backed by authoritative ACCEPTED evidence in ledger
-                    is_admitted = True
                     supp_ids = getattr(h, "supporting_evidence_ids", [])
-                    if (eff_ledger or ev_map) and supp_ids:
-                        has_acc = False
+                    is_admitted = False
+                    if supp_ids and (eff_ledger or ev_map):
+                        is_admitted = True
                         for eid in supp_ids:
-                            rec = eff_ledger.get_record(eid) if eff_ledger else ev_map.get(eid)
+                            if eff_ledger and hasattr(eff_ledger, "get_authoritative_record"):
+                                rec = eff_ledger.get_authoritative_record(eid)
+                            else:
+                                raw_rec = ev_map.get(eid) if ev_map else None
+                                if raw_rec:
+                                    adm = getattr(raw_rec, "admission_state", None)
+                                    adm_val = getattr(adm, "value", str(adm)) if adm is not None else None
+                                    rec = raw_rec if adm_val == "ACCEPTED" else None
+                                else:
+                                    rec = None
                             if not rec:
                                 is_admitted = False
                                 break
-                            adm = getattr(rec, "admission_state", None)
-                            adm_val = getattr(adm, "value", str(adm)) if adm is not None else "ACCEPTED"
-                            if adm_val in ("REJECTED", "QUARANTINED"):
-                                is_admitted = False
-                                break
-                            if adm_val == "ACCEPTED":
-                                has_acc = True
-                        if not has_acc:
-                            is_admitted = False
 
                     if is_admitted:
                         confirmed_problems.append(h_stmt)
@@ -489,7 +495,7 @@ class DiagnosticVerdictAggregator:
                         probable_problems.append(h_stmt)
                         problem_categories.append((h_stmt, h_cat))
                         limiting_factors.append(
-                            f"Hypothesis [{h_id}] claims CONFIRMED but is backed by non-authoritative/quarantined evidence."
+                            f"Hypothesis [{h_id}] claims CONFIRMED but lacks authoritative ACCEPTED supporting evidence."
                         )
                         continue
 

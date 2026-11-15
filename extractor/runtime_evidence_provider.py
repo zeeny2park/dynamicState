@@ -190,6 +190,18 @@ class RuntimeEvidenceRecord:
         if self.observed_value is None and self.normalized_observation is not None:
             self.observed_value = self.normalized_observation
 
+    @property
+    def admission_state(self) -> str:
+        if getattr(self, "_admission_state", None) is not None:
+            return self._admission_state
+        if self.collection_status == COLLECTION_STATUS_SUCCESS:
+            return "ACCEPTED"
+        return "REJECTED"
+
+    @admission_state.setter
+    def admission_state(self, val: str):
+        self._admission_state = val
+
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
 

@@ -1158,7 +1158,7 @@ class DurableTrustStore:
         self.used_operation_ids: Dict[str, Dict[str, Any]] = {}
         self.identity_conflict_events: List[Dict[str, Any]] = []
         self._startup_reconciled: bool = False
-        if self.store_path:
+        if self.store_path and os.path.exists(self.store_path):
             self.load()
 
     @contextlib.contextmanager
@@ -1237,7 +1237,7 @@ class DurableTrustStore:
         if not path:
             return
         prep = "to" if operation == "save" else "from"
-        if os.path.islink(path):
+        if os.path.islink(path) or (not os.path.exists(path) and os.path.lexists(path)):
             raise SecurityViolationError(f"Refusing to {operation} trust store {prep} symlink: '{path}'")
 
         abs_path = os.path.abspath(path)
@@ -1333,12 +1333,35 @@ class DurableTrustStore:
             self._verify_path_security(self.store_path, operation="load")
             self._cleanup_stale_temp_files()
             try:
-                flags = os.O_RDONLY
+                flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
                 if hasattr(os, "O_NOFOLLOW"):
                     flags |= os.O_NOFOLLOW
-                fd = os.open(self.store_path, flags)
-                with os.fdopen(fd, "r", encoding="utf-8") as f:
-                    content = f.read().strip()
+                try:
+                    fd = os.open(self.store_path, flags)
+                except OSError as open_err:
+                    if getattr(open_err, "errno", None) in (errno.ELOOP, errno.EMLINK):
+                        raise SecurityViolationError(f"Refusing to load trust store from symlink: '{self.store_path}'") from open_err
+                    raise
+                try:
+                    st = os.fstat(fd)
+                    if stat.S_ISLNK(st.st_mode):
+                        raise SecurityViolationError(f"Refusing to load trust store from symlink: '{self.store_path}'")
+                    if not stat.S_ISREG(st.st_mode):
+                        raise SecurityViolationError(f"Trust store path is not a regular file: '{self.store_path}'")
+                    if st.st_nlink > 1:
+                        raise SecurityViolationError(
+                            f"Trust store file '{self.store_path}' has hard links (nlink={st.st_nlink}), rejecting due to hard-link replacement risk"
+                        )
+                    if hasattr(os, "getuid") and st.st_uid != os.getuid():
+                        raise SecurityViolationError(f"Trust store file owned by UID {st.st_uid}, expected {os.getuid()}")
+                    with os.fdopen(fd, "r", encoding="utf-8") as f:
+                        content = f.read().strip()
+                except BaseException:
+                    try:
+                        os.close(fd)
+                    except OSError:
+                        pass
+                    raise
                 if not content:
                     return
                 data = json.loads(content)
@@ -1504,27 +1527,38 @@ class DurableTrustStore:
             tmp_path = os.path.join(dir_name, f".trust_tmp_{uuid.uuid4().hex[:12]}")
             commit_point_reached = False
             try:
-                flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+                flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0)
                 if hasattr(os, "O_NOFOLLOW"):
                     flags |= os.O_NOFOLLOW
-                fd = os.open(tmp_path, flags, 0o600)
+                try:
+                    fd = os.open(tmp_path, flags, 0o600)
+                except OSError as open_err:
+                    if getattr(open_err, "errno", None) in (errno.ELOOP, errno.EMLINK):
+                        raise SecurityViolationError(f"Refusing to save trust store to symlink: '{tmp_path}'") from open_err
+                    raise
                 try:
                     try:
                         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
                     except (BlockingIOError, OSError) as flock_err:
                         raise SecurityViolationError(f"Failed to acquire exclusive lock on temporary trust store '{tmp_path}': {flock_err}") from flock_err
+                    # Apply and verify 0600 mode directly on open FD to prevent TOCTOU pathname races
+                    try:
+                        os.fchmod(fd, 0o600)
+                        os.chmod(tmp_path, 0o600)
+                    except OSError as ce:
+                        raise RuntimeError(f"Failed to apply 0600 mode on temporary trust store: {ce}") from ce
+                    st = os.fstat(fd)
+                    if stat.S_ISLNK(st.st_mode):
+                        raise SecurityViolationError(f"Refusing to save trust store to symlink: '{tmp_path}'")
+                    if st.st_nlink > 1:
+                        raise SecurityViolationError(
+                            f"Temporary trust store file '{tmp_path}' has hard links (nlink={st.st_nlink})"
+                        )
+                    if (stat.S_IMODE(st.st_mode) & 0o077) != 0:
+                        raise RuntimeError(f"Failed to verify 0600 mode on temporary trust store: got {oct(st.st_mode)}")
                     with os.fdopen(fd, "w", encoding="utf-8") as f:
                         json.dump(payload, f, indent=2)
                         f.flush()
-                        # Apply and verify 0600 mode on temporary file before replacement
-                        try:
-                            os.chmod(tmp_path, 0o600)
-                        except OSError as ce:
-                            raise RuntimeError(f"Failed to apply 0600 mode on temporary trust store: {ce}") from ce
-                        st = os.stat(tmp_path)
-                        import stat as _st
-                        if _st.S_IMODE(st.st_mode) != 0o600:
-                            raise RuntimeError(f"Failed to verify 0600 mode on temporary trust store: got {oct(st.st_mode)}")
                         # fsync temporary file data and metadata after permission changes
                         os.fsync(f.fileno())
                 except BaseException:
@@ -1838,52 +1872,103 @@ class DurableTrustStore:
         pid: int,
         metadata: Optional[Dict[str, Any]] = None,
         allow_idempotent: bool = False,
+        require_canonical_replay_identity: bool = False,
+        require_lifecycle_enforcement: bool = False,
     ) -> None:
         oid = validate_operation_id(op_id)
         with self._file_lock():
             self.load()
 
             # Canonical Replay Identity & Digest Verification
-            if metadata:
-                has_canon_ident = "canonical_identity" in metadata
-                has_canon_dig = "canonical_digest" in metadata
-                if has_canon_ident or has_canon_dig:
-                    if not (has_canon_ident and has_canon_dig):
-                        raise MissingIdentityFieldError(
-                            f"Both 'canonical_identity' and 'canonical_digest' must be provided together for operation '{oid}'"
-                        )
-                    c_ident_raw = metadata["canonical_identity"]
-                    c_dig_supplied = str(metadata["canonical_digest"])
-                    if isinstance(c_ident_raw, CanonicalOperationIdentity):
-                        c_ident_obj = c_ident_raw
-                    elif isinstance(c_ident_raw, dict):
-                        p_ident_raw = c_ident_raw.get("process_identity")
-                        if not isinstance(p_ident_raw, dict):
-                            raise MissingIdentityFieldError("canonical_identity missing valid process_identity dict")
-                        proc_id = ProcessIdentity(
-                            host_identity=str(p_ident_raw.get("host_identity", "")),
-                            boot_id=str(p_ident_raw.get("boot_id", "")),
-                            pid=int(p_ident_raw.get("pid", 0)),
-                            process_start_time=int(p_ident_raw.get("process_start_time", 0)),
-                        )
-                        c_ident_obj = CanonicalOperationIdentity(
-                            operation_id=str(c_ident_raw.get("operation_id", "")),
-                            operation_kind=str(c_ident_raw.get("operation_kind", "")),
-                            process_identity=proc_id,
-                            build_id=str(c_ident_raw.get("build_id", "")),
-                            session_identity=str(c_ident_raw.get("session_identity", "")),
-                            request_scope=str(c_ident_raw.get("request_scope", "")),
-                            normalized_parameters=c_ident_raw.get("normalized_parameters", {}),
-                            schema_version=str(c_ident_raw.get("schema_version", "1.0")),
-                        )
-                    else:
-                        raise MissingIdentityFieldError("canonical_identity must be a dict or CanonicalOperationIdentity")
+            requires_canon = (
+                require_canonical_replay_identity
+                or getattr(self, "require_canonical_replay_identity", False)
+                or (metadata is not None and bool(metadata.get("require_canonical_replay_identity")))
+            )
+            has_canon_ident = bool(metadata and "canonical_identity" in metadata)
+            has_canon_dig = bool(metadata and "canonical_digest" in metadata)
 
-                    # Verify caller-provided digest against recomputed RFC 8785 digest
-                    recomputed_dig = c_ident_obj.digest()
-                    if not hmac.compare_digest(c_dig_supplied, recomputed_dig):
+            if requires_canon and not (has_canon_ident and has_canon_dig):
+                if not has_canon_ident and not has_canon_dig:
+                    raise MissingIdentityFieldError(
+                        f"Both 'canonical_identity' and 'canonical_digest' are required for operation '{oid}'"
+                    )
+                raise MissingIdentityFieldError(
+                    f"Both 'canonical_identity' and 'canonical_digest' must be provided together for operation '{oid}'"
+                )
+
+            if has_canon_ident or has_canon_dig:
+                if not (has_canon_ident and has_canon_dig):
+                    raise MissingIdentityFieldError(
+                        f"Both 'canonical_identity' and 'canonical_digest' must be provided together for operation '{oid}'"
+                    )
+                c_ident_raw = metadata["canonical_identity"]
+                c_dig_supplied = str(metadata["canonical_digest"])
+                if isinstance(c_ident_raw, CanonicalOperationIdentity):
+                    c_ident_obj = c_ident_raw
+                elif isinstance(c_ident_raw, dict):
+                    p_ident_raw = c_ident_raw.get("process_identity")
+                    if not isinstance(p_ident_raw, dict):
+                        raise MissingIdentityFieldError("canonical_identity missing valid process_identity dict")
+                    proc_id = ProcessIdentity(
+                        host_identity=str(p_ident_raw.get("host_identity", "")),
+                        boot_id=str(p_ident_raw.get("boot_id", "")),
+                        pid=int(p_ident_raw.get("pid", 0)),
+                        process_start_time=int(p_ident_raw.get("process_start_time", 0)),
+                    )
+                    c_ident_obj = CanonicalOperationIdentity(
+                        operation_id=str(c_ident_raw.get("operation_id", "")),
+                        operation_kind=str(c_ident_raw.get("operation_kind", "")),
+                        process_identity=proc_id,
+                        build_id=str(c_ident_raw.get("build_id", "")),
+                        session_identity=str(c_ident_raw.get("session_identity", "")),
+                        request_scope=str(c_ident_raw.get("request_scope", "")),
+                        normalized_parameters=c_ident_raw.get("normalized_parameters", {}),
+                        schema_version=str(c_ident_raw.get("schema_version", "1.0")),
+                    )
+                else:
+                    raise MissingIdentityFieldError("canonical_identity must be a dict or CanonicalOperationIdentity")
+
+                # Verify caller-provided digest against recomputed RFC 8785 digest
+                recomputed_dig = c_ident_obj.digest()
+                if not hmac.compare_digest(c_dig_supplied, recomputed_dig):
+                    raise SecurityViolationError(
+                        f"Caller-provided canonical_digest '{c_dig_supplied}' does not match recomputed RFC 8785 digest '{recomputed_dig}' for operation '{oid}'"
+                    )
+
+                # Compare canonical identity fields against actual method arguments
+                if c_ident_obj.operation_id != oid:
+                    raise SecurityViolationError(
+                        f"Canonical identity operation_id '{c_ident_obj.operation_id}' does not match op_id '{oid}'"
+                    )
+                if c_ident_obj.session_identity != str(session_id):
+                    raise SecurityViolationError(
+                        f"Canonical identity session_identity '{c_ident_obj.session_identity}' does not match session_id '{session_id}'"
+                    )
+                if int(c_ident_obj.process_identity.pid) != int(pid):
+                    raise SecurityViolationError(
+                        f"Canonical identity pid '{c_ident_obj.process_identity.pid}' does not match pid '{pid}'"
+                    )
+                if metadata:
+                    m_host = metadata.get("target_host") or metadata.get("host_identity")
+                    if m_host and str(m_host) != str(c_ident_obj.process_identity.host_identity):
                         raise SecurityViolationError(
-                            f"Caller-provided canonical_digest '{c_dig_supplied}' does not match recomputed RFC 8785 digest '{recomputed_dig}' for operation '{oid}'"
+                            f"Canonical identity host '{c_ident_obj.process_identity.host_identity}' does not match metadata '{m_host}'"
+                        )
+                    m_boot = metadata.get("boot_id")
+                    if m_boot and str(m_boot) != str(c_ident_obj.process_identity.boot_id):
+                        raise SecurityViolationError(
+                            f"Canonical identity boot_id '{c_ident_obj.process_identity.boot_id}' does not match metadata '{m_boot}'"
+                        )
+                    m_start = metadata.get("process_start_time")
+                    if m_start is not None and int(m_start) != int(c_ident_obj.process_identity.process_start_time):
+                        raise SecurityViolationError(
+                            f"Canonical identity process_start_time '{c_ident_obj.process_identity.process_start_time}' does not match metadata '{m_start}'"
+                        )
+                    m_bid = metadata.get("build_id")
+                    if m_bid and str(m_bid) != str(c_ident_obj.build_id):
+                        raise SecurityViolationError(
+                            f"Canonical identity build_id '{c_ident_obj.build_id}' does not match metadata '{m_bid}'"
                         )
 
             if oid in self.used_operation_ids:
@@ -2069,6 +2154,17 @@ class DurableTrustStore:
                             raise
                     return
                 raise ValueError(f"Operation ID '{oid}' is already committed and single-use")
+
+            enforce_lifecycle = (
+                require_lifecycle_enforcement
+                or getattr(self, "enforce_lifecycle", False)
+                or (metadata is not None and (bool(metadata.get("require_lifecycle_enforcement")) or bool(metadata.get("require_lifecycle_persistence"))))
+            )
+            if enforce_lifecycle:
+                raise InvalidStateTransitionError(
+                    f"Direct creation of operation '{oid}' in COMMITTED state rejected; "
+                    f"lifecycle must progress CREATED -> VALIDATED -> RESERVED -> EXECUTING -> COMMITTED"
+                )
 
             rec = {
                 "session_id": str(session_id),
