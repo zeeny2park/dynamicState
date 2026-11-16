@@ -354,9 +354,7 @@ def _typed_owners(provider: Any, ctx: Dict[str, Any], rd: _Reader, ranges: List[
         for path, n in hits.items():
             owners.append({"variable": var.name, "variable_path": cont.readable(path), "root_kind": kind,
                            "module": mname, "pointers_into_new_ranges": n})
-        row = cont.elements(var, kind)
-        if row:
-            owners.append(row)
+        owners.extend(cont.elements_all(var, t, kind, T))
     owners.sort(key=lambda o: -o["pointers_into_new_ranges"])
     return {"status": "COMPLETED", "globals_read": len(wanted), "owners": owners[:MAX_OWNERS]}
 
@@ -382,10 +380,9 @@ class _ContainerOwners:
             hit = None
         return hit[1] if hit else path
 
-    def elements(self, var: Any, kind: str) -> Optional[Dict[str, Any]]:
+    def _decode_ref(self, var: Any, path: str, ref: Any, kind: str) -> Optional[Dict[str, Any]]:
         from ..cpp_containers import K_VECTOR, ContainerMemory, decode, summary
         try:
-            ref = self.paths.at_variable(self.mname, var.name)
             if ref is None or ref.layout.kind != K_VECTOR or ref.layout.elem_size != 8 \
                     or not str(ref.layout.elem_type or "").endswith("*"):
                 return None
@@ -401,8 +398,40 @@ class _ContainerOwners:
             return None
         if not hits:
             return None
-        return {"variable": var.name, "variable_path": var.name + "[*]", "root_kind": kind, "module": self.mname,
+        return {"variable": var.name, "variable_path": path + "[*]", "root_kind": kind, "module": self.mname,
                 "pointers_into_new_ranges": hits, "container": dict(summary(d), elements_read=n)}
+
+    def elements(self, var: Any, kind: str) -> Optional[Dict[str, Any]]:
+        ref = self.paths.at_variable(self.mname, var.name)
+        return self._decode_ref(var, var.name, ref, kind)
+
+    def elements_all(self, var: Any, t: Any, kind: str, T: Any) -> List[Dict[str, Any]]:
+        out: List[Dict[str, Any]] = []
+        direct = self.elements(var, kind)
+        if direct:
+            out.append(direct)
+            return out
+        def walk(cur_t: Any, path: str, depth: int) -> None:
+            if cur_t is None or depth > 4:
+                return
+            if cur_t.tag not in ("DW_TAG_structure_type", "DW_TAG_class_type", "DW_TAG_union_type"):
+                return
+            for m in cur_t.members or []:
+                if not m.name or m.type_offset is None:
+                    continue
+                mpath = f"{path}.{m.name}"
+                try:
+                    ref = self.paths.at_variable(self.mname, mpath)
+                except Exception:  # noqa: BLE001
+                    ref = None
+                if ref is not None:
+                    row = self._decode_ref(var, mpath, ref, kind)
+                    if row:
+                        out.append(row)
+                    continue
+                walk(T(m.type_offset), mpath, depth + 1)
+        walk(t, var.name, 0)
+        return out
 
 
 def _leak_walks(provider: Any, ctx: Dict[str, Any]) -> List[Dict[str, Any]]:
