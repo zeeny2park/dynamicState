@@ -3213,6 +3213,17 @@ class HypothesisValidator:
                     new_status = HYPOTHESIS_STATUS_INCONCLUSIVE
                     new_conf = CONFIDENCE_LOW
                 elif not has_auth_support:
+                    supp_recs_all = [ledger.get_record(eid) for eid in raw_supp_ids] if ledger else []
+                    has_rejected_or_quarantined = any(
+                        getattr(getattr(r, "admission_state", None), "value", str(getattr(r, "admission_state", None))) in ("REJECTED", "QUARANTINED")
+                        or ((getattr(r, "details", {}) or {}).get("caller_submitted") and getattr(getattr(r, "admission_state", None), "value", str(getattr(r, "admission_state", None))) != "ACCEPTED")
+                        or (getattr(r, "details", {}) or {}).get("unverified_caller_claim")
+                        for r in supp_recs_all if r
+                    )
+                    has_any_accepted = any(
+                        getattr(getattr(r, "admission_state", None), "value", str(getattr(r, "admission_state", None))) == "ACCEPTED"
+                        for r in supp_recs_all if r
+                    )
                     if new_evidence and (new_evidence.details or {}).get("unverified_caller_claim"):
                         new_status = HYPOTHESIS_STATUS_INCONCLUSIVE
                         new_conf = CONFIDENCE_LOW
@@ -3221,10 +3232,17 @@ class HypothesisValidator:
                         new_status = old_status if old_status in (HYPOTHESIS_STATUS_PROPOSED, "CREATED") else HYPOTHESIS_STATUS_PROPOSED
                         new_conf = old_conf
                         reason = "Causal proof / verification rejected; remains PROPOSED."
-                    else:
+                    elif has_rejected_or_quarantined or (has_any_accepted and not all(getattr(getattr(r, "admission_state", None), "value", str(getattr(r, "admission_state", None))) == "ACCEPTED" for r in supp_recs_all if r)):
                         new_status = HYPOTHESIS_STATUS_INCONCLUSIVE
                         new_conf = CONFIDENCE_LOW
-                        reason = "Supporting evidence lacks authoritative admission; remains INCONCLUSIVE."
+                        reason = "Supporting evidence contains unadmitted, rejected, or quarantined records; remains INCONCLUSIVE."
+                    elif new_evidence is None:
+                        new_status = old_status if old_status in (HYPOTHESIS_STATUS_PROPOSED, "CREATED") else HYPOTHESIS_STATUS_PROPOSED
+                        new_conf = old_conf
+                        reason = "Supporting evidence lacks authoritative admission; remains PROPOSED."
+                    else:
+                        new_status = HYPOTHESIS_STATUS_SUPPORTED
+                        new_conf = CONFIDENCE_MEDIUM if (not has_partial_evidence and not has_non_atomic_evidence) else CONFIDENCE_LOW
                 else:
                     new_status = HYPOTHESIS_STATUS_SUPPORTED
                     new_conf = CONFIDENCE_MEDIUM if (not has_partial_evidence and not has_non_atomic_evidence) else CONFIDENCE_LOW

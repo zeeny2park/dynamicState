@@ -3365,7 +3365,7 @@ class InvestigationManager:
                 for eid in target_hypo.supporting_evidence_ids
             )
         )
-        if not has_auth_support:
+        if not has_auth_support and target_hypo.validation_status in (HYPOTHESIS_STATUS_SUPPORTED, HYPOTHESIS_STATUS_VALIDATED):
             target_hypo.validation_status = HYPOTHESIS_STATUS_INCONCLUSIVE
             target_hypo.confidence = CONFIDENCE_LOW
 
