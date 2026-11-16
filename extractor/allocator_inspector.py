@@ -96,6 +96,9 @@ class ChunkInfo:
     is_valid_start: Optional[bool] = None  # None if cannot be verified
     allocator_type: AllocatorType = AllocatorType.UNKNOWN
     limitations: List[str] = field(default_factory=list)
+    usable_size: Optional[int] = None
+    padding_bytes: Optional[int] = None
+    alignment_verified: bool = False
 
     def to_dict(self) -> Dict[str, Any]:
         d = asdict(self)
@@ -171,6 +174,73 @@ class GlibcPtMallocInspector(AllocatorInspector):
     def user_ptr_to_chunk(self, user_ptr: int) -> int:
         return user_ptr - 2 * self.size_sz
 
+    def request2size(self, req: int) -> int:
+        """glibc request2size macro: converts requested user bytes to chunk size."""
+        overhead = self.size_sz
+        align_mask = self.malloc_alignment - 1
+        raw = req + overhead + align_mask
+        if raw < self.min_chunk_size:
+            return self.min_chunk_size
+        return raw & ~align_mask
+
+    def usable_size(self, chunk_size: int, is_mmapped: bool = False) -> int:
+        """glibc usable user data capacity for a chunk of chunk_size."""
+        if is_mmapped:
+            return max(0, chunk_size - 2 * self.size_sz)
+        return max(0, chunk_size - self.size_sz)
+
+    def padding_bytes(self, chunk_size: int, requested_size: int, is_mmapped: bool = False) -> int:
+        """glibc padding (internal fragmentation) between requested size and usable chunk capacity."""
+        usable = self.usable_size(chunk_size, is_mmapped=is_mmapped)
+        return max(0, usable - requested_size)
+
+    def verify_chunk_alignment_and_padding(
+        self,
+        chunk_address: int,
+        chunk_size: int,
+        requested_size: Optional[int] = None,
+        is_mmapped: bool = False,
+    ) -> Tuple[bool, List[str]]:
+        """Verify glibc chunk size alignment, pointer alignment, and padding arithmetic."""
+        errors: List[str] = []
+        user_ptr = self.chunk_to_user_ptr(chunk_address)
+
+        # 1. Pointer alignment (malloc returns pointer aligned to 2 * SIZE_SZ)
+        if user_ptr % self.malloc_alignment != 0:
+            errors.append(f"User pointer {hex(user_ptr)} violates glibc alignment ({self.malloc_alignment}B)")
+
+        # 2. Chunk header alignment (must be on 2 * SIZE_SZ boundary)
+        if chunk_address % (2 * self.size_sz) != 0:
+            errors.append(f"Chunk address {hex(chunk_address)} violates alignment ({2 * self.size_sz}B)")
+
+        # 3. Chunk size alignment & bounds
+        if not is_mmapped:
+            if chunk_size < self.min_chunk_size:
+                errors.append(f"Chunk size {chunk_size} is smaller than glibc minimum ({self.min_chunk_size}B)")
+            if chunk_size % self.malloc_alignment != 0:
+                errors.append(f"Chunk size {chunk_size} is not aligned to glibc quantum ({self.malloc_alignment}B)")
+        else:
+            if chunk_size <= 0:
+                errors.append(f"Mmapped chunk size {chunk_size} must be positive")
+
+        # 4. Padding and request size arithmetic verification
+        if requested_size is not None:
+            if requested_size < 0:
+                errors.append(f"Requested size {requested_size} cannot be negative")
+            else:
+                expected_min_chunk = self.request2size(requested_size)
+                if not is_mmapped and chunk_size < expected_min_chunk:
+                    errors.append(
+                        f"Chunk size {chunk_size} is smaller than glibc request2size({requested_size})={expected_min_chunk}"
+                    )
+                usable = self.usable_size(chunk_size, is_mmapped=is_mmapped)
+                if requested_size > usable:
+                    errors.append(
+                        f"Requested size {requested_size} exceeds usable chunk capacity {usable}"
+                    )
+
+        return len(errors) == 0, errors
+
     def inspect_chunk(
         self,
         raw_bytes: bytes,
@@ -221,14 +291,17 @@ class GlibcPtMallocInspector(AllocatorInspector):
         mask = ~(self.malloc_alignment - 1) & 0xFFFFFFFFFFFFFFFF
         chunk_size = size_flags & mask
 
-        # Validate chunk boundary and minimum size
-        is_valid_start = True
-        if chunk_size < self.min_chunk_size and not is_mmapped:
-            is_valid_start = False
-            limitations.append(f"Chunk size {chunk_size} is smaller than glibc minimum ({self.min_chunk_size}B)")
-        elif chunk_size % self.malloc_alignment != 0 and not is_mmapped:
-            is_valid_start = False
-            limitations.append(f"Chunk size {chunk_size} is not aligned to glibc quantum ({self.malloc_alignment}B)")
+        # Validate chunk boundary, alignment, and padding arithmetic
+        is_valid_align, align_errors = self.verify_chunk_alignment_and_padding(
+            chunk_header_addr, chunk_size, requested_size=None, is_mmapped=is_mmapped
+        )
+        is_valid_start = is_valid_align
+        if not is_valid_align:
+            limitations.extend(align_errors)
+
+        usable_sz = self.usable_size(chunk_size, is_mmapped=is_mmapped)
+        req_sz = max(0, chunk_size - header_size) if chunk_size >= header_size else 0
+        pad_sz = self.padding_bytes(chunk_size, req_sz, is_mmapped=is_mmapped)
 
         # P0: Determine current chunk allocation state correctly
         # PREV_INUSE describes the previous chunk! Never derive this chunk's status from PREV_INUSE!
@@ -269,7 +342,7 @@ class GlibcPtMallocInspector(AllocatorInspector):
         return ChunkInfo(
             address=chunk_header_addr,
             user_data_address=user_data_addr,
-            requested_size=max(0, chunk_size - header_size) if chunk_size >= header_size else 0,
+            requested_size=req_sz,
             chunk_size=chunk_size,
             is_allocated=is_allocated,
             prev_inuse=prev_inuse,
@@ -284,6 +357,9 @@ class GlibcPtMallocInspector(AllocatorInspector):
             is_valid_start=is_valid_start,
             allocator_type=self.allocator_type(),
             limitations=limitations,
+            usable_size=usable_sz,
+            padding_bytes=pad_sz,
+            alignment_verified=is_valid_align,
         )
 
     def is_valid_allocation_start(self, address: int, maps: List[Dict[str, Any]]) -> Optional[bool]:
@@ -363,17 +439,15 @@ class GlibcPtMallocInspector(AllocatorInspector):
             chunk_size = size_flags & mask
             is_mmapped = bool(size_flags & 0x2)
 
-            if chunk_size < self.min_chunk_size and not is_mmapped:
+            chunk_header_addr = target_address - header_size
+            is_valid_align, align_errors = self.verify_chunk_alignment_and_padding(
+                chunk_header_addr, chunk_size, is_mmapped=is_mmapped
+            )
+            if not is_valid_align:
                 return FreeValidationResult(
                     False,
                     FreeValidationOutcome.FREE_TARGET_INVALID_BOUNDARY,
-                    f"Chunk size {chunk_size} at {hex(target_address - header_size)} below minimum {self.min_chunk_size}B",
-                )
-            if chunk_size % self.malloc_alignment != 0 and not is_mmapped:
-                return FreeValidationResult(
-                    False,
-                    FreeValidationOutcome.FREE_TARGET_INVALID_BOUNDARY,
-                    f"Chunk size {chunk_size} not aligned to {self.malloc_alignment}B",
+                    f"Chunk at {hex(chunk_header_addr)} violates alignment/boundary: {'; '.join(align_errors)}",
                 )
 
             # Check if chunk is already released via next chunk's PREV_INUSE

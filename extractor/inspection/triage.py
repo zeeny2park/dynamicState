@@ -98,27 +98,61 @@ def auto_triage_incident(
     if callstack_res.get("deadlock_detected"):
         for cyc in callstack_res.get("deadlock_cycles", []):
             desc = " -> ".join(f"TID {e['waiter_tid']} ({e['waiter_name']}) waits on {e['lock_name']} held by TID {e['owner_tid']}" for e in cyc)
+            cycle_call_chains: Dict[str, str] = {}
+            for e in cyc:
+                w_tid = e.get("waiter_tid")
+                w_th = next((t for t in callstack_res.get("threads", []) if t["tid"] == w_tid), None)
+                if w_th and w_th.get("callstack"):
+                    cc = [f.get("function_name") for f in w_th["callstack"] if f.get("function_name")]
+                    if cc:
+                        cycle_call_chains[str(w_tid)] = " -> ".join(reversed(cc))
+                    for f in w_th["callstack"]:
+                        loc = f.get("source_location")
+                        if loc and loc not in source_targets:
+                            source_targets.append(loc)
             findings.append({
                 "severity": "CRITICAL",
                 "category": "DEADLOCK",
                 "title": "Circular Mutex Deadlock Detected",
                 "summary": desc,
+                "call_chains": cycle_call_chains,
                 "recommended_action": "Inspect lock acquisition order in the involved thread functions.",
             })
     for lk in callstack_res.get("locks", []):
         if lk.get("is_locked") and lk.get("owner_tid"):
             owner_th = next((t for t in callstack_res.get("threads", []) if t["tid"] == lk["owner_tid"]), None)
+            owner_cs = (owner_th or {}).get("callstack") or []
+            # Higher call context (call chain) analysis
+            call_chain = [
+                {
+                    "frame_index": f.get("frame_index"),
+                    "function_name": f.get("function_name"),
+                    "source_location": f.get("source_location"),
+                    "decl_file": f.get("decl_file"),
+                    "decl_line": f.get("decl_line"),
+                    "module": f.get("module"),
+                }
+                for f in owner_cs
+                if f.get("function_name")
+            ]
+            call_chain_summary = " -> ".join(reversed([f["function_name"] for f in call_chain])) if call_chain else None
+            user_frames = [f for f in call_chain if f.get("source_location")]
+            caller_context = user_frames[1:] if len(user_frames) > 1 else []
             # IMP-011: CFI stacks start with the (source-less) libc wait frames: take the first frame with a source line
-            top_loc = next((f.get("source_location") for f in ((owner_th or {}).get("callstack") or [])
-                            if f.get("source_location")), None)
-            if top_loc and top_loc not in source_targets:
-                source_targets.append(top_loc)
+            top_loc = user_frames[0]["source_location"] if user_frames else None
+            for uf in user_frames:
+                loc = uf["source_location"]
+                if loc and loc not in source_targets:
+                    source_targets.append(loc)
             findings.append({
                 "severity": "HIGH" if lk.get("waiting_tids") else "MEDIUM",
                 "category": "MUTEX_LOCK_HELD",
                 "title": f"Mutex '{lk['name']}' Held by TID {lk['owner_tid']} ({lk.get('owner_thread_name')})",
                 "summary": f"Mutex {lk['name']} ({lk['runtime_address']}) is locked by TID {lk['owner_tid']}" + (f" with waiting threads {lk['waiting_tids']}" if lk.get("waiting_tids") else ""),
                 "source_location": top_loc,
+                "call_chain": call_chain,
+                "call_chain_summary": call_chain_summary,
+                "caller_context": caller_context,
                 "recommended_action": f"Check why TID {lk['owner_tid']} ({lk.get('owner_thread_name')}) is holding '{lk['name']}' without releasing it.",
             })
 
@@ -342,6 +376,9 @@ def build_dependency_graph(
         threads_by_tid[tid_val] = t
         t_node_id = f"THREAD:{tid_val}"
         top_frame = t["callstack"][0] if t.get("callstack") else None
+        call_chain = [f.get("function_name") for f in (t.get("callstack") or []) if f.get("function_name")]
+        call_chain_summary = " -> ".join(reversed(call_chain)) if call_chain else None
+        caller_frames = [f for f in (t.get("callstack") or []) if f.get("source_location")]
         wait_lock = t.get("waiting_on_lock")
         t_status = "BLOCKED" if wait_lock else "NORMAL"
         _add_node(
@@ -355,11 +392,22 @@ def build_dependency_graph(
                 "state": t.get("state"),
                 "syscall": t.get("syscall"),
                 "top_function": top_frame.get("function_name") if top_frame else None,
+                "call_chain": call_chain,
+                "call_chain_summary": call_chain_summary,
+                "caller_context": caller_frames[1:] if len(caller_frames) > 1 else [],
                 "source_location": next((f.get("source_location") for f in (t.get("callstack") or [])
                                          if f.get("source_location")), None),
             },
         )
         _add_edge(proc_node_id, t_node_id, "HAS_THREAD")
+
+        for f_idx, fr in enumerate((t.get("callstack") or [])[:5]):
+            fn = fr.get("function_name")
+            if fn and not fn.startswith("_") and not fn.startswith("??"):
+                fn_node_id = f"FUNC:{fn}"
+                _add_node(fn_node_id, kind="FUNCTION", label=f"{fn}()",
+                          meta={"source_location": fr.get("source_location"), "frame_level": f_idx})
+                _add_edge(t_node_id, fn_node_id, "CALLS", detail=f"Frame #{f_idx}")
 
     for lk in callstacks.get("locks", []):
         lk_name = lk["name"]

@@ -751,6 +751,22 @@ def inspect_thread_callstacks_and_locks(
         if not pc_observed and (sc_info.get("state") == "running" or t_state == "R"):
             frames = [_unobserved_line_frame(f) if f.get("estimated") else f for f in frames]
 
+        call_chain = [
+            {
+                "frame_index": f.get("frame_index"),
+                "function_name": f.get("function_name"),
+                "source_location": f.get("source_location"),
+                "decl_file": f.get("decl_file"),
+                "decl_line": f.get("decl_line"),
+                "module": f.get("module"),
+            }
+            for f in frames
+            if f.get("function_name")
+        ]
+        call_chain_summary = " -> ".join(reversed([f["function_name"] for f in call_chain])) if call_chain else None
+        user_frames = [f for f in call_chain if f.get("source_location")]
+        caller_context = user_frames[1:] if len(user_frames) > 1 else []
+
         thread_reports.append({
             "tid": t_tid,
             "name": t_name,
@@ -763,6 +779,9 @@ def inspect_thread_callstacks_and_locks(
             "waiting_on_lock": waiting_on_lock,
             "frames_count": len(frames),
             "callstack": frames,
+            "call_chain": call_chain,
+            "call_chain_summary": call_chain_summary,
+            "caller_context": caller_context,
             # IMP-011 (added fields): how the stack was obtained and what it cost
             **mgr._imp011_thread_summary(cfi_res, sc_info, unwinder_reason),
             "top_user_frame_index": next((i for i, f in enumerate(frames)

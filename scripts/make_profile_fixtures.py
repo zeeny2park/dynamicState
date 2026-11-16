@@ -29,11 +29,11 @@ def prune_obs(o):
         for t in cs.get("threads") or []:
             frames = [{k: f[k] for k in ("function_name", "module", "module_path", "source_location") if f.get(k)}
                       for f in (t.get("callstack") or [])[:8] if isinstance(f, dict)]
-            thr.append({k: t.get(k) for k in ("tid", "name", "state", "syscall", "waiting_on_lock") if k in t} | {"callstack": frames})
-        o["callstacks_info"] = {k: cs[k] for k in ("status", "target_abi", "threads_inspected", "lock_owner_status") if k in cs} | {"threads": thr}
+            thr.append({**{k: t.get(k) for k in ("tid", "name", "state", "syscall", "waiting_on_lock") if k in t}, "callstack": frames})
+        o["callstacks_info"] = {**{k: cs[k] for k in ("status", "target_abi", "threads_inspected", "lock_owner_status") if k in cs}, "threads": thr}
     if isinstance(o.get("threads"), list):
         keep = ("tid", "name", "state", "cpus_allowed_list", "sched_policy", "syscall")
-        o["threads"] = [{k: t[k] for k in keep if k in t} | {"stack_info": {"size": (t.get("stack_info") or {}).get("size")}}
+        o["threads"] = [{**{k: t[k] for k in keep if k in t}, "stack_info": {"size": (t.get("stack_info") or {}).get("size")}}
                         for t in o["threads"] if isinstance(t, dict)]
     if isinstance(o.get("thread_summary"), list):
         o["thread_summary"] = [{k: v for k, v in t.items() if k not in ("syscall_samples", "top_frames")} for t in o["thread_summary"]]

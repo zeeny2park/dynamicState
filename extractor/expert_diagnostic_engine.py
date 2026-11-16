@@ -2269,6 +2269,19 @@ class AdaptiveInvestigationSession:
         eff_step_prov = PROVENANCE_CLASS_LIVE_RUNTIME_CAPTURE if step_rcpt is not None else (
             PROVENANCE_CLASS_IMPORTED_UNVERIFIED if self.pid else PROVENANCE_CLASS_SYNTHETIC_FIXTURE
         )
+        inherited_parent_id: Optional[str] = None
+        if step_rcpt is None and self.pid and self.pid > 0 and hasattr(self.adapter, "_issued_live_receipts"):
+            matching_rcpts = [
+                r for r in self.adapter._issued_live_receipts
+                if getattr(r, "pid", None) == int(self.pid) and getattr(r, "session_id", None) == self.ledger.session_id
+            ]
+            if matching_rcpts and (any(getattr(r, "provenance_class", None) in ("LIVE_RUNTIME_CAPTURE", "CONTROLLED_RUNTIME_REPRODUCTION") for r in ev_records) or (isinstance(obs_data, dict) and "shared with the integrity" in str(obs_data))):
+                step_rcpt = matching_rcpts[-1]
+                eff_step_prov = PROVENANCE_CLASS_LIVE_RUNTIME_CAPTURE
+                op_id = getattr(step_rcpt, "operation_id", None)
+                if self.ledger and op_id and op_id in getattr(self.ledger, "_operation_to_evidence_ids", {}):
+                    inherited_parent_id = self.ledger._operation_to_evidence_ids[op_id][0]
+
         rcpt_dict_payload = step_rcpt.to_dict() if step_rcpt is not None else None
 
         # Enrich and correlate evidence records (Section 7: 1:1 finding-to-evidence relationship)
@@ -2302,6 +2315,10 @@ class AdaptiveInvestigationSession:
 
             if i == 0:
                 primary_step_ev_id = ev_id
+                if inherited_parent_id:
+                    matching_rec.parent_evidence_ids = [inherited_parent_id]
+                    if isinstance(matching_rec.raw_details, dict):
+                        matching_rec.raw_details["derived_from"] = inherited_parent_id
             elif primary_step_ev_id:
                 matching_rec.parent_evidence_ids = [primary_step_ev_id]
                 if isinstance(matching_rec.raw_details, dict):
@@ -2309,8 +2326,10 @@ class AdaptiveInvestigationSession:
 
             consumed_step_ev_ids.append(ev_id)
             step_ev_details = dict(eval_result.details)
-            if i > 0 and primary_step_ev_id:
-                step_ev_details["derived_from"] = primary_step_ev_id
+            eff_parents = [primary_step_ev_id] if (i > 0 and primary_step_ev_id) else ([inherited_parent_id] if inherited_parent_id else [])
+            if eff_parents:
+                step_ev_details["derived_from"] = eff_parents[0]
+
             ev_payload = {
                 "evidence_id": ev_id,
                 # The observed rule decides the category (e.g. a runaway thread is PROCESS_INSTABILITY, not a
@@ -2328,7 +2347,7 @@ class AdaptiveInvestigationSession:
                 "raw_observation": obs_data,
                 "normalized_observation": obs_actual_val,
                 "provenance_class": prov_class,
-                **({"parent_evidence_ids": [primary_step_ev_id]} if (i > 0 and primary_step_ev_id) else {}),
+                **({"parent_evidence_ids": eff_parents} if eff_parents else {}),
                 **({"live_capture_receipt": rcpt_dict_payload} if rcpt_dict_payload else {}),
             }
             correlated = self.correlator.correlate(ev_payload, target_pid=self.pid)
@@ -2351,12 +2370,25 @@ class AdaptiveInvestigationSession:
                 obs_data.get("value") if obs_data.get("value") is not None else None
             )
             contra_details = dict(eval_result.details)
-            if primary_step_ev_id:
-                contra_details["derived_from"] = primary_step_ev_id
+            eff_contra_parents = [primary_step_ev_id] if (primary_step_ev_id and primary_step_ev_id != contra_ev_id) else ([inherited_parent_id] if inherited_parent_id else [])
+            if eff_contra_parents:
+                contra_details["derived_from"] = eff_contra_parents[0]
             elif j == 0:
                 primary_step_ev_id = contra_ev_id
-            elif primary_step_ev_id:
-                contra_details["derived_from"] = primary_step_ev_id
+
+            contra_rec = RuntimeEvidenceRecord(
+                evidence_id=contra_ev_id,
+                collection_method=recipe.recipe_id,
+                target_pid=self.pid,
+                observed_value=obs_contra_val,
+                raw_observation=obs_data,
+                normalized_observation=obs_contra_val,
+                provenance_class=eff_step_prov,
+            )
+            if eff_contra_parents:
+                contra_rec.parent_evidence_ids = eff_contra_parents
+            self.collected_evidence_records.append(contra_rec)
+
             ev_payload = {
                 "evidence_id": contra_ev_id,
                 "problem_category": recipe.problem_category,
@@ -2371,7 +2403,7 @@ class AdaptiveInvestigationSession:
                 "raw_observation": obs_data,
                 "normalized_observation": obs_contra_val,
                 "provenance_class": eff_step_prov,
-                **({"parent_evidence_ids": [primary_step_ev_id]} if primary_step_ev_id and primary_step_ev_id != contra_ev_id else {}),
+                **({"parent_evidence_ids": eff_contra_parents} if eff_contra_parents else {}),
                 **({"live_capture_receipt": rcpt_dict_payload} if rcpt_dict_payload else {}),
             }
             correlated = self.correlator.correlate(ev_payload, target_pid=self.pid)
@@ -2393,6 +2425,17 @@ class AdaptiveInvestigationSession:
                     obs_data.get("current_rss_kb") if obs_data.get("current_rss_kb") is not None else obs_data
                 )
             )
+            base_rec = RuntimeEvidenceRecord(
+                evidence_id=base_ev_id,
+                collection_method=recipe.recipe_id,
+                target_pid=self.pid,
+                observed_value=obs_base_val,
+                raw_observation=obs_data,
+                normalized_observation=obs_base_val,
+                provenance_class=eff_step_prov,
+            )
+            self.collected_evidence_records.append(base_rec)
+
             ev_payload = {
                 "evidence_id": base_ev_id,
                 "problem_category": recipe.problem_category,
@@ -3636,8 +3679,8 @@ class AdaptiveInvestigationSession:
                     affected_entity=h.category,
                     observed_behavior=h.confidence_basis,
                     technical_explanation=f"Deterministic criteria confirmed fault: {h.confidence_basis}",
-                    supporting_evidence_ids=h.supporting_evidence_ids,
-                    contradicting_evidence_ids=[e.get("evidence_id") for e in h.contradicting_evidence if e.get("evidence_id")],
+                    supporting_evidence_ids=[e_id for e_id in h.supporting_evidence_ids if e_id in eligible_evidence_ids],
+                    contradicting_evidence_ids=[e.get("evidence_id") for e in h.contradicting_evidence if e.get("evidence_id") in eligible_evidence_ids],
                     applicable_diagnostic_rules=h.applicable_diagnostic_rules,
                     confidence_basis=h.confidence_basis,
                     verification_status="CONFIRMED",
@@ -3656,8 +3699,8 @@ class AdaptiveInvestigationSession:
                     affected_entity=h.category,
                     observed_behavior=h.confidence_basis,
                     technical_explanation="Evidence supports hypothesis but conclusive invariant failure or primary observation remains unverified.",
-                    supporting_evidence_ids=h.supporting_evidence_ids,
-                    contradicting_evidence_ids=[e.get("evidence_id") for e in h.contradicting_evidence if e.get("evidence_id")],
+                    supporting_evidence_ids=[e_id for e_id in h.supporting_evidence_ids if e_id in eligible_evidence_ids],
+                    contradicting_evidence_ids=[e.get("evidence_id") for e in h.contradicting_evidence if e.get("evidence_id") in eligible_evidence_ids],
                     applicable_diagnostic_rules=h.applicable_diagnostic_rules,
                     confidence_basis=h.confidence_basis,
                     verification_status="SUSPECTED",
@@ -3756,16 +3799,18 @@ class AdaptiveInvestigationSession:
                 epistemic_level="derived_evidence" if p_ids else "observation",
                 authority_status="VERIFIED" if l_rec is not None else "UNVERIFIED",
             ))
+        sec_g_rejected = {
+            rec.evidence_id: (rec.admission_reason or getattr(rec.admission_state, "value", str(rec.admission_state)))
+            for rec in (self.ledger.get_audit_trail() if self.ledger else [])
+            if rec.evidence_id not in eligible_evidence_ids
+        }
+        sec_g_rejected.update(rej_ev_map)
         sec_g = EvidenceAndProvenanceSection(
             evidence_count=len(ev_entries),
             evidence_records=ev_entries,
             independent_root_sources=sorted(indep_roots_union),
             dependency_graph=dep_graph_union,
-            rejected_or_unverified_evidence={
-                rec.evidence_id: (rec.admission_reason or getattr(rec.admission_state, "value", str(rec.admission_state)))
-                for rec in (self.ledger.get_audit_trail() if self.ledger else [])
-                if rec.evidence_id not in eligible_evidence_ids
-            } | rej_ev_map,
+            rejected_or_unverified_evidence=sec_g_rejected,
         )
 
         # Section H: Limitations & Unverified Areas

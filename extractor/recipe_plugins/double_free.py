@@ -720,8 +720,24 @@ def double_free_rule(recipe: DiagnosticRecipe, data: Dict[str, Any]) -> Optional
         if not confirmed:
             d["certainty_cap"] = "PROBABLE"
             d["certainty_cap_reason"] = str(fs[0].get("level_reason") or "free-list repeat without safe-linking")
+        ownerless_lifo = all(
+            bool(f.get("owner_unknown")) and any(
+                lk.get("list_kind") in ("tcache", "fastbin") for lk in f.get("lists", [])
+            )
+            for f in fs
+        )
+        if ownerless_lifo and not any(f.get("variable") or f.get("variable_path") for f in fs):
+            confirmed = False
+            d["double_free_confirmed"] = False
+            d["certainty_cap"] = "PROBABLE"
+            d["certainty_cap_reason"] = "ownerless LIFO chunk: double free cannot be confirmed without owner variable"
+            d["finding_severity"] = "WARNING"
+            d["verdict_demoted"] = True
+            confidence = 0.65
+        else:
+            confidence = 0.95 if confirmed else 0.75
         return RecipeEvaluationResult(
-            recipe_id=rid, status=RECIPE_STATUS_SUPPORTED, confidence=0.95 if confirmed else 0.75,
+            recipe_id=rid, status=RECIPE_STATUS_SUPPORTED, confidence=confidence,
             confidence_basis=facts[0], supporting_facts=facts, limitations=lims,
             recommended_action="Find where the named pointer (or the object holding it) is freed and make it free "
                                "exactly once (clear the pointer after free); rebuild with AddressSanitizer to get "

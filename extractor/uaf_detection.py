@@ -90,7 +90,7 @@ class UafConfig:
 
 
 class _Free:
-    __slots__ = ("ci", "addr", "size", "state", "list_kind", "list_key", "pos", "list_name", "skip", "hash_len",
+    __slots__ = ("ci", "addr", "size", "state", "list_kind", "list_key", "pos", "list_count", "list_name", "skip", "hash_len",
                  "h0", "refs", "corroboration", "takes_next")
 
     def __init__(self, ci: int, addr: int, size: int, state: int) -> None:
@@ -101,6 +101,7 @@ class _Free:
         self.list_kind = ""
         self.list_key: Tuple[Any, ...] = ()
         self.pos = -1
+        self.list_count = 0
         self.list_name = ""
         self.skip = 16
         self.hash_len = 0
@@ -262,11 +263,12 @@ class UafDetector:
                     continue
                 key = ("tcache", user, b)
                 self.lists[key] = chain
+                chain_len = len(chain)
                 for pos, c in enumerate(chain):
                     f = self.free.get(c)
                     if f is None or f.state != ST_TCACHE:
                         continue
-                    f.list_kind, f.list_key, f.pos, f.skip = "tcache", key, pos, 16
+                    f.list_kind, f.list_key, f.pos, f.list_count, f.skip = "tcache", key, pos, chain_len, 16
                     f.takes_next = pos == 0
                     f.list_name = ("tcache bin %d (chunk size %d) of the tcache at 0x%x, entry %d of %d"
                                    % (b, f.size, user, pos, len(chain)))
@@ -284,11 +286,12 @@ class UafDetector:
                     continue
                 key = ("fastbin", ai, b)
                 self.lists[key] = chain
+                chain_len = len(chain)
                 for pos, c in enumerate(chain):
                     f = self.free.get(c)
                     if f is None or f.state != ST_FASTBIN:
                         continue
-                    f.list_kind, f.list_key, f.pos, f.skip = "fastbin", key, pos, 16
+                    f.list_kind, f.list_key, f.pos, f.list_count, f.skip = "fastbin", key, pos, chain_len, 16
                     f.takes_next = pos == 0
                     f.list_name = "fastbin %d (chunk size %d) of arena %d, entry %d of %d" % (b, f.size, ai, pos,
                                                                                               len(chain))
@@ -610,8 +613,19 @@ class UafDetector:
             row["dangling_pointers"] = [{"variable": d["root"], "variable_path": d["path"], "owner_kind": d["kind"],
                                          "slot_address": "0x%x" % d["slot"], "interior_offset": d["interior"]}
                                         for d in dangling[:4]]
-        else:
+        if not dangling:
             row["owner_unknown"] = "no reference remains: no typed pointer refers to the freed chunk"
+            if f.list_kind in ("tcache", "fastbin"):
+                row["ownerless_lifo"] = True
+                row["pos"] = f.pos
+                row["list_count"] = f.list_count
+                row["allocation_guard"] = {
+                    "guard_type": "multi_depth_lifo",
+                    "pos": f.pos,
+                    "count": f.list_count,
+                    "within_allocation_depth": bool(f.pos >= 0 and f.list_count > 0 and f.pos < f.list_count),
+                }
+                row["verdict_demoted"] = True
         if f.corroboration:
             row["corroboration"] = f.corroboration[:4]
         if write is not None:
@@ -623,8 +637,11 @@ class UafDetector:
             row["description"] = ("use after free: %s still points to %s and the chunk was written while free (%s)"
                                   % (row["variable_path"], where, row["write_evidence"]))
         elif level == LEVEL_PROBABLE:
-            row["description"] = ("%s was written while free (%s); owner unknown: no reference remains"
-                                  % (where, row["write_evidence"]))
+            guard_note = ""
+            if row.get("ownerless_lifo") and (row.get("allocation_guard") or {}).get("within_allocation_depth"):
+                guard_note = "; ownerless LIFO chunk (pos %d < count %d: multi-depth allocation guard applied, verdict demoted)" % (f.pos, f.list_count)
+            row["description"] = ("%s was written while free (%s); owner unknown: no reference remains%s"
+                                  % (where, row["write_evidence"], guard_note))
         else:
             row["description"] = ("dangling pointer: %s points to %s, stable over %.2f s; no write into it was "
                                   "observed (candidate: a use is not proven)" % (row["variable_path"], where, window))

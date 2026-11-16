@@ -111,11 +111,23 @@ def freed_memory_use_rule(recipe: DiagnosticRecipe, data: Dict[str, Any]) -> Opt
             d["certainty_cap_reason"] = (
                 "freed memory written with no typed pointer left to it (owner unknown)" if "probable" in levels else
                 "a dangling pointer to a free chunk with no write observed: a candidate, a use is not proven")
+        ownerless_lifo = [f for f in fs if f.get("ownerless_lifo")]
+        if not confirmed and ownerless_lifo and len(ownerless_lifo) == len([f for f in fs if f.get("level") != "candidate"]):
+            d["certainty_cap"] = "PROBABLE"
+            d["certainty_cap_reason"] = (
+                "ownerless LIFO chunk (%s): multi-depth (pos < count) allocation cannot be excluded; verdict demoted"
+                % ownerless_lifo[0].get("free_list", "LIFO list")
+            )
+            d["verdict_demoted"] = True
+            d["allocation_guard"] = ownerless_lifo[0].get("allocation_guard")
+            confidence = 0.65
+        else:
+            confidence = 0.95 if confirmed else (0.75 if "probable" in levels else 0.5)
         if levels == {"candidate"}:
             d["finding_severity"] = "WARNING"
         return RecipeEvaluationResult(
             recipe_id=rid, status=RECIPE_STATUS_SUPPORTED,
-            confidence=0.95 if confirmed else (0.75 if "probable" in levels else 0.5),
+            confidence=confidence,
             confidence_basis=facts[0], supporting_facts=facts, limitations=lims,
             recommended_action="Clear (or stop using) the named pointer when its block is freed; rebuild with "
                                "AddressSanitizer to find the access site.",
