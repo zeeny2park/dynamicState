@@ -28,7 +28,7 @@ jobs:
       - name: Install system dependencies (QEMU for the ARM64 guest, cross compilers, ssh client)
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends qemu-system-arm gcc gcc-aarch64-linux-gnu gcc-x86-64-linux-gnu make binutils openssh-client dpkg-dev xz-utils
+          sudo apt-get install -y --no-install-recommends qemu-system-arm gcc gcc-aarch64-linux-gnu libc6-dev-arm64-cross gcc-x86-64-linux-gnu make binutils openssh-client dpkg-dev xz-utils
           qemu-system-aarch64 --version
 
       - name: Install Python test dependencies
