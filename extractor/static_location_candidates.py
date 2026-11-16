@@ -1090,6 +1090,64 @@ def _unreachable_leak_candidates(ctx: _Ctx) -> List[_Cand]:
             if n in observed:
                 c.add(1, f"`{n}` was on a live thread's stack", f"`{n}`가 살아 있는 스레드의 스택에서 관측됨")
             out.append(c)
+    if not out:
+        out.extend(_scoped_partial_leak_candidates(ctx, funcs, scope, named, workers, observed, classes, wrap_re))
+    return out
+
+
+def _has_early_return_before_free(ctx: _Ctx, f: _Func, p: str, alloc_ln: int) -> Optional[int]:
+    """Line number of an early ``return`` between ``alloc_ln`` and a later ``free``/``delete`` of ``p``, if any."""
+    pid = _ident(p)
+    free_lns = [ln for ln, code in ctx.prog.body(f)
+                if ln > alloc_ln and (_FREE_RE.search(code) or _DELETE_RE.search(code)) and pid.search(code)]
+    if not free_lns:
+        return None
+    last_free = max(free_lns)
+    for ln, code in ctx.prog.body(f):
+        if alloc_ln < ln < last_free and re.search(r"\breturn\b", code):
+            return ln
+    return None
+
+
+def _scoped_partial_leak_candidates(
+    ctx: _Ctx, funcs: Dict[str, _Func], scope: Set[str], named: Dict[str, str],
+    workers: Set[str], observed: Set[str], classes: Set[int], wrap_re: Any,
+) -> List[_Cand]:
+    """Fallback when no strictly unescaped local leak was found: allocations in the attributed thread's scope
+    that either have an early return before ``free(p)`` or match the leaking size class."""
+    out: List[_Cand] = []
+    who = ", ".join(f"`{k}`" for k in sorted(named)) if named else ""
+    for n in sorted(scope):
+        f = funcs[n]
+        for p, var in f.locals.items():
+            if var.is_parameter or _pointee(ctx.idx, var.type_offset) is None:
+                continue
+            for ln, code in ctx.prog.body(f):
+                a = next(((lhs, rhs) for lhs, rhs in _assigns(code) if _lhs_name(lhs) == p), None)
+                if a is None:
+                    continue
+                if not (_ALLOC_RE.search(a[1]) or (wrap_re is not None and wrap_re.search(a[1]))):
+                    continue
+                early = _has_early_return_before_free(ctx, f, p, ln)
+                if early is not None:
+                    c = _Cand(f, ln, "allocation", 3, [(
+                        f"allocates `{p}` in `{n}`, which has an early return (line {early}) before freeing it",
+                        f"`{n}`에서 `{p}`를 할당하지만 해제 전에 조기 반환({early}행)하는 경로가 있음")])
+                elif named:
+                    c = _Cand(f, ln, "allocation", 2, [(
+                        f"allocates `{p}` in `{n}`, reached from thread {who}",
+                        f"누수가 귀속된 스레드 {who}에서 도달하는 `{n}` 안의 `{p}` 할당")])
+                else:
+                    continue
+                _size_reason(ctx, _alloc_type(ctx, f, code, p), classes, c)
+                if named and n in scope:
+                    c.add(1, f"reached from the start function of thread {who}, which the leak was attributed to",
+                          f"누수가 귀속된 스레드 {who}의 시작 함수에서 도달함")
+                elif n in workers and n != "main":
+                    c.add(1, f"`{n}` runs on a thread started by pthread_create", f"`{n}`는 pthread_create로 시작한 스레드에서 실행됨")
+                if n in observed:
+                    c.add(1, f"`{n}` was on a live thread's stack", f"`{n}`가 살아 있는 스레드의 스택에서 관측됨")
+                out.append(c)
     return out
 
 
@@ -1279,7 +1337,7 @@ def _free_sites(ctx: _Ctx, double: bool) -> Tuple[List[_Cand], Dict[str, int]]:
             for ln, code in ctx.prog.body(f):
                 for arg in _free_args(code):
                     if ctx.refers(f, root, arg):
-                        c = _Cand(f, ln, "free", 3, [(f"frees `{arg}`", f"`{arg}`를 해제함")])
+                        c = _Cand(f, ln, "free", 4, [(f"frees `{arg}`", f"`{arg}`를 해제함")])
                         frees_root.setdefault(f.name, ln)
                     else:
                         base = re.match(r"^\s*\(?\s*([A-Za-z_]\w*)", arg)
