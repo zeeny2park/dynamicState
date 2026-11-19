@@ -791,7 +791,10 @@ class TargetExecutionAdapter(ABC):
             self.rollback_capture_transaction(target_tx, f"Target process exited during capture: {live_err}")
             raise ProcessLookupError(f"Target process {target_tx.pid} terminated during capture: {live_err}")
 
-        ok_pin, pin_err = self.verify_pinned_identity(target_tx.pid, _current_identity=cur_ident)
+        ok_pin, pin_err = self.verify_pinned_identity(
+            target_tx.pid,
+            _current_identity=cur_ident if type(self).__name__ == "RemoteSshTargetAdapter" else None,
+        )
         if not ok_pin:
             self.rollback_capture_transaction(target_tx, f"Pinned identity changed: {pin_err}")
             raise PIDReusedError(f"Pinned identity changed during capture transaction on PID {target_tx.pid}: {pin_err}")
