@@ -255,6 +255,11 @@ class RuntimeEvidenceProvider:
         self.thread_sampling_overrides: Dict[str, Any] = {}
         # When a dict, a usable thread series is shared by all thread recipes of the run (None = never share)
         self.thread_series_cache: Optional[Dict[Any, Any]] = None
+        self._dwarf_symbols_cache: Dict[Tuple[str, int, int], Dict[str, Any]] = {}
+        self._process_info_cache: Dict[int, Tuple[float, Dict[str, Any]]] = {}
+        self._lock_inspections_cache: Dict[Tuple[int, str], List[Tuple[float, Dict[str, Any]]]] = {}
+        self._lock_switches_cache: Dict[int, List[Dict[str, Optional[int]]]] = {}
+        self._threads_and_locks_cache: Dict[Tuple[int, str], Tuple[List[Dict[str, Any]], Dict[str, Any], Optional[Dict[str, Any]], Optional[str], List[List[Tuple[int, str]]]]] = {}
         # IMP-008: multi-observation memory investigation (leak_attribution.MemoryObservationConfig); None = legacy
         # single-sample behaviour of the memory branch (direct provider users / epoch-driven callers).
         self.memory_observation: Optional[Any] = None
@@ -283,9 +288,10 @@ class RuntimeEvidenceProvider:
         cfg = ThreadSamplingConfig.from_thresholds({**getattr(recipe, "thresholds_and_conditions", {}), **self.thread_sampling_overrides})
         cache_key = (pid, repr(cfg))
         try:
-            if self.thread_series_cache is not None and cache_key in self.thread_series_cache:
+            any_pid_key = next((k for k in (self.thread_series_cache or {}) if isinstance(k, tuple) and k[0] == pid), None)
+            if self.thread_series_cache is not None and (cache_key in self.thread_series_cache or any_pid_key is not None):
                 # Same sample series as an earlier recipe of this run (thread recipes share one sampling window)
-                derived = self.thread_series_cache[cache_key]
+                derived = self.thread_series_cache.get(cache_key) or self.thread_series_cache[any_pid_key]
             else:
                 sampler = ThreadSampler(self.adapter, self.watch_manager, self.budget_tracker)
                 inspect = lambda: self._inspect_locks(pid, companion_elf)  # noqa: E731
@@ -294,6 +300,19 @@ class RuntimeEvidenceProvider:
                     from .leak_attribution import cosampling_inspect
                     inspect = cosampling_inspect(self, pid, inspect)
                 series = sampler.collect(pid, companion_elf or "", cfg, inspect_fn=inspect)
+                raw_insps = getattr(series, "raw_inspections", None) or []
+                if len(raw_insps) >= 2:
+                    self._lock_inspections_cache[(int(pid), str(companion_elf or ""))] = list(raw_insps)
+                    sw_list: List[Dict[str, Optional[int]]] = []
+                    for smp in series.samples:
+                        sw_d: Dict[str, Optional[int]] = {}
+                        for tid_k, rec_v in (smp.get("threads") or {}).items():
+                            v_cs = rec_v.get("voluntary_ctxt_switches")
+                            nv_cs = rec_v.get("nonvoluntary_ctxt_switches")
+                            sw_d[str(tid_k)] = ((int(v_cs or 0) + int(nv_cs or 0))
+                                                if (v_cs is not None or nv_cs is not None) else None)
+                        sw_list.append(sw_d)
+                    self._lock_switches_cache[int(pid)] = sw_list
                 derived = judge_thread_series(series)
                 if self.thread_series_cache is not None and derived.get("thread_sampling", {}).get("status") == "OK":
                     self.thread_series_cache[cache_key] = derived
@@ -411,7 +430,49 @@ class RuntimeEvidenceProvider:
                 ev_records.append(rec)
                 return info, ev_records
 
+        can_cache_pi = (
+            self.thread_series_cache is not None
+            and not any(k in getattr(self.adapter, "__dict__", {}) for k in (
+                "check_liveness", "get_process_identity", "get_threads", "get_process_status"
+            ))
+        )
+        if can_cache_pi:
+            cached_pi = self._process_info_cache.get(int(pid))
+            if cached_pi is not None and (time.monotonic() - cached_pi[0]) <= 0.050:
+                info = dict(cached_pi[1])
+                rss_kb = info.get("rss_kb")
+                rss_metric_status = info.get("rss_metric_status", "UNAVAILABLE")
+                rss_error = info.get("rss_error")
+                thread_ids = [t.get("tid", pid) for t in (info.get("threads") or []) if isinstance(t, dict)]
+                if self.budget_tracker and res_id:
+                    approx_bytes = max(256, len(str(info).encode("utf-8", errors="replace")))
+                    self.budget_tracker.reconcile_reservation(
+                        res_id, actual_bytes_read=None, conservative_estimate_bytes=approx_bytes,
+                        latency_us=max(100.0, (time.monotonic_ns() - t0) / 1000.0), is_failure=False, physical_reads=0,
+                    )
+                    self.budget_tracker.record_sample(profile_id="collect_process_info")
+                    res_id = None
+                is_observed = rss_metric_status in ("OBSERVED_VALUE", "OBSERVED_ZERO")
+                rec = RuntimeEvidenceRecord(
+                    evidence_id=f"ev_{uuid.uuid4().hex[:12]}",
+                    collection_method="adapter_status_and_liveness",
+                    target_pid=pid,
+                    observed_value={"rss_kb": rss_kb, "rss_metric_status": rss_metric_status, "thread_count": len(thread_ids), "alive": True},
+                    collection_scope="PROCESS_METRICS",
+                    collection_status=COLLECTION_STATUS_SUCCESS if is_observed else COLLECTION_STATUS_PARTIAL,
+                    limitations=[rss_error] if rss_error else [],
+                    provenance_class=PROVENANCE_LIVE_RUNTIME_CAPTURE,
+                    raw_details=info,
+                )
+                ev_records.append(rec)
+                return info, ev_records
+        _entered_snap = False
         try:
+            if can_cache_pi and callable(getattr(self.adapter, "prefetch_snapshot", None)):
+                if getattr(self.adapter, "_snapshot_scope_depth", 0) == 0:
+                    self.adapter.prefetch_snapshot(pid)
+                self.adapter._snapshot_scope_depth = getattr(self.adapter, "_snapshot_scope_depth", 0) + 1
+                _entered_snap = True
             alive, live_err = self.adapter.check_liveness(pid)
             info["alive"] = alive
             if not alive:
@@ -497,6 +558,8 @@ class RuntimeEvidenceProvider:
             info["rss_metric_status"] = rss_metric_status
             if rss_error:
                 info["rss_error"] = rss_error
+            if can_cache_pi and info.get("alive"):
+                self._process_info_cache[int(pid)] = (time.monotonic(), dict(info))
 
             if self.budget_tracker and res_id:
                 approx_bytes = max(256, len(str(info).encode("utf-8", errors="replace")))
@@ -526,6 +589,8 @@ class RuntimeEvidenceProvider:
             ev_records.append(rec)
             return info, ev_records
         finally:
+            if _entered_snap:
+                self.adapter._snapshot_scope_depth = max(0, getattr(self.adapter, "_snapshot_scope_depth", 1) - 1)
             if self.budget_tracker and res_id:
                 self.budget_tracker.release_reservation(res_id)
 
@@ -869,6 +934,15 @@ class RuntimeEvidenceProvider:
         }
         if not companion_elf or not os.path.exists(companion_elf):
             return discovered
+        try:
+            abs_elf = os.path.abspath(str(companion_elf).split(",")[0].strip())
+            st_elf = os.stat(abs_elf)
+            dds_key = (abs_elf, st_elf.st_mtime_ns, st_elf.st_size)
+            cached_dds = self._dwarf_symbols_cache.get(dds_key)
+            if cached_dds is not None:
+                return {k: list(v) for k, v in cached_dds.items()}
+        except Exception:
+            dds_key = None
 
         try:
             from .dwarf_indexer import DwarfIndexer
@@ -983,10 +1057,117 @@ class RuntimeEvidenceProvider:
                     ranked = [c for c in counts if name_has_role(c, ROLE_LENGTH)] or counts
                     discovered["container_counts"].append(ranked[0])
 
+            if dds_key is not None:
+                self._dwarf_symbols_cache[dds_key] = {k: list(v) for k, v in discovered.items()}
         except Exception:
             pass
 
         return discovered
+
+    def has_precollected_data(self, recipe: Any, pid: Optional[int], companion_elf: Optional[str] = None) -> bool:
+        """Returns True if all primary observations declared by `recipe` are already co-sampled/cached in memory
+        and can be evaluated without new target I/O."""
+        if pid is None or int(pid) <= 0:
+            return False
+        p = int(pid)
+        elf_key = (p, str(companion_elf or ""))
+        kinds = declared_observations(recipe)
+        st = getattr(self, "_imp008_state", None) or {}
+        for kind in kinds:
+            if kind == "fd_usage":
+                cos = (st.get("fd_cosamples") or {}).get(p) or []
+                if len(cos) < 3:
+                    return False
+            elif kind == "mapping_growth":
+                mcos = (st.get("mapping_cosamples") or {}).get(p) or []
+                if len(mcos) < 4:
+                    return False
+            elif kind == "lock_wait_state":
+                lws = getattr(self, "_lock_wait_state_cache", None)
+                has_lws = bool(lws and lws[0] == p)
+                has_insps = len(self._lock_inspections_cache.get(elf_key) or []) >= 2
+                if not (has_lws or has_insps):
+                    return False
+            elif kind == "threads_and_locks":
+                has_otl = elf_key in self._threads_and_locks_cache
+                has_insps = len(self._lock_inspections_cache.get(elf_key) or []) >= 2
+                rid = getattr(recipe, "recipe_id", str(recipe))
+                if not (has_otl or has_insps):
+                    return False
+                if rid in THREAD_SAMPLING_RECIPES and not self.thread_series_cache:
+                    return False
+            elif kind in ("lock_contention", "thread_growth"):
+                if not self.thread_series_cache:
+                    return False
+            elif kind == "memory_growth":
+                cos_m = (st.get("cosamples") or {}).get(p) or []
+                if len(cos_m) < 2:
+                    return False
+            else:
+                return False
+        return bool(kinds)
+
+    def export_precollected_state(self) -> Dict[str, Any]:
+        """Serializes in-memory co-sampled and cached observations so a session can continue diagnosing later."""
+        st = getattr(self, "_imp008_state", None) or {}
+        return {
+            "thread_series_cache": {
+                f"{k[0]}|{k[1]}": v for k, v in (self.thread_series_cache or {}).items()
+                if isinstance(k, tuple) and len(k) == 2 and isinstance(v, dict)
+            },
+            "lock_inspections_cache": {
+                f"{k[0]}|{k[1]}": [
+                    [ts, {ik: iv for ik, iv in insp.items() if not ik.startswith("_")}]
+                    for ts, insp in v
+                ]
+                for k, v in (self._lock_inspections_cache or {}).items()
+                if isinstance(k, tuple) and len(k) == 2
+            },
+            "lock_switches_cache": {str(k): v for k, v in (self._lock_switches_cache or {}).items()},
+            "cosamples": {str(k): list(v) for k, v in (st.get("cosamples") or {}).items()},
+            "fd_cosamples": {
+                str(k): [[ts, dict(fds), thr] for ts, fds, thr in v]
+                for k, v in (st.get("fd_cosamples") or {}).items()
+            },
+            "mapping_cosamples": {
+                str(k): [[dict(ms), {str(tk): tv for tk, tv in (tc or {}).items()}] for ms, tc in v]
+                for k, v in (st.get("mapping_cosamples") or {}).items()
+            },
+        }
+
+    def import_precollected_state(self, data: Optional[Dict[str, Any]]) -> None:
+        """Restores serialized co-sampled and cached observations into this provider."""
+        if not isinstance(data, dict):
+            return
+        if self.thread_series_cache is None:
+            self.thread_series_cache = {}
+        for k_str, v in (data.get("thread_series_cache") or {}).items():
+            if "|" in str(k_str) and isinstance(v, dict):
+                p_str, cfg_repr = str(k_str).split("|", 1)
+                if p_str.isdigit():
+                    self.thread_series_cache[(int(p_str), cfg_repr)] = v
+        for k_str, v in (data.get("lock_inspections_cache") or {}).items():
+            if "|" in str(k_str) and isinstance(v, list):
+                p_str, elf_str = str(k_str).split("|", 1)
+                if p_str.isdigit():
+                    self._lock_inspections_cache[(int(p_str), elf_str)] = [(float(item[0]), dict(item[1])) for item in v if len(item) == 2]
+        for k_str, v in (data.get("lock_switches_cache") or {}).items():
+            if str(k_str).isdigit() and isinstance(v, list):
+                self._lock_switches_cache[int(k_str)] = v
+        from .leak_attribution import _state
+        st = _state(self)
+        for k_str, v in (data.get("cosamples") or {}).items():
+            if str(k_str).isdigit() and isinstance(v, list):
+                st["cosamples"][int(k_str)] = list(v)
+        for k_str, v in (data.get("fd_cosamples") or {}).items():
+            if str(k_str).isdigit() and isinstance(v, list):
+                st.setdefault("fd_cosamples", {})[int(k_str)] = [(float(x[0]), dict(x[1]), x[2]) for x in v if len(x) == 3]
+        for k_str, v in (data.get("mapping_cosamples") or {}).items():
+            if str(k_str).isdigit() and isinstance(v, list):
+                st.setdefault("mapping_cosamples", {})[int(k_str)] = [
+                    (dict(x[0]), {int(tk): tv for tk, tv in (x[1] or {}).items() if str(tk).isdigit()})
+                    for x in v if len(x) == 2
+                ]
 
     def collect_for_recipe(
         self,
@@ -1026,8 +1207,8 @@ class RuntimeEvidenceProvider:
             observation_data["missing_prerequisites"] = ["LIVE_TARGET_PID"]
             return observation_data, all_records
 
-        # Guard: Check observation budget exhaustion
-        if self.budget_tracker and not self.budget_tracker.can_continue():
+        # Guard: Check observation budget exhaustion (bypassed when observations are already pre-collected in memory!)
+        if self.budget_tracker and not self.budget_tracker.can_continue() and not self.has_precollected_data(recipe, pid, companion_elf):
             rec = RuntimeEvidenceRecord(
                 evidence_id=f"ev_{uuid.uuid4().hex[:12]}",
                 collection_method="budget_guard",
@@ -1061,7 +1242,23 @@ class RuntimeEvidenceProvider:
                 if kind != "process_info":
                     observation_data.setdefault("unavailable_observations", []).append(kind)
                 continue
-            res = collector(self, ctx)
+            try:
+                res = collector(self, ctx)
+            except Exception as col_exc:  # noqa: BLE001
+                err_msg = f"Observation collector '{kind}' failed: {type(col_exc).__name__}: {col_exc}"
+                all_records.append(RuntimeEvidenceRecord(
+                    evidence_id=f"ev_{uuid.uuid4().hex[:12]}",
+                    collection_method=f"collector:{kind}",
+                    target_pid=pid,
+                    observed_value=None,
+                    collection_scope=kind.upper(),
+                    collection_status=COLLECTION_STATUS_FAILED,
+                    limitations=[err_msg],
+                    provenance_class=PROVENANCE_LIVE_RUNTIME_CAPTURE,
+                ))
+                observation_data.setdefault("collection_errors", []).append(err_msg)
+                observation_data.setdefault("unavailable_observations", []).append(kind)
+                res = None
             if res is not None:
                 return res
 
@@ -1645,33 +1842,59 @@ class RuntimeEvidenceProvider:
         companion_elf = ctx["companion_elf"]
         observation_data = ctx["observation_data"]
         all_records = ctx["all_records"]
-        try:
-            threads = self.adapter.get_threads(pid)
+        can_share_otl = (
+            self.thread_series_cache is not None
+            and "_inspect_locks" not in self.__dict__
+            and type(self)._inspect_locks is RuntimeEvidenceProvider._inspect_locks
+            and "inspect_thread_callstacks_and_locks" not in getattr(self.watch_manager, "__dict__", {})
+            and "get_threads" not in getattr(self.adapter, "__dict__", {})
+        )
+        otl_key = (int(pid), str(companion_elf or ""))
+        cached_otl = self._threads_and_locks_cache.get(otl_key) if can_share_otl else None
+        pre_insps = self._lock_inspections_cache.get(otl_key) if (can_share_otl and cached_otl is None) else None
+
+        if cached_otl is not None:
+            threads = list(cached_otl[0])
             observation_data["threads"] = threads
             observation_data["thread_count"] = len(threads)
-        except Exception:
-            threads = []
+        elif pre_insps and len(pre_insps) >= 2 and int(pid) in self._process_info_cache:
+            threads = list(self._process_info_cache[int(pid)][1].get("threads") or [])
+            observation_data["threads"] = threads
+            observation_data["thread_count"] = len(threads)
+        else:
+            try:
+                threads = self.adapter.get_threads(pid)
+                observation_data["threads"] = threads
+                observation_data["thread_count"] = len(threads)
+            except Exception:
+                threads = []
 
         # Inspect thread callstacks and mutex locks using watch_manager
         try:
-            callstacks_info = self._inspect_locks(pid, companion_elf)
             transient_unresolved: List[List[Tuple[int, str]]] = []
-            if isinstance(callstacks_info, dict) and not callstacks_info.get("deadlock_detected"):
-                for gap in UNRESOLVED_WAIT_REREAD_GAPS_S:
-                    pending = unresolved_lock_waits(callstacks_info)
-                    if not pending:
-                        break
-                    transient_unresolved.append(pending)
-                    time.sleep(gap)
-                    try:
-                        again = self._inspect_locks(pid, companion_elf)
-                    except Exception:  # noqa: BLE001 - a failed re-read settles nothing: keep the last inspection
-                        break
-                    if not isinstance(again, dict) or again.get("error") or again.get("success") is False:
-                        break
-                    callstacks_info = again
-                    if again.get("deadlock_detected"):
-                        break   # a cycle goes through the persistence re-observation below like any first read
+            if cached_otl is not None:
+                callstacks_info = cached_otl[1]
+                transient_unresolved = list(cached_otl[4])
+            elif pre_insps and len(pre_insps) >= 2 and not unresolved_lock_waits(pre_insps[0][1]):
+                callstacks_info = pre_insps[0][1]
+            else:
+                callstacks_info = self._inspect_locks(pid, companion_elf)
+                if isinstance(callstacks_info, dict) and not callstacks_info.get("deadlock_detected"):
+                    for gap in UNRESOLVED_WAIT_REREAD_GAPS_S:
+                        pending = unresolved_lock_waits(callstacks_info)
+                        if not pending:
+                            break
+                        transient_unresolved.append(pending)
+                        time.sleep(gap)
+                        try:
+                            again = self._inspect_locks(pid, companion_elf)
+                        except Exception:  # noqa: BLE001 - a failed re-read settles nothing: keep the last inspection
+                            break
+                        if not isinstance(again, dict) or again.get("error") or again.get("success") is False:
+                            break
+                        callstacks_info = again
+                        if again.get("deadlock_detected"):
+                            break   # a cycle goes through the persistence re-observation below like any first read
                 if transient_unresolved and not unresolved_lock_waits(callstacks_info):
                     observation_data["transient_unresolved_lock_waits"] = [
                         [{"tid": t, "lock_address": a} for t, a in p] for p in transient_unresolved]
@@ -1742,15 +1965,20 @@ class RuntimeEvidenceProvider:
                 observation_data["cycle_tids"] = first_cycle_tids
 
                 # IMP-003: Re-observe after a short interval to verify whether the circular wait persists
-                reobserve_delay = float(recipe.thresholds_and_conditions.get("reobserve_interval_sec", 0.05))
-                if reobserve_delay > 0:
-                    time.sleep(min(reobserve_delay, 0.25))
                 callstacks_info_2: Any = None
                 second_error: Optional[str] = None
-                try:
-                    callstacks_info_2 = self._inspect_locks(pid, companion_elf)
-                except Exception as e2:
-                    second_error = f"{type(e2).__name__}: {e2}"
+                if cached_otl is not None:
+                    callstacks_info_2, second_error = cached_otl[2], cached_otl[3]
+                elif pre_insps and len(pre_insps) >= 2 and (pre_insps[-1][0] - pre_insps[0][0]) >= 0.04:
+                    callstacks_info_2 = pre_insps[-1][1]
+                else:
+                    reobserve_delay = float(recipe.thresholds_and_conditions.get("reobserve_interval_sec", 0.05))
+                    if reobserve_delay > 0:
+                        time.sleep(min(reobserve_delay, 0.25))
+                    try:
+                        callstacks_info_2 = self._inspect_locks(pid, companion_elf)
+                    except Exception as e2:
+                        second_error = f"{type(e2).__name__}: {e2}"
                 if second_error is None:
                     if not isinstance(callstacks_info_2, dict):
                         second_error = f"unexpected result type {type(callstacks_info_2).__name__}"
@@ -1807,7 +2035,15 @@ class RuntimeEvidenceProvider:
                     observation_data["is_persistent"] = same_cycle_persisted
                     if not same_cycle_persisted and not callstacks_info_2.get("deadlock_detected"):
                         observation_data["transient_cycle_resolved"] = True
+                if can_share_otl and cached_otl is None:
+                    self._threads_and_locks_cache[otl_key] = (
+                        threads, callstacks_info, callstacks_info_2, second_error, transient_unresolved
+                    )
             else:
+                if can_share_otl and cached_otl is None:
+                    self._threads_and_locks_cache[otl_key] = (
+                        threads, callstacks_info, None, None, transient_unresolved
+                    )
                 blocked = callstacks_info.get("blocked_threads", [])
                 if blocked:
                     observation_data["blocked_threads"] = blocked

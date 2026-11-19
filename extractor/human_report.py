@@ -2112,7 +2112,9 @@ def diagnose_with_summary(pid: int, debug_image: Optional[str] = None, symptom: 
                           adapter: Any = None, symptom_fields: Any = None,
                           keep_report: bool = False, default_check_budget_s: Optional[float] = None,
                           default_check_max_s: Optional[float] = None,
-                          enable_tracing: Optional[bool] = None) -> Tuple[Dict[str, Any], str]:
+                          enable_tracing: Optional[bool] = None,
+                          resume_investigation_id: Optional[str] = None,
+                          continue_collected_only: bool = False) -> Tuple[Dict[str, Any], str]:
     """Run ``diagnose`` once and return ``(result_dict_without_inline_report, human_summary_markdown)``.
 
     The inline full report is requested only to give the summary its names and numbers; it is dropped from the
@@ -2132,6 +2134,10 @@ def diagnose_with_summary(pid: int, debug_image: Optional[str] = None, symptom: 
         kw["default_check_max_s"] = default_check_max_s
     if enable_tracing is not None:
         kw["enable_tracing"] = enable_tracing
+    if resume_investigation_id is not None:
+        kw["resume_investigation_id"] = resume_investigation_id
+    if continue_collected_only:
+        kw["continue_collected_only"] = True
     res = diagnose(pid, debug_image=debug_image, symptom=symptom, time_limit_s=time_limit_s,
                    include_report=True, **kw)
     d = res.to_dict()

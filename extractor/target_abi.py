@@ -309,6 +309,18 @@ def detect_target_abi(
     ``maps`` lets a caller that already holds /proc/PID/maps avoid a second read.
     ``probe_version=False`` skips the (local-only) scan of the libc file for the glibc version.
     """
+    can_cache = (
+        maps is None
+        and type(adapter).__name__ == "RemoteSshTargetAdapter"
+        and "read_target_file" not in getattr(adapter, "__dict__", {})
+        and "get_proc_maps" not in getattr(adapter, "__dict__", {})
+    )
+    if can_cache:
+        abi_cache = getattr(adapter, "_abi_cache", None)
+        if isinstance(abi_cache, dict):
+            cached_abi = abi_cache.get((int(pid), bool(probe_version)))
+            if cached_abi is not None:
+                return TargetABI.from_dict(cached_abi.to_dict())
     abi = TargetABI()
     reader = getattr(adapter, "read_target_file", None)
     if callable(reader):  # kernel release of the target host (local or remote); anything not a release string is dropped
@@ -407,6 +419,15 @@ def detect_target_abi(
             pass
     abi.libc_version = version if abi.libc == LIBC_GLIBC else None
     abi.status = DETECTION_DETECTED
+    if can_cache:
+        try:
+            abi_cache = getattr(adapter, "_abi_cache", None)
+            if not isinstance(abi_cache, dict):
+                abi_cache = {}
+                setattr(adapter, "_abi_cache", abi_cache)
+            abi_cache[(int(pid), bool(probe_version))] = TargetABI.from_dict(abi.to_dict())
+        except Exception:  # noqa: BLE001
+            pass
     return abi
 
 

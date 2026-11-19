@@ -106,7 +106,12 @@ def _imp011_prepare_unwinder(
             (main_mod or {}).get("debug_image"),
         )
 
+    prefetched_pages: Dict[Tuple[int, int], Tuple[Optional[bytes], str, Optional[str]]] = {}
+
     def _read(addr: int, size: int) -> Tuple[Optional[bytes], str, Optional[str]]:
+        hit = prefetched_pages.pop((int(addr), int(size)), None)
+        if hit is not None:
+            return hit
         return target_adapter.read_memory(pid, addr, size)
 
     try:
@@ -114,6 +119,11 @@ def _imp011_prepare_unwinder(
             target_abi.architecture, map_data.get("mappings") or [], _read, endian=endian, pid=pid,
             image_provider=provider,
         )
+        if uw is not None:
+            uw._prefetched_pages = prefetched_pages
+            plt_cache_by_pid = getattr(target_adapter, "_cfi_plt_cache", None)
+            if isinstance(plt_cache_by_pid, dict) and int(pid) in plt_cache_by_pid:
+                uw._plt_cache.update(plt_cache_by_pid[int(pid)])
         if uw is not None and provider is not None:
             uw.remote_image_provider = provider
     except Exception as exc:  # noqa: BLE001
@@ -283,7 +293,7 @@ def inspect_thread_callstacks_and_locks(
     load_bias = map_data.get("base_address_int", 0)
     primary_idx = DwarfIndexer.get_index(primary_elf)
     # IMP-015: target ABI from the target itself (never the host); gates every layout assumption below.
-    target_abi = detect_target_abi(target_adapter, pid)
+    target_abi = detect_target_abi(target_adapter, pid, maps=map_data.get("mappings"))
     owner_support = check_support(target_abi, FEATURE_MUTEX_OWNER)
     syscall_support = check_support(target_abi, FEATURE_SYSCALL_NAMES)
     frame_support = check_support(target_abi, FEATURE_FRAME_LAYOUT)
@@ -437,6 +447,49 @@ def inspect_thread_callstacks_and_locks(
     if not all_threads:
         limitations.append(f"Process thread list (/proc/{pid}/task) could not be read.")
 
+    # Batch-prefetch candidate lock bytes and initial blocked-thread stack pages in ONE remote round-trip
+    prefetched_locks: Dict[Tuple[int, int], Tuple[Optional[bytes], str, Optional[str]]] = {}
+    can_batch = (
+        hasattr(target_adapter, "read_memory_batch")
+        and "read_memory" not in getattr(target_adapter, "__dict__", {})
+    )
+    if can_batch:
+        batch_reqs: List[Tuple[int, int]] = []
+        seen_reqs: Set[Tuple[int, int]] = set()
+        if owner_support.supported:
+            for l_name, l_addr, l_size, l_toff, l_idx in candidate_locks:
+                if glibc_mutex_layout(l_idx, l_toff):
+                    rk = (int(l_addr), int(l_size))
+                    if rk not in seen_reqs:
+                        seen_reqs.add(rk)
+                        batch_reqs.append(rk)
+        uw_pages = getattr(unwinder, "_prefetched_pages", None) if unwinder is not None else None
+        if uw_pages is not None and target_adapter.is_remote():
+            for t in target_threads:
+                sc_t = dict(t.get("syscall") or {})
+                if sc_t.get("sp") and sc_t.get("pc"):
+                    sp_v = int(sc_t["sp"])
+                    lo_v, hi_v = unwinder.stack_bounds(sp_v)
+                    base_p = sp_v & ~4095
+                    for pg in (base_p, base_p + 4096):
+                        st_a = max(pg, lo_v)
+                        en_a = min(pg + 4096, hi_v)
+                        if en_a > st_a:
+                            rk = (int(st_a), int(en_a - st_a))
+                            if rk not in seen_reqs:
+                                seen_reqs.add(rk)
+                                batch_reqs.append(rk)
+        if len(batch_reqs) > 1:
+            try:
+                batch_res = target_adapter.read_memory_batch(pid, batch_reqs)
+                if len(batch_res) == len(batch_reqs):
+                    for rk, rv in zip(batch_reqs, batch_res):
+                        prefetched_locks[rk] = rv
+                        if uw_pages is not None:
+                            uw_pages[rk] = rv
+            except Exception:
+                pass
+
     not_interpreted: List[str] = []
     for l_name, l_addr, l_size, l_toff, l_idx in candidate_locks:
         layout = glibc_mutex_layout(l_idx, l_toff)
@@ -485,7 +538,11 @@ def inspect_thread_callstacks_and_locks(
             locks_by_addr[l_addr] = l_info
             continue
         try:
-            raw_lock, lst, l_err = target_adapter.read_memory(pid, l_addr, l_size)
+            hit_lock = prefetched_locks.get((int(l_addr), int(l_size)))
+            if hit_lock is not None:
+                raw_lock, lst, l_err = hit_lock
+            else:
+                raw_lock, lst, l_err = target_adapter.read_memory(pid, l_addr, l_size)
         except Exception as l_exc:
             raw_lock, lst, l_err = None, "READ_ERROR", f"{type(l_exc).__name__}: {l_exc}"
         if lst != "OBSERVED" or not raw_lock or len(raw_lock) < 12:
@@ -834,9 +891,35 @@ def inspect_thread_callstacks_and_locks(
             or (target_threads and len(stack_read_errors) >= len(target_threads))
         )
     )
+    if unwinder is not None and getattr(unwinder, "_plt_cache", None):
+        try:
+            plt_cache_by_pid = getattr(target_adapter, "_cfi_plt_cache", None)
+            if not isinstance(plt_cache_by_pid, dict):
+                plt_cache_by_pid = {}
+                setattr(target_adapter, "_cfi_plt_cache", plt_cache_by_pid)
+            plt_cache_by_pid.setdefault(int(pid), {}).update(unwinder._plt_cache)
+        except Exception:
+            pass
+    sampler_syscalls: Dict[int, Optional[Dict[str, Any]]] = {}
+    for t in all_threads:
+        if t.get("tid") is None:
+            continue
+        sc_raw = t.get("syscall") or {}
+        if sc_raw.get("state") == "running":
+            sampler_syscalls[int(t["tid"])] = {"running": True}
+        elif sc_raw.get("state") == "blocked" and sc_raw.get("nr") is not None:
+            sampler_syscalls[int(t["tid"])] = {
+                "running": False,
+                "nr": int(sc_raw["nr"]),
+                "args": [int(x) for x in (sc_raw.get("args") or [])],
+            }
+        else:
+            sampler_syscalls[int(t["tid"])] = None
     cs_status = "ANOMALIES_DETECTED" if (deadlock_cycles or wait_for_edges) else ("INCONCLUSIVE" if is_inconclusive else "OBSERVED")
     latency_us = round((time.monotonic_ns() - t_start_ns) / 1000.0, 2)
     return {
+        "_map_data": map_data,
+        "_sampler_syscalls": sampler_syscalls,
         "pid": pid,
         "target_host": target_adapter.target_host(),
         "is_remote": target_adapter.is_remote(),

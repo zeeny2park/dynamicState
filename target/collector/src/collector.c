@@ -1890,9 +1890,36 @@ int collector_report_ident(pid_t pid, int with_header, void *out_file) {
     return 0;
 }
 
+static char *slurp_dynamic_file(const char *path, size_t *out_len, int *out_trunc) {
+    if (out_len) *out_len = 0;
+    if (out_trunc) *out_trunc = 0;
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) return NULL;
+    size_t cap = 65536, n = 0;
+    char *buf = (char *)malloc(cap);
+    if (!buf) { close(fd); errno = ENOMEM; return NULL; }
+    int truncated = 0;
+    for (;;) {
+        if (n + 4096 > cap) {
+            if (cap >= PROCFILE_MAX) { truncated = 1; break; }
+            char *nb = (char *)realloc(buf, cap * 2);
+            if (!nb) { truncated = 1; break; }
+            buf = nb; cap *= 2;
+        }
+        ssize_t r = read(fd, buf + n, cap - n);
+        if (r < 0 && errno == EINTR) continue;
+        if (r <= 0) break;
+        n += (size_t)r;
+    }
+    close(fd);
+    if (out_len) *out_len = n;
+    if (out_trunc) *out_trunc = truncated;
+    return buf;
+}
+
 int collector_report_procfile(pid_t pid, const char *name, void *out_file) {
     FILE *out = out_file ? (FILE *)out_file : stdout;
-    static const char *const allowed[] = {"maps", "status", "stat", "limits", "comm", NULL};
+    static const char *const allowed[] = {"maps", "status", "stat", "limits", "comm", "osrelease", "threads-max", NULL};
     int ok = 0;
     for (int i = 0; allowed[i]; i++) if (strcmp(allowed[i], name) == 0) ok = 1;
     if (!ok) {
@@ -1901,7 +1928,13 @@ int collector_report_procfile(pid_t pid, const char *name, void *out_file) {
         return -1;
     }
     char path[96];
-    snprintf(path, sizeof(path), "/proc/%ld/%s", (long)pid, name);
+    if (strcmp(name, "osrelease") == 0) {
+        snprintf(path, sizeof(path), "/proc/sys/kernel/osrelease");
+    } else if (strcmp(name, "threads-max") == 0) {
+        snprintf(path, sizeof(path), "/proc/sys/kernel/threads-max");
+    } else {
+        snprintf(path, sizeof(path), "/proc/%ld/%s", (long)pid, name);
+    }
     int fd = open(path, O_RDONLY);
     if (fd < 0) {
         fprintf(out, "{\"success\":false,\"error\":\"%s\"}\n", errno == ENOENT || errno == ESRCH ? "TARGET_TERMINATED" : "UNREADABLE");
@@ -1930,6 +1963,168 @@ int collector_report_procfile(pid_t pid, const char *name, void *out_file) {
     fputs("\"}\n", out);
     fflush(out);
     free(buf);
+    return 0;
+}
+
+int collector_report_fds(pid_t pid, void *out_file) {
+    FILE *out = out_file ? (FILE *)out_file : stdout;
+    char dpath[64];
+    snprintf(dpath, sizeof(dpath), "/proc/%ld/fd", (long)pid);
+    DIR *d = opendir(dpath);
+    if (!d) {
+        fprintf(out, "{\"success\":false,\"error\":\"%s\"}\n",
+                (errno == ENOENT || errno == ESRCH) ? "TARGET_TERMINATED" : "UNREADABLE");
+        fflush(out);
+        return -1;
+    }
+    fprintf(out, "{\"success\":true,\"pid\":%ld,\"targets\":[", (long)pid);
+    struct dirent *de;
+    int total = 0, emitted = 0;
+    char lpath[320], link[1024];
+    while ((de = readdir(d)) != NULL) {
+        if (de->d_name[0] < '0' || de->d_name[0] > '9') continue;
+        total++;
+        if (emitted < 2048) {
+            snprintf(lpath, sizeof(lpath), "/proc/%ld/fd/%s", (long)pid, de->d_name);
+            ssize_t ln = readlink(lpath, link, sizeof(link) - 1);
+            if (ln < 0) ln = 0;
+            link[ln] = '\0';
+            if (emitted > 0) fputc(',', out);
+            fputc('"', out);
+            put_json_escaped(out, link, (size_t)ln);
+            fputc('"', out);
+            emitted++;
+        }
+    }
+    closedir(d);
+    fprintf(out, "],\"count\":%d}\n", total);
+    fflush(out);
+    return 0;
+}
+
+int collector_report_snapshot(pid_t pid, void *out_file) {
+    FILE *out = out_file ? (FILE *)out_file : stdout;
+    char path[96], raw[4096], link[4096];
+    snprintf(path, sizeof(path), "/proc/%ld/stat", (long)pid);
+    if (slurp_small(path, raw, sizeof(raw)) == 0) {
+        fprintf(out, "{\"success\":false,\"error\":\"TARGET_TERMINATED\"}\n");
+        fflush(out);
+        return -1;
+    }
+    fprintf(out, "{\"success\":true,\"pid\":%ld,\"stat\":\"", (long)pid);
+    put_json_escaped(out, raw, strlen(raw));
+    fputc('"', out);
+
+    snprintf(path, sizeof(path), "/proc/%ld/exe", (long)pid);
+    ssize_t ln = readlink(path, link, sizeof(link) - 1);
+    if (ln < 0) ln = 0;
+    link[ln] = '\0';
+    fputs(",\"exe\":\"", out);
+    put_json_escaped(out, link, (size_t)ln);
+    fputc('"', out);
+    struct stat st;
+    if (stat(path, &st) == 0) {
+        fprintf(out, ",\"exe_fp\":\"%llu:%llu:%lld\"", (unsigned long long)st.st_ino,
+                (unsigned long long)st.st_size, (long long)st.st_mtime);
+    }
+    if (slurp_small("/proc/sys/kernel/random/boot_id", raw, sizeof(raw)) > 0) {
+        size_t n = strlen(raw);
+        while (n > 0 && (raw[n - 1] == '\n' || raw[n - 1] == '\r')) raw[--n] = '\0';
+        fputs(",\"boot_id\":\"", out);
+        put_json_escaped(out, raw, n);
+        fputc('"', out);
+    }
+    struct utsname un;
+    if (uname(&un) == 0) {
+        fputs(",\"machine\":\"", out);
+        put_json_escaped(out, un.machine, strlen(un.machine));
+        fputc('"', out);
+    }
+    if (slurp_small("/proc/sys/kernel/osrelease", raw, sizeof(raw)) > 0) {
+        size_t n = strlen(raw);
+        while (n > 0 && (raw[n - 1] == '\n' || raw[n - 1] == '\r')) raw[--n] = '\0';
+        fputs(",\"osrelease\":\"", out);
+        put_json_escaped(out, raw, n);
+        fputc('"', out);
+    }
+    if (slurp_small("/proc/sys/kernel/threads-max", raw, sizeof(raw)) > 0) {
+        size_t n = strlen(raw);
+        while (n > 0 && (raw[n - 1] == '\n' || raw[n - 1] == '\r')) raw[--n] = '\0';
+        fputs(",\"threads_max\":\"", out);
+        put_json_escaped(out, raw, n);
+        fputc('"', out);
+    }
+    static const char *const pfiles[] = {"comm", "status", "limits", "maps", NULL};
+    for (int i = 0; pfiles[i]; i++) {
+        snprintf(path, sizeof(path), "/proc/%ld/%s", (long)pid, pfiles[i]);
+        size_t plen = 0;
+        int ptrunc = 0;
+        char *pbuf = slurp_dynamic_file(path, &plen, &ptrunc);
+        if (pbuf) {
+            fprintf(out, ",\"%s\":\"", pfiles[i]);
+            put_json_escaped(out, pbuf, plen);
+            fputc('"', out);
+            free(pbuf);
+        }
+    }
+    /* Threads (first page) */
+    snprintf(path, sizeof(path), "/proc/%d/task", (int)pid);
+    DIR *td = opendir(path);
+    if (td) {
+        int *tids = (int *)malloc(sizeof(int) * THREADS_MAX_ENUM);
+        if (tids) {
+            int ntids = 0, truncated = 0;
+            struct dirent *de;
+            while ((de = readdir(td)) != NULL) {
+                char *endp = NULL;
+                long v = strtol(de->d_name, &endp, 10);
+                if (endp == de->d_name || *endp != '\0' || v <= 0 || v > 2147483647L) continue;
+                if (ntids >= THREADS_MAX_ENUM) { truncated = 1; break; }
+                tids[ntids++] = (int)v;
+            }
+            qsort(tids, (size_t)ntids, sizeof(int), cmp_int);
+            fputs(",\"threads\":[", out);
+            int emitted = 0, more = 0;
+            long last_tid = 0;
+            for (int i = 0; i < ntids; i++) {
+                if (emitted >= THREADS_PAGE_SIZE) { more = 1; break; }
+                last_tid = tids[i];
+                if (emit_thread(out, pid, tids[i], emitted == 0) == 0) emitted++;
+            }
+            free(tids);
+            fprintf(out, "],\"threads_count\":%d,\"threads_more\":%s,\"threads_next_after_tid\":%ld,\"threads_truncated\":%s",
+                    emitted, more ? "true" : "false", more ? last_tid : 0L, truncated ? "true" : "false");
+        }
+        closedir(td);
+    }
+    /* FDs */
+    snprintf(path, sizeof(path), "/proc/%ld/fd", (long)pid);
+    DIR *fd_dir = opendir(path);
+    if (fd_dir) {
+        fputs(",\"fd_targets\":[", out);
+        struct dirent *de;
+        int total_fds = 0, emitted_fds = 0;
+        char lpath[320];
+        while ((de = readdir(fd_dir)) != NULL) {
+            if (de->d_name[0] < '0' || de->d_name[0] > '9') continue;
+            total_fds++;
+            if (emitted_fds < 2048) {
+                snprintf(lpath, sizeof(lpath), "/proc/%ld/fd/%s", (long)pid, de->d_name);
+                ssize_t fln = readlink(lpath, link, sizeof(link) - 1);
+                if (fln < 0) fln = 0;
+                link[fln] = '\0';
+                if (emitted_fds > 0) fputc(',', out);
+                fputc('"', out);
+                put_json_escaped(out, link, (size_t)fln);
+                fputc('"', out);
+                emitted_fds++;
+            }
+        }
+        closedir(fd_dir);
+        fprintf(out, "],\"fd_count\":%d", total_fds);
+    }
+    fputs("}\n", out);
+    fflush(out);
     return 0;
 }
 
@@ -2071,6 +2266,66 @@ int collector_daemon_loop(int backend, void *in_file, void *out_file) {
                 continue;
             }
             collector_read_threads((pid_t)p_val, after_tid, out);
+            continue;
+        }
+        if (strncmp(p, "FDS ", 4) == 0) {
+            char *rest = p + 4;
+            while (*rest == ' ') rest++;
+            char *endp = NULL;
+            errno = 0;
+            long p_val = strtol(rest, &endp, 10);
+            if (errno != 0 || endp == rest || *endp != '\0' || p_val <= 0 || p_val > 4194304L) {
+                fprintf(out, "{\"success\":false,\"error\":\"INVALID_PID\"}\n");
+                fflush(out);
+                continue;
+            }
+            collector_report_fds((pid_t)p_val, out);
+            continue;
+        }
+        if (strncmp(p, "SNAPSHOT ", 9) == 0) {
+            char *rest = p + 9;
+            while (*rest == ' ') rest++;
+            char *endp = NULL;
+            errno = 0;
+            long p_val = strtol(rest, &endp, 10);
+            if (errno != 0 || endp == rest || *endp != '\0' || p_val <= 0 || p_val > 4194304L) {
+                fprintf(out, "{\"success\":false,\"error\":\"INVALID_PID\"}\n");
+                fflush(out);
+                continue;
+            }
+            collector_report_snapshot((pid_t)p_val, out);
+            continue;
+        }
+        if (strncmp(p, "TIDALIVE ", 9) == 0) {
+            char *rest = p + 9;
+            while (*rest == ' ') rest++;
+            char *endp = NULL;
+            errno = 0;
+            long t_val = strtol(rest, &endp, 10);
+            if (errno != 0 || endp == rest || *endp != '\0' || t_val <= 0 || t_val > 4194304L) {
+                fprintf(out, "{\"success\":false,\"error\":\"INVALID_ARGS\"}\n");
+                fflush(out);
+                continue;
+            }
+            char tpath[64];
+            struct stat tst;
+            snprintf(tpath, sizeof(tpath), "/proc/%ld", t_val);
+            int alive = (stat(tpath, &tst) == 0 && S_ISDIR(tst.st_mode));
+            fprintf(out, "{\"success\":true,\"tid\":%ld,\"alive\":%s}\n", t_val, alive ? "true" : "false");
+            fflush(out);
+            continue;
+        }
+        if (strncmp(p, "STATFILE ", 9) == 0) {
+            char *fpath = p + 9;
+            while (*fpath == ' ') fpath++;
+            struct stat fst;
+            if (*fpath && stat(fpath, &fst) == 0 && S_ISREG(fst.st_mode)) {
+                fprintf(out, "{\"success\":true,\"size\":%llu,\"mtime\":%lld}\n",
+                        (unsigned long long)fst.st_size, (long long)fst.st_mtime);
+            } else {
+                fprintf(out, "{\"success\":false,\"error\":\"NOT_FOUND\"}\n");
+            }
+            fflush(out);
             continue;
         }
         fprintf(out, "{\"success\":false,\"error\":\"UNKNOWN_COMMAND\"}\n");

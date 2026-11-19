@@ -64,6 +64,8 @@
       report_h: "보고서", report_desc: "이 화면과 같은 내용 + 부분별 상세 기록",
       open_html: "HTML 보고서 열기", md: "Markdown", json: "JSON (<span class=\"mono\">diagnose</span> 결과)",
       copy: "요약 복사", copied: "요약을 복사했습니다.", again: "같은 대상 다시 진단",
+      continue_live: "이어서 진단 (미실행 검사 포함)", continue_collected: "수집된 데이터로 계속 진단",
+      resume_id_label: "이전 조사 ID (이어서 진단)", resume_id_ph: "예: inv_xxxxxxxxxxxx",
       impact: "수집이 대상에 준 영향: 정지 {stop} · 읽기 {bytes} · {time} · 쓰기 없음", method_detail: "수집 방법 상세 기록",
       no_report: "보고서 파일이 없습니다.",
       err_TARGET_NOT_FOUND: "프로세스를 찾을 수 없습니다: {target}. PID나 프로세스 이름을 확인하세요.",
@@ -139,6 +141,8 @@
       report_h: "Report", report_desc: "The same content as this page, plus detailed records per part",
       open_html: "Open HTML report", md: "Markdown", json: "JSON (<span class=\"mono\">diagnose</span> result)",
       copy: "Copy summary", copied: "Summary copied.", again: "Diagnose the same target again",
+      continue_live: "Continue diagnosis (remaining checks)", continue_collected: "Diagnose collected data only",
+      resume_id_label: "Resume investigation ID", resume_id_ph: "e.g. inv_xxxxxxxxxxxx",
       impact: "Impact of the collection on the target: stopped {stop} · read {bytes} · {time} · no writes",
       method_detail: "Detailed records of the method", no_report: "No report file.",
       err_TARGET_NOT_FOUND: "No such process: {target}. Check the PID or the process name.",
@@ -768,6 +772,8 @@
       (jsHref ? '<a class="btn btn-outline" href="' + esc(jsHref) + '" target="_blank" rel="noopener" style="text-decoration:none">' + tr(lang, "json") + "</a>"
         : js ? '<button type="button" class="btn btn-outline" data-act="json">' + tr(lang, "json") + "</button>" : "") +
       '<button type="button" class="btn btn-outline" data-act="copy">' + esc(tr(lang, "copy")) + "</button>" +
+      (s.request && (v.result || {}).investigation_id && !ui.replay ? '<button type="button" class="btn btn-outline" data-act="continue-live" data-inv="' + esc((v.result || {}).investigation_id) + '">' + esc(tr(lang, "continue_live")) + "</button>" +
+        '<button type="button" class="btn btn-outline" data-act="continue-collected" data-inv="' + esc((v.result || {}).investigation_id) + '">' + esc(tr(lang, "continue_collected")) + "</button>" : "") +
       (s.request ? '<button type="button" class="btn btn-ghost" data-act="again">' + esc(tr(lang, "again")) + "</button>" : "") +
       '</div><div class="card-content" style="padding-top:0"><p class="impact">' +
       esc(tr(lang, "impact", { stop: T && T.stop ? T.stop.value : "—", bytes: T && T.bytes ? T.bytes.value : "—", time: T && T.duration ? T.duration.value : "—" })) +
@@ -853,7 +859,9 @@
       inp("debug_image", "mono elf", tr(lang, "elf_ph"), tr(lang, "elf_label")) + "</div>" +
       '<div class="opt"><span>' + esc(tr(lang, "opt_line")) + "</span>" +
       '<details id="adv"><summary>' + esc(tr(lang, "advanced")) + '</summary><label class="adv">' + esc(tr(lang, "budget_label")) +
-      ' <input class="input mono" name="time_limit_s" type="number" min="1" max="120" step="1" placeholder="20" value="' + esc(f.time_limit_s || "") + '"></label></details></div>' +
+      ' <input class="input mono" name="time_limit_s" type="number" min="1" max="120" step="1" placeholder="20" value="' + esc(f.time_limit_s || "") + '"></label>' +
+      '<label class="adv" style="margin-left:12px">' + esc(tr(lang, "resume_id_label")) +
+      ' <input class="input mono" name="resume_investigation_id" type="text" placeholder="' + esc(tr(lang, "resume_id_ph")) + '" value="' + esc(f.resume_investigation_id || "") + '"></label></details></div>' +
       (ui.formError ? '<div class="alert alert-tone tone-fail" role="alert">' + esc(ui.formError) + "</div>" : "") +
       "</form></div>" + '<div class="recent" id="recent">' + recent + "</div>";
   }
@@ -1090,13 +1098,15 @@
   function start(req) {
     ui.formError = ""; ui.starting = true; draw();
     var body = { language: ui.lang, symptom: req.symptom || undefined, debug_image: req.debug_image || undefined,
-      time_limit_s: req.time_limit_s ? Number(req.time_limit_s) : undefined };
+      time_limit_s: req.time_limit_s ? Number(req.time_limit_s) : undefined,
+      resume_investigation_id: req.resume_investigation_id || undefined,
+      continue_collected_only: req.continue_collected_only ? true : undefined };
     if (req.mode === "ssh") {
       body.remote_host = req.remote_host; body.ssh_user = req.ssh_user || undefined;
       body.ssh_port = req.ssh_port ? Number(req.ssh_port) : undefined; body.ssh_key = req.ssh_key || undefined;
     }
     var fail = function (code, message) { ui.starting = false; ui.formError = errorText({ code: code, message: message }, ui.lang, req); draw(); };
-    resolvePid(req).then(function (pid) {
+    (req.continue_collected_only && /^\d+$/.test(String(req.target || "")) ? Promise.resolve(Number(req.target)) : resolvePid(req)).then(function (pid) {
       body.pid = pid;
       return getJSON("api/diagnose/start", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
     }).then(function (b) {
@@ -1255,6 +1265,17 @@
         if (ui.replay) { history.replaceState(null, "", "?replay=" + encodeURIComponent(ui.replay)); route(); }
         else if (request) { var rq = request; reset(); history.pushState(null, "", location.pathname); start(rq); }
         break;
+      case "continue-live":
+      case "continue-collected": {
+        s = state();
+        var inv = el.getAttribute("data-inv");
+        var rq2 = Object.assign({}, request || {});
+        if (!rq2.target && s.target && s.target.pid != null) rq2.target = String(s.target.pid);
+        rq2.resume_investigation_id = inv;
+        rq2.continue_collected_only = (act === "continue-collected");
+        reset(); history.pushState(null, "", location.pathname); start(rq2);
+        break;
+      }
       case "md": s = state(); download(((s.target || {}).process_name || "diagnosis") + "." + ui.lang + ".md", L(s.verdict.human_summary, ui.lang), "text/markdown"); break;
       case "json": s = state(); download(((s.target || {}).process_name || "diagnosis") + ".json", JSON.stringify(s.verdict.result, null, 2), "application/json"); break;
       case "copy": {

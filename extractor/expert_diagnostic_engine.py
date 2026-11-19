@@ -17,6 +17,7 @@ from .dataclass_dict import asdict  # same result as dataclasses.asdict, much fa
 from datetime import datetime, timezone
 from enum import Enum
 import hashlib
+import contextlib
 import json
 import os
 import re
@@ -1571,6 +1572,7 @@ class AdaptiveInvestigationSession:
                 self._save_to_disk()
 
         if self.state not in TERMINAL_STATES and steps_executed >= limit():
+            self._synthesize_collected_evidence_before_stop()
             self.state = STATE_INCONCLUSIVE
             self._finalize_conclusion(
                 stop_reason="STEP_BUDGET_REACHED",
@@ -2041,6 +2043,122 @@ class AdaptiveInvestigationSession:
         except Exception as le:
             return f"FAILED: {type(le).__name__}: {le}"
 
+    def _synthesize_collected_evidence_before_stop(self) -> None:
+        """Synthesizes hypotheses (_step_analyze) and runs in-memory verification (_step_verify) over all evidence
+        already collected so far, without touching the target.  Guarantees that collected data is always diagnosed
+        even when the session stops early due to budget or step limits."""
+        if not self.collected_evidence:
+            return
+        saved_state = self.state
+        try:
+            if not self.active_hypotheses:
+                self._step_analyze()
+            if any(isinstance(e, dict) and e.get("status") == "SUPPORTED" for e in self.collected_evidence):
+                for hyp in list(self.active_hypotheses):
+                    if not hyp.verification_execution_results:
+                        self._execute_verification_for_hypothesis(hyp)
+                self._bind_competing_candidates()
+        except Exception as exc:  # noqa: BLE001
+            self._record_timeline_event("ANALYZE_AFTER_BUDGET_FAILED", {"error": f"{type(exc).__name__}: {exc}"})
+        finally:
+            self.state = saved_state
+
+    def evaluate_precollected_steps(self) -> int:
+        """Evaluates all pending or time-budget-skipped plan steps whose required observations were ALREADY
+        collected/co-sampled in memory, performing zero new target I/O."""
+        if not self.plan:
+            return 0
+        already_exec = {c.recipe_id for c in self.checks if c.status not in (CheckStatus.NOT_EXECUTED, CheckStatus.SKIPPED)}
+        evaluated = 0
+        saved_bt = self.budget_tracker
+        saved_dcb = self.default_check_budget
+        try:
+            # Temporarily detach budget_tracker and default_check_budget so in-memory evaluation of already-collected data is never blocked
+            self.budget_tracker = None
+            self.evidence_provider.budget_tracker = None
+            self.default_check_budget = DefaultCheckBudget.resolve(total_s=0, per_check_s=0)
+            for idx, step in enumerate(list(self.plan.steps)):
+                if step.recipe_id in already_exec:
+                    continue
+                recipe = self.recipe_registry.get_recipe(step.recipe_id)
+                if not recipe:
+                    continue
+                if not self.evidence_provider.has_precollected_data(recipe, self.pid, self.companion_elf):
+                    continue
+                step.status = "PENDING"
+                step.not_run_reason = None
+                self.plan.current_step_index = idx
+                self.state = STATE_COLLECTING
+                self._step_collect_next()
+                already_exec.add(step.recipe_id)
+                evaluated += 1
+        finally:
+            self.budget_tracker = saved_bt
+            self.evidence_provider.budget_tracker = saved_bt
+            self.default_check_budget = saved_dcb
+        return evaluated
+
+    def continue_investigation(
+        self,
+        *,
+        collected_only: bool = False,
+        additional_wall_clock_s: float = 120.0,
+        additional_bytes: int = 64 * 1024 * 1024,
+        additional_samples: int = 200,
+        disable_default_check_budget: bool = True,
+        max_steps: Optional[int] = None,
+    ) -> DiagnosticConclusion:
+        """Continues diagnosing a session that previously stopped due to budget exhaustion, step limits,
+        default-check time budget, or user pause, reusing 100% of already-collected observations.
+
+        * ``collected_only=True``: diagnoses all remaining recipes that have pre-collected/co-sampled data
+          purely from memory/disk without performing any new target reads, then runs analyze -> verify -> narrow.
+        * ``collected_only=False``: expands observation budgets, re-opens any steps skipped by time_budget,
+          evaluates pre-collected steps first, and runs remaining steps against the target to completion.
+        """
+        self.is_paused = False
+        self.conclusion = None
+        if disable_default_check_budget:
+            self.default_check_budget = DefaultCheckBudget.resolve(total_s=0, per_check_s=0)
+        if self.plan:
+            already_exec = {c.recipe_id for c in self.checks if c.status not in (CheckStatus.NOT_EXECUTED, CheckStatus.SKIPPED)}
+            self.checks = [c for c in self.checks if c.status not in (CheckStatus.NOT_EXECUTED, CheckStatus.SKIPPED)]
+            for s in self.plan.steps:
+                if s.recipe_id not in already_exec and (s.status in ("SKIPPED", "NOT_EXECUTED", "RUNNING") or s.not_run_reason):
+                    s.status = "PENDING"
+                    s.not_run_reason = None
+            first_pending = next((i for i, s in enumerate(self.plan.steps) if s.status == "PENDING" and s.recipe_id not in already_exec), len(self.plan.steps))
+            self.plan.current_step_index = first_pending
+
+        # 1. Always evaluate any pending steps whose observations are already pre-collected in memory
+        self.evaluate_precollected_steps()
+
+        if collected_only:
+            self._step_analyze()
+            self._step_verify()
+            self._step_narrow()
+            self._save_to_disk()
+            return self.conclusion
+
+        # 2. Expand budget tracker limits for live continuation
+        if self.budget_tracker is not None:
+            lim = self.budget_tracker.limits
+            lim.max_wall_clock_ms = max(float(lim.max_wall_clock_ms), float(getattr(self.budget_tracker.metrics, "wall_clock_elapsed_ms", 0.0) or 0.0) + float(additional_wall_clock_s) * 1000.0)
+            lim.max_bytes_read = max(int(lim.max_bytes_read), int(self.budget_tracker.metrics.bytes_read) + int(additional_bytes))
+            lim.max_samples = max(int(lim.max_samples), int(self.budget_tracker.metrics.samples_collected) + int(additional_samples))
+            self.budget_tracker.metrics.is_budget_exhausted = False
+            self.budget_tracker.metrics.exhaustion_reason = None
+
+        if self.plan:
+            already_exec = {c.recipe_id for c in self.checks if c.status not in (CheckStatus.NOT_EXECUTED, CheckStatus.SKIPPED)}
+            first_pending = next((i for i, s in enumerate(self.plan.steps) if s.status == "PENDING" and s.recipe_id not in already_exec), len(self.plan.steps))
+            self.plan.current_step_index = first_pending
+            self.state = STATE_COLLECTING if first_pending < len(self.plan.steps) else STATE_ANALYZING
+        else:
+            self.state = STATE_CLASSIFYING
+
+        return self.run_to_completion(max_steps=max_steps)
+
     def _halt_on_budget(self) -> str:
         """End the collection because the observation budget ran out.
 
@@ -2050,6 +2168,10 @@ class AdaptiveInvestigationSession:
         contention, a spinning thread) was dropped whenever a loaded host made the run slower than the budget, and
         the verdict said "no problem finding was produced".  The findings stay probable (the verify / narrow steps
         that could confirm them did not run) and the run is still never HEALTHY: budget_exhausted blocks it."""
+        try:
+            self.evaluate_precollected_steps()
+        except Exception:  # noqa: BLE001
+            pass
         self.state = STATE_BUDGET_EXHAUSTED
         reason = self.budget_tracker.exhaustion_reason or "Observation resource budget exhausted."
         if any(isinstance(e, dict) and e.get("status") == "SUPPORTED" for e in self.collected_evidence):
@@ -2130,8 +2252,10 @@ class AdaptiveInvestigationSession:
         )
         diagnostic_check.start()
 
+        is_precollected = self.evidence_provider.has_precollected_data(recipe, self.pid, self.companion_elf)
+
         # Record real temporal memory sample for session persistence (Section 4)
-        if self.pid and self.pid > 0:
+        if not is_precollected and self.pid and self.pid > 0:
             try:
                 p_st = self.adapter.get_process_status(self.pid)
                 sample_rss = int(p_st.get("VmRSS", 0)) if "VmRSS" in p_st else None
@@ -2150,32 +2274,74 @@ class AdaptiveInvestigationSession:
             except Exception:
                 pass
 
-        # Open transaction on self.adapter for live process if supported
-        step_tx = None
-        if self.pid and self.pid > 0 and hasattr(self.adapter, "begin_capture_transaction"):
-            # A failed mandatory transaction must stop collection. Continuing here would turn
-            # a lifecycle persistence failure into an apparently successful unscoped diagnosis.
-            step_tx = self.adapter.begin_capture_transaction(
-                session_id=self.ledger.session_id,
-                pid=int(self.pid),
-                operation_type="diagnostic",
-                snapshot_binding=f"snap_{self.investigation_id}_{step.step_id}",
-                require_lifecycle_persistence=True,
+        # Compute bounded per-recipe deadline so a single slow/hung remote collection cannot exhaust the entire budget
+        _step_deadline_ctx = contextlib.nullcontext()
+        if not is_precollected and hasattr(self.adapter, "collection_deadline"):
+            rem_ms = None
+            if self.budget_tracker is not None:
+                rem_ms = max(0.0, float(self.budget_tracker.limits.max_wall_clock_ms) - float(self.budget_tracker.elapsed_ms))
+            pending_cnt = sum(1 for _s in (self.plan.steps[self.plan.current_step_index:] if self.plan else []) if _s.status == "PENDING")
+            if rem_ms is not None and rem_ms > 0:
+                rem_s = rem_ms / 1000.0
+                per_step_s = max(1.5, min(15.0, rem_s / max(1, min(pending_cnt, 3)))) if rem_s < 4.0 else max(4.0, min(15.0, rem_s / max(1, min(pending_cnt, 3))))
+            else:
+                per_step_s = 12.0
+            _step_deadline_ctx = self.adapter.collection_deadline(per_step_s)
+
+        def _fail_step_and_continue(err: BaseException, stage_label: str) -> Dict[str, Any]:
+            err_msg = f"{stage_label}: {type(err).__name__}: {err}"
+            step.status = "FAILED"
+            step.result = {"status": "ERROR", "error": err_msg}
+            diagnostic_check.complete(
+                status=CheckStatus.ERROR,
+                actual_observations={"error": err_msg},
+                technical_interpretation=err_msg,
+                limitations=[err_msg],
+                error_details=err_msg,
             )
+            self.checks.append(diagnostic_check)
+            if self.methodology:
+                self.methodology.add_check(diagnostic_check)
+            self._record_timeline_event("STEP_FAILED", {
+                "step_id": step.step_id,
+                "recipe_id": step.recipe_id,
+                "error": err_msg,
+            })
+            self.plan.current_step_index += 1
+            if self.plan.current_step_index >= len(self.plan.steps):
+                self.state = STATE_ANALYZING
+            return {"action": "COLLECT_STEP_FAILED", "step_id": step.step_id, "recipe_id": step.recipe_id, "error": err_msg}
+
+        # Open transaction on self.adapter for live process if supported (skip when evaluating already-collected in-memory data)
+        step_tx = None
+        if not is_precollected and self.pid and self.pid > 0 and hasattr(self.adapter, "begin_capture_transaction"):
+            try:
+                step_tx = self.adapter.begin_capture_transaction(
+                    session_id=self.ledger.session_id,
+                    pid=int(self.pid),
+                    operation_type="diagnostic",
+                    snapshot_binding=f"snap_{self.investigation_id}_{step.step_id}",
+                    require_lifecycle_persistence=True,
+                )
+            except Exception as tx_begin_err:
+                return _fail_step_and_continue(tx_begin_err, "Capture transaction failed")
 
         # Perform actual live runtime evidence acquisition via RuntimeEvidenceProvider
         _t0_collect = time.monotonic()
         try:
             cur_epoch = (self.plan.current_step_index + 1) if self.plan else 1
-            obs_data, ev_records = self.evidence_provider.collect_for_recipe(
-                recipe=recipe,
-                pid=self.pid,
-                companion_elf=self.companion_elf,
-                target_assessment=self.target_assessment,
-                classification=self.classification_result,
-                session_id=self.investigation_id,
-                epoch_id=cur_epoch,
-            )
+            with _step_deadline_ctx:
+                obs_data, ev_records = self.evidence_provider.collect_for_recipe(
+                    recipe=recipe,
+                    pid=self.pid,
+                    companion_elf=self.companion_elf,
+                    target_assessment=self.target_assessment,
+                    classification=self.classification_result,
+                    session_id=self.investigation_id,
+                    epoch_id=cur_epoch,
+                )
+        except (KeyboardInterrupt, SystemExit):
+            raise
         except BaseException as collect_err:
             if step_tx is not None:
                 from .capture_backend import OperationLifecycleState
@@ -2186,11 +2352,9 @@ class AdaptiveInvestigationSession:
                     self.adapter.rollback_capture_transaction(
                         step_tx, f"Collection {terminal.value.lower()}: {collect_err}", terminal_state=terminal
                     )
-                except Exception as rollback_err:
-                    raise RuntimeError(
-                        f"Collection failed and mandatory lifecycle rollback failed: {rollback_err}"
-                    ) from collect_err
-            raise
+                except Exception:
+                    pass
+            return _fail_step_and_continue(collect_err, "Collection failed")
 
         step_rcpt = None
         if step_tx is not None:
@@ -3941,6 +4105,7 @@ class AdaptiveInvestigationSession:
             "competing_hypotheses": [h.to_dict() for h in self.competing_hypotheses],
             "default_check_budget": self.default_check_budget.to_dict(),
             "followup_decisions": self.followup_decisions,
+            "precollected_state": self.evidence_provider.export_precollected_state() if hasattr(self.evidence_provider, "export_precollected_state") else {},
         }
 
     def _persist_text(self) -> str:
@@ -4038,6 +4203,8 @@ class AdaptiveInvestigationSession:
         ]
         if data.get("ledger") and isinstance(data["ledger"], dict):
             sess.ledger = EvidenceLedger.from_dict(data["ledger"])
+            if hasattr(sess.ledger, "trust_store") and getattr(sess.ledger, "trust_store", None) is None:
+                sess.ledger.trust_store = getattr(sess.adapter, "trust_store", None)
         sess.active_hypotheses = [
             ExpertHypothesis.from_dict(h) for h in data.get("active_hypotheses", [])
             if isinstance(h, dict)
@@ -4112,6 +4279,8 @@ class AdaptiveInvestigationSession:
                 if isinstance(h, dict)
             ]
         # one hypothesis model: candidates are re-bound to the verified hypotheses (never trusted from disk)
+        if data.get("precollected_state") and hasattr(sess.evidence_provider, "import_precollected_state"):
+            sess.evidence_provider.import_precollected_state(data.get("precollected_state"))
         if any(h.verification_execution_results for h in sess.active_hypotheses + sess.rejected_hypotheses):
             sess._bind_competing_candidates()
         return sess
@@ -4290,6 +4459,49 @@ class ExpertDiagnosticEngine:
     def list_sessions(self) -> List[Dict[str, Any]]:
         """Lists metadata for all active and completed sessions."""
         return [sess.get_status() for sess in self.sessions.values()]
+
+    def continue_investigation(
+        self,
+        investigation_id: str,
+        *,
+        adapter: Optional[TargetExecutionAdapter] = None,
+        collected_only: bool = False,
+        additional_wall_clock_s: float = 120.0,
+        additional_bytes: int = 64 * 1024 * 1024,
+        additional_samples: int = 200,
+        disable_default_check_budget: bool = True,
+        max_steps: Optional[int] = None,
+    ) -> AdaptiveInvestigationSession:
+        """Loads an existing session by ID and continues diagnosing from already-collected data."""
+        sess = self.get_session(investigation_id)
+        if sess is None:
+            raise ValueError(f"Investigation session '{investigation_id}' not found in {self.corpus_dir}")
+        factory = self.session_listener_factory
+        if factory is not None:
+            try:
+                sess.timeline_listener = factory(sess)
+            except Exception:  # noqa: BLE001
+                pass
+        if adapter is not None:
+            from .capture_backend import DurableTrustStore, get_default_trust_store
+            eff_ts = getattr(adapter, "trust_store", None) or getattr(sess.adapter, "trust_store", None) or get_default_trust_store()
+            if eff_ts is None:
+                eff_ts = DurableTrustStore(os.path.join(sess.corpus_dir, "trust_store.json"))
+            adapter.trust_store = eff_ts
+            if sess.ledger is not None and getattr(sess.ledger, "trust_store", None) is None:
+                sess.ledger.trust_store = eff_ts
+            sess.adapter = adapter
+            sess.evidence_provider.adapter = adapter
+            sess.correlator.adapter = adapter
+        sess.continue_investigation(
+            collected_only=collected_only,
+            additional_wall_clock_s=additional_wall_clock_s,
+            additional_bytes=additional_bytes,
+            additional_samples=additional_samples,
+            disable_default_check_budget=disable_default_check_budget,
+            max_steps=max_steps,
+        )
+        return sess
 
 
 # =============================================================================
@@ -4575,6 +4787,8 @@ def diagnose(
     default_check_budget_s: Optional[float] = None,
     default_check_max_s: Optional[float] = None,
     enable_tracing: Optional[bool] = None,
+    resume_investigation_id: Optional[str] = None,
+    continue_collected_only: bool = False,
 ) -> DiagnoseResult:
     """Diagnose live process ``pid`` end to end in one call and return a :class:`DiagnoseResult`.
 
@@ -4641,6 +4855,18 @@ def diagnose(
             remote = bool(adapter is not None and adapter.is_remote())
         except Exception:  # noqa: BLE001
             remote = adapter is not None and not isinstance(adapter, LocalTargetAdapter)
+        _diag_bg_pool = None
+        if debug_image and os.path.isfile(str(debug_image).split(",")[0].strip()):
+            try:
+                from concurrent.futures import ThreadPoolExecutor
+                from .dwarf_indexer import DwarfIndexer
+                from .cfi_unwinder import load_elf_image
+                _p_dbg = os.path.abspath(str(debug_image).split(",")[0].strip())
+                _diag_bg_pool = ThreadPoolExecutor(max_workers=2)
+                _diag_bg_pool.submit(DwarfIndexer.get_index, _p_dbg)
+                _diag_bg_pool.submit(load_elf_image, _p_dbg)
+            except Exception:
+                _diag_bg_pool = None
         if remote:
             if not extra_target:
                 try:
@@ -4648,7 +4874,8 @@ def diagnose(
                 except Exception:  # noqa: BLE001
                     extra_target.update({"transport": "remote"})
             # Reachability first: an SSH/transport failure is "target_unreachable", not "no such process".
-            run_ssh = getattr(adapter, "run_ssh", None)
+            # When continuing purely from already-collected data (continue_collected_only=True), SSH reachability is not required.
+            run_ssh = getattr(adapter, "run_ssh", None) if not continue_collected_only else None
             if callable(run_ssh):
                 try:
                     rc, _out, err = run_ssh("true")
@@ -4681,12 +4908,21 @@ def diagnose(
                               "stripped and is not used as a default",
                               "No debug image was given for the remote target, so it was not diagnosed. Provide the "
                               "matching unstripped ELF. No conclusion was reached.")
+        if remote and continue_collected_only:
+            pass
         return _diagnose_run(pid, debug_image, symptom, adapter=adapter, corpus_dir=corpus_dir,
                              time_limit_s=time_limit_s, max_steps=max_steps, include_report=include_report,
                              engine=engine, extra_target=extra_target, pre_nc=pre_nc, t0=t0, remote=remote,
                              symptom_fields=symptom_fields, default_check_budget_s=default_check_budget_s,
-                             default_check_max_s=default_check_max_s, enable_tracing=enable_tracing)
+                             default_check_max_s=default_check_max_s, enable_tracing=enable_tracing,
+                             resume_investigation_id=resume_investigation_id,
+                             continue_collected_only=continue_collected_only)
     finally:
+        if _diag_bg_pool is not None:
+            try:
+                _diag_bg_pool.shutdown(wait=False)
+            except Exception:
+                pass
         if own_adapter is not None:
             try:
                 own_adapter.close()
@@ -4742,6 +4978,8 @@ def _diagnose_run(
     default_check_budget_s: Optional[float] = None,
     default_check_max_s: Optional[float] = None,
     enable_tracing: Optional[bool] = None,
+    resume_investigation_id: Optional[str] = None,
+    continue_collected_only: bool = False,
 ) -> DiagnoseResult:
     res = _new_diagnose_result(pid, debug_image)
     res.target.update(extra_target)
@@ -4757,7 +4995,14 @@ def _diagnose_run(
 
     try:
         adapter = adapter or LocalTargetAdapter()
-        name, bad = _preflight_target(pid, adapter)
+        if continue_collected_only and resume_investigation_id:
+            name, bad = f"pid_{pid}", None
+        else:
+            name, bad = _preflight_target(pid, adapter)
+            if bad and resume_investigation_id:
+                # Target exited or disconnected, but we have an existing session: fall back to diagnosing collected data!
+                continue_collected_only = True
+                name, bad = f"pid_{pid}", None
         res.target["process_name"] = name
         if bad:
             nc.append({"kind": "target_unreadable", "item": f"pid {pid}", "reason": bad})
@@ -4824,17 +5069,30 @@ def _diagnose_run(
         stage = "start_investigation"
         with caps_ctx:
             try:
-                session = engine.start_investigation(
-                    problem_statement=symptom or ("" if symptom_fields else DIAGNOSE_DEFAULT_SYMPTOM),
-                    pid=pid, companion_elf=debug_image, adapter=adapter, budget_limits=limits,
-                    symptom_fields=symptom_fields,
-                    default_check_budget=DefaultCheckBudget.resolve(default_check_budget_s, default_check_max_s),
-                )
-                res.investigation_id = session.investigation_id
-                if getattr(session, "budget_tracker", None) is not None:
-                    session.budget_tracker.attach_target_cpu_probe(meter.attributable_cpu_ms)
-                stage = "run_to_completion"
-                conclusion = session.run_to_completion(max_steps=max_steps)
+                if resume_investigation_id:
+                    stage = "continue_investigation"
+                    session = engine.continue_investigation(
+                        resume_investigation_id,
+                        adapter=adapter,
+                        collected_only=continue_collected_only,
+                        additional_wall_clock_s=float(time_limit_s or REMOTE_DEFAULT_TIME_LIMIT_S),
+                        disable_default_check_budget=(default_check_budget_s is None and default_check_max_s is None),
+                        max_steps=max_steps,
+                    )
+                    res.investigation_id = session.investigation_id
+                    conclusion = session.conclusion
+                else:
+                    session = engine.start_investigation(
+                        problem_statement=symptom or ("" if symptom_fields else DIAGNOSE_DEFAULT_SYMPTOM),
+                        pid=pid, companion_elf=debug_image, adapter=adapter, budget_limits=limits,
+                        symptom_fields=symptom_fields,
+                        default_check_budget=DefaultCheckBudget.resolve(default_check_budget_s, default_check_max_s),
+                    )
+                    res.investigation_id = session.investigation_id
+                    if getattr(session, "budget_tracker", None) is not None:
+                        session.budget_tracker.attach_target_cpu_probe(meter.attributable_cpu_ms)
+                    stage = "run_to_completion"
+                    conclusion = session.run_to_completion(max_steps=max_steps)
             except Exception as exc:  # noqa: BLE001
                 nc.append({"kind": "stage_failed", "item": stage, "reason": f"{type(exc).__name__}: {exc}"})
                 if session is not None:

@@ -463,14 +463,46 @@ def collect_mapping_growth(provider: Any, ctx: Dict[str, Any]) -> None:
     known_malloc: List[Tuple[int, int]] = []         # ranges classified as malloc in this window
     added_outside: List[Dict[str, Any]] = []
     threads_before = threads_after = None
+    mcos = ((getattr(provider, "_imp008_state", None) or {}).get("mapping_cosamples") or {}).get(int(pid)) or []
+    pre_samples: Optional[List[Tuple[Dict[str, Any], Dict[int, Dict[str, Any]]]]] = None
+    if len(mcos) >= SAMPLES and "get_proc_maps" not in getattr(adapter, "__dict__", {}):
+        s_first, _ = mcos[0]
+        s_last, _ = mcos[-1]
+        r_first = [(m["start"], m["end"]) for m in s_first["anon"]]
+        r_last = [(m["start"], m["end"]) for m in s_last["anon"]]
+        if r_first == r_last:
+            # No anonymous mapping changes across the shared window: reuse 4 co-sampled points directly
+            idxs = [0, 1, len(mcos) - 2, len(mcos) - 1]
+            pre_samples = [mcos[k] for k in idxs]
+        else:
+            # Anonymous mappings changed: reuse 3 spaced co-samples + 1 fresh sample at >= INTERVAL_S
+            now = time.monotonic()
+            wait_s = max(0.0, INTERVAL_S - (now - s_last["t"]))
+            if wait_s > 0:
+                time.sleep(wait_s)
+            s_now = _proc_sample(adapter, pid)
+            if s_now is not None:
+                tc_now = _thread_counts(adapter, pid)
+                pre_samples = [mcos[0], mcos[len(mcos) // 2], mcos[-1], (s_now, tc_now)]
+            else:
+                idxs = [0, 1, len(mcos) - 2, len(mcos) - 1]
+                pre_samples = [mcos[k] for k in idxs]
+
     for i in range(SAMPLES):
-        if i == 0:
-            threads_before = _thread_counts(adapter, pid)
-        s = _proc_sample(adapter, pid)
-        if s is None:
-            break
-        if i + 1 == SAMPLES:
-            threads_after = _thread_counts(adapter, pid)
+        if pre_samples is not None:
+            s, tc_cur = pre_samples[i]
+            if i == 0:
+                threads_before = tc_cur
+            if i + 1 == SAMPLES:
+                threads_after = tc_cur
+        else:
+            if i == 0:
+                threads_before = _thread_counts(adapter, pid)
+            s = _proc_sample(adapter, pid)
+            if s is None:
+                break
+            if i + 1 == SAMPLES:
+                threads_after = _thread_counts(adapter, pid)
         if snaps:
             prev = snaps[-1]
             pr = [(m["start"], m["end"]) for m in prev["anon"]]
@@ -498,7 +530,7 @@ def collect_mapping_growth(provider: Any, ctx: Dict[str, Any]) -> None:
                           "removed_outside_kb": rem_outside // 1024, "removed_malloc_kb": rem_malloc // 1024,
                           "net_outside_kb": (sz(KIND_OUTSIDE) + sz(KIND_STACK) - rem_outside) // 1024})
         snaps.append(s)
-        if i + 1 < SAMPLES:
+        if pre_samples is None and i + 1 < SAMPLES:
             time.sleep(INTERVAL_S)
     obs: Dict[str, Any] = {"samples": [], "steps": steps, "t0": snaps[0]["t"] if snaps else None}
     obs["allocator_chunks_supported"] = can_decode_chunks

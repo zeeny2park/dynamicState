@@ -19,6 +19,28 @@ from .investigation import InvestigationManager
 from .verdict_engine import sanitize_report_output_path
 
 
+
+def _ensure_cli_capture_key(corpus_dir: str) -> None:
+    """Ensure a persistent per-corpus capture signing key exists when no env key is configured,
+    so ``diagnose --resume`` can verify receipts across separate CLI invocations."""
+    if any(os.environ.get(k) for k in ("DYNAMICSTATE_CAPTURE_SECRET", "DYNAMICSTATE_CAPTURE_KEY_FILE", "DYNAMICSTATE_CAPTURE_KEYRING")):
+        return
+    try:
+        cdir = os.path.abspath(corpus_dir)
+        os.makedirs(cdir, exist_ok=True)
+        key_path = os.path.join(cdir, ".capture_key")
+        if not os.path.exists(key_path):
+            fd = os.open(key_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            try:
+                os.write(fd, (os.urandom(32).hex() + "\n").encode("ascii"))
+            finally:
+                os.close(fd)
+        os.environ["DYNAMICSTATE_CAPTURE_KEY_FILE"] = key_path
+        from .capture_backend import _DEFAULT_KEY_STORE
+        _DEFAULT_KEY_STORE.reload_from_environment()
+    except Exception:
+        pass
+
 def main():
     parser = argparse.ArgumentParser(
         prog="dynamic-state",
@@ -120,6 +142,8 @@ def main():
     inv_parser.add_argument("--report-html", dest="report_html_path", type=str, default=None, help="Optional path to write standalone Zero-CDN HTML investigation report")
     inv_parser.add_argument("--json", action="store_true", default=False, help="Print output in JSON format")
     inv_parser.add_argument("--authorize-target", action="store_true", default=False, help="Explicitly authorize live target interaction")
+    inv_parser.add_argument("--resume", "--resume-investigation-id", dest="resume_investigation_id", type=str, default=None, help="Resume an existing investigation ID")
+    inv_parser.add_argument("--continue-collected-only", dest="continue_collected_only", action="store_true", default=False, help="Diagnose only from already-collected data when resuming")
 
     # 9. compare
     cmp_parser = subparsers.add_parser("compare", help="Compare two observations semantically with uncertainty tracking")
@@ -550,6 +574,10 @@ def main():
                       help="Auto-deploy the native collector to the remote target first (faster reads)")
     dx_p.add_argument("--collector-path", dest="collector_path", type=str, default=None,
                       help="Path of an already installed collector on the remote target")
+    dx_p.add_argument("--resume", "--resume-investigation-id", dest="resume_investigation_id", type=str, default=None,
+                      help="Resume an existing investigation ID (reuses already-collected data)")
+    dx_p.add_argument("--continue-collected-only", dest="continue_collected_only", action="store_true", default=False,
+                      help="When resuming with --resume, diagnose only from already-collected data without new target reads")
 
     from .skill_cli import add_parsers as _add_skill_parsers, dispatch as _skill_dispatch
     _add_skill_parsers(subparsers)
@@ -904,6 +932,7 @@ def main():
         sys.exit(0 if status in ("COMPLETE", "PARTIAL") else 1)
 
     elif args.command == "investigate" and args.pid is not None and not args.snapshot and not args.memory_snapshot:
+        _ensure_cli_capture_key(args.corpus)
         # IMP-017: a live-process investigation is the one diagnosis entry point, diagnose(); the goal is the
         # symptom.  (Offline snapshots below still use the snapshot investigation manager: diagnose needs a live
         # process.)  The investigation is read-only, so --authorize-target is not needed and is ignored.
@@ -911,7 +940,9 @@ def main():
         from .human_report import render_human_report
         from .diagnostic_report import DiagnosticReport
         res = diagnose(args.pid, debug_image=args.debug_image, symptom=args.goal, include_report=True,
-                       engine=ExpertDiagnosticEngine(corpus_dir=os.path.abspath(args.corpus))).to_dict()
+                       engine=ExpertDiagnosticEngine(corpus_dir=os.path.abspath(args.corpus)),
+                       resume_investigation_id=getattr(args, "resume_investigation_id", None),
+                       continue_collected_only=bool(getattr(args, "continue_collected_only", False))).to_dict()
         full = res.pop("report", None)
         summary = render_human_report(res, full)
         report = dict(res)
@@ -1800,6 +1831,7 @@ def main():
         sys.exit(0)
 
     elif args.command == "diagnose":
+        _ensure_cli_capture_key(args.corpus)
         from .expert_diagnostic_engine import ExpertDiagnosticEngine
         from .human_report import diagnose_with_summary
         remote_target = None
@@ -1819,6 +1851,8 @@ def main():
             target=remote_target, symptom_fields=symptom_fields,
             default_check_budget_s=args.default_check_budget_s, default_check_max_s=args.default_check_max_s,
             enable_tracing=args.enable_tracing,
+            resume_investigation_id=args.resume_investigation_id,
+            continue_collected_only=args.continue_collected_only,
         )
         if args.json:
             result["human_summary"] = summary

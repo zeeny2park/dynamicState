@@ -134,12 +134,30 @@ def _state(provider: Any) -> Dict[str, Any]:
 
 
 def cosampling_inspect(provider: Any, pid: int, inner: Callable[[], Any]) -> Callable[[], Any]:
-    """Wrap the thread sampler's per-sample inspect hook: one /proc memory sample per thread sample."""
+    """Wrap the thread sampler's per-sample inspect hook: co-samples /proc memory, mappings, and fds once per sample."""
     def _f():
+        st = _state(provider)
         s = proc_memory_sample(provider.adapter, pid)
         if s is not None:
             s["source"] = "thread_sampling_window"
-            _state(provider)["cosamples"].setdefault(int(pid), []).append(s)
+            st["cosamples"].setdefault(int(pid), []).append(s)
+        try:
+            from .recipe_plugins import mapping_growth as _mg
+            ms = _mg._proc_sample(provider.adapter, pid)
+            if ms is not None:
+                tc = _mg._thread_counts(provider.adapter, pid)
+                st.setdefault("mapping_cosamples", {}).setdefault(int(pid), []).append((ms, tc))
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            from .recipe_plugins import fd_leak as _fl
+            fds = _fl._read_fds(provider.adapter, pid)
+            if fds is not None:
+                st.setdefault("fd_cosamples", {}).setdefault(int(pid), []).append(
+                    (time.monotonic(), fds, _fl._threads(provider.adapter, pid))
+                )
+        except Exception:  # noqa: BLE001
+            pass
         return inner()
     return _f
 

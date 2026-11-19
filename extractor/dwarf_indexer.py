@@ -1278,10 +1278,13 @@ class DwarfIndexer:
 
     @classmethod
     def _build_index(cls, path: str, elf_info: BinaryIdentity) -> DwarfIndex:
+        from concurrent.futures import ThreadPoolExecutor
         pointer_size = 8 if elf_info.elf_class == "ELF64" else 4
         endianness = elf_info.endianness
         unit_tables: Dict[int, Dict[int, str]] = {}
-        file_table = cls._parse_line_file_table(path, unit_tables)
+        _line_pool = ThreadPoolExecutor(max_workers=2)
+        _line_fut = _line_pool.submit(cls._parse_line_file_table, path, unit_tables)
+        _cfi_fut = _line_pool.submit(parse_cfi_table, path, elf_info.architecture)
 
         index = DwarfIndex(
             artifact_path=path,
@@ -1293,7 +1296,7 @@ class DwarfIndexer:
             elf_type=elf_info.elf_type or "ET_DYN",
             pt_loads=elf_info.pt_loads,
             pt_tls=elf_info.pt_tls,
-            file_table=file_table,
+            file_table={},
         )
 
         die_regex = re.compile(r"^\s*<(\d+)><([0-9a-fA-F]+)>:\s*Abbrev Number:\s*(\d+)(?:\s*\((DW_TAG_[a-zA-Z0-9_]+)\))?")
@@ -1352,6 +1355,11 @@ class DwarfIndexer:
         except Exception:
             return index
 
+        try:
+            file_table = _line_fut.result(timeout=20)
+        except Exception:
+            file_table = {}
+        index.file_table = file_table
         by_offset: Dict[int, Dict[str, Any]] = {d["offset"]: d for d in dies}
 
         # DW_AT_decl_file is an index into the file table of the DIE's own compilation unit (its DW_AT_stmt_list).
@@ -1476,7 +1484,12 @@ class DwarfIndexer:
             i += 1
 
         # Second pass: parse variables and subprograms
-        cfi_table = parse_cfi_table(path, index.architecture)
+        try:
+            cfi_table = _cfi_fut.result(timeout=20)
+        except Exception:
+            cfi_table = {}
+        finally:
+            _line_pool.shutdown(wait=False)
         # Location lists read from the section bytes: binutils < 2.39 cannot decode DW_FORM_loclistx (clang 14+,
         # DWARF 5) and prints an empty DW_AT_location, so DIEs without readable text fall back to this map.
         binary_loclists: Optional[Dict[int, int]] = None

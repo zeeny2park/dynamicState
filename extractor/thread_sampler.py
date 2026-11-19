@@ -19,6 +19,8 @@ Three parts:
 
 from __future__ import annotations
 
+import contextlib
+
 import os
 import struct
 import time
@@ -363,19 +365,26 @@ def augment_lock_info(
     """
     if not isinstance(info, dict) or info.get("error") or not info.get("threads"):
         return info
+    if info.get("_lock_info_augmented"):
+        return info
     try:
         remote = bool(adapter.is_remote())
     except Exception:  # noqa: BLE001
         return info
     remote_syscalls: Dict[int, Optional[Dict[str, Any]]] = {}
     if remote:
-        try:
-            recs = adapter.read_thread_samples(pid, counters) if getattr(type(adapter), "thread_samples_supported", False) else None
-        except Exception:  # noqa: BLE001
-            recs = None
-        if not recs:
-            return info
-        remote_syscalls = {int(r["tid"]): r.get("syscall") for r in recs if r.get("tid") is not None}
+        if (isinstance(info.get("_sampler_syscalls"), dict)
+                and getattr(type(adapter), "thread_samples_supported", False)
+                and "read_thread_samples" not in getattr(adapter, "__dict__", {})):
+            remote_syscalls = info["_sampler_syscalls"]
+        else:
+            try:
+                recs = adapter.read_thread_samples(pid, counters) if getattr(type(adapter), "thread_samples_supported", False) else None
+            except Exception:  # noqa: BLE001
+                recs = None
+            if not recs:
+                return info
+            remote_syscalls = {int(r["tid"]): r.get("syscall") for r in recs if r.get("tid") is not None}
 
     def syscall_of(tid: int) -> Optional[Dict[str, Any]]:
         return remote_syscalls.get(tid) if remote else read_syscall(pid, tid, counters)
@@ -390,7 +399,7 @@ def augment_lock_info(
             return info
         from .dwarf_indexer import DwarfIndexer
         idx = DwarfIndexer.get_index(primary)
-        map_data = watch_manager._get_process_maps_and_load_bias(pid=pid, companion_elf_path=companion_elf, adapter=adapter)
+        map_data = info.get("_map_data") or watch_manager._get_process_maps_and_load_bias(pid=pid, companion_elf_path=companion_elf, adapter=adapter)
         bias = int(map_data.get("base_address_int", 0) or 0)
         is_dyn = idx.elf_type == "ET_DYN"
         data = _dwarf_data_for(idx, primary)
@@ -421,7 +430,11 @@ def augment_lock_info(
                              owner_thread_name=None, owner_status=owner_support.status,
                              owner_status_reason=owner_support.message)
                 return entry
-            raw, st, err = adapter.read_memory(pid, addr, 12)
+            hit_mw = prefetched_mutex_words.get(addr)
+            if hit_mw is not None:
+                raw, st, err = hit_mw
+            else:
+                raw, st, err = adapter.read_memory(pid, addr, 12)
             if st != "OBSERVED" or not raw or len(raw) < 12:
                 entry.update(is_locked=None, owner_tid=None, owner_thread_name=None, owner_status="READ_FAILED",
                              owner_status_reason=str(err or st))
@@ -438,11 +451,32 @@ def augment_lock_info(
             )
             return entry
 
+        prefetched_mutex_words: Dict[int, Tuple[Optional[bytes], str, Optional[str]]] = {}
+        can_batch_aug = (
+            hasattr(adapter, "read_memory_batch")
+            and "read_memory" not in getattr(adapter, "__dict__", {})
+        )
         # 1) struct-member mutexes (variable.member)
+        ptr_lookup: Dict[int, Optional[bytes]] = {}
+        if can_batch_aug and data.members:
+            ptr_addrs = sorted({rt(var_link) for _, var_link, _, via_ptr in data.members if via_ptr})
+            if len(ptr_addrs) > 1:
+                try:
+                    p_res = adapter.read_memory_batch(pid, [(a, ptr_size) for a in ptr_addrs])
+                    for a, (rb, rst, _) in zip(ptr_addrs, p_res):
+                        if rst == "OBSERVED" and rb and len(rb) >= ptr_size:
+                            ptr_lookup[a] = rb
+                except Exception:
+                    pass
+        pending_member_mutexes: List[Tuple[str, int]] = []
         for name, var_link, off, via_ptr in data.members:
             var_rt = rt(var_link)
             if via_ptr:
-                raw, st, _ = adapter.read_memory(pid, var_rt, ptr_size)
+                if var_rt in ptr_lookup:
+                    raw = ptr_lookup[var_rt]
+                    st = "OBSERVED"
+                else:
+                    raw, st, _ = adapter.read_memory(pid, var_rt, ptr_size)
                 if st != "OBSERVED" or not raw or len(raw) < ptr_size:
                     continue
                 base = struct.unpack(endian + ("Q" if ptr_size == 8 else "I"), raw[:ptr_size])[0]
@@ -458,6 +492,16 @@ def augment_lock_info(
                         l["name"] = name
                 continue
             known_addrs.add(addr)
+            pending_member_mutexes.append((name, addr))
+        if can_batch_aug and owner_support.supported and len(pending_member_mutexes) > 1:
+            try:
+                m_res = adapter.read_memory_batch(pid, [(addr, 12) for _, addr in pending_member_mutexes])
+                if len(m_res) == len(pending_member_mutexes):
+                    for (_, addr), rv in zip(pending_member_mutexes, m_res):
+                        prefetched_mutex_words[addr] = rv
+            except Exception:
+                pass
+        for name, addr in pending_member_mutexes:
             new_locks.append(read_mutex(name, addr, "STRUCT_MEMBER"))
 
         # 2) futex addresses threads are waiting on that no known lock covers
@@ -574,6 +618,7 @@ def augment_lock_info(
         notes.append(f"member/futex mutex discovery failed: {type(exc).__name__}: {exc}")
         out = dict(info)
         out["limitations"] = notes
+        out["_lock_info_augmented"] = True
         return out
     return out
 
@@ -756,56 +801,79 @@ class ThreadSampler:
                 n_max = min(n_max, int(self.budget_tracker.limits.max_samples))
             except Exception:  # noqa: BLE001
                 pass
+        consec_enum_failures = 0
         for i in range(1, n_max + 1):
+            rem_fn = getattr(self.adapter, "remaining_deadline_sec", None)
+            rem_dl = rem_fn() if callable(rem_fn) else None
+            if rem_dl is not None and rem_dl <= 0:
+                series.stop_reason = "collection step deadline reached"
+                break
             if i > 1:
                 why = self._budget_ok(t_start, cfg)
                 if why:
                     series.stop_reason = why
                     break
-                time.sleep(interval)
+                sleep_s = interval if rem_dl is None else max(0.0, min(interval, rem_dl * 0.5))
+                if sleep_s > 0:
+                    time.sleep(sleep_s)
             t_now = time.monotonic()
-            recs: Optional[List[Dict[str, Any]]]
-            if supported:
-                recs = self.adapter.read_thread_samples(pid, series.counters)
-            else:
-                recs = read_local_thread_samples(pid, series.counters)
-            if recs is None:
-                series.failures.append({"index": i, "stage": "enumerate", "error": "thread enumeration failed"})
-                if not self._target_alive(pid, remote):
-                    series.stop_reason = "target process exited"
-                    break
-                continue
-            threads: Dict[int, Dict[str, Any]] = {int(r["tid"]): r for r in recs}
-            info = None
-            lock_digest: Optional[List[Dict[str, Any]]] = None
-            if inspect_fn is not None:
+            snap_ctx = getattr(self.adapter, "snapshot_scope", None) if inspect_fn is not None else None
+            with (snap_ctx(pid) if callable(snap_ctx) else contextlib.nullcontext()):
+                recs: Optional[List[Dict[str, Any]]]
                 try:
-                    info = inspect_fn()
-                    if not isinstance(info, dict):
-                        raise TypeError(f"unexpected result type {type(info).__name__}")
-                    if info.get("error") or info.get("success") is False or (
-                        info.get("status") == "INCONCLUSIVE" and not info.get("deadlock_detected")
-                    ):
-                        raise RuntimeError(str(info.get("error") or "; ".join(str(x) for x in (info.get("limitations") or [])[:3])
-                                               or "inspection INCONCLUSIVE"))
-                    info = augment_lock_info(
-                        info, pid=pid, adapter=self.adapter, companion_elf=companion_elf,
-                        watch_manager=self.watch_manager, counters=series.counters,
-                    )
-                    if series.abi is None and info.get("target_abi"):
-                        series.abi = TargetABI.from_dict(info["target_abi"])
-                    series.lock_series.add_sample(i, info)
-                    lock_digest = _lock_digest(info)
-                    by_tid = {int(t["tid"]): t for t in info.get("threads", []) if t.get("tid") is not None}
-                    for tid, rec in threads.items():
-                        tr = by_tid.get(tid)
-                        if tr:
-                            rec["top_frame"] = _top_frame(tr)
-                            rec["waiting_on_lock"] = tr.get("waiting_on_lock")
-                except Exception as exc:  # noqa: BLE001
-                    reason = f"{type(exc).__name__}: {exc}"
-                    series.lock_series.add_failure(i, reason)
-                    series.failures.append({"index": i, "stage": "lock_inspection", "error": reason})
+                    if supported:
+                        recs = self.adapter.read_thread_samples(pid, series.counters)
+                    else:
+                        recs = read_local_thread_samples(pid, series.counters)
+                except Exception as enum_exc:  # noqa: BLE001
+                    recs = None
+                    series.failures.append({"index": i, "stage": "enumerate", "error": f"{type(enum_exc).__name__}: {enum_exc}"})
+                if recs is None:
+                    consec_enum_failures += 1
+                    if not series.failures or series.failures[-1].get("index") != i:
+                        series.failures.append({"index": i, "stage": "enumerate", "error": "thread enumeration failed"})
+                    if not self._target_alive(pid, remote):
+                        series.stop_reason = "target process exited"
+                        break
+                    if consec_enum_failures >= 2:
+                        series.stop_reason = "thread enumeration failed repeatedly"
+                        break
+                    continue
+                consec_enum_failures = 0
+                threads: Dict[int, Dict[str, Any]] = {int(r["tid"]): r for r in recs}
+                info = None
+                lock_digest: Optional[List[Dict[str, Any]]] = None
+                if inspect_fn is not None:
+                    try:
+                        info = inspect_fn()
+                        if not isinstance(info, dict):
+                            raise TypeError(f"unexpected result type {type(info).__name__}")
+                        if info.get("error") or info.get("success") is False or (
+                            info.get("status") == "INCONCLUSIVE" and not info.get("deadlock_detected")
+                        ):
+                            raise RuntimeError(str(info.get("error") or "; ".join(str(x) for x in (info.get("limitations") or [])[:3])
+                                                   or "inspection INCONCLUSIVE"))
+                        info = augment_lock_info(
+                            info, pid=pid, adapter=self.adapter, companion_elf=companion_elf,
+                            watch_manager=self.watch_manager, counters=series.counters,
+                        )
+                        if series.abi is None and info.get("target_abi"):
+                            series.abi = TargetABI.from_dict(info["target_abi"])
+                        series.lock_series.add_sample(i, info)
+                        if not hasattr(series, "raw_inspections"):
+                            series.raw_inspections = []
+                        series.raw_inspections.append((t_now, info))
+                        lock_digest = _lock_digest(info)
+                        by_tid = {int(t["tid"]): t for t in info.get("threads", []) if t.get("tid") is not None}
+                        for tid, rec in threads.items():
+                            tr = by_tid.get(tid)
+                            if tr:
+                                rec["top_frame"] = _top_frame(tr)
+                                rec["waiting_on_lock"] = tr.get("waiting_on_lock")
+                    except Exception as exc:  # noqa: BLE001
+                        reason = f"{type(exc).__name__}: {exc}"
+                        series.lock_series.add_failure(i, reason)
+                        series.failures.append({"index": i, "stage": "lock_inspection", "error": reason})
             if self.budget_tracker is not None:
                 try:
                     self.budget_tracker.record_sample()

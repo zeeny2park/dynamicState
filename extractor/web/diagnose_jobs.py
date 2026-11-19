@@ -362,7 +362,7 @@ class DiagnoseJobManager:
 
     # -- API
     def start(self, params: Dict[str, Any]) -> Dict[str, Any]:
-        if self._diagnose_fn is None and not params.get("remote_target"):
+        if self._diagnose_fn is None and not params.get("remote_target") and not params.get("continue_collected_only"):
             refused = preflight_error(int(params["pid"]))
             if refused is not None:
                 return {"success": False, "error": refused}
@@ -400,9 +400,11 @@ class DiagnoseJobManager:
                 from extractor.human_report import diagnose_with_summary as fn  # same function as POST /api/diagnose
                 extra["keep_report"] = True     # the view and the report are made from this very result
             p = job.params
-            for k in ("default_check_budget_s", "default_check_max_s", "enable_tracing"):   # options
+            for k in ("default_check_budget_s", "default_check_max_s", "enable_tracing", "resume_investigation_id"):   # options
                 if p.get(k) is not None:
                     extra[k] = p[k]
+            if p.get("continue_collected_only"):
+                extra["continue_collected_only"] = True
             result, summary = fn(
                 p["pid"], debug_image=p.get("debug_image"), symptom=p.get("symptom"), time_limit_s=p.get("time_limit_s"),
                 engine=engine, lang=job.language, target=p.get("remote_target"), symptom_fields=p.get("symptom_fields"),

@@ -657,7 +657,7 @@ class TargetExecutionAdapter(ABC):
             raise ProcessLookupError(f"Cannot begin capture transaction: target PID {pid} is not alive: {live_err}")
 
         if int(pid) in self._pinned_identities:
-            ok_pin, pin_err = self.verify_pinned_identity(int(pid))
+            ok_pin, pin_err = self.verify_pinned_identity(int(pid), _allow_recent_sec=0.05)
             if not ok_pin:
                 raise PIDReusedError(f"Cannot begin capture transaction: {pin_err}")
             ident = self._pinned_identities[int(pid)]
@@ -781,12 +781,17 @@ class TargetExecutionAdapter(ABC):
                         )
 
         cur_ident = self.get_process_identity(target_tx.pid)
-        alive, live_err = self.check_liveness(target_tx.pid)
+        if (type(self).__name__ == "RemoteSshTargetAdapter"
+                and "check_liveness" not in self.__dict__
+                and cur_ident.get("start_time") and cur_ident.get("executable")):
+            alive, live_err = True, None
+        else:
+            alive, live_err = self.check_liveness(target_tx.pid)
         if not alive:
             self.rollback_capture_transaction(target_tx, f"Target process exited during capture: {live_err}")
             raise ProcessLookupError(f"Target process {target_tx.pid} terminated during capture: {live_err}")
 
-        ok_pin, pin_err = self.verify_pinned_identity(target_tx.pid)
+        ok_pin, pin_err = self.verify_pinned_identity(target_tx.pid, _current_identity=cur_ident)
         if not ok_pin:
             self.rollback_capture_transaction(target_tx, f"Pinned identity changed: {pin_err}")
             raise PIDReusedError(f"Pinned identity changed during capture transaction on PID {target_tx.pid}: {pin_err}")
@@ -1132,13 +1137,25 @@ class TargetExecutionAdapter(ABC):
         self._pinned_identities[int(pid)] = dict(ident)
         return ident
 
-    def verify_pinned_identity(self, pid: int) -> Tuple[bool, Optional[str]]:
+    def verify_pinned_identity(
+        self,
+        pid: int,
+        _current_identity: Optional[Dict[str, Any]] = None,
+        _allow_recent_sec: float = 0.0,
+    ) -> Tuple[bool, Optional[str]]:
         """Verify that a pinned target process has not been replaced via PID reuse or execve."""
         self._ensure_tracking_state()
         pinned = self._pinned_identities.get(int(pid))
         if not pinned:
             return True, None
-        cur = self.get_process_identity(int(pid))
+        cur = _current_identity
+        if cur is None and _allow_recent_sec > 0.0 and type(self).__name__ == "RemoteSshTargetAdapter":
+            if "get_process_identity" not in self.__dict__ and "_identity_probe" not in self.__dict__:
+                recent = getattr(self, "_last_identity_cache", {}).get(int(pid))
+                if recent is not None and (time.monotonic() - recent[0]) <= _allow_recent_sec:
+                    cur = recent[1]
+        if cur is None:
+            cur = self.get_process_identity(int(pid))
         if not cur.get("boot_id") and cur.get("process_identity"):
             parts = str(cur["process_identity"]).split(":")
             if len(parts) >= 3 and parts[2]:
@@ -1243,7 +1260,7 @@ class TargetExecutionAdapter(ABC):
             )
 
         if int(pid) in self._pinned_identities:
-            ok_pin, pin_err = self.verify_pinned_identity(int(pid))
+            ok_pin, pin_err = self.verify_pinned_identity(int(pid), _allow_recent_sec=0.05)
             if not ok_pin:
                 raise ValueError(f"Cannot issue live receipt: pinned identity verification failed: {pin_err}")
             ident = self._pinned_identities[int(pid)]
@@ -1934,7 +1951,7 @@ class LocalTargetAdapter(TargetExecutionAdapter):
         self._ensure_tracking_state()
         if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 1:
             return None, "UNAVAILABLE", f"Invalid or reserved PID {pid}"
-        ok_pin, pin_err = self.verify_pinned_identity(pid)
+        ok_pin, pin_err = self.verify_pinned_identity(pid, _allow_recent_sec=0.05)
         if not ok_pin:
             st = "PID_REUSED" if (pin_err and "PID_REUSED" in pin_err) else "IDENTITY_UNAVAILABLE"
             return None, st, pin_err
@@ -2310,8 +2327,19 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
         self.last_threads_transport: Optional[str] = None
         self.command_log = RemoteCommandLog()
         self._proc_cmds_unsupported_for: Optional[str] = None   # collector without IDENT / PROCFILE
+        self._fds_unsupported_for: Optional[str] = None
+        self._snapshot_unsupported_for: Optional[str] = None
+        self._statfile_unsupported_for: Optional[str] = None
+        self._tidalive_unsupported_for: Optional[str] = None
         self._exe_cache: Dict[Tuple[str, str], Dict[str, Any]] = {}   # (exe path, file fingerprint) -> header + parsed ELF
         self._ident_seen: set = set()
+        self._last_identity_cache: Dict[int, Tuple[float, Dict[str, Any]]] = {}
+        self._maps_micro_cache: Dict[int, Tuple[float, List[Dict[str, Any]]]] = {}
+        self._status_micro_cache: Dict[int, Tuple[float, Dict[str, Any]]] = {}
+        self._threads_raw_micro_cache: Dict[int, Tuple[float, List[Dict[str, Any]], str]] = {}
+        self._snapshot_cache: Dict[int, Tuple[float, Dict[str, Any]]] = {}
+        self._snapshot_scope_depth: int = 0
+        self._deadline_tls = threading.local()
 
     def remote_command_summary(self, since: int = 0) -> Dict[str, Any]:
         return self.command_log.summary(since)
@@ -2323,6 +2351,34 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
         u = f"{self.user}@" if self.user else ""
         p = f":{self.port}" if self.port != 22 else ""
         return f"{u}{self.host}{p}"
+
+    @contextlib.contextmanager
+    def collection_deadline(self, timeout_sec: Optional[float]):
+        """Bounds all remote SSH / daemon operations inside this block to at most ``timeout_sec`` seconds."""
+        if timeout_sec is None or timeout_sec <= 0:
+            yield
+            return
+        prev = getattr(self._deadline_tls, "deadline", None)
+        new_dl = time.monotonic() + float(timeout_sec)
+        self._deadline_tls.deadline = min(prev, new_dl) if prev is not None else new_dl
+        try:
+            yield
+        finally:
+            self._deadline_tls.deadline = prev
+
+    def remaining_deadline_sec(self) -> Optional[float]:
+        dl = getattr(self._deadline_tls, "deadline", None)
+        if dl is None:
+            return None
+        return dl - time.monotonic()
+
+    def _bound_timeout(self, requested: float) -> float:
+        rem = self.remaining_deadline_sec()
+        if rem is None:
+            return requested
+        if rem <= 0:
+            raise TimeoutError("Remote collection step deadline exceeded")
+        return min(requested, max(0.2, rem))
 
     def _default_command_runner(
         self, cmd_args: List[str], timeout: float, input_bytes: Optional[bytes] = None
@@ -2364,6 +2420,11 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
         runners then receive it as the ``input_bytes`` keyword argument.
         """
         t = timeout or self.timeout_sec
+        rem = self.remaining_deadline_sec()
+        if rem is not None:
+            if rem <= 0:
+                return -1, "", "Remote collection step deadline exceeded"
+            t = min(t, max(0.2, rem))
         args = self._ssh_args(remote_shell_cmd)
         t0 = time.monotonic()
         res: Tuple[int, str, str]
@@ -2414,6 +2475,8 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
             "-o", "BatchMode=yes",
             "-o", "StrictHostKeyChecking=accept-new",
             "-o", "ConnectTimeout=5",
+            "-o", "ServerAliveInterval=2",
+            "-o", "ServerAliveCountMax=2",
         ]
         if self.key_file:
             args.extend(["-i", self.key_file])
@@ -2469,9 +2532,78 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
                 res["hdr"] = None
         return res
 
+    @contextlib.contextmanager
+    def snapshot_scope(self, pid: int):
+        """Fetches a compound process snapshot (ident + status + maps + limits + threads + fds) in ONE daemon
+        exchange and serves nested metadata queries within the scope without redundant round-trips."""
+        can_use = (
+            type(self) is RemoteSshTargetAdapter
+            and bool(self.collector_path)
+            and self._use_daemon
+            and self._snapshot_unsupported_for != self.collector_path
+            and self._proc_cmds_unsupported_for != self.collector_path
+            and self._threads_unsupported_for != self.collector_path
+            and not any(k in self.__dict__ for k in (
+                "read_target_file", "get_proc_maps", "get_process_status",
+                "get_threads", "read_thread_samples", "check_liveness", "get_process_identity",
+            ))
+        )
+        if can_use and self._snapshot_scope_depth == 0:
+            self.prefetch_snapshot(pid)
+        self._snapshot_scope_depth += 1
+        try:
+            yield
+        finally:
+            self._snapshot_scope_depth = max(0, self._snapshot_scope_depth - 1)
+
+    def prefetch_snapshot(self, pid: int) -> Optional[Dict[str, Any]]:
+        if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
+            return None
+        if not self.collector_path or self._snapshot_unsupported_for == self.collector_path:
+            return None
+        payload = self._daemon_json(f"SNAPSHOT {int(pid)}")
+        if payload is None:
+            return None
+        if not payload.get("success"):
+            if payload.get("error") == "UNKNOWN_COMMAND":
+                self._snapshot_unsupported_for = self.collector_path
+            elif payload.get("error") == "TARGET_TERMINATED":
+                self._snapshot_cache[int(pid)] = (time.monotonic(), {"terminated": True})
+            return None
+        now = time.monotonic()
+        self._snapshot_cache[int(pid)] = (now, payload)
+        self._maps_micro_cache.pop(int(pid), None)
+        self._status_micro_cache.pop(int(pid), None)
+        self._threads_raw_micro_cache.pop(int(pid), None)
+        osrel = str(payload.get("osrelease") or "").strip()
+        if osrel and re.fullmatch(r"\d+\.\d+[\w.+~-]*", osrel):
+            self._target_kernel_release = osrel
+        return payload
+
+    def _active_snapshot(self, pid: int, max_age_s: float = 0.030) -> Optional[Dict[str, Any]]:
+        if self._snapshot_scope_depth <= 0:
+            return None
+        hit = self._snapshot_cache.get(int(pid))
+        if hit is not None and (time.monotonic() - hit[0]) <= max_age_s:
+            return hit[1]
+        return None
+
     def _identity_probe(self, pid: int, with_header: bool = False) -> Optional[Dict[str, Any]]:
         """exe link, /proc/PID/stat, boot_id, exe fingerprint, uname -m (+ ELF header) in ONE exchange:
         a daemon request when the collector has IDENT, else ONE shell command.  None = transport failure."""
+        if not with_header:
+            snap = self._active_snapshot(pid)
+            if snap is not None:
+                if snap.get("terminated"):
+                    return {"exe": "", "stat": "", "boot_id": "", "exe_fp": "", "machine": "", "hdr": None}
+                return {
+                    "exe": str(snap.get("exe") or ""),
+                    "stat": str(snap.get("stat") or "").strip(),
+                    "boot_id": str(snap.get("boot_id") or "").strip(),
+                    "exe_fp": str(snap.get("exe_fp") or ""),
+                    "machine": str(snap.get("machine") or ""),
+                    "hdr": None,
+                }
         if self.collector_path and self._proc_cmds_unsupported_for != self.collector_path:
             payload = self._daemon_json(f"IDENT {int(pid)}" + (" HDR" if with_header else ""))
             if payload is not None:
@@ -2498,6 +2630,13 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
 
     def _procfile_text(self, pid: int, name: str) -> Optional[str]:
         """Text of /proc/PID/<name> through the daemon (None = use the shell path).  "" = process gone."""
+        snap = self._active_snapshot(pid)
+        if snap is not None:
+            if snap.get("terminated"):
+                return ""
+            key = "threads_max" if name == "threads-max" else name
+            if key in snap and isinstance(snap[key], str):
+                return snap[key]
         if not self.collector_path or self._proc_cmds_unsupported_for == self.collector_path:
             return None
         payload = self._daemon_json(f"PROCFILE {int(pid)} {name}")
@@ -2613,7 +2752,7 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
         start_time = self._start_time_from_stat(pr.get("stat", ""))
         boot_id = pr.get("boot_id", "")
 
-        return {
+        res_ident = {
             "pid": pid,
             "executable": exe,
             "executable_identity": f"{exe}:remote",
@@ -2629,9 +2768,19 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
             "is_remote": True,
             "host": self.target_host(),
         }
+        if start_time and exe:
+            self._last_identity_cache[int(pid)] = (time.monotonic(), dict(res_ident))
+        return res_ident
 
     def read_target_file(self, pid: int, path: str, max_bytes: int) -> Optional[bytes]:
-        m = re.fullmatch(r"/proc/(\d+)/(maps|status|stat|limits|comm|exe)", str(path))
+        p_str = str(path)
+        if p_str in ("/proc/sys/kernel/osrelease", "/proc/sys/kernel/threads-max"):
+            sys_name = "osrelease" if p_str.endswith("osrelease") else "threads-max"
+            eff_pid = int(pid) if isinstance(pid, int) and pid > 0 else 1
+            text = self._procfile_text(eff_pid, sys_name)
+            if text is not None:
+                return (text + "\n").encode("utf-8", "replace")[:max(0, int(max_bytes))]
+        m = re.fullmatch(r"/proc/(\d+)/(maps|status|stat|limits|comm|exe)", p_str)
         if m:
             if m.group(2) == "exe":
                 if int(max_bytes) <= IDENT_HEADER_BYTES:
@@ -2642,7 +2791,7 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
                 text = self._procfile_text(int(m.group(1)), m.group(2))
                 if text is not None:
                     return text.encode("utf-8", "replace")[:max(0, int(max_bytes))]
-        cmd = f"head -c {int(max_bytes)} {shlex.quote(str(path))} 2>/dev/null | base64"
+        cmd = f"head -c {int(max_bytes)} {shlex.quote(p_str)} 2>/dev/null | base64"
         rc, out, _ = self.run_ssh(cmd, timeout=self.timeout_sec * 1.5)
         if rc != 0 or not out.strip():
             return None
@@ -2653,7 +2802,22 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
 
     def stat_target_file(self, pid: int, path: str) -> Optional[Tuple[int, int]]:
         """(size, mtime) of a file on the target in one exchange; None where it cannot be determined."""
-        q = shlex.quote(str(path))
+        p_str = str(path)
+        if (self.collector_path and self._statfile_unsupported_for != self.collector_path
+                and self._proc_cmds_unsupported_for != self.collector_path
+                and "\n" not in p_str and "\r" not in p_str):
+            payload = self._daemon_json(f"STATFILE {p_str}")
+            if payload is not None:
+                if payload.get("success") and "size" in payload and "mtime" in payload:
+                    try:
+                        return int(payload["size"]), int(payload["mtime"])
+                    except (TypeError, ValueError):
+                        pass
+                if payload.get("error") == "UNKNOWN_COMMAND":
+                    self._statfile_unsupported_for = self.collector_path
+                else:
+                    return None
+        q = shlex.quote(p_str)
         cmd = f"stat -c '%s %Y' {q} 2>/dev/null"
         rc, out, _ = self.run_ssh(cmd)
         parts = out.split()
@@ -2664,7 +2828,44 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
                 pass
         return None
 
+    def list_open_fds(self, pid: int) -> Optional[Tuple[int, List[str]]]:
+        """Returns (total_fd_count, target_paths) via daemon SNAPSHOT/FDS when available, else None."""
+        if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
+            return None
+        snap = self._active_snapshot(pid)
+        if snap is not None and "fd_count" in snap and isinstance(snap.get("fd_targets"), list):
+            return int(snap["fd_count"]), [str(x) for x in snap["fd_targets"]]
+        if (self.collector_path and self._fds_unsupported_for != self.collector_path
+                and self._proc_cmds_unsupported_for != self.collector_path):
+            payload = self._daemon_json(f"FDS {int(pid)}")
+            if payload is not None:
+                if payload.get("success") and "count" in payload:
+                    return int(payload["count"]), [str(x) for x in (payload.get("targets") or [])]
+                if payload.get("error") == "UNKNOWN_COMMAND":
+                    self._fds_unsupported_for = self.collector_path
+                else:
+                    return None
+        return None
+
+    def check_tid_alive(self, tid: int) -> Optional[bool]:
+        """Checks /proc/<tid> existence via daemon TIDALIVE when available, else None."""
+        if isinstance(tid, bool) or not isinstance(tid, int) or tid <= 0:
+            return False
+        if (self.collector_path and self._tidalive_unsupported_for != self.collector_path
+                and self._proc_cmds_unsupported_for != self.collector_path):
+            payload = self._daemon_json(f"TIDALIVE {int(tid)}")
+            if payload is not None:
+                if payload.get("success") and "alive" in payload:
+                    return bool(payload["alive"])
+                if payload.get("error") == "UNKNOWN_COMMAND":
+                    self._tidalive_unsupported_for = self.collector_path
+        return None
+
     def get_proc_maps(self, pid: int) -> List[Dict[str, Any]]:
+        now = time.monotonic()
+        cached_m = self._maps_micro_cache.get(int(pid))
+        if cached_m is not None and (now - cached_m[0]) <= 0.020:
+            return [dict(m) for m in cached_m[1]]
         mappings: List[Dict[str, Any]] = []
         stdout = self._procfile_text(int(pid), "maps")   # one daemon exchange when the channel is up
         if stdout is None:
@@ -2719,12 +2920,18 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
                     "is_writable": "w" in perms,
                     "is_executable": "x" in perms,
                 })
+        if mappings:
+            self._maps_micro_cache[int(pid)] = (time.monotonic(), [dict(m) for m in mappings])
         return mappings
 
     def get_process_status(self, pid: int) -> Dict[str, Any]:
         status: Dict[str, Any] = {}
         if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 1:
             return status
+        now = time.monotonic()
+        cached_s = self._status_micro_cache.get(int(pid))
+        if cached_s is not None and (now - cached_s[0]) <= 0.020:
+            return dict(cached_s[1])
         stdout = self._procfile_text(int(pid), "status")
         rc = 0
         if stdout is None:
@@ -2744,6 +2951,8 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
                             status[k] = v
                     else:
                         status[k] = v
+        if status:
+            self._status_micro_cache[int(pid)] = (time.monotonic(), dict(status))
         return status
 
     # ---- IMP-011 part 3: remote thread information -------------------------------------------
@@ -2805,7 +3014,7 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
             after = 0
             for _ in range(self.THREADS_MAX_PAGES):
                 line = f"THREADS {int(pid)}" + (f" {after}" if after else "")
-                reply = ch.exchange(line, max(self.timeout_sec, 1.0))
+                reply = ch.exchange(line, self._bound_timeout(max(self.timeout_sec, 1.0)))
                 try:
                     payload = json.loads(reply)
                 except ValueError:
@@ -2845,22 +3054,36 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
                 return collected
         return collected
 
-    def _threads_raw(self, pid: int) -> Tuple[Optional[List[Dict[str, Any]]], str]:
+    def _threads_raw(self, pid: int, allow_micro_cache: bool = False) -> Tuple[Optional[List[Dict[str, Any]]], str]:
         """(wire entries, transport): daemon channel, else per-call collector, else one batched sh command."""
         if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
             return None, "invalid_pid"
+        snap = self._active_snapshot(pid)
+        if snap is not None and isinstance(snap.get("threads"), list) and not snap.get("threads_more"):
+            raw_snap = [t for t in snap["threads"] if isinstance(t, dict) and "tid" in t]
+            self._threads_raw_micro_cache[int(pid)] = (time.monotonic(), raw_snap, "daemon")
+            return raw_snap, "daemon"
+        if allow_micro_cache:
+            cached_t = self._threads_raw_micro_cache.get(int(pid))
+            if cached_t is not None and (time.monotonic() - cached_t[0]) <= 0.020:
+                return cached_t[1], cached_t[2]
         if self.collector_path and self._threads_unsupported_for != self.collector_path:
             raw = self._threads_via_daemon(pid)
             if raw is not None:
+                self._threads_raw_micro_cache[int(pid)] = (time.monotonic(), raw, "daemon")
                 return raw, "daemon"
             if self._threads_unsupported_for != self.collector_path:
                 raw = self._threads_via_collector_oneshot(pid)
                 if raw is not None:
+                    self._threads_raw_micro_cache[int(pid)] = (time.monotonic(), raw, "collector")
                     return raw, "collector"
         rc, out, _ = self.run_ssh(f"sh -c {shlex.quote(self._threads_shell_script(pid))}")
         if rc != 0 and not out:
             return None, "shell"
-        return self._parse_threads_shell_output(out), "shell"
+        parsed = self._parse_threads_shell_output(out)
+        if parsed is not None:
+            self._threads_raw_micro_cache[int(pid)] = (time.monotonic(), parsed, "shell")
+        return parsed, "shell"
 
     def read_thread_samples(self, pid: int, counters: Optional[Dict[str, int]] = None) -> Optional[List[Dict[str, Any]]]:
         raw, transport = self._threads_raw(pid)
@@ -2875,7 +3098,7 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
     def _daemon_json(self, line: str) -> Optional[Dict[str, Any]]:
         """One daemon exchange expecting a JSON object reply; None = use another transport."""
         def run(ch: _DaemonChannel) -> Optional[Dict[str, Any]]:
-            reply = ch.exchange(line, max(self.timeout_sec, 1.0))
+            reply = ch.exchange(line, self._bound_timeout(max(self.timeout_sec, 1.0)))
             try:
                 payload = json.loads(reply)
             except ValueError:
@@ -2921,7 +3144,7 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
         return parsed
 
     def get_threads(self, pid: int) -> List[Dict[str, Any]]:
-        raw, transport = self._threads_raw(pid)
+        raw, transport = self._threads_raw(pid, allow_micro_cache=True)
         if not raw:
             return []
         self.last_threads_transport = transport
@@ -2988,7 +3211,7 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
         ch = _DaemonChannel(proc)
         ch.log = self.command_log
         try:
-            reply = ch.exchange("PING", max(self.timeout_sec, 1.0))
+            reply = ch.exchange("PING", self._bound_timeout(max(self.timeout_sec, 1.0)))
             self.command_log.add("daemon_open", "daemon_open", "_open_daemon_locked", _call_sites()[1],
                                  time.monotonic() - t0, len(reply))
             if "PONG" not in reply:
@@ -3024,7 +3247,7 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
         out: List[Tuple[Optional[bytes], str, Optional[str]]] = []
         for chunk in chunks:
             spec = ",".join(f"0x{int(a):x}:{max(0, int(z))}" for a, z in chunk)
-            reply = ch.exchange(f"READ {int(pid)} {spec}", max(self.timeout_sec, 1.0))
+            reply = ch.exchange(f"READ {int(pid)} {spec}", self._bound_timeout(max(self.timeout_sec, 1.0)))
             try:
                 payload = json.loads(reply)
             except ValueError:
@@ -3068,10 +3291,14 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
                         self._open_daemon_locked()
                     self.daemon_stats["requests"] += 1
                     return fn(self._daemon)
-                except (DaemonChannelError, OSError, ValueError):
+                except (DaemonChannelError, OSError, ValueError) as exc:
                     self._close_daemon_locked(graceful=False)
                     if self.daemon_stats["opens"] == 0:
                         self._daemon_unsupported_for = path  # never worked: remember for the session
+                        self.daemon_stats["fallbacks"] += 1
+                        return None
+                    rem = self.remaining_deadline_sec()
+                    if (rem is not None and rem <= 0.2) or "timeout" in str(exc).lower():
                         self.daemon_stats["fallbacks"] += 1
                         return None
                     if attempt == 1:
@@ -3194,7 +3421,7 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
         self._ensure_tracking_state()
         if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 1:
             return [(None, "UNAVAILABLE", f"Invalid PID {pid}") for _ in slices]
-        ok_pin, pin_err = self.verify_pinned_identity(pid)
+        ok_pin, pin_err = self.verify_pinned_identity(pid, _allow_recent_sec=0.05)
         if not ok_pin:
             st = "PID_REUSED" if (pin_err and "PID_REUSED" in pin_err) else "IDENTITY_UNAVAILABLE"
             return [(None, st, pin_err) for _ in slices]

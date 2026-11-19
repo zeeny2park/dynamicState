@@ -96,6 +96,8 @@ int collector_report_stats(void *out_file);
 int collector_report_impact(pid_t pid, void *out_file);
 int collector_report_ident(pid_t pid, int with_header, void *out_file);
 int collector_report_procfile(pid_t pid, const char *name, void *out_file);
+int collector_report_fds(pid_t pid, void *out_file);
+int collector_report_snapshot(pid_t pid, void *out_file);
 int collector_daemon_loop(int backend, void *in_file, void *out_file);
 
 #ifdef __cplusplus

@@ -57,6 +57,18 @@ def _read_fds(adapter: Any, pid: int) -> Optional[Dict[str, str]]:
             return out
         except OSError:
             return None
+    list_fds = getattr(adapter, "list_open_fds", None)
+    if callable(list_fds) and "run_ssh" not in getattr(adapter, "__dict__", {}):
+        try:
+            res_fds = list_fds(int(pid))
+            if res_fds is not None:
+                cnt, targets = res_fds
+                out = {str(i): t for i, t in enumerate(targets)}
+                for j in range(len(targets), int(cnt)):
+                    out[str(j)] = "?"
+                return out
+        except Exception:  # noqa: BLE001
+            pass
     run = getattr(adapter, "run_ssh", None)
     if not callable(run):
         return None
@@ -101,16 +113,48 @@ def collect_fd_usage(provider: Any, ctx: Dict[str, Any]) -> None:
     samples: List[Dict[str, Any]] = []
     first: Optional[Dict[str, str]] = None
     last: Optional[Dict[str, str]] = None
-    t0 = time.monotonic()
-    for i in range(SAMPLES):
-        fds = _read_fds(adapter, pid)
-        if fds is None:
-            break
-        first = fds if first is None else first
-        last = fds
-        samples.append({"t_s": round(time.monotonic() - t0, 3), "open_fds": len(fds), "threads": _threads(adapter, pid)})
-        if i + 1 < SAMPLES:
-            time.sleep(INTERVAL_S)
+    cos = ((getattr(provider, "_imp008_state", None) or {}).get("fd_cosamples") or {}).get(int(pid)) or []
+    can_reuse_cos = (
+        len(cos) >= SAMPLES
+        and "run_ssh" not in getattr(adapter, "__dict__", {})
+    )
+    if can_reuse_cos:
+        picked = [cos[0], cos[len(cos) // 2], cos[-1]]
+        c0, c1, c2 = len(picked[0][1]), len(picked[1][1]), len(picked[2][1])
+        if c2 <= c0 or (c0 < c1 < c2 and (c2 - c0) >= MIN_GROWTH):
+            base_t = picked[0][0]
+            first = picked[0][1]
+            last = picked[-1][1]
+            for ts_p, fds_p, thr_p in picked:
+                samples.append({"t_s": round(ts_p - base_t, 3), "open_fds": len(fds_p), "threads": thr_p})
+        else:
+            # FDs grew slightly during the 0.6s window: take one more sample after INTERVAL_S
+            now = time.monotonic()
+            wait_s = max(0.0, INTERVAL_S - (now - cos[-1][0]))
+            if wait_s > 0:
+                time.sleep(wait_s)
+            fds_now = _read_fds(adapter, pid)
+            if fds_now is not None:
+                picked = [cos[0], cos[-1], (time.monotonic(), fds_now, _threads(adapter, pid))]
+            else:
+                picked = [cos[0], cos[len(cos) // 2], cos[-1]]
+            if picked:
+                base_t = picked[0][0]
+                first = picked[0][1]
+                last = picked[-1][1]
+                for ts_p, fds_p, thr_p in picked:
+                    samples.append({"t_s": round(ts_p - base_t, 3), "open_fds": len(fds_p), "threads": thr_p})
+    if not samples:
+        t0 = time.monotonic()
+        for i in range(SAMPLES):
+            fds = _read_fds(adapter, pid)
+            if fds is None:
+                break
+            first = fds if first is None else first
+            last = fds
+            samples.append({"t_s": round(time.monotonic() - t0, 3), "open_fds": len(fds), "threads": _threads(adapter, pid)})
+            if i + 1 < SAMPLES:
+                time.sleep(INTERVAL_S)
     obs: Dict[str, Any] = {"samples": samples, "fd_limit": _fd_limit(adapter, pid)}
     if first is not None and last is not None:
         new = [last[k] for k in last if k not in first or first[k] != last[k]]

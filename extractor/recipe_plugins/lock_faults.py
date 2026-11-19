@@ -119,6 +119,11 @@ def _tid_exists(adapter: Any, pid: int, tid: int) -> Optional[bool]:
     try:
         if adapter is None or not getattr(adapter, "is_remote", lambda: False)():
             return os.path.isdir(f"/proc/{int(tid)}")
+        chk_tid = getattr(adapter, "check_tid_alive", None)
+        if callable(chk_tid) and "run_ssh" not in getattr(adapter, "__dict__", {}):
+            res_alive = chk_tid(int(tid))
+            if res_alive is not None:
+                return bool(res_alive)
         run = getattr(adapter, "run_ssh", None)
         if not callable(run):
             return None
@@ -195,7 +200,21 @@ def collect_lock_wait_state(provider: Any, ctx: Dict[str, Any]) -> None:
     samples: List[Dict[str, Any]] = []
     t0 = time.monotonic()
     err: Optional[str] = None
-    for i in range(SAMPLES):
+    elf_key = (int(pid), str(ctx.get("companion_elf") or ""))
+    pre_insps = (getattr(provider, "_lock_inspections_cache", None) or {}).get(elf_key) or []
+    can_reuse_lws = (
+        len(pre_insps) >= SAMPLES
+        and "_inspect_locks" not in getattr(provider, "__dict__", {})
+        and "inspect_thread_callstacks_and_locks" not in getattr(getattr(provider, "watch_manager", None), "__dict__", {})
+    )
+    if can_reuse_lws:
+        base_t = pre_insps[0][0]
+        sw_map = (getattr(provider, "_lock_switches_cache", None) or {}).get(int(pid)) or []
+        for idx_s in range(SAMPLES):
+            ts_i, info_i = pre_insps[idx_s]
+            sw_i = sw_map[idx_s] if idx_s < len(sw_map) else {}
+            samples.append(_digest(info_i, max(0.0, ts_i - base_t), sw_i))
+    for i in range(0 if samples else SAMPLES):
         try:
             info = provider._inspect_locks(pid, ctx.get("companion_elf"))
             if not isinstance(info, dict) or info.get("error") or info.get("success") is False:

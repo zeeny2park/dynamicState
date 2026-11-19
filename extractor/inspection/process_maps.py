@@ -1,3 +1,4 @@
+import contextlib
 """Process memory maps, ELF load bias (main image and shared libraries) and the memory-map/thread overview.
 
 Moved verbatim from extractor/watch_session.py; ``WatchSessionManager`` binds the functions taking the manager
@@ -233,7 +234,8 @@ def _get_process_maps_and_load_bias(
         except Exception:
             pass
     target_adapter = adapter or mgr._resolve_adapter(pid=pid or 1)
-    cache_key = (pid, str(companion_elf_path or ""), target_adapter.target_host())
+    norm_elf = os.path.abspath(str(companion_elf_path).split(",")[0].strip()) if companion_elf_path else ""
+    cache_key = (pid, norm_elf, str(companion_elf_path or ""), target_adapter.target_host())
     now_mono = time.monotonic()
 
     with mgr._lock:
@@ -241,12 +243,19 @@ def _get_process_maps_and_load_bias(
         if cached is not None and (now_mono - cached[0]) <= ttl_sec:
             return cached[1]
 
-    alive, live_err = target_adapter.check_liveness(pid)
-    if not alive:
-        raise RuntimeError(f"Target process PID {pid} is not accessible on {target_adapter.target_host()}: {live_err}")
+    snap_ctx = getattr(target_adapter, "snapshot_scope", None)
+    with (snap_ctx(pid) if callable(snap_ctx) else contextlib.nullcontext()):
+        alive, live_err = target_adapter.check_liveness(pid)
+        if not alive:
+            raise RuntimeError(f"Target process PID {pid} is not accessible on {target_adapter.target_host()}: {live_err}")
 
-    mappings = target_adapter.get_proc_maps(pid)
-    runtime_ident = target_adapter.get_process_identity(pid)
+        mappings = target_adapter.get_proc_maps(pid)
+        pinned_map = getattr(target_adapter, "_pinned_identities", None)
+        if (isinstance(pinned_map, dict) and int(pid) in pinned_map
+                and "get_process_identity" not in getattr(target_adapter, "__dict__", {})):
+            runtime_ident = pinned_map[int(pid)]
+        else:
+            runtime_ident = target_adapter.get_process_identity(pid)
     primary_elf, extra_so_elfs = mgr._split_companion_elf_paths(companion_elf_path)
 
     companion_identity: Optional[BinaryIdentity] = None

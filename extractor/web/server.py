@@ -3418,10 +3418,19 @@ class WebApiAdapter:
         enable_tracing = params.get("enable_tracing")
         if enable_tracing is not None:
             enable_tracing = bool(enable_tracing)
+        resume_investigation_id = params.get("resume_investigation_id") or None
+        if resume_investigation_id is not None:
+            if not isinstance(resume_investigation_id, str) or not resume_investigation_id.strip():
+                return {"success": False, "error": {"code": "INVALID_PARAM", "message": "resume_investigation_id must be a non-empty string"}}
+            resume_investigation_id = resume_investigation_id.strip()
+        continue_collected_only = bool(params.get("continue_collected_only"))
         return {"success": True, "args": {
             "pid": pid, "debug_image": debug_image, "symptom": symptom, "time_limit_s": time_limit_s,
             "language": language, "remote_target": remote_target, "symptom_fields": symptom_fields,
-            "enable_tracing": enable_tracing, **check_budget}}
+            "enable_tracing": enable_tracing,
+            "resume_investigation_id": resume_investigation_id,
+            "continue_collected_only": continue_collected_only,
+            **check_budget}}
 
     def diagnose_api(self, params: Dict[str, Any]) -> Dict[str, Any]:
         """POST /api/diagnose: the one-call entry point (IMP-006). Calls the same diagnose() as MCP and CLI.
@@ -3444,6 +3453,8 @@ class WebApiAdapter:
                 symptom_fields=symptom_fields, default_check_budget_s=a.get("default_check_budget_s"),
                 default_check_max_s=a.get("default_check_max_s"),
                 enable_tracing=a.get("enable_tracing"),
+                resume_investigation_id=a.get("resume_investigation_id"),
+                continue_collected_only=bool(a.get("continue_collected_only")),
             )
             return {"success": True, "result": _to_json_serializable({**result, "human_summary": summary})}
         except Exception as e:
