@@ -6,6 +6,7 @@ live memory capture, and C++ semantic investigation.
 """
 
 from dataclasses import asdict
+import asyncio
 import json
 import os
 import sys
@@ -44,6 +45,28 @@ except ImportError as _mcp_import_error:
                 self.tools[t_name] = fn
                 return fn
             return decorator
+
+        async def call_tool(self, name: str, arguments: Optional[Dict[str, Any]] = None):
+            if name not in self.tools:
+                raise ValueError(f"Unknown MCP tool: {name}")
+            fn = self.tools[name]
+            result = fn(**(arguments or {}))
+            if asyncio.iscoroutine(result):
+                result = await result
+            text = result if isinstance(result, str) else json.dumps(result, default=str)
+
+            class _FallbackTextContent:
+                def __init__(self, text_val: str):
+                    self.type = "text"
+                    self.text = text_val
+
+            class _FallbackCallToolResult:
+                def __init__(self, text_val: str):
+                    self.content = [_FallbackTextContent(text_val)]
+                    self.isError = False
+                    self.is_error = False
+
+            return _FallbackCallToolResult(text)
 
         def run(self, transport: str = "stdio"):
             print(MCP_INSTALL_HINT, file=sys.stderr)

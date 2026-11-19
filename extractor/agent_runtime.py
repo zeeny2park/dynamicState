@@ -55,7 +55,7 @@ class AgentRuntime:
     All operations are strictly bound by runtime safety boundaries.
     """
 
-    def __init__(self, controller: Optional[RuntimeController] = None, corpus_dir: str = "corpus", observation_mode: str = "LOW_IMPACT", allow_mutation: bool = False):
+    def __init__(self, controller: Optional[RuntimeController] = None, corpus_dir: str = "corpus", observation_mode: str = "LOW_IMPACT", allow_mutation: bool = False, trust_store: Optional[Any] = None, trust_store_path: Optional[str] = None, allow_non_durable_trust: bool = False):
         self.controller = controller
         self.corpus_dir = os.path.abspath(corpus_dir)
         self.corpus = StateCorpus(self.corpus_dir)
@@ -92,8 +92,31 @@ class AgentRuntime:
         # Phase 21 Persistent Watch Session Manager
         self.watch_session_manager: WatchSessionManager = WatchSessionManager(corpus_dir=self.corpus_dir)
 
+        # P0-3: Mandatory Durable TrustStore initialization for production runtime entry points
+        from .capture_backend import DurableTrustStore, get_default_trust_store, set_default_trust_store
+        self.allow_non_durable_trust: bool = bool(allow_non_durable_trust)
+        if trust_store is not None:
+            self.trust_store = trust_store
+        elif trust_store_path:
+            self.trust_store = DurableTrustStore(trust_store_path)
+        else:
+            env_ts_path = os.environ.get("DYNAMICSTATE_TRUST_STORE_PATH")
+            if env_ts_path:
+                self.trust_store = DurableTrustStore(env_ts_path)
+            else:
+                os.makedirs(self.corpus_dir, mode=0o700, exist_ok=True)
+                self.trust_store = DurableTrustStore(os.path.join(self.corpus_dir, "trust_store.json"))
+        if not self.allow_non_durable_trust and not getattr(self.trust_store, "is_durable", bool(getattr(self.trust_store, "store_path", None))):
+            raise RuntimeError(
+                "AgentRuntime requires a file-backed durable TrustStore in production mode "
+                "(pass allow_non_durable_trust=True only for explicit non-production testing)"
+            )
+        if getattr(self.trust_store, "is_durable", False) and get_default_trust_store() is None:
+            set_default_trust_store(self.trust_store)
+
         # Phase 2.1 Adaptive Investigation & Expert Diagnostic Engine
         self.expert_diagnostic_engine: ExpertDiagnosticEngine = ExpertDiagnosticEngine(corpus_dir=self.corpus_dir)
+        self.expert_diagnostic_engine.trust_store = self.trust_store
 
     # -------------------------------------------------------------------------
     # Protocol Action Dispatcher

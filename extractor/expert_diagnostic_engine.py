@@ -1220,6 +1220,19 @@ DEFAULT_MIN_STEP_CAP = 30
 STEP_MARGIN_BEYOND_PLAN = 10
 
 
+
+def _is_ledger_admitted_evidence_entry(entry: Dict[str, Any]) -> bool:
+    """Return True if a collected evidence entry was not failed or quarantined during ledger admission."""
+    adm = entry.get("ledger_admission_state")
+    if adm in ("FAILED", "QUARANTINED", "REJECTED"):
+        return False
+    status = entry.get("ledger_status")
+    if not isinstance(status, str) or not status:
+        return True
+    prefix = status.split(":", 1)[0].strip().upper()
+    return prefix not in ("FAILED", "QUARANTINED", "REJECTED")
+
+
 class AdaptiveInvestigationSession:
     """Represents a single active or completed expert investigation session."""
 
@@ -2862,12 +2875,12 @@ class AdaptiveInvestigationSession:
             supp_ev = [
                 e for e in ev_list
                 if e.get("status") == "SUPPORTED"
-                and not str(e.get("ledger_status", "")).startswith(("FAILED", "QUARANTINED"))
+                and _is_ledger_admitted_evidence_entry(e)
             ]
             contra_ev = [
                 e for e in ev_list
                 if e.get("status") == "CONTRADICTED"
-                and not str(e.get("ledger_status", "")).startswith(("FAILED", "QUARANTINED"))
+                and _is_ledger_admitted_evidence_entry(e)
             ]
 
             # Build executable verification criteria for this problem category
@@ -3879,7 +3892,7 @@ class AdaptiveInvestigationSession:
                     classification=CLASSIFICATION_OBSERVED_SYMPTOM,
                     problem_description=ev.get("finding", ""),
                     affected_entity=ev.get("symbol") or str(ev.get("address")),
-                    observed_behavior=str(ev.get("observed_value")),
+                    observed_behavior=(str(json.loads(json.dumps(ev.get("observed_value"), default=str))) if isinstance(ev.get("observed_value"), (dict, list)) else str(ev.get("observed_value"))),
                     supporting_evidence_ids=[ev.get("evidence_id", "")],
                     verification_status="OBSERVED",
                     epistemic_level="observation",

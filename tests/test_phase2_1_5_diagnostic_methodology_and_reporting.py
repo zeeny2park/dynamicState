@@ -233,8 +233,8 @@ class TestHypothesisEvidenceIntegrity(unittest.TestCase):
                 target_identity={"pid": 1234, "process_identity": "proc_1234", "executable_identity": "/proc/1234/exe", "build_id": "sha1:testbuildid12345"},
                 observation=obs_str,
             )
-            ledger._by_id[eid] = rec
-            ledger._records.append(rec)
+            ledger.add_record(rec)
+            ledger.accept_record(eid)
 
         hyp = CompetingHypothesis(
             hypothesis_id="HYP_UAF_01",
@@ -497,7 +497,7 @@ class TestMasterDiagnosticReportEngine(unittest.TestCase):
                         target_pid=2048,
                         timestamp="2026-11-08T00:00:00Z",
                         duration_sec=0.01,
-                        provenance_class="DIRECT_MEASUREMENT",
+                        provenance_class="LIVE_RUNTIME_CAPTURE",
                         raw_observation={"queue_len": 50000},
                         normalized_observation={"queue_len": 50000},
                     )
@@ -579,8 +579,7 @@ class TestRealisticCppScenarios(unittest.TestCase):
     """Area 15: C++ Scenarios (UAF, Leak, Deadlock, Warm-up)."""
 
     def test_cpp_memory_leak_investigation_end_to_end(self):
-        debug_elf = "/tmp/expert_diagnostic_debug.elf"
-        ensure_expert_diagnostic_fixture(need_stripped=False)
+        debug_elf, _ = ensure_expert_diagnostic_fixture(need_stripped=False)
 
         proc = fixture_popen([debug_elf, "leak"], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         try:

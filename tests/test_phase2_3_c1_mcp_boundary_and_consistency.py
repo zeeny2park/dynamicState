@@ -230,7 +230,8 @@ class TestPhase23C1McpBoundaryAndConsistency(unittest.TestCase):
         self.assertEqual(len(report_findings), len(json_findings))
 
         # 5. Assert evidence identifier agreement
-        collected_ev_ids = [r.evidence_id for r in session.collected_evidence_records]
+        eligible_ids = {r.evidence_id for r in session.ledger.get_eligible_evidence()}
+        collected_ev_ids = [r.evidence_id for r in session.collected_evidence_records if r.evidence_id in eligible_ids]
         report_ev_ids = [r.evidence_id for r in report.section_g_evidence_and_provenance.evidence_records]
         self.assertEqual(collected_ev_ids, report_ev_ids)
         self.assertGreater(len(report_ev_ids), 0)

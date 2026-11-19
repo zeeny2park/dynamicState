@@ -842,6 +842,9 @@ class TrustConsumptionResult:
 class DurableCommitOutcome(Enum):
     NOT_COMMITTED = "NOT_COMMITTED"
     COMMITTED = "COMMITTED"
+    ALREADY_COMMITTED = "ALREADY_COMMITTED"
+    NON_DURABLE = "NON_DURABLE"
+    REJECTED = "REJECTED"
     COMMIT_UNKNOWN = "COMMIT_UNKNOWN"
 
 
@@ -1162,6 +1165,11 @@ class DurableTrustStore:
         if self.store_path and os.path.exists(self.store_path):
             self.load()
 
+    @property
+    def is_durable(self) -> bool:
+        """Return True only when backed by a concrete persistent store_path."""
+        return bool(self.store_path and str(self.store_path).strip())
+
     @contextlib.contextmanager
     def _file_lock(self, timeout: float = 5.0):
         """Cross-process and cross-thread re-entrant mutual exclusion context with 5.0s timeout."""
@@ -1173,7 +1181,10 @@ class DurableTrustStore:
             lock_path = self.store_path + ".lock"
             if self._lock_depth == 0:
                 dir_name = os.path.dirname(os.path.abspath(lock_path))
-                os.makedirs(dir_name, mode=0o700, exist_ok=True)
+                if os.path.exists(dir_name):
+                    self._verify_parent_dir_security(dir_name)
+                else:
+                    os.makedirs(dir_name, mode=0o700, exist_ok=True)
                 flags = os.O_RDWR | os.O_CREAT
                 if hasattr(os, "O_NOFOLLOW"):
                     flags |= os.O_NOFOLLOW
@@ -1233,19 +1244,9 @@ class DurableTrustStore:
                     except OSError:
                         pass
 
-    def _verify_path_security(self, path: str, operation: str = "access") -> None:
-        """Verify filesystem security constraints: no symlinks, correct ownership, secure permissions."""
-        if not path:
-            return
-        prep = "to" if operation == "save" else "from"
-        if os.path.islink(path) or (not os.path.exists(path) and os.path.lexists(path)):
-            raise SecurityViolationError(f"Refusing to {operation} trust store {prep} symlink: '{path}'")
-
-        abs_path = os.path.abspath(path)
-        dir_name = os.path.dirname(abs_path)
-
-        # Verify all path ancestors up to root
-        curr = dir_name
+    def _verify_parent_dir_security(self, dir_name: str) -> None:
+        """Verify parent directory and all ancestors: no symlinks, correct ownership, safe permissions."""
+        curr = os.path.abspath(dir_name)
         while curr and curr != "/":
             if os.path.islink(curr):
                 raise SecurityViolationError(f"Trust store ancestor is a symlink: '{curr}'")
@@ -1264,6 +1265,28 @@ class DurableTrustStore:
                 raise SecurityViolationError(f"Trust store parent directory is a symlink: '{dir_name}'")
             if hasattr(os, "getuid") and dst.st_uid != os.getuid():
                 raise SecurityViolationError(f"Trust store parent directory owned by UID {dst.st_uid}, expected {os.getuid()}")
+            dir_mode = stat.S_IMODE(dst.st_mode)
+            is_sticky = bool(dst.st_mode & stat.S_ISVTX)
+            if (dir_mode & 0o002) != 0 and not is_sticky:
+                raise SecurityViolationError(
+                    f"Trust store parent directory '{dir_name}' has unsafe world-writable permissions (mode={oct(dir_mode)})"
+                )
+            if (dir_mode & 0o020) != 0 and not is_sticky:
+                raise SecurityViolationError(
+                    f"Trust store parent directory '{dir_name}' has unsafe group-writable permissions (mode={oct(dir_mode)})"
+                )
+
+    def _verify_path_security(self, path: str, operation: str = "access") -> None:
+        """Verify filesystem security constraints: no symlinks, correct ownership, secure permissions."""
+        if not path:
+            return
+        prep = "to" if operation == "save" else "from"
+        if os.path.islink(path) or (not os.path.exists(path) and os.path.lexists(path)):
+            raise SecurityViolationError(f"Refusing to {operation} trust store {prep} symlink: '{path}'")
+
+        abs_path = os.path.abspath(path)
+        dir_name = os.path.dirname(abs_path)
+        self._verify_parent_dir_security(dir_name)
 
         if os.path.lexists(path):
             st = os.lstat(path)
@@ -1421,6 +1444,8 @@ class DurableTrustStore:
                             raise ValueError(f"used_attestations entry '{aid}' missing valid 'evidence_id'")
                         if "session_id" in rec and (not isinstance(rec["session_id"], str) or not rec["session_id"]):
                             raise ValueError(f"used_attestations entry '{aid}' has invalid session_id")
+                        if "operation_id" in rec and (not isinstance(rec["operation_id"], str) or not rec["operation_id"].strip()):
+                            raise ValueError(f"used_attestations entry '{aid}' has invalid operation_id")
                         if "pid" in rec:
                             p = rec["pid"]
                             if isinstance(p, bool) or not isinstance(p, int) or p < 0:
@@ -1510,7 +1535,7 @@ class DurableTrustStore:
         """Atomically persist trust store state to disk with strict commit outcome semantics."""
         with self._file_lock():
             if not self.store_path:
-                return DurableCommitOutcome.COMMITTED
+                return DurableCommitOutcome.NON_DURABLE
             self._verify_path_security(self.store_path, operation="save")
             payload = {
                 "schema_version": "1.1.0",
@@ -1707,12 +1732,25 @@ class DurableTrustStore:
         require_operation_id: bool = True,
     ) -> TrustConsumptionResult:
         """Atomic trust-consumption contract eliminating check-then-record race conditions."""
-        eff_op_id = operation_id if (operation_id is not None and str(operation_id).strip()) else getattr(attestation, "operation_id", None)
+        arg_op_id = str(operation_id).strip() if (operation_id is not None and str(operation_id).strip()) else None
+        att_op_raw = getattr(attestation, "operation_id", None)
+        att_op_id = str(att_op_raw).strip() if (att_op_raw is not None and str(att_op_raw).strip()) else None
+        if arg_op_id is not None:
+            validate_operation_id(arg_op_id)
+        if att_op_id is not None:
+            validate_operation_id(att_op_id)
+        if arg_op_id is not None and att_op_id is not None and arg_op_id != att_op_id:
+            return TrustConsumptionResult(
+                status=TrustConsumptionStatus.IDENTITY_MISMATCH,
+                reason=f"OPERATION_ID_MISMATCH: Expected operation '{arg_op_id}', attestation has '{att_op_id}'",
+                attestation_id=str(getattr(attestation, "attestation_id", "")),
+                key_id=str(getattr(attestation, "key_id", "")),
+                evidence_id=str(evidence_id),
+            )
+        eff_op_id = arg_op_id or att_op_id
         if require_operation_id:
             if eff_op_id is None or not str(eff_op_id).strip():
                 raise MissingIdentityFieldError("operation_id is mandatory for durable attestation consumption")
-            validate_operation_id(str(eff_op_id))
-        elif eff_op_id is not None:
             validate_operation_id(str(eff_op_id))
         with self._file_lock():
             self.load()
@@ -1729,13 +1767,14 @@ class DurableTrustStore:
                     evidence_id=str(evidence_id),
                 )
 
-            # 2. Signature verification & identity validation
+            # 2. Signature verification & identity validation (explicitly binding canonical operation_id)
             ok_v, err_v = attestation.verify(
                 secret=secret,
                 key_store=key_store,
                 current_time_ns=current_time_ns,
                 expected_session_id=session_id,
                 expected_pid=expected_pid,
+                expected_operation_id=eff_op_id,
                 expected_process_identity=expected_process_identity,
                 expected_executable_identity=expected_executable_identity,
                 expected_build_id=expected_build_id,
@@ -1785,11 +1824,22 @@ class DurableTrustStore:
                     bound_eid = bound_info.get("evidence_id")
                     bound_sess = bound_info.get("session_id")
                     bound_pid = bound_info.get("pid")
-                    # Exact original committed evidence recovery
-                    if bound_eid == str(evidence_id) and (not session_id or bound_sess == str(session_id)) and (expected_pid is None or int(bound_pid) == int(expected_pid)):
+                    bound_op = bound_info.get("operation_id")
+                    op_matches = (
+                        (bound_op is None and eff_op_id is None)
+                        or (bound_op is not None and eff_op_id is not None and str(bound_op) == str(eff_op_id))
+                        or (bound_op is None and not require_operation_id)
+                    )
+                    # Exact original committed evidence + canonical operation_id recovery
+                    if (
+                        bound_eid == str(evidence_id)
+                        and (not session_id or bound_sess == str(session_id))
+                        and (expected_pid is None or int(bound_pid) == int(expected_pid))
+                        and op_matches
+                    ):
                         return TrustConsumptionResult(
                             status=TrustConsumptionStatus.IDEMPOTENT_RECOVERY,
-                            reason="Idempotent re-verification of same evidence record",
+                            reason="Idempotent re-verification of same evidence record and canonical operation_id",
                             attestation_id=att_id,
                             key_id=kid,
                             evidence_id=str(evidence_id),
@@ -1798,7 +1848,10 @@ class DurableTrustStore:
                     else:
                         return TrustConsumptionResult(
                             status=TrustConsumptionStatus.REPLAY_CONFLICT,
-                            reason=f"Attestation ID '{att_id}' already consumed by evidence '{bound_eid}' (session={bound_sess}, pid={bound_pid})",
+                            reason=(
+                                f"Attestation ID '{att_id}' already consumed by evidence '{bound_eid}' "
+                                f"(session={bound_sess}, pid={bound_pid}, operation_id={bound_op})"
+                            ),
                             attestation_id=att_id,
                             key_id=kid,
                             evidence_id=str(evidence_id),
@@ -1818,12 +1871,15 @@ class DurableTrustStore:
             orig_used_dict = dict(self.used_attestations)
 
             self.used_attestation_ids.add(att_id)
-            self.used_attestations[att_id] = {
+            att_rec = {
                 "evidence_id": str(evidence_id),
                 "session_id": str(session_id or attestation.session_id),
                 "pid": int(expected_pid or attestation.target_identity.get("pid", 0)),
                 "recorded_at": now_iso,
             }
+            if eff_op_id is not None:
+                att_rec["operation_id"] = str(eff_op_id)
+            self.used_attestations[att_id] = att_rec
 
             try:
                 self.save()
@@ -1865,6 +1921,149 @@ class DurableTrustStore:
                 evidence_id=str(evidence_id),
                 recorded_at=now_iso,
             )
+
+    def reconcile_attestations_atomic(
+        self,
+        items: List[Dict[str, Any]],
+    ) -> List[TrustConsumptionResult]:
+        """Atomically validate and reconcile a batch of attestations under one lock and one save.
+
+        If ANY item fails validation or replay checks, NO durable TrustStore mutation occurs.
+        """
+        if not items:
+            return []
+        with self._file_lock():
+            self.load()
+            if not hasattr(self, "used_attestations"):
+                self.used_attestations: Dict[str, Dict[str, Any]] = {}
+
+            orig_used_set = set(self.used_attestation_ids)
+            orig_used_dict = {k: dict(v) for k, v in self.used_attestations.items()}
+            pending_set = set(orig_used_set)
+            pending_dict = {k: dict(v) for k, v in orig_used_dict.items()}
+            results: List[TrustConsumptionResult] = []
+            now_iso = datetime.now(timezone.utc).isoformat()
+            needs_save = False
+
+            for item in items:
+                attestation = item["attestation"]
+                evidence_id = str(item["evidence_id"])
+                session_id = item.get("session_id")
+                expected_pid = item.get("expected_pid")
+                expected_process_identity = item.get("expected_process_identity")
+                expected_executable_identity = item.get("expected_executable_identity")
+                expected_build_id = item.get("expected_build_id")
+                expected_target_host = item.get("expected_target_host")
+                operation_id = item.get("operation_id")
+                require_operation_id = item.get("require_operation_id", True)
+
+                arg_op_id = str(operation_id).strip() if (operation_id is not None and str(operation_id).strip()) else None
+                att_op_raw = getattr(attestation, "operation_id", None)
+                att_op_id = str(att_op_raw).strip() if (att_op_raw is not None and str(att_op_raw).strip()) else None
+                att_id = str(attestation.attestation_id)
+                kid = str(attestation.key_id)
+
+                if arg_op_id is not None and att_op_id is not None and arg_op_id != att_op_id:
+                    raise ValueError(
+                        f"CausalAttestation rejected for record '{evidence_id}': [IDENTITY_MISMATCH] "
+                        f"OPERATION_ID_MISMATCH: Expected operation '{arg_op_id}', attestation has '{att_op_id}'"
+                    )
+                eff_op_id = arg_op_id or att_op_id
+                if require_operation_id:
+                    if eff_op_id is None or not str(eff_op_id).strip():
+                        raise MissingIdentityFieldError("operation_id is mandatory for durable attestation consumption")
+                    validate_operation_id(str(eff_op_id))
+                elif eff_op_id is not None:
+                    validate_operation_id(str(eff_op_id))
+
+                if kid in self.revoked_keys or attestation.revoked:
+                    raise ValueError(
+                        f"CausalAttestation rejected for record '{evidence_id}': [REVOKED] "
+                        f"Attestation key '{kid}' or attestation itself is revoked"
+                    )
+
+                ok_v, err_v = attestation.verify(
+                    expected_session_id=session_id,
+                    expected_pid=expected_pid,
+                    expected_operation_id=eff_op_id,
+                    expected_process_identity=expected_process_identity,
+                    expected_executable_identity=expected_executable_identity,
+                    expected_build_id=expected_build_id,
+                    expected_target_host=expected_target_host,
+                    trust_store=self,
+                )
+                if not ok_v:
+                    raise ValueError(f"CausalAttestation rejected for record '{evidence_id}': {err_v}")
+
+                if att_id in pending_set:
+                    bound_info = pending_dict.get(att_id)
+                    if bound_info:
+                        bound_eid = bound_info.get("evidence_id")
+                        bound_sess = bound_info.get("session_id")
+                        bound_pid = bound_info.get("pid")
+                        bound_op = bound_info.get("operation_id")
+                        op_matches = (
+                            (bound_op is None and eff_op_id is None)
+                            or (bound_op is not None and eff_op_id is not None and str(bound_op) == str(eff_op_id))
+                            or (bound_op is None and not require_operation_id)
+                        )
+                        if (
+                            bound_eid == evidence_id
+                            and (not session_id or bound_sess == str(session_id))
+                            and (expected_pid is None or int(bound_pid) == int(expected_pid))
+                            and op_matches
+                        ):
+                            results.append(TrustConsumptionResult(
+                                status=TrustConsumptionStatus.IDEMPOTENT_RECOVERY,
+                                reason="Idempotent re-verification of same evidence record and canonical operation_id",
+                                attestation_id=att_id,
+                                key_id=kid,
+                                evidence_id=evidence_id,
+                                recorded_at=bound_info.get("recorded_at", ""),
+                            ))
+                            continue
+                    raise ValueError(
+                        f"Replay of causal attestation ID '{att_id}' rejected on record '{evidence_id}': [REPLAY_CONFLICT]"
+                    )
+
+                pending_set.add(att_id)
+                att_rec = {
+                    "evidence_id": evidence_id,
+                    "session_id": str(session_id or attestation.session_id),
+                    "pid": int(expected_pid or attestation.target_identity.get("pid", 0)),
+                    "recorded_at": now_iso,
+                }
+                if eff_op_id is not None:
+                    att_rec["operation_id"] = str(eff_op_id)
+                pending_dict[att_id] = att_rec
+                needs_save = True
+                results.append(TrustConsumptionResult(
+                    status=TrustConsumptionStatus.NEW_ACCEPTANCE,
+                    reason="Successfully verified and consumed attestation",
+                    attestation_id=att_id,
+                    key_id=kid,
+                    evidence_id=evidence_id,
+                    recorded_at=now_iso,
+                ))
+
+            if needs_save:
+                self.used_attestation_ids = pending_set
+                self.used_attestations = pending_dict
+                try:
+                    self.save()
+                except DurableCommitError as dce:
+                    if dce.outcome == DurableCommitOutcome.COMMIT_UNKNOWN:
+                        self.reconcile_from_disk()
+                    else:
+                        self.used_attestation_ids = orig_used_set
+                        self.used_attestations = orig_used_dict
+                    raise RuntimeError(f"Persistence failure during atomic trust reconciliation: {dce}") from dce
+                except Exception as e:
+                    self.used_attestation_ids = orig_used_set
+                    self.used_attestations = orig_used_dict
+                    raise RuntimeError(f"Persistence failure during atomic trust reconciliation: {e}") from e
+
+            return results
 
     def record_used_operation(
         self,

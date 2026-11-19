@@ -656,6 +656,31 @@ class TargetExecutionAdapter(ABC):
         if not alive:
             raise ProcessLookupError(f"Cannot begin capture transaction: target PID {pid} is not alive: {live_err}")
 
+        # P0-3: Validate mandatory durable TrustStore configuration BEFORE capture side effects begin
+        from .capture_backend import get_default_trust_store, OperationLifecycleState
+        eff_ts = getattr(self, "trust_store", None) or get_default_trust_store()
+        if require_lifecycle_persistence is True:
+            should_persist = True
+        elif require_lifecycle_persistence is False:
+            should_persist = False
+        else:
+            should_persist = getattr(self, "require_lifecycle_persistence", None)
+            if should_persist is None:
+                should_persist = bool(
+                    isinstance(self, LocalTargetAdapter)
+                    and not getattr(self, "allow_non_durable_trust", False)
+                )
+
+        if should_persist:
+            if not eff_ts or not callable(getattr(eff_ts, "transition_operation_lifecycle", None)):
+                raise RuntimeError(
+                    "Capture transaction requires durable lifecycle persistence, but no durable TrustStore is configured"
+                )
+            if not getattr(eff_ts, "is_durable", bool(getattr(eff_ts, "store_path", None))):
+                raise RuntimeError(
+                    "Capture transaction requires a file-backed durable TrustStore; in-memory non-durable TrustStore rejected"
+                )
+
         if int(pid) in self._pinned_identities:
             ok_pin, pin_err = self.verify_pinned_identity(int(pid), _allow_recent_sec=0.05)
             if not ok_pin:
@@ -680,24 +705,9 @@ class TargetExecutionAdapter(ABC):
         self._active_by_scope[(str(th), str(session_id), int(pid))] = tx
 
         # P0-5: If lifecycle persistence is required, advance lifecycle DAG CREATED -> VALIDATED -> RESERVED -> EXECUTING
-        from .capture_backend import get_default_trust_store, OperationLifecycleState
-        eff_ts = getattr(self, "trust_store", None) or get_default_trust_store()
-        if require_lifecycle_persistence is True:
-            should_persist = True
-        elif require_lifecycle_persistence is False:
-            should_persist = False
-        else:
-            should_persist = getattr(self, "require_lifecycle_persistence", None)
-            if should_persist is None:
-                should_persist = bool(eff_ts and isinstance(self, LocalTargetAdapter))
-
         tx.require_lifecycle_persistence = bool(should_persist)
         if should_persist:
             tx.metadata["require_lifecycle_persistence"] = True
-            if not eff_ts or not callable(getattr(eff_ts, "transition_operation_lifecycle", None)):
-                self._active_transactions.pop(tx.transaction_id, None)
-                self._active_by_scope.pop((str(th), str(session_id), int(pid)), None)
-                raise RuntimeError("Capture transaction requires durable lifecycle persistence, but no lifecycle trust store is available")
             lifecycle_state = None
             try:
                 eff_ts.transition_operation_lifecycle(
@@ -854,7 +864,11 @@ class TargetExecutionAdapter(ABC):
         )
         eff_ts = getattr(self, "trust_store", None) or get_default_trust_store()
         lifecycle_required = bool(target_tx.metadata.get("require_lifecycle_persistence"))
-        if lifecycle_required and (not eff_ts or not callable(getattr(eff_ts, "record_used_operation", None))):
+        if lifecycle_required and (
+            not eff_ts
+            or not callable(getattr(eff_ts, "record_used_operation", None))
+            or not getattr(eff_ts, "is_durable", bool(getattr(eff_ts, "store_path", None)))
+        ):
             self.rollback_capture_transaction(target_tx, "Required durable trust store unavailable at capture commit")
             raise RuntimeError("Capture transaction cannot commit without its required durable trust store")
         if eff_ts:
@@ -1469,11 +1483,16 @@ class LocalTargetAdapter(TargetExecutionAdapter):
         self,
         memory_reader_fn: Optional[Callable[[int, int, int], Tuple[Optional[bytes], str, Optional[str]]]] = None,
         adapter_id: Optional[str] = None,
+        trust_store: Optional[Any] = None,
+        allow_non_durable_trust: bool = False,
     ):
         self._ensure_tracking_state()
         if adapter_id:
             self._adapter_id = str(adapter_id)
         self._memory_reader = memory_reader_fn
+        if trust_store is not None:
+            self.trust_store = trust_store
+        self.allow_non_durable_trust: bool = bool(allow_non_durable_trust)
 
     def is_remote(self) -> bool:
         return False

@@ -1487,7 +1487,7 @@ class CompetingHypothesis:
                 eff_ledger=eff_ledger,
                 target_context=ctx,
             )
-            if auth_info["status"] == "IDENTITY_MISMATCH":
+            if auth_info["status"] in ("IDENTITY_MISMATCH", "MISSING_IDENTITY"):
                 if evidence_id:
                     self.rejected_evidence_reasons[evidence_id] = auth_info["reason"]
                     self.identity_validation_records[evidence_id] = auth_info

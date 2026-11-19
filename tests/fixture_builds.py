@@ -21,9 +21,9 @@ from typing import List, Optional, Tuple
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 FIXTURE_DIR = os.path.join(REPO_ROOT, "tests", "fixtures", "real_runtime")
 
-EXPERT_DEBUG_ELF = "/tmp/expert_diagnostic_debug.elf"
-EXPERT_STRIPPED_ELF = "/tmp/expert_diagnostic_stripped.elf"
-REAL_RUNTIME_DEBUG_ELF = "/tmp/real_runtime_app_debug.elf"
+EXPERT_DEBUG_ELF = os.path.join(tempfile.gettempdir(), "expert_diagnostic_debug.elf")
+EXPERT_STRIPPED_ELF = os.path.join(tempfile.gettempdir(), "expert_diagnostic_stripped.elf")
+REAL_RUNTIME_DEBUG_ELF = os.path.join(tempfile.gettempdir(), "real_runtime_app_debug.elf")
 
 _EXPERT_SRC = os.path.join(FIXTURE_DIR, "expert_diagnostic_scenarios.cpp")
 _EXPERT_CXXFLAGS = ["-g", "-O0", "-fno-inline", "-fno-omit-frame-pointer"]

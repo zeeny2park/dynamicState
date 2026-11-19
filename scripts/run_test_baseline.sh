@@ -1,10 +1,17 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# dynamicState — test baseline recorder (IMP-005)
+# dynamicState — test baseline recorder (IMP-005 / A.3.17 integrity closure)
 #
 # Runs every tests/test_*.py in its own interpreter with a per-file timeout and
 # writes a machine-readable, self-describing summary so "how many tests pass" is
 # a recorded fact rather than a claim.
+#
+# Integrity guarantees:
+#   - Zero-test files NEVER report PASSED (classified as FAILED / ZERO_TESTS).
+#   - Pytest-only files are detected via AST; never silently passed via unittest.
+#   - Skip markers (BASELINE_SKIP / CI_FLAKY) are recognized ONLY as explicit
+#     top-level header comments (first 25 lines), never inside functions/strings.
+#   - BASELINE_RECORD_ONLY=1 is explicitly labeled as non-gating informational.
 #
 # Usage: scripts/run_test_baseline.sh [output_dir]   (default: docs/test_baseline)
 # Env:   BASELINE_JOBS (default 2, never above available CPUs),
@@ -61,32 +68,112 @@ if [ "${#ALL_TEST_FILES[@]}" -eq 0 ]; then
     exit 2
 fi
 
+HAS_PYTEST=0
+if python3 -m pytest --version >/dev/null 2>&1; then
+    HAS_PYTEST=1
+fi
+
+detect_framework() {
+    python3 - "$1" <<'PY'
+import ast, sys
+path = sys.argv[1]
+try:
+    src = open(path, "r", encoding="utf-8", errors="replace").read()
+    tree = ast.parse(src, filename=path)
+except Exception:
+    print("unittest")
+    sys.exit(0)
+
+imports_pytest = False
+has_testcase = False
+has_top_level_test_fn = False
+
+for node in ast.walk(tree):
+    if isinstance(node, ast.Import):
+        for alias in node.names:
+            if alias.name == "pytest" or alias.name.startswith("pytest."):
+                imports_pytest = True
+    elif isinstance(node, ast.ImportFrom):
+        if node.module and (node.module == "pytest" or node.module.startswith("pytest.")):
+            imports_pytest = True
+    elif isinstance(node, ast.ClassDef):
+        for b in node.bases:
+            b_name = ""
+            if isinstance(b, ast.Name):
+                b_name = b.id
+            elif isinstance(b, ast.Attribute):
+                b_name = b.attr
+            if "TestCase" in b_name:
+                has_testcase = True
+
+for node in tree.body:
+    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name.startswith("test_"):
+        has_top_level_test_fn = True
+
+if imports_pytest or (has_top_level_test_fn and not has_testcase):
+    print("pytest")
+else:
+    print("unittest")
+PY
+}
+
 run_one() {
-    local f="$1" n rc status tests_ran last_line
+    local f="$1" n rc status tests_ran last_line fw
     n="$(basename "$f" .py)"
-    set +e
-    timeout -k 10 "${TMO}" python3 scripts/run_unittest.py "$f" >"${LOGS}/${n}.log" 2>&1
-    rc=$?
-    set -e
+    cd "${REPO_ROOT}"
+    fw="$(detect_framework "$f")"
+
+    if [ "${fw}" = "pytest" ]; then
+        if [ "${HAS_PYTEST}" -eq 1 ]; then
+            set +e
+            timeout -k 10 "${TMO}" python3 -m pytest -q "$f" >"${LOGS}/${n}.log" 2>&1
+            rc=$?
+            set -e
+            tests_ran="$(python3 - "${LOGS}/${n}.log" <<'PY'
+import re, sys
+text = open(sys.argv[1], "r", encoding="utf-8", errors="replace").read()
+total = 0
+for m in re.finditer(r"(\d+)\s+(passed|failed|error|errors|xfailed|xpassed)", text):
+    total += int(m.group(1))
+print(total)
+PY
+)"
+        else
+            echo "FRAMEWORK_MISMATCH: '${f}' requires pytest, which is not installed in this environment (refusing to run pytest-only test via unittest)" >"${LOGS}/${n}.log"
+            rc=5
+            tests_ran=0
+        fi
+    else
+        set +e
+        timeout -k 10 "${TMO}" python3 "${REPO_ROOT}/scripts/run_unittest.py" "$f" >"${LOGS}/${n}.log" 2>&1
+        rc=$?
+        set -e
+        tests_ran="$(grep -E '^Ran [0-9]+ tests?' "${LOGS}/${n}.log" | tail -1 | awk '{print $2}')"
+    fi
+
+    if [ -z "${tests_ran}" ]; then
+        tests_ran=0
+    fi
 
     if [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ]; then
         status="INFRA_FAILURE"
-    elif [ "$rc" -eq 0 ]; then
+    elif [ "$rc" -eq 0 ] && [ "${tests_ran}" -gt 0 ]; then
         status="PASSED"
+    elif [ "${tests_ran}" -eq 0 ]; then
+        status="FAILED"
+        rc=5
+        echo "ZERO_TESTS: 0 tests executed in '${f}' (false-PASS prevented)" >>"${LOGS}/${n}.log"
     else
         status="FAILED"
     fi
 
-    tests_ran="$(grep -E '^Ran [0-9]+ tests?' "${LOGS}/${n}.log" | tail -1 | awk '{print $2}')"
-    if [ -z "${tests_ran}" ]; then
-        tests_ran=0
-    fi
     last_line="$(tail -1 "${LOGS}/${n}.log" 2>/dev/null | tr -d '\n\r\t' || echo "")"
 
     printf '%s\t%s\t%s\t%s\t%s\n' "$n" "$status" "$rc" "$tests_ran" "$last_line" >>"${LOGS}/_rows.tsv"
-    [ "$rc" -eq 0 ] || cp "${LOGS}/${n}.log" "${OUT}/failed_${n}.log"
+    [ "${status}" = "PASSED" ] || cp "${LOGS}/${n}.log" "${OUT}/failed_${n}.log"
 }
-export -f run_one; export LOGS TMO OUT
+export -f detect_framework run_one
+export REPO_ROOT LOGS TMO OUT HAS_PYTEST
 
 touch "${LOGS}/_rows.tsv"
 PARALLEL_EXEC=()
@@ -94,9 +181,11 @@ SERIAL_EXEC=()
 
 for f in "${ALL_TEST_FILES[@]}"; do
     n="$(basename "$f" .py)"
-    skip_line="$(grep -m 1 -E "(BASELINE_SKIP|CI_FLAKY)" "$f" || true)"
+    # Only recognize explicit top-level header comment directives in the first 25 lines.
+    # Markers inside functions, strings, docstrings, or assertions MUST NOT skip the file.
+    skip_line="$(head -n 25 "$f" | grep -m 1 -E '^#[[:space:]]*(BASELINE_SKIP|CI_FLAKY)(:|[[:space:]]|$)' || true)"
     if [ -n "${skip_line}" ]; then
-        reason="$(echo "${skip_line}" | sed -E 's/^# *(BASELINE_SKIP|CI_FLAKY):? *//')"
+        reason="$(echo "${skip_line}" | sed -E 's/^#[[:space:]]*(BASELINE_SKIP|CI_FLAKY):?[[:space:]]*//')"
         if echo "${skip_line}" | grep -qiE "eBPF|root|capability|privilege|permission"; then
             status="SKIPPED_CAPABILITY"
         else
@@ -104,7 +193,7 @@ for f in "${ALL_TEST_FILES[@]}"; do
         fi
         printf '%s\t%s\t%s\t%s\t%s\n' "$n" "$status" "SKIPPED" "0" "$reason" >>"${LOGS}/_rows.tsv"
     else
-        if grep -q "BASELINE_SERIAL" "$f"; then
+        if head -n 25 "$f" | grep -q -E '^#[[:space:]]*BASELINE_SERIAL(:|[[:space:]]|$)'; then
             SERIAL_EXEC+=("$f")
         else
             PARALLEL_EXEC+=("$f")
@@ -122,9 +211,17 @@ for f in "${SERIAL_EXEC[@]}"; do
     run_one "$f"
 done
 
+GIT_COMMIT="nogit"
+if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    GIT_COMMIT="$(git rev-parse --short HEAD 2>/dev/null || echo 'nogit')"
+    if ! git diff --quiet HEAD -- . ':!docs/test_baseline' 2>/dev/null; then
+        GIT_COMMIT="${GIT_COMMIT}+dirty"
+    fi
+fi
+
 SUMMARY="${OUT}/summary.tsv"
 {
-    echo "# commit=$(git rev-parse --short HEAD)$(git diff --quiet HEAD -- . ':!docs/test_baseline' || echo '+dirty') date=$(date -u +%Y-%m-%dT%H:%MZ) arch=$(uname -m) python=$(python3 -c 'import platform;print(platform.python_version())') kernel=$(uname -r)"
+    echo "# commit=${GIT_COMMIT} date=$(date -u +%Y-%m-%dT%H:%MZ) arch=$(uname -m) python=$(python3 -c 'import platform;print(platform.python_version())') kernel=$(uname -r)"
     printf 'file\tstatus\texit_code\ttests_ran\tdetail\n'
     LC_ALL=C sort "${LOGS}/_rows.tsv"
 } >"${SUMMARY}"
@@ -138,16 +235,20 @@ SKIP_FLAKY_FILES=$(awk -F'\t' 'NR>2 && $2=="SKIPPED_FLAKY"' "${SUMMARY}" | wc -l
 EXEC_FILES=$(( PASSED_FILES + FAILED_FILES + INFRA_FILES ))
 TESTS_RAN=$(awk -F'\t' 'NR>2 {s+=$4} END{print s+0}' "${SUMMARY}")
 BAD=$(( FAILED_FILES + INFRA_FILES ))
+RUN_MODE="GATING"
+if [ "${BASELINE_RECORD_ONLY:-0}" = "1" ]; then
+    RUN_MODE="RECORD_ONLY_NON_GATING"
+fi
 
 {
-    echo "files_total=${TOTAL_FILES} files_executed=${EXEC_FILES} files_passed=${PASSED_FILES} files_failed=${FAILED_FILES} files_skipped_capability=${SKIP_CAP_FILES} files_skipped_flaky=${SKIP_FLAKY_FILES} files_infra_failure=${INFRA_FILES} tests_ran=${TESTS_RAN}"
+    echo "files_total=${TOTAL_FILES} files_executed=${EXEC_FILES} files_passed=${PASSED_FILES} files_failed=${FAILED_FILES} files_skipped_capability=${SKIP_CAP_FILES} files_skipped_flaky=${SKIP_FLAKY_FILES} files_infra_failure=${INFRA_FILES} tests_ran=${TESTS_RAN} mode=${RUN_MODE}"
     echo "files=${TOTAL_FILES} failing_files=${BAD} tests_ran=${TESTS_RAN}"
 } >"${OUT}/totals.txt"
 
 cat "${OUT}/totals.txt"
 
 if [ "${BASELINE_RECORD_ONLY:-0}" = "1" ]; then
-    echo "BASELINE_RECORD_ONLY=1: baseline recorded as informational artifact without gating (executed=${EXEC_FILES}, passed=${PASSED_FILES}, failing_files=${BAD}, skipped_flaky=${SKIP_FLAKY_FILES}, skipped_capability=${SKIP_CAP_FILES})"
+    echo "BASELINE_RECORD_ONLY=1: baseline recorded as informational artifact without gating (mode=${RUN_MODE}, executed=${EXEC_FILES}, passed=${PASSED_FILES}, failing_files=${BAD}, skipped_flaky=${SKIP_FLAKY_FILES}, skipped_capability=${SKIP_CAP_FILES})"
     exit 0
 fi
 

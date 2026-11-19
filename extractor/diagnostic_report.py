@@ -322,6 +322,16 @@ class FinalConclusionsSection:
         return cls(**_filter_dataclass_fields(cls, data))
 
 
+def _format_obs_deterministic(val: Any) -> str:
+    """Format observation deterministically so in-memory and JSON-reloaded renders are identical."""
+    if isinstance(val, (dict, list)):
+        try:
+            return str(json.loads(json.dumps(val, default=str)))
+        except Exception:
+            return str(val)
+    return str(val)
+
+
 @dataclass
 class DiagnosticReport:
     """Master structured diagnostic report for Phase 2.1.8 (Sections A–I + 20 Required Engineering Items)."""
@@ -718,7 +728,7 @@ class DiagnosticReport:
                 md.append(f"- **Technical Principle**: {c.get('technical_rationale')}")
                 md.append(f"- **Decision Criteria**: `{c.get('decision_criteria')}`")
                 md.append(f"- **Inspected Entity**: `{c.get('inspected_entity') or 'Target Address Space'}`")
-                md.append(f"- **Actual Observations**: `{c.get('actual_observations')}`")
+                md.append(f"- **Actual Observations**: `{_format_obs_deterministic(c.get('actual_observations'))}`")
                 md.append(f"- **Technical Interpretation**: {c.get('technical_interpretation') or 'No anomalies detected.'}")
                 if c.get("supporting_evidence_ids"):
                     md.append(f"- **Supporting Evidence IDs**: `{', '.join(c.get('supporting_evidence_ids'))}`")
@@ -739,7 +749,7 @@ class DiagnosticReport:
                 ep_tag = "[DERIVED EVIDENCE]" if (obs.parent_evidence_ids or obs.epistemic_level == EPISTEMIC_DERIVED_EVIDENCE) else "[OBSERVED FACT]"
                 md.append(
                     f"- `[{obs.evidence_id}]` {ep_tag} Method: `{obs.collection_method}` | "
-                    f"Authority: `{obs.authority_status}` | Value: `{obs.normalized_observation}`"
+                    f"Authority: `{obs.authority_status}` | Value: `{_format_obs_deterministic(obs.normalized_observation)}`"
                 )
             md.append("")
 
@@ -841,7 +851,7 @@ class DiagnosticReport:
                 )
                 if ev.parent_evidence_ids:
                     md.append(f"- **Parent Evidence IDs**: `{', '.join(ev.parent_evidence_ids)}`")
-                md.append(f"- **Normalized Observation**: `{ev.normalized_observation}`")
+                md.append(f"- **Normalized Observation**: `{_format_obs_deterministic(ev.normalized_observation)}`")
                 if ev.correlated_source:
                     corr = ev.correlated_source
                     md.append(
@@ -1083,7 +1093,7 @@ class DiagnosticReport:
                     f"<td><code>{html.escape(str(c.get('check_id', '')))}</code></td>"
                     f"<td><code>{html.escape(str(c.get('recipe_id', '')))}</code></td>"
                     f"<td><small>{html.escape(str(c.get('decision_criteria', '')))}</small></td>"
-                    f"<td><code>{html.escape(str(c.get('actual_observations', '')))}</code></td>"
+                    f"<td><code>{html.escape(_format_obs_deterministic(c.get('actual_observations', '')))}</code></td>"
                     f"<td>{html.escape(str(c.get('technical_interpretation', '')))}</td>"
                     f"<td><small>{dur_str}</small></td>"
                     f"</tr>"
@@ -1162,7 +1172,7 @@ class DiagnosticReport:
                     f"<td><code>{html.escape(ev.epistemic_level)}</code></td>"
                     f"<td><code>{html.escape(ev.collection_method)}</code></td>"
                     f"<td><small>{html.escape(ev.provenance_class)} ({html.escape(ev.authority_status)})</small></td>"
-                    f"<td><code>{html.escape(str(ev.normalized_observation))}</code></td>"
+                    f"<td><code>{html.escape(_format_obs_deterministic(ev.normalized_observation))}</code></td>"
                     f"<td><small>{html.escape(corr_str)}</small></td>"
                     f"</tr>"
                 )
@@ -1384,7 +1394,7 @@ def detail_checks_html(checks: List[Dict[str, Any]]) -> str:
             f'<tr id="{detail_anchor("chk", c.get("check_id", ""))}"><td>{detail_badge(c.get("status", "UNKNOWN"))}</td>'
             f"<td><code>{_e(c.get('check_id', ''))}</code><br><code>{_e(c.get('recipe_id', ''))}</code></td>"
             f"<td><small>{_e(c.get('decision_criteria', ''))}</small></td>"
-            f"<td><code>{_e(c.get('actual_observations', ''))}</code></td>"
+            f"<td><code>{_e(_format_obs_deterministic(c.get('actual_observations', '')))}</code></td>"
             f"<td>{_e(c.get('technical_interpretation', ''))}"
             + (f"<br><small>Limitations: {_e('; '.join(str(x) for x in lim))}</small>" if lim else "")
             + (f"<br><small>Error: {_e(c.get('error_details'))}</small>" if c.get("error_details") else "")
@@ -1472,7 +1482,7 @@ def detail_evidence_html(records: List[Dict[str, Any]]) -> str:
             f'<tr id="{detail_anchor("ev", ev.get("evidence_id", ""))}"><td><code>{_e(ev.get("evidence_id", ""))}</code></td>'
             f"<td><code>{_e(ev.get('epistemic_level', ''))}</code></td><td><code>{_e(ev.get('collection_method', ''))}</code></td>"
             f"<td><small>{_e(ev.get('provenance_class', ''))} ({_e(ev.get('authority_status', ''))})</small></td>"
-            f"<td><code>{_e(ev.get('normalized_observation'))}</code></td><td><small>{_e(corr_s)}</small></td></tr>")
+            f"<td><code>{_e(_format_obs_deterministic(ev.get('normalized_observation')))}</code></td><td><small>{_e(corr_s)}</small></td></tr>")
     return ('<div class="dsd-scroll"><table><tr><th>Evidence ID</th><th>Epistemic Level</th><th>Method</th>'
             "<th>Provenance / Authority</th><th>Observed Value</th><th>Source Location</th></tr>" + "".join(rows)
             + "</table></div>")

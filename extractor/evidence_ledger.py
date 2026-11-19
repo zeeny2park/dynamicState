@@ -1050,6 +1050,67 @@ class EvidenceRecord:
         )
 
 
+
+def resolve_canonical_operation_id(
+    record: "EvidenceRecord",
+    live_capture_receipt: Optional[Any] = None,
+    causal_attestation: Optional[Any] = None,
+    explicit_operation_id: Optional[str] = None,
+) -> Optional[str]:
+    """Resolve one authoritative canonical operation_id across all record sources.
+
+    Rejects any conflict between explicit_operation_id, record.details['operation_id'],
+    record.provenance['operation_id'], live_capture_receipt.operation_id, and
+    causal_attestation.operation_id instead of silently choosing by precedence.
+    """
+    sources: Dict[str, str] = {}
+
+    def _add(label: str, val: Any) -> None:
+        if val is None:
+            return
+        if not isinstance(val, str):
+            raise ValueError(f"Invalid non-string operation_id in {label}: {val!r}")
+        s = val.strip()
+        if s:
+            sources[label] = s
+
+    if explicit_operation_id is not None:
+        _add("explicit_operation_id", explicit_operation_id)
+
+    details = record.details or {}
+    prov = record.provenance or {}
+    if "operation_id" in details and details["operation_id"] is not None:
+        _add("record.details.operation_id", details["operation_id"])
+    if "operation_id" in prov and prov["operation_id"] is not None:
+        _add("record.provenance.operation_id", prov["operation_id"])
+
+    lcr = live_capture_receipt
+    if lcr is None:
+        lcr = prov.get("live_capture_receipt") or details.get("live_capture_receipt")
+    if lcr is not None:
+        lcr_op = lcr.get("operation_id") if isinstance(lcr, dict) else getattr(lcr, "operation_id", None)
+        if lcr_op is not None:
+            _add("live_capture_receipt.operation_id", lcr_op)
+
+    ca = causal_attestation
+    if ca is None:
+        ca = prov.get("causal_attestation") or details.get("causal_attestation")
+    if ca is not None:
+        ca_op = ca.get("operation_id") if isinstance(ca, dict) else getattr(ca, "operation_id", None)
+        if ca_op is not None:
+            _add("causal_attestation.operation_id", ca_op)
+
+    distinct = set(sources.values())
+    if len(distinct) > 1:
+        detail_str = ", ".join(f"{k}={v!r}" for k, v in sorted(sources.items()))
+        raise ValueError(
+            f"Operation ID mismatch (conflicting canonical operation_id) on record '{record.evidence_id}': {detail_str}"
+        )
+    if len(distinct) == 1:
+        return next(iter(distinct))
+    return None
+
+
 class EvidenceLedger:
     """Versioned container and query index for evidence records within an investigation."""
 
@@ -1061,6 +1122,7 @@ class EvidenceLedger:
         capability_key: Optional[str] = None,
         trust_store: Optional[Any] = None,
         allow_legacy_signatures: bool = True,
+        require_durable_trust_store: bool = False,
     ):
         self.session_id: str = session_id or f"inv_sess_{uuid.uuid4().hex[:8]}"
         self.schema_version: str = schema_version
@@ -1080,6 +1142,15 @@ class EvidenceLedger:
                 self.trust_store = get_default_trust_store()
             except ImportError:
                 self.trust_store = None
+        self.require_durable_trust_store: bool = bool(require_durable_trust_store)
+        if self.require_durable_trust_store:
+            if self.trust_store is None or not getattr(
+                self.trust_store, "is_durable", bool(getattr(self.trust_store, "store_path", None))
+            ):
+                raise RuntimeError(
+                    "EvidenceLedger requires a configured file-backed durable TrustStore "
+                    "(set DYNAMICSTATE_TRUST_STORE_PATH or pass a durable DurableTrustStore)"
+                )
         self._used_causal_attestation_ids: Set[str] = set()
         self._causal_attestation_to_evidence_id: Dict[str, str] = {}
         self._used_execution_ids: Set[str] = set()
@@ -1406,12 +1477,8 @@ class EvidenceLedger:
                         if c_id:
                             self.trust_store.record_used_attestation(c_id)
 
-                    # P0-2: Bind operation in trust store
-                    op_id = (record.details or {}).get("operation_id")
-                    if not op_id and lcr:
-                        op_id = lcr.get("operation_id") if isinstance(lcr, dict) else getattr(lcr, "operation_id", None)
-                    if not op_id and raw_causal:
-                        op_id = raw_causal.get("operation_id") if isinstance(raw_causal, dict) else getattr(raw_causal, "operation_id", None)
+                    # P0-2: Bind canonical operation_id in trust store
+                    op_id = resolve_canonical_operation_id(record, live_capture_receipt=lcr, causal_attestation=raw_causal)
                     if op_id:
                         t_ident = record.target_identity or {}
                         pid_val = t_ident.get("pid")
@@ -1815,34 +1882,28 @@ class EvidenceLedger:
                 f"Self-referential derivation rejected: record '{record.evidence_id}' has derived_from equal to itself"
             )
 
-        # Operation replay & type validation metadata extraction
-        op_id = getattr(rcpt_obj, "operation_id", None) if 'rcpt_obj' in locals() and rcpt_obj else None
-        rcpt_id = getattr(rcpt_obj, "receipt_id", None) if 'rcpt_obj' in locals() and rcpt_obj else None
-        rcpt_obs_dig = getattr(rcpt_obj, "observation_digest", "") if 'rcpt_obj' in locals() and rcpt_obj else ""
-        rcpt_op_type = getattr(rcpt_obj, "operation_type", "") if 'rcpt_obj' in locals() and rcpt_obj else ""
+        # Operation replay & type validation metadata extraction (strict canonical operation_id, no silent precedence)
+        raw_rc_for_meta = rcpt_obj if 'rcpt_obj' in locals() and rcpt_obj else (
+            p_prov.get("live_capture_receipt") or (record.details or {}).get("live_capture_receipt")
+        )
+        if raw_rc_for_meta is not None:
+            if isinstance(raw_rc_for_meta, dict):
+                rcpt_id = raw_rc_for_meta.get("receipt_id")
+                rcpt_obs_dig = raw_rc_for_meta.get("observation_digest", "")
+                rcpt_op_type = raw_rc_for_meta.get("operation_type", "")
+            else:
+                rcpt_id = getattr(raw_rc_for_meta, "receipt_id", None)
+                rcpt_obs_dig = getattr(raw_rc_for_meta, "observation_digest", "")
+                rcpt_op_type = getattr(raw_rc_for_meta, "operation_type", "")
+        else:
+            rcpt_id = None
+            rcpt_obs_dig = ""
+            rcpt_op_type = ""
 
-        if not op_id:
-            raw_rc = p_prov.get("live_capture_receipt") or (record.details or {}).get("live_capture_receipt")
-            if raw_rc:
-                from .capture_backend import LiveCaptureReceipt
-                if isinstance(raw_rc, LiveCaptureReceipt):
-                    op_id = getattr(raw_rc, "operation_id", None)
-                    rcpt_id = getattr(raw_rc, "receipt_id", None)
-                    rcpt_obs_dig = getattr(raw_rc, "observation_digest", "")
-                    rcpt_op_type = getattr(raw_rc, "operation_type", "")
-                elif isinstance(raw_rc, dict):
-                    op_id = raw_rc.get("operation_id")
-                    rcpt_id = raw_rc.get("receipt_id")
-                    rcpt_obs_dig = raw_rc.get("observation_digest", "")
-                    rcpt_op_type = raw_rc.get("operation_type", "")
-
-        if not op_id and record.details:
-            op_id = record.details.get("operation_id")
         if not rcpt_id and record.details and "receipt_id" in record.details:
             rcpt_id = record.details["receipt_id"]
-        if not op_id and record.provenance and "causal_attestation" in record.provenance:
-            ca = record.provenance["causal_attestation"]
-            op_id = getattr(ca, "operation_id", None) if hasattr(ca, "operation_id") else (ca.get("operation_id") if isinstance(ca, dict) else None)
+
+        op_id = resolve_canonical_operation_id(record, live_capture_receipt=raw_rc_for_meta)
 
         # Validate derived_from if present
         derived_from = (record.details or {}).get("derived_from")
@@ -1919,6 +1980,20 @@ class EvidenceLedger:
                     if len(record.parent_evidence_ids) == 1:
                         record.details["parent_evidence_digest"] = exp_p_digest
 
+
+        # Early read-only check for causal attestation replay before generic op_id replay
+        _early_causal = p_prov.get("causal_attestation") or p_details.get("causal_attestation")
+        if _early_causal is not None:
+            _early_att_id = (
+                _early_causal.get("attestation_id")
+                if isinstance(_early_causal, dict)
+                else getattr(_early_causal, "attestation_id", None)
+            )
+            if _early_att_id and _early_att_id in getattr(self, "_causal_attestation_to_evidence_id", {}):
+                if self._causal_attestation_to_evidence_id[_early_att_id] != record.evidence_id:
+                    raise ValueError(
+                        f"Replay of causal attestation ID '{_early_att_id}' rejected on record '{record.evidence_id}'"
+                    )
 
         if op_id:
             if not hasattr(self, "_used_operation_ids"):
@@ -2049,58 +2124,35 @@ class EvidenceLedger:
             r_exe = r_ident.get("executable_identity") or r_ident.get("executable")
             r_bid = r_ident.get("build_id")
 
-            eff_ts = getattr(self, "trust_store", None)
-            if eff_ts and hasattr(eff_ts, "consume_attestation"):
-                from .capture_backend import TrustConsumptionStatus
-                cons_res = eff_ts.consume_attestation(
-                    attestation=c_att,
-                    evidence_id=record.evidence_id,
-                    session_id=record.session_id or self.session_id,
-                    expected_pid=r_pid,
-                    expected_process_identity=r_proc,
-                    expected_executable_identity=r_exe,
-                    expected_build_id=r_bid,
-                    expected_target_host=r_ident.get("target_host"),
-                )
-                if not cons_res.is_accepted:
-                    if cons_res.status == TrustConsumptionStatus.PERSISTENCE_FAILURE:
-                        raise RuntimeError(cons_res.reason)
-                    if cons_res.status == TrustConsumptionStatus.REPLAY_CONFLICT:
-                        raise ValueError(f"Replay of causal attestation ID '{c_att.attestation_id}' rejected on record '{record.evidence_id}': [{cons_res.status.value}] {cons_res.reason}")
-                    raise ValueError(f"CausalAttestation rejected for record '{record.evidence_id}': [{cons_res.status.value}] {cons_res.reason}")
-            else:
-                ok_att, err_att = c_att.verify(
-                    expected_session_id=record.session_id or self.session_id,
-                    expected_pid=r_pid,
-                    expected_process_identity=r_proc,
-                    expected_executable_identity=r_exe,
-                    expected_build_id=r_bid,
-                    expected_target_host=r_ident.get("target_host"),
-                    trust_store=eff_ts,
-                )
-                if not ok_att:
-                    raise ValueError(f"CausalAttestation rejected for record '{record.evidence_id}': {err_att}")
-
-                if eff_ts and hasattr(eff_ts, "is_attestation_used") and eff_ts.is_attestation_used(c_att.attestation_id):
-                    bound_eid = getattr(self, "_causal_attestation_to_evidence_id", {}).get(c_att.attestation_id)
-                    if bound_eid != record.evidence_id:
-                        raise ValueError(f"Replay of causal attestation ID '{c_att.attestation_id}' rejected by durable trust store on record '{record.evidence_id}'")
-
+            # ALL non-consuming validations MUST complete BEFORE durable attestation consumption!
             if c_pid is not None and r_pid is not None and int(c_pid) != int(r_pid):
                 raise ValueError(f"CausalAttestation target PID mismatch for record '{record.evidence_id}': attestation has {c_pid}, record has {r_pid}")
 
-            if not hasattr(self, "_used_causal_attestation_ids"):
-                self._used_causal_attestation_ids: Set[str] = set()
-            if not hasattr(self, "_causal_attestation_to_evidence_id"):
-                self._causal_attestation_to_evidence_id: Dict[str, str] = {}
+            # Verify canonical operation ID matching across attestation, record.details, provenance, and receipt
+            canonical_att_op = resolve_canonical_operation_id(
+                record,
+                live_capture_receipt=(p_prov.get("live_capture_receipt") or p_details.get("live_capture_receipt")),
+                causal_attestation=c_att,
+            )
+            rec_op = (record.details or {}).get("operation_id")
+            if rec_op and str(c_att.operation_id) != str(rec_op):
+                raise ValueError(f"CausalAttestation operation ID mismatch: attestation={c_att.operation_id}, record={rec_op}")
 
-            if c_att.attestation_id in self._causal_attestation_to_evidence_id:
-                bound_eid = self._causal_attestation_to_evidence_id[c_att.attestation_id]
-                if bound_eid != record.evidence_id:
-                    raise ValueError(f"Replay of causal attestation ID '{c_att.attestation_id}' rejected on record '{record.evidence_id}'")
-            else:
-                self._causal_attestation_to_evidence_id[c_att.attestation_id] = record.evidence_id
-                self._used_causal_attestation_ids.add(c_att.attestation_id)
+            raw_rcpt = p_prov.get("live_capture_receipt") or p_details.get("live_capture_receipt")
+            if raw_rcpt:
+                rcpt_op = raw_rcpt.get("operation_id") if isinstance(raw_rcpt, dict) else getattr(raw_rcpt, "operation_id", None)
+                if rcpt_op and str(c_att.operation_id) != str(rcpt_op):
+                    raise ValueError(
+                        f"CausalAttestation operation ID '{c_att.operation_id}' does not match "
+                        f"live capture receipt operation ID '{rcpt_op}'"
+                    )
+
+            # Reject synthetic or imported provenance escalation to production authority BEFORE consumption
+            prov_cls_pre = p_prov.get("provenance_class") or record.provenance_class
+            if prov_cls_pre in ("SYNTHETIC", "SYNTHETIC_FIXTURE", "IMPORTED_UNVERIFIED"):
+                ca_auth = raw_causal.get("authority_level") if isinstance(raw_causal, dict) else getattr(raw_causal, "authority_level", None)
+                if ca_auth == "PRODUCTION":
+                    raise ValueError(f"Synthetic or imported evidence '{record.evidence_id}' cannot claim PRODUCTION authority causal_attestation")
 
             # Precondition evidence verification
             if not c_att.precondition_evidence_id or c_att.precondition_evidence_id not in self._by_id:
@@ -2131,25 +2183,92 @@ class EvidenceLedger:
                 if post_rec.session_id and pre_rec.session_id and str(post_rec.session_id) != str(pre_rec.session_id):
                     raise ValueError(f"CausalAttestation cross-session evidence binding rejected: pre='{pre_rec.session_id}', post='{post_rec.session_id}'")
 
-            # Verify operation ID matching
-            rec_op = (record.details or {}).get("operation_id")
-            if rec_op and str(c_att.operation_id) != str(rec_op):
-                raise ValueError(f"CausalAttestation operation ID mismatch: attestation={c_att.operation_id}, record={rec_op}")
-
-            raw_rcpt = p_prov.get("live_capture_receipt") or p_details.get("live_capture_receipt")
-            if raw_rcpt:
-                rcpt_op = raw_rcpt.get("operation_id") if isinstance(raw_rcpt, dict) else getattr(raw_rcpt, "operation_id", None)
-                if rcpt_op and not str(rcpt_op).startswith("ctx_") and str(c_att.operation_id) != str(rcpt_op):
-                    raise ValueError(
-                        f"CausalAttestation operation ID '{c_att.operation_id}' does not match "
-                        f"live capture receipt operation ID '{rcpt_op}'"
-                    )
-
             # Verify intervention details authorization
             if not c_att.intervention_details or not isinstance(c_att.intervention_details, dict):
                 raise ValueError(f"CausalAttestation on record '{record.evidence_id}' missing verifiable intervention_details")
             if not any(k in c_att.intervention_details for k in ("intervention_id", "verified_intervention", "authorized_by", "action", "transition_id")):
                 raise ValueError(f"CausalAttestation on record '{record.evidence_id}' lacks verifiable intervention authorization or identity")
+
+            if not hasattr(self, "_used_causal_attestation_ids"):
+                self._used_causal_attestation_ids: Set[str] = set()
+            if not hasattr(self, "_causal_attestation_to_evidence_id"):
+                self._causal_attestation_to_evidence_id: Dict[str, str] = {}
+
+            if c_att.attestation_id in self._causal_attestation_to_evidence_id:
+                bound_eid = self._causal_attestation_to_evidence_id[c_att.attestation_id]
+                if bound_eid != record.evidence_id:
+                    raise ValueError(f"Replay of causal attestation ID '{c_att.attestation_id}' rejected on record '{record.evidence_id}'")
+
+            # Now perform cryptographic verification and (unless deferred during isolated recovery) durable consumption
+            defer_ts = bool(getattr(self, "_defer_trust_store_consumption", False))
+            eff_ts = getattr(self, "trust_store", None)
+            if not defer_ts and eff_ts and hasattr(eff_ts, "consume_attestation"):
+                from .capture_backend import TrustConsumptionStatus
+                cons_res = eff_ts.consume_attestation(
+                    attestation=c_att,
+                    evidence_id=record.evidence_id,
+                    session_id=record.session_id or self.session_id,
+                    expected_pid=r_pid,
+                    expected_process_identity=r_proc,
+                    expected_executable_identity=r_exe,
+                    expected_build_id=r_bid,
+                    expected_target_host=r_ident.get("target_host"),
+                    operation_id=canonical_att_op,
+                )
+                if not cons_res.is_accepted:
+                    if cons_res.status == TrustConsumptionStatus.PERSISTENCE_FAILURE:
+                        raise RuntimeError(cons_res.reason)
+                    if cons_res.status == TrustConsumptionStatus.REPLAY_CONFLICT:
+                        raise ValueError(f"Replay of causal attestation ID '{c_att.attestation_id}' rejected on record '{record.evidence_id}': [{cons_res.status.value}] {cons_res.reason}")
+                    raise ValueError(f"CausalAttestation rejected for record '{record.evidence_id}': [{cons_res.status.value}] {cons_res.reason}")
+            else:
+                ro_ts = getattr(self, "_readonly_trust_store", None) if defer_ts else eff_ts
+                ok_att, err_att = c_att.verify(
+                    expected_session_id=record.session_id or self.session_id,
+                    expected_pid=r_pid,
+                    expected_operation_id=canonical_att_op,
+                    expected_process_identity=r_proc,
+                    expected_executable_identity=r_exe,
+                    expected_build_id=r_bid,
+                    expected_target_host=r_ident.get("target_host"),
+                    trust_store=ro_ts,
+                )
+                if not ok_att:
+                    raise ValueError(f"CausalAttestation rejected for record '{record.evidence_id}': {err_att}")
+
+                if defer_ts and ro_ts is not None:
+                    used_ids = getattr(ro_ts, "used_attestation_ids", set())
+                    if c_att.attestation_id in used_ids:
+                        bound_info = getattr(ro_ts, "used_attestations", {}).get(c_att.attestation_id)
+                        if bound_info:
+                            b_eid = bound_info.get("evidence_id")
+                            b_sess = bound_info.get("session_id")
+                            b_pid = bound_info.get("pid")
+                            b_op = bound_info.get("operation_id")
+                            op_ok = (b_op is None) or (canonical_att_op is not None and str(b_op) == str(canonical_att_op))
+                            if not (
+                                b_eid == str(record.evidence_id)
+                                and (not (record.session_id or self.session_id) or b_sess == str(record.session_id or self.session_id))
+                                and (r_pid is None or int(b_pid) == int(r_pid))
+                                and op_ok
+                            ):
+                                raise ValueError(
+                                    f"Replay of causal attestation ID '{c_att.attestation_id}' rejected on record '{record.evidence_id}': "
+                                    f"[REPLAY_CONFLICT] already consumed by evidence '{b_eid}'"
+                                )
+                        else:
+                            raise ValueError(
+                                f"Replay of causal attestation ID '{c_att.attestation_id}' rejected on record '{record.evidence_id}': "
+                                f"[REPLAY_CONFLICT] already recorded as used in trust store"
+                            )
+                elif not defer_ts and eff_ts and hasattr(eff_ts, "is_attestation_used") and eff_ts.is_attestation_used(c_att.attestation_id):
+                    bound_eid = getattr(self, "_causal_attestation_to_evidence_id", {}).get(c_att.attestation_id)
+                    if bound_eid != record.evidence_id:
+                        raise ValueError(f"Replay of causal attestation ID '{c_att.attestation_id}' rejected by durable trust store on record '{record.evidence_id}'")
+
+            if c_att.attestation_id not in self._causal_attestation_to_evidence_id:
+                self._causal_attestation_to_evidence_id[c_att.attestation_id] = record.evidence_id
+                self._used_causal_attestation_ids.add(c_att.attestation_id)
 
         if (
             p_details.get("causal_proof") is True
@@ -2508,18 +2627,46 @@ class EvidenceLedger:
         if not isinstance(data, dict):
             raise ValueError("EvidenceLedger serialization data must be a dictionary")
 
+        # Stage 1 — Parse & validate top-level schema and container types
         schema_ver = data.get("schema_version", EVIDENCE_SCHEMA_VERSION)
+        if not isinstance(schema_ver, str) or not schema_ver.strip():
+            raise ValueError(f"Invalid serialized ledger schema_version: {schema_ver!r}")
+        raw_records = data.get("records", [])
+        if not isinstance(raw_records, list):
+            raise ValueError("Serialized ledger 'records' field must be a list")
+        if "record_count" in data:
+            rc = data["record_count"]
+            if isinstance(rc, bool) or not isinstance(rc, int) or rc != len(raw_records):
+                raise ValueError(
+                    f"Serialized ledger record_count mismatch: declared={rc!r}, actual={len(raw_records)}"
+                )
+        if "used_causal_attestation_ids" in data and not isinstance(data["used_causal_attestation_ids"], list):
+            raise ValueError("Serialized ledger 'used_causal_attestation_ids' must be a list")
+        for idx_dict_field in (
+            "causal_attestation_to_evidence_id",
+            "operation_to_receipt_id",
+            "operation_to_evidence_ids",
+            "used_operation_ids",
+        ):
+            if idx_dict_field in data and not isinstance(data[idx_dict_field], dict):
+                raise ValueError(f"Serialized ledger '{idx_dict_field}' must be a dictionary")
+
+        # Stage 2 — Reconstruct in isolation (ZERO mutations to live trust_store)
         session_id = data.get("session_id")
         kwargs: Dict[str, Any] = {
             "session_id": session_id,
             "schema_version": schema_ver,
-            "trust_store": trust_store,
+            "trust_store": None,
         }
         if session_secret is not None:
             kwargs["session_secret"] = session_secret
         if allow_legacy_signatures is not None:
             kwargs["allow_legacy_signatures"] = allow_legacy_signatures
         ledger = cls(**kwargs)
+        # Ensure isolated ledger does NOT hold default trust_store during Stage 2
+        ledger.trust_store = None
+        ledger._defer_trust_store_consumption = True
+        ledger._readonly_trust_store = trust_store
         if "target_identity" in data:
             ledger.target_identity = data["target_identity"]
         ledger.created_at = data.get("created_at", ledger.created_at)
@@ -2530,11 +2677,7 @@ class EvidenceLedger:
         ledger._operation_to_receipt_id = {}
 
         seen_ids = set()
-        raw_records = data.get("records", [])
-        if not isinstance(raw_records, list):
-            raise ValueError("Serialized ledger 'records' field must be a list")
-
-        # 1. Transactionally validate and add each record, rebuilding authoritative state
+        pending_attestations: List[Dict[str, Any]] = []
         for rec_data in raw_records:
             if not isinstance(rec_data, dict):
                 raise ValueError("Malformed evidence record in serialized ledger: must be a dictionary")
@@ -2543,6 +2686,26 @@ class EvidenceLedger:
                 raise ValueError(f"Duplicate evidence_id '{rec.evidence_id}' during ledger reconstruction")
             seen_ids.add(rec.evidence_id)
             ledger.add_record(rec)
+            # Collect causal attestation metadata for Stage 4 atomic reconciliation
+            p_prov = rec.provenance or {}
+            p_details = rec.details or {}
+            raw_causal = p_prov.get("causal_attestation") or p_details.get("causal_attestation")
+            if raw_causal is not None:
+                from .capture_backend import CausalAttestation
+                c_att = raw_causal if isinstance(raw_causal, CausalAttestation) else CausalAttestation.from_dict(raw_causal)
+                r_ident = rec.target_identity or {}
+                canon_op = resolve_canonical_operation_id(rec, causal_attestation=c_att)
+                pending_attestations.append({
+                    "attestation": c_att,
+                    "evidence_id": rec.evidence_id,
+                    "session_id": rec.session_id or ledger.session_id,
+                    "expected_pid": r_ident.get("pid"),
+                    "expected_process_identity": r_ident.get("process_identity"),
+                    "expected_executable_identity": r_ident.get("executable_identity") or r_ident.get("executable"),
+                    "expected_build_id": r_ident.get("build_id"),
+                    "expected_target_host": r_ident.get("target_host"),
+                    "operation_id": canon_op,
+                })
 
         # 2. Extract rebuilt authoritative indexes
         rebuilt_causal_ids = set(ledger._used_causal_attestation_ids)
@@ -2553,7 +2716,10 @@ class EvidenceLedger:
 
         # 3. Strictly compare serialized indexes against rebuilt authoritative indexes
         if "used_causal_attestation_ids" in data:
-            ser_causal_ids = set(data.get("used_causal_attestation_ids", []))
+            ser_causal_list = list(data.get("used_causal_attestation_ids", []))
+            if len(ser_causal_list) != len(set(ser_causal_list)):
+                raise ValueError("Duplicate attestation ID detected in serialized used_causal_attestation_ids")
+            ser_causal_ids = set(ser_causal_list)
             if ser_causal_ids != rebuilt_causal_ids:
                 raise ValueError(
                     f"Authoritative index mismatch during reconstruction: serialized used_causal_attestation_ids "
@@ -2653,6 +2819,34 @@ class EvidenceLedger:
                     rebuilt_eids = rebuilt_rec.get("evidence_ids", [])
                     if ser_eids != rebuilt_eids:
                         raise ValueError(f"Canonical ordered evidence_ids mismatch for operation '{op_k}': serialized={ser_eids}, rebuilt={rebuilt_eids}")
+
+        # Stage 4 — Reconcile durable TrustStore ONLY AFTER complete Ledger & index validation
+        if trust_store is not None and pending_attestations:
+            if hasattr(trust_store, "reconcile_attestations_atomic"):
+                trust_store.reconcile_attestations_atomic(pending_attestations)
+            elif hasattr(trust_store, "consume_attestation"):
+                from .capture_backend import TrustConsumptionStatus
+                for item in pending_attestations:
+                    cons_res = trust_store.consume_attestation(**item)
+                    if not cons_res.is_accepted:
+                        if cons_res.status == TrustConsumptionStatus.PERSISTENCE_FAILURE:
+                            raise RuntimeError(cons_res.reason)
+                        raise ValueError(
+                            f"CausalAttestation reconciliation rejected for record '{item['evidence_id']}': "
+                            f"[{cons_res.status.value}] {cons_res.reason}"
+                        )
+
+        # Stage 5 — Commit reconstructed ledger atomically
+        ledger._defer_trust_store_consumption = False
+        ledger._readonly_trust_store = None
+        if trust_store is not None:
+            ledger.trust_store = trust_store
+        else:
+            try:
+                from .capture_backend import get_default_trust_store
+                ledger.trust_store = get_default_trust_store()
+            except ImportError:
+                ledger.trust_store = None
 
         return ledger
 

@@ -187,8 +187,8 @@ class TestPhase218CompleteValidation(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.fixture_src = os.path.abspath("tests/fixtures/real_runtime/phase2_1_8_runtime_targets.cpp")
-        cls.debug_bin = "/tmp/phase2_1_8_targets_debug"
-        cls.stripped_bin = "/tmp/phase2_1_8_targets_stripped"
+        cls.debug_bin = os.path.join(tempfile.gettempdir(), "phase2_1_8_targets_debug")
+        cls.stripped_bin = os.path.join(tempfile.gettempdir(), "phase2_1_8_targets_stripped")
         ensure_built(
             cls.debug_bin,
             lambda t: ["g++", "-g", "-O0", "-pthread", "-Wl,--build-id=sha1", cls.fixture_src, "-o", t],
@@ -373,7 +373,13 @@ class TestPhase218CompleteValidation(unittest.TestCase):
             details={"provenance_class": PROVENANCE_CLASS_LIVE_RUNTIME_CAPTURE},
             target_identity={},
         )
-        ledger.add_record(rec_missing_ident)
+        with self.assertRaises(ValueError):
+            ledger.add_record(rec_missing_ident)
+        # Insert directly for isolated CompetingHypothesis missing-identity unit check
+        from extractor.evidence_ledger import EvidenceAdmissionState
+        rec_missing_ident.admission_state = EvidenceAdmissionState.ACCEPTED
+        ledger._by_id[rec_missing_ident.evidence_id] = rec_missing_ident
+        ledger._records.append(rec_missing_ident)
 
         hyp = CompetingHypothesis(
             hypothesis_id="HYP_MAT_E",
