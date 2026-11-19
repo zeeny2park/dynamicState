@@ -8,6 +8,7 @@ import time
 import unittest
 
 from extractor.agent_runtime import AgentRuntime
+from extractor.capture_backend import set_default_trust_store
 from extractor.check_budget import DefaultCheckBudget
 from extractor.expert_diagnostic_engine import (
     ExpertDiagnosticEngine,
@@ -19,6 +20,7 @@ from extractor.web.server import WebApiAdapter
 
 class TestContinueCollectedDiagnosis(unittest.TestCase):
     def setUp(self):
+        set_default_trust_store(None)
         self.tmpdir = tempfile.mkdtemp(dir=os.environ.get("TMPDIR", "/tmp"))
         self.src_path = os.path.join(self.tmpdir, "sleep_target.c")
         self.bin_path = os.path.join(self.tmpdir, "sleep_target")
@@ -43,6 +45,7 @@ class TestContinueCollectedDiagnosis(unittest.TestCase):
         time.sleep(0.05)
 
     def tearDown(self):
+        set_default_trust_store(None)
         if self.proc and self.proc.poll() is None:
             try:
                 os.kill(self.proc.pid, signal.SIGKILL)

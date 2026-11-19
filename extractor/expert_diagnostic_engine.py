@@ -1221,6 +1221,36 @@ STEP_MARGIN_BEYOND_PLAN = 10
 
 
 
+MAX_CONSECUTIVE_REMOTE_FAILURES = 3
+REMOTE_CHECKPOINT_INTERVAL_S = 15.0
+
+
+def _is_remote_transport_error(err: BaseException) -> bool:
+    """Return True if ``err`` indicates a remote transport/SSH/timeout/disconnect failure."""
+    if isinstance(err, (TimeoutError, ConnectionError, BrokenPipeError)):
+        return True
+    name = type(err).__name__
+    if name in ("DaemonChannelError", "TimeoutExpired", "SSHException"):
+        return True
+    msg = str(err).lower()
+    return any(tok in msg for tok in (
+        "timed out",
+        "deadline exceeded",
+        "connection refused",
+        "connection reset",
+        "broken pipe",
+        "no route to host",
+        "network is unreachable",
+        "host is down",
+        "ssh execution error",
+        "ssh command timed out",
+        "shared connection",
+        "control socket",
+        "daemon reply",
+        "daemon closed",
+    ))
+
+
 def _is_ledger_admitted_evidence_entry(entry: Dict[str, Any]) -> bool:
     """Return True if a collected evidence entry was not failed or quarantined during ledger admission."""
     adm = entry.get("ledger_admission_state")
@@ -1575,14 +1605,35 @@ class AdaptiveInvestigationSession:
         # Nothing reads the investigation file between those points: the web progress stream and the MCP tools read
         # the in-memory session.  Saving after every collection step rewrote the whole, growing session each time
         # (tens of MB per save on a many-thread target; most of a diagnosis's CPU time).
+        _is_remote_adapter = False
+        try:
+            _is_remote_adapter = bool(self.adapter is not None and self.adapter.is_remote())
+        except Exception:  # noqa: BLE001
+            _is_remote_adapter = False
+        _last_checkpoint = time.monotonic()
+
         while self.state not in TERMINAL_STATES and steps_executed < limit():
             if self.is_paused:
+                break
+            if self.budget_tracker is not None and not self.budget_tracker.can_continue():
+                self._halt_on_budget()
                 break
             before = self.state
             self._advance()
             steps_executed += 1
             if before != STATE_COLLECTING and self.state == STATE_COLLECTING:
                 self._save_to_disk()
+                _last_checkpoint = time.monotonic()
+            elif (
+                _is_remote_adapter
+                and self.state == STATE_COLLECTING
+                and (time.monotonic() - _last_checkpoint) >= REMOTE_CHECKPOINT_INTERVAL_S
+            ):
+                try:
+                    self._save_to_disk()
+                except Exception:  # noqa: BLE001 - periodic checkpoint must not abort active collection
+                    pass
+                _last_checkpoint = time.monotonic()
 
         if self.state not in TERMINAL_STATES and steps_executed >= limit():
             self._synthesize_collected_evidence_before_stop()
@@ -2301,6 +2352,12 @@ class AdaptiveInvestigationSession:
                 per_step_s = 12.0
             _step_deadline_ctx = self.adapter.collection_deadline(per_step_s)
 
+        _is_remote_step = False
+        try:
+            _is_remote_step = bool(self.adapter is not None and self.adapter.is_remote())
+        except Exception:  # noqa: BLE001
+            _is_remote_step = False
+
         def _fail_step_and_continue(err: BaseException, stage_label: str) -> Dict[str, Any]:
             err_msg = f"{stage_label}: {type(err).__name__}: {err}"
             step.status = "FAILED"
@@ -2321,29 +2378,63 @@ class AdaptiveInvestigationSession:
                 "error": err_msg,
             })
             self.plan.current_step_index += 1
+
+            # Circuit breaker for dead/severed remote transport links: avoid burning the entire budget
+            # retrying every remaining recipe against an unreachable remote host.
+            if _is_remote_step and _is_remote_transport_error(err):
+                self._consecutive_remote_failures = int(getattr(self, "_consecutive_remote_failures", 0)) + 1
+                if self._consecutive_remote_failures >= MAX_CONSECUTIVE_REMOTE_FAILURES:
+                    for rem_step in self.plan.steps[self.plan.current_step_index:]:
+                        if rem_step.status == "PENDING":
+                            rem_step.status = "SKIPPED"
+                            rem_step.not_run_reason = "remote_connection_lost"
+                    self.plan.current_step_index = len(self.plan.steps)
+                    self._record_timeline_event("REMOTE_CONNECTION_LOST", {
+                        "consecutive_failures": self._consecutive_remote_failures,
+                        "last_error": err_msg,
+                    })
+                    try:
+                        self.evaluate_precollected_steps()
+                    except Exception:  # noqa: BLE001
+                        pass
+                    self._synthesize_collected_evidence_before_stop()
+                    self.state = STATE_INCONCLUSIVE
+                    self._finalize_conclusion(
+                        stop_reason="REMOTE_CONNECTION_LOST",
+                        summary=(
+                            f"Remote collection halted after {self._consecutive_remote_failures} consecutive "
+                            f"transport/timeout failures ({err_msg}). Collected findings were preserved."
+                        ),
+                    )
+                    return {
+                        "action": "REMOTE_CONNECTION_LOST",
+                        "step_id": step.step_id,
+                        "recipe_id": step.recipe_id,
+                        "error": err_msg,
+                    }
+
             if self.plan.current_step_index >= len(self.plan.steps):
                 self.state = STATE_ANALYZING
             return {"action": "COLLECT_STEP_FAILED", "step_id": step.step_id, "recipe_id": step.recipe_id, "error": err_msg}
 
-        # Open transaction on self.adapter for live process if supported (skip when evaluating already-collected in-memory data)
+        # Open transaction & perform live acquisition within the per-step remote deadline
         step_tx = None
-        if not is_precollected and self.pid and self.pid > 0 and hasattr(self.adapter, "begin_capture_transaction"):
-            try:
-                step_tx = self.adapter.begin_capture_transaction(
-                    session_id=self.ledger.session_id,
-                    pid=int(self.pid),
-                    operation_type="diagnostic",
-                    snapshot_binding=f"snap_{self.investigation_id}_{step.step_id}",
-                    require_lifecycle_persistence=True,
-                )
-            except Exception as tx_begin_err:
-                return _fail_step_and_continue(tx_begin_err, "Capture transaction failed")
-
-        # Perform actual live runtime evidence acquisition via RuntimeEvidenceProvider
         _t0_collect = time.monotonic()
         try:
-            cur_epoch = (self.plan.current_step_index + 1) if self.plan else 1
             with _step_deadline_ctx:
+                if not is_precollected and self.pid and self.pid > 0 and hasattr(self.adapter, "begin_capture_transaction"):
+                    try:
+                        step_tx = self.adapter.begin_capture_transaction(
+                            session_id=self.ledger.session_id,
+                            pid=int(self.pid),
+                            operation_type="diagnostic",
+                            snapshot_binding=f"snap_{self.investigation_id}_{step.step_id}",
+                            require_lifecycle_persistence=True,
+                        )
+                    except Exception as tx_begin_err:
+                        return _fail_step_and_continue(tx_begin_err, "Capture transaction failed")
+
+                cur_epoch = (self.plan.current_step_index + 1) if self.plan else 1
                 obs_data, ev_records = self.evidence_provider.collect_for_recipe(
                     recipe=recipe,
                     pid=self.pid,
@@ -2434,8 +2525,14 @@ class AdaptiveInvestigationSession:
             **obs_data,
         }
 
-        # Deterministic recipe evaluation against real acquired observations
-        eval_result = self.recipe_registry.evaluate_recipe(recipe, eval_context)
+        if _is_remote_step and not is_precollected:
+            self._consecutive_remote_failures = 0
+
+        # Deterministic recipe evaluation against real acquired observations (isolated per step)
+        try:
+            eval_result = self.recipe_registry.evaluate_recipe(recipe, eval_context)
+        except Exception as eval_err:  # noqa: BLE001
+            return _fail_step_and_continue(eval_err, "Recipe evaluation failed")
         # The evaluated rules are done with live objects; what is recorded in checks / reports must be plain data
         # (an object repr carries a memory address and differs between a session and its reloaded copy).
         for _k, _v in list(obs_data.items()):
@@ -2527,7 +2624,10 @@ class AdaptiveInvestigationSession:
                 **({"parent_evidence_ids": eff_parents} if eff_parents else {}),
                 **({"live_capture_receipt": rcpt_dict_payload} if rcpt_dict_payload else {}),
             }
-            correlated = self.correlator.correlate(ev_payload, target_pid=self.pid)
+            try:
+                correlated = self.correlator.correlate(ev_payload, target_pid=self.pid)
+            except Exception:  # noqa: BLE001
+                correlated = {}
             enriched_ev = attach_typed_evidence({**ev_payload, "correlation": correlated, "step_id": step.step_id})
 
             ledger_status = self._record_authoritative_evidence_in_ledger(
@@ -2583,7 +2683,10 @@ class AdaptiveInvestigationSession:
                 **({"parent_evidence_ids": eff_contra_parents} if eff_contra_parents else {}),
                 **({"live_capture_receipt": rcpt_dict_payload} if rcpt_dict_payload else {}),
             }
-            correlated = self.correlator.correlate(ev_payload, target_pid=self.pid)
+            try:
+                correlated = self.correlator.correlate(ev_payload, target_pid=self.pid)
+            except Exception:  # noqa: BLE001
+                correlated = {}
             enriched_ev = attach_typed_evidence({**ev_payload, "correlation": correlated, "step_id": step.step_id})
             enriched_ev["ledger_status"] = self._record_authoritative_evidence_in_ledger(
                 ev_id=contra_ev_id,
@@ -2627,7 +2730,10 @@ class AdaptiveInvestigationSession:
                 "provenance_class": eff_step_prov,
                 **({"live_capture_receipt": rcpt_dict_payload} if rcpt_dict_payload else {}),
             }
-            correlated = self.correlator.correlate(ev_payload, target_pid=self.pid)
+            try:
+                correlated = self.correlator.correlate(ev_payload, target_pid=self.pid)
+            except Exception:  # noqa: BLE001
+                correlated = {}
             enriched_ev = attach_typed_evidence({**ev_payload, "correlation": correlated, "step_id": step.step_id})
             enriched_ev["ledger_status"] = self._record_authoritative_evidence_in_ledger(
                 ev_id=base_ev_id,
@@ -2665,9 +2771,15 @@ class AdaptiveInvestigationSession:
             ch.ledger = self.ledger
             if recipe.recipe_id in ch.applicable_diagnostic_rules or recipe.problem_category == ch.category:
                 for fact in eval_result.supporting_facts:
-                    ch.add_supporting_observation(fact, evidence_id=primary_ev_id, target_context=_ch_ctx)
+                    try:
+                        ch.add_supporting_observation(fact, evidence_id=primary_ev_id, target_context=_ch_ctx)
+                    except Exception:  # noqa: BLE001
+                        pass
                 for fact in eval_result.contradicting_facts:
-                    ch.add_contradicting_observation(fact, evidence_id=primary_ev_id, target_context=_ch_ctx)
+                    try:
+                        ch.add_contradicting_observation(fact, evidence_id=primary_ev_id, target_context=_ch_ctx)
+                    except Exception:  # noqa: BLE001
+                        pass
 
         step.status = "COMPLETED"
         step.result = {
@@ -5080,7 +5192,12 @@ def _diagnose_run(
 
         session = None
         stage = "start_investigation"
-        with caps_ctx:
+        _overall_deadline_ctx = (
+            adapter.collection_deadline(float(limits.max_wall_clock_ms) / 1000.0)
+            if (remote and limits is not None and hasattr(adapter, "collection_deadline"))
+            else nullcontext()
+        )
+        with caps_ctx, _overall_deadline_ctx:
             try:
                 if resume_investigation_id:
                     stage = "continue_investigation"
@@ -5109,10 +5226,44 @@ def _diagnose_run(
             except Exception as exc:  # noqa: BLE001
                 nc.append({"kind": "stage_failed", "item": stage, "reason": f"{type(exc).__name__}: {exc}"})
                 if session is not None:
-                    res.state = session.state
-                    res.checks_run = [_diagnose_check_row(c) for c in session.checks
-                                      if c.status not in (CheckStatus.NOT_EXECUTED, CheckStatus.SKIPPED)]
-                return _finish(f"The diagnosis failed during '{stage}' ({type(exc).__name__}). No conclusion was reached.")
+                    executed_before_err = [
+                        c for c in session.checks
+                        if c.status not in (CheckStatus.NOT_EXECUTED, CheckStatus.SKIPPED)
+                    ]
+                    if executed_before_err and session.collected_evidence:
+                        # Preserve all evidence & findings already collected before the unexpected exception
+                        try:
+                            session._synthesize_collected_evidence_before_stop()
+                            session.state = STATE_INCONCLUSIVE
+                            conclusion = session._finalize_conclusion(
+                                stop_reason="PARTIAL_FAILURE",
+                                summary=(
+                                    f"Diagnosis encountered {type(exc).__name__} during '{stage}' after "
+                                    f"{len(executed_before_err)} check(s); partial findings preserved."
+                                ),
+                            )
+                            session._save_to_disk()
+                        except Exception:  # noqa: BLE001
+                            conclusion = None
+                    else:
+                        try:
+                            session._save_to_disk()
+                        except Exception:  # noqa: BLE001
+                            pass
+                        conclusion = None
+                    if conclusion is None:
+                        res.state = session.state
+                        res.checks_run = [_diagnose_check_row(c) for c in executed_before_err]
+                        return _finish(f"The diagnosis failed during '{stage}' ({type(exc).__name__}). No conclusion was reached.")
+                else:
+                    return _finish(f"The diagnosis failed during '{stage}' ({type(exc).__name__}). No conclusion was reached.")
+
+        if conclusion is not None and getattr(conclusion, "stop_reason", None) == "REMOTE_CONNECTION_LOST":
+            nc.append({
+                "kind": "remote_connection_lost",
+                "item": str(extra_target.get("host") or "remote target"),
+                "reason": str(getattr(conclusion, "summary", "") or "Remote SSH connection lost during diagnosis"),
+            })
 
         res.state = session.state
         if session.classification_result is not None and session.classification_result.interpretation:

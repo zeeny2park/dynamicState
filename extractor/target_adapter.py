@@ -2447,7 +2447,7 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
             if rem <= 0:
                 return -1, "", "Remote collection step deadline exceeded"
             t = min(t, max(0.2, rem))
-        args = self._ssh_args(remote_shell_cmd)
+        args = self._ssh_args(remote_shell_cmd, connect_timeout=t)
         t0 = time.monotonic()
         res: Tuple[int, str, str]
         try:
@@ -2459,13 +2459,43 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
             res = (-1, "", f"SSH command timed out after {t:.1f}s")
         except Exception as e:
             res = (-1, "", f"SSH execution error: {e}")
+        err_text = res[2] or ""
         if (self._cm_used and not self._cm_disabled and res[0] == 255
-                and re.search(r"control|mux|bad configuration option|unknown percent|unsupported option", res[2] or "", re.I)):
+                and re.search(r"bad configuration option|unknown percent|unsupported option", err_text, re.I)):
             self._cm_disabled = True   # this ssh cannot do connection sharing: plain connections from now on
-            try:
-                res = self._command_runner(self._ssh_args(remote_shell_cmd), t, **({"input_bytes": input_bytes} if input_bytes is not None else {}))
-            except Exception as e:  # noqa: BLE001
-                res = (-1, "", f"SSH execution error: {e}")
+            rem_retry = self.remaining_deadline_sec()
+            t_retry = min(t, max(0.2, rem_retry)) if rem_retry is not None else t
+            if rem_retry is None or rem_retry > 0.5:
+                try:
+                    res = self._command_runner(
+                        self._ssh_args(remote_shell_cmd, connect_timeout=t_retry),
+                        t_retry,
+                        **({"input_bytes": input_bytes} if input_bytes is not None else {}),
+                    )
+                except Exception as e:  # noqa: BLE001
+                    res = (-1, "", f"SSH execution error: {e}")
+        elif (self._cm_used and not self._cm_disabled and res[0] == 255
+                and re.search(r"control|mux|broken pipe|connection reset|shared connection.*closed", err_text, re.I)):
+            # Stale or broken ControlMaster socket: reset transport and retry once without mux if budget remains
+            rem_retry = self.remaining_deadline_sec()
+            if rem_retry is None or rem_retry > 1.0:
+                self._cm_disabled = True
+                try:
+                    with self._daemon_lock:
+                        self._close_daemon_locked(graceful=False)
+                except Exception:  # noqa: BLE001
+                    pass
+                t_retry = min(t, max(0.2, rem_retry)) if rem_retry is not None else t
+                try:
+                    res = self._command_runner(
+                        self._ssh_args(remote_shell_cmd, connect_timeout=t_retry),
+                        t_retry,
+                        **({"input_bytes": input_bytes} if input_bytes is not None else {}),
+                    )
+                except subprocess.TimeoutExpired:
+                    res = (-1, "", f"SSH command timed out after {t_retry:.1f}s")
+                except Exception as e:  # noqa: BLE001
+                    res = (-1, "", f"SSH execution error: {e}")
         try:
             site, caller = _call_sites()
             self.command_log.add("ssh", _classify_ssh_purpose(remote_shell_cmd), site, caller,
@@ -2490,13 +2520,16 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
         # %C = hash of (local host, remote host, port, user): short enough for the 104-byte unix socket limit
         return ["-o", "ControlMaster=auto", "-o", f"ControlPath={ctrl_dir}/%C", "-o", "ControlPersist=30s"]
 
-    def _ssh_args(self, remote_shell_cmd: str) -> List[str]:
+    def _ssh_args(self, remote_shell_cmd: str, connect_timeout: Optional[float] = None) -> List[str]:
+        ct = 5
+        if connect_timeout is not None and connect_timeout > 0:
+            ct = max(1, min(5, int(connect_timeout + 0.999)))
         args = [
             self.ssh_bin,
             "-p", str(self.port),
             "-o", "BatchMode=yes",
             "-o", "StrictHostKeyChecking=accept-new",
-            "-o", "ConnectTimeout=5",
+            "-o", f"ConnectTimeout={ct}",
             "-o", "ServerAliveInterval=2",
             "-o", "ServerAliveCountMax=2",
         ]

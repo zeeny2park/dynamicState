@@ -70,13 +70,29 @@ def preflight_error(pid: int) -> Optional[Dict[str, str]]:
 
 
 def outcome_notice(result: Dict[str, Any], job: "DiagnoseJob") -> Optional[Dict[str, str]]:
-    """What the UI should say next to a verdict that the target itself prevented: it exited during the diagnosis,
-    or it could not be read.  From the result's ``target_unreadable`` entry, or a local process that is gone now."""
-    for n in result.get("not_covered") or []:
-        if isinstance(n, dict) and n.get("kind") == "target_unreadable":
-            code = _reason_code(str(n.get("reason") or ""))
+    """What the UI should say next to a verdict that the target or transport prevented or cut short."""
+    nc_list = [n for n in (result.get("not_covered") or []) if isinstance(n, dict)]
+    for n in nc_list:
+        kind = n.get("kind")
+        reason = str(n.get("reason") or "")
+        if kind == "target_unreadable":
+            code = _reason_code(reason)
             return {"code": "TARGET_EXITED" if code == "TARGET_NOT_FOUND" and job.target_name else code,
-                    "message": str(n.get("reason") or "")}
+                    "message": reason}
+        if kind == "target_unreachable":
+            return {"code": "TARGET_UNREACHABLE", "message": reason}
+        if kind == "remote_connection_lost":
+            return {"code": "REMOTE_CONNECTION_LOST", "message": reason}
+        if kind == "stage_failed":
+            return {"code": "DIAGNOSE_PARTIAL_ERROR", "message": reason}
+    if (
+        result.get("stop_reason") == "BUDGET_EXHAUSTED"
+        or (isinstance(result.get("collection_impact"), dict) and result["collection_impact"].get("budget_exhausted"))
+    ):
+        return {
+            "code": "TIME_BUDGET_EXCEEDED",
+            "message": str(result.get("summary") or "Diagnosis stopped because the observation time budget was reached."),
+        }
     if not job.remote_host and job.target_name and not _alive(int(job.pid)):
         return {"code": "TARGET_EXITED", "message": f"process {job.pid} exited during the diagnosis"}
     return None
@@ -466,6 +482,28 @@ class DiagnoseJobManager:
         """"Add to report": the next report of this job carries the observation as its own section (or none)."""
         with job.report_lock:
             job.observation = observation
+
+    def cancel(self, job_id: str) -> Dict[str, Any]:
+        """Gracefully stop a running diagnosis job (e.g. long-running remote diagnosis) so partial results can finish."""
+        job = self.get(job_id)
+        if job is None:
+            return {"success": False, "error": {"code": "JOB_NOT_FOUND", "message": f"Unknown job_id: {job_id}"}}
+        if job.state != "running":
+            return {"success": True, "job_id": job.job_id, "state": job.state, "cancelled": False}
+        sess = job.session
+        if sess is not None:
+            try:
+                sess.is_paused = True
+            except Exception:  # noqa: BLE001
+                pass
+            adapter = getattr(sess, "adapter", None)
+            if adapter is not None and hasattr(adapter, "close"):
+                try:
+                    adapter.close()
+                except Exception:  # noqa: BLE001
+                    pass
+        job.emit("cancel_requested", {"job_id": job.job_id, "message": "Cancellation requested by user"})
+        return {"success": True, "job_id": job.job_id, "state": job.state, "cancelled": True}
 
     def get(self, job_id: str) -> Optional[DiagnoseJob]:
         if not is_valid_job_id(job_id):

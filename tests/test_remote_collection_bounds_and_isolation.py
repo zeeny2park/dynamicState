@@ -5,6 +5,7 @@ import time
 import unittest
 from unittest.mock import patch
 
+from extractor.capture_backend import set_default_trust_store
 from extractor.diagnostic_report import CheckStatus
 from extractor.expert_diagnostic_engine import ExpertDiagnosticEngine
 from extractor.runtime_evidence_provider import (
@@ -18,6 +19,7 @@ from extractor.thread_sampler import ThreadSampler, ThreadSamplingConfig
 
 class TestRemoteCollectionBoundsAndIsolation(unittest.TestCase):
     def setUp(self):
+        set_default_trust_store(None)
         self.tmpdir = tempfile.mkdtemp(dir=os.environ.get("TMPDIR", "/tmp"))
         self.src_path = os.path.join(self.tmpdir, "bound_target.c")
         self.bin_path = os.path.join(self.tmpdir, "bound_target")
@@ -42,6 +44,7 @@ class TestRemoteCollectionBoundsAndIsolation(unittest.TestCase):
         time.sleep(0.05)
 
     def tearDown(self):
+        set_default_trust_store(None)
         if self.proc and self.proc.poll() is None:
             self.proc.kill()
             self.proc.wait(timeout=2)
