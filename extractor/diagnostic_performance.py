@@ -58,31 +58,45 @@ class DiagnosticPerformanceMetrics:
     hypotheses_eliminated_count: int = 0
     replans_count: int = 0
 
-    def merge_adapter_metrics(self, adapter_metrics: Optional[Dict[str, Any]]) -> None:
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "_adapter_snapshots", {})
+
+    def merge_adapter_metrics(
+        self,
+        adapter_metrics: Optional[Dict[str, Any]],
+        adapter_id: Optional[str] = None,
+    ) -> None:
         if not adapter_metrics or not isinstance(adapter_metrics, dict):
             return
-        self.ssh_commands_count = int(adapter_metrics.get("ssh_commands_count", self.ssh_commands_count))
-        self.ssh_connections_count = int(adapter_metrics.get("ssh_connections_count", self.ssh_connections_count))
-        self.control_master_reconnects_count = int(
-            adapter_metrics.get("control_master_reconnects_count", self.control_master_reconnects_count)
+        aid = adapter_id or str(adapter_metrics.get("adapter_id") or "default")
+        snapshots = getattr(self, "_adapter_snapshots", None)
+        if snapshots is None:
+            snapshots = {}
+            object.__setattr__(self, "_adapter_snapshots", snapshots)
+        snapshots[aid] = dict(adapter_metrics)
+
+        # Aggregate totals across all recorded adapters
+        self.ssh_commands_count = sum(int(s.get("ssh_commands_count", 0)) for s in snapshots.values())
+        self.ssh_connections_count = sum(int(s.get("ssh_connections_count", 0)) for s in snapshots.values())
+        self.control_master_reconnects_count = sum(
+            int(s.get("control_master_reconnects_count", 0)) for s in snapshots.values()
         )
-        self.retries_count = int(adapter_metrics.get("retries_count", self.retries_count))
-        self.remote_bytes_transferred = int(
-            adapter_metrics.get("remote_bytes_transferred", self.remote_bytes_transferred)
+        self.retries_count = sum(int(s.get("retries_count", 0)) for s in snapshots.values())
+        self.remote_bytes_transferred = sum(
+            int(s.get("remote_bytes_transferred", 0)) for s in snapshots.values()
         )
-        self.remote_connection_establishment_s = max(
-            self.remote_connection_establishment_s,
-            float(adapter_metrics.get("remote_connection_establishment_s", 0.0)),
+        self.remote_connection_establishment_s = round(
+            sum(float(s.get("remote_connection_establishment_s", 0.0)) for s in snapshots.values()), 4
         )
-        self.ssh_command_execution_s = max(
-            self.ssh_command_execution_s,
-            float(adapter_metrics.get("ssh_command_execution_s", 0.0)),
+        self.ssh_command_execution_s = round(
+            sum(float(s.get("ssh_command_execution_s", 0.0)) for s in snapshots.values()), 4
         )
-        self.remote_command_s = max(
-            self.remote_command_s,
-            float(adapter_metrics.get("remote_command_s", 0.0)),
+        self.remote_command_s = round(
+            sum(float(s.get("remote_command_s", 0.0)) for s in snapshots.values()), 4
         )
-        self.retry_s = max(self.retry_s, float(adapter_metrics.get("retry_s", 0.0)))
+        self.retry_s = round(
+            sum(float(s.get("retry_s", 0.0)) for s in snapshots.values()), 4
+        )
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -178,32 +192,12 @@ class DiagnosticPerformanceTracker:
     def record_hypotheses_eliminated(self, count: int) -> None:
         self.metrics.hypotheses_eliminated_count = max(self.metrics.hypotheses_eliminated_count, int(count))
 
-    def merge_adapter_metrics(self, adapter_metrics: Optional[Dict[str, Any]]) -> None:
-        if not adapter_metrics or not isinstance(adapter_metrics, dict):
-            return
-        m = self.metrics
-        m.ssh_commands_count = int(adapter_metrics.get("ssh_commands_count", m.ssh_commands_count))
-        m.ssh_connections_count = int(adapter_metrics.get("ssh_connections_count", m.ssh_connections_count))
-        m.control_master_reconnects_count = int(
-            adapter_metrics.get("control_master_reconnects_count", m.control_master_reconnects_count)
-        )
-        m.retries_count = int(adapter_metrics.get("retries_count", m.retries_count))
-        m.remote_bytes_transferred = int(
-            adapter_metrics.get("remote_bytes_transferred", m.remote_bytes_transferred)
-        )
-        m.remote_connection_establishment_s = max(
-            m.remote_connection_establishment_s,
-            float(adapter_metrics.get("remote_connection_establishment_s", 0.0)),
-        )
-        m.ssh_command_execution_s = max(
-            m.ssh_command_execution_s,
-            float(adapter_metrics.get("ssh_command_execution_s", 0.0)),
-        )
-        m.remote_command_s = max(
-            m.remote_command_s,
-            float(adapter_metrics.get("remote_command_s", 0.0)),
-        )
-        m.retry_s = max(m.retry_s, float(adapter_metrics.get("retry_s", 0.0)))
+    def merge_adapter_metrics(
+        self,
+        adapter_metrics: Optional[Dict[str, Any]],
+        adapter_id: Optional[str] = None,
+    ) -> None:
+        self.metrics.merge_adapter_metrics(adapter_metrics, adapter_id=adapter_id)
 
     def finish(self, total_wall_clock_s: Optional[float] = None) -> DiagnosticPerformanceMetrics:
         if total_wall_clock_s is not None and total_wall_clock_s > 0:

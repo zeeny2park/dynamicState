@@ -99,6 +99,11 @@ class TestDiagnosisPipelineMetricsIntegration(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix="phase1_perf_test_")
         self.corpus = os.path.join(self.tmp, "corpus")
+        os.makedirs(self.corpus, mode=0o700, exist_ok=True)
+        try:
+            os.chmod(self.corpus, 0o700)
+        except OSError:
+            pass
 
     def tearDown(self):
         shutil.rmtree(self.tmp, ignore_errors=True)

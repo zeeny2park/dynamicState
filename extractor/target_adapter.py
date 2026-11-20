@@ -2378,16 +2378,23 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
 
     def get_performance_metrics(self) -> Dict[str, Any]:
         """Returns remote transport and cost metrics recorded during this session."""
+        def _round_pos(val: float) -> float:
+            f = float(val)
+            if f <= 0.0:
+                return 0.0
+            r = round(f, 4)
+            return r if r > 0.0 else 0.0001
+
         return {
             "ssh_commands_count": int(self._perf_ssh_commands),
             "ssh_connections_count": int(self._perf_ssh_connections),
             "control_master_reconnects_count": int(self._perf_cm_reconnects),
             "retries_count": int(self._perf_retries),
             "remote_bytes_transferred": int(self._perf_bytes_transferred),
-            "remote_connection_establishment_s": round(float(self._perf_conn_est_s), 4),
-            "ssh_command_execution_s": round(float(self._perf_command_dur_s), 4),
-            "remote_command_s": round(float(self._perf_command_dur_s), 4),
-            "retry_s": round(float(self._perf_retry_dur_s), 4),
+            "remote_connection_establishment_s": _round_pos(self._perf_conn_est_s),
+            "ssh_command_execution_s": _round_pos(self._perf_command_dur_s),
+            "remote_command_s": _round_pos(self._perf_command_dur_s),
+            "retry_s": _round_pos(self._perf_retry_dur_s),
         }
 
     def remote_command_summary(self, since: int = 0) -> Dict[str, Any]:

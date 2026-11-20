@@ -2187,8 +2187,6 @@ class AdaptiveInvestigationSession:
                 self._step_collect_next()
                 already_exec.add(step.recipe_id)
                 evaluated += 1
-                if hasattr(self, "perf_tracker"):
-                    self.perf_tracker.record_reused_observation()
         finally:
             self.budget_tracker = saved_bt
             self.evidence_provider.budget_tracker = saved_bt
@@ -5043,6 +5041,13 @@ def diagnose(
         r.summary = summary
         r.healthy_scope = not_healthy_scope(r.not_covered, summary)
         r.duration_s = round(time.monotonic() - t0, 3)
+        _early_tracker = DiagnosticPerformanceTracker()
+        _perf_m = _early_tracker.finish(total_wall_clock_s=r.duration_s)
+        if adapter and hasattr(adapter, "get_performance_metrics"):
+            _perf_m.merge_adapter_metrics(adapter.get_performance_metrics(), adapter_id=f"adapter_{id(adapter)}")
+        _perf_m.target_impact = dict(r.collection_impact)
+        r.performance_metrics = _perf_m.to_dict()
+        r.collection_impact["performance_metrics"] = r.performance_metrics
         return r
 
     try:
@@ -5207,7 +5212,7 @@ def _diagnose_run(
         trk = getattr(session, "perf_tracker", None) or fallback_tracker
         perf_m = trk.finish(total_wall_clock_s=res.duration_s)
         if hasattr(adapter, "get_performance_metrics"):
-            perf_m.merge_adapter_metrics(adapter.get_performance_metrics())
+            perf_m.merge_adapter_metrics(adapter.get_performance_metrics(), adapter_id=f"adapter_{id(adapter)}")
         perf_m.target_impact = dict(res.collection_impact)
         res.performance_metrics = perf_m.to_dict()
         res.collection_impact["performance_metrics"] = res.performance_metrics
@@ -5584,7 +5589,7 @@ def _diagnose_run(
         if hasattr(session, "perf_tracker"):
             perf_m = session.perf_tracker.finish(total_wall_clock_s=round(time.monotonic() - t0, 3))
             if hasattr(adapter, "get_performance_metrics"):
-                perf_m.merge_adapter_metrics(adapter.get_performance_metrics())
+                perf_m.merge_adapter_metrics(adapter.get_performance_metrics(), adapter_id=f"adapter_{id(adapter)}")
             perf_m.target_impact = dict(res.collection_impact)
             res.performance_metrics = perf_m.to_dict()
             res.collection_impact["performance_metrics"] = res.performance_metrics
