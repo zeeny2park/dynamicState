@@ -1475,6 +1475,10 @@ class TargetExecutionAdapter(ABC):
         """Clean up any active connection or temporary resources."""
         pass
 
+    def get_performance_metrics(self) -> Dict[str, Any]:
+        """Returns transport and performance metrics recorded by this adapter."""
+        return {}
+
 
 class LocalTargetAdapter(TargetExecutionAdapter):
     """Execution adapter for local Linux processes using direct /proc and process_vm_readv."""
@@ -2362,6 +2366,29 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
         self._snapshot_cache: Dict[int, Tuple[float, Dict[str, Any]]] = {}
         self._snapshot_scope_depth: int = 0
         self._deadline_tls = threading.local()
+        # Trustworthy performance baseline instrumentation (Phase 1)
+        self._perf_ssh_commands: int = 0
+        self._perf_ssh_connections: int = 0
+        self._perf_cm_reconnects: int = 0
+        self._perf_retries: int = 0
+        self._perf_bytes_transferred: int = 0
+        self._perf_command_dur_s: float = 0.0
+        self._perf_conn_est_s: float = 0.0
+        self._perf_retry_dur_s: float = 0.0
+
+    def get_performance_metrics(self) -> Dict[str, Any]:
+        """Returns remote transport and cost metrics recorded during this session."""
+        return {
+            "ssh_commands_count": int(self._perf_ssh_commands),
+            "ssh_connections_count": int(self._perf_ssh_connections),
+            "control_master_reconnects_count": int(self._perf_cm_reconnects),
+            "retries_count": int(self._perf_retries),
+            "remote_bytes_transferred": int(self._perf_bytes_transferred),
+            "remote_connection_establishment_s": round(float(self._perf_conn_est_s), 4),
+            "ssh_command_execution_s": round(float(self._perf_command_dur_s), 4),
+            "remote_command_s": round(float(self._perf_command_dur_s), 4),
+            "retry_s": round(float(self._perf_retry_dur_s), 4),
+        }
 
     def remote_command_summary(self, since: int = 0) -> Dict[str, Any]:
         return self.command_log.summary(since)
@@ -2449,6 +2476,10 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
             t = min(t, max(0.2, rem))
         args = self._ssh_args(remote_shell_cmd, connect_timeout=t)
         t0 = time.monotonic()
+        self._perf_ssh_commands += 1
+        is_first_cmd = (self._perf_ssh_commands == 1)
+        if is_first_cmd or not self.use_control_master or self._cm_disabled:
+            self._perf_ssh_connections += 1
         res: Tuple[int, str, str]
         try:
             if input_bytes is not None:
@@ -2463,6 +2494,8 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
         if (self._cm_used and not self._cm_disabled and res[0] == 255
                 and re.search(r"bad configuration option|unknown percent|unsupported option", err_text, re.I)):
             self._cm_disabled = True   # this ssh cannot do connection sharing: plain connections from now on
+            self._perf_retries += 1
+            t_retry_start = time.monotonic()
             rem_retry = self.remaining_deadline_sec()
             t_retry = min(t, max(0.2, rem_retry)) if rem_retry is not None else t
             if rem_retry is None or rem_retry > 0.5:
@@ -2474,9 +2507,13 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
                     )
                 except Exception as e:  # noqa: BLE001
                     res = (-1, "", f"SSH execution error: {e}")
+            self._perf_retry_dur_s += max(0.0, time.monotonic() - t_retry_start)
         elif (self._cm_used and not self._cm_disabled and res[0] == 255
                 and re.search(r"control|mux|broken pipe|connection reset|shared connection.*closed", err_text, re.I)):
             # Stale or broken ControlMaster socket: reset transport and retry once without mux if budget remains
+            self._perf_cm_reconnects += 1
+            self._perf_retries += 1
+            t_retry_start = time.monotonic()
             rem_retry = self.remaining_deadline_sec()
             if rem_retry is None or rem_retry > 1.0:
                 self._cm_disabled = True
@@ -2496,6 +2533,14 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
                     res = (-1, "", f"SSH command timed out after {t_retry:.1f}s")
                 except Exception as e:  # noqa: BLE001
                     res = (-1, "", f"SSH execution error: {e}")
+            self._perf_retry_dur_s += max(0.0, time.monotonic() - t_retry_start)
+        cmd_elapsed = max(0.0, time.monotonic() - t0)
+        self._perf_command_dur_s += cmd_elapsed
+        if is_first_cmd:
+            self._perf_conn_est_s = cmd_elapsed
+        n_in = len(remote_shell_cmd.encode("utf-8", "replace")) + (len(input_bytes) if input_bytes else 0)
+        n_out = len((res[1] or "").encode("utf-8", "replace")) + len((res[2] or "").encode("utf-8", "replace"))
+        self._perf_bytes_transferred += (n_in + n_out)
         try:
             site, caller = _call_sites()
             self.command_log.add("ssh", _classify_ssh_purpose(remote_shell_cmd), site, caller,

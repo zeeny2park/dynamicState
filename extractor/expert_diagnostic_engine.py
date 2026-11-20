@@ -26,6 +26,7 @@ import time
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Union
 import uuid
 
+from .diagnostic_performance import DiagnosticPerformanceTracker
 from .diagnostic_recipes import (
     recipe_requires_lock_owner,
     BASELINE_RECIPE_IDS,
@@ -1369,6 +1370,7 @@ class AdaptiveInvestigationSession:
         self.allocator_inspector: Optional[AllocatorInspector] = None
         self.structural_discovery = CppStructuralDiscovery()
         self.concurrency_graph = WaitForGraph()
+        self.perf_tracker = DiagnosticPerformanceTracker()
 
         # State machine
         self.state = STATE_CREATED
@@ -1409,6 +1411,7 @@ class AdaptiveInvestigationSession:
         target_path = os.path.join(self._investigations_dir, f"{self.investigation_id}.json")
         tmp_path = os.path.join(self._investigations_dir, f".tmp_{self.investigation_id}_{uuid.uuid4().hex[:8]}")
         outcome = DurableCommitOutcome.NOT_COMMITTED
+        _t_cp0 = time.monotonic()
 
         try:
             # 1. Symlink and trust-boundary check
@@ -1509,6 +1512,9 @@ class AdaptiveInvestigationSession:
                 outcome=outcome,
                 cause=e,
             ) from e
+        finally:
+            if hasattr(self, "perf_tracker"):
+                self.perf_tracker.metrics.checkpoint_s += max(0.0, time.monotonic() - _t_cp0)
 
     def _record_timeline_event(self, event_type: str, details: Dict[str, Any]) -> None:
         """Appends an event to the chronological timeline."""
@@ -1719,70 +1725,77 @@ class AdaptiveInvestigationSession:
         return {"action": "ASSESS", "state": self.state, "capabilities": self.target_assessment.capabilities}
 
     def _step_plan(self) -> Dict[str, Any]:
+        _t_plan0 = time.monotonic()
         if not self.classification_result or not self.target_assessment:
             self.state = STATE_FAILED
             return {"action": "PLAN", "state": self.state, "error": "Missing prerequisites for planning"}
 
-        if self.target_recipe:
-            r_meta = self.recipe_registry.get_recipe(self.target_recipe)
-            if r_meta:
-                primary_step = InvestigationStep(
-                    step_id=f"step_{r_meta.recipe_id.lower()}_01",
-                    recipe_id=r_meta.recipe_id,
-                    recipe_name=r_meta.name,
-                    category=r_meta.problem_category,
-                    domain=r_meta.domain,
-                    rationale=f"Targeted execution of diagnostic recipe {r_meta.name}",
-                    priority=1,
-                    cost_score=0.9,
-                    safety_score=1.0,
-                    expected_info_gain=0.9,
-                    multi_factor_score=0.95,
-                )
-                self.plan = InvestigationPlan(
-                    steps=[primary_step],
-                    total_steps=1,
-                    current_step_index=0,
-                    plan_rationale=f"Targeted execution of diagnostic recipe {r_meta.recipe_id}",
-                )
-
-        if not self.plan:
-            self.plan = self.planner.create_plan(
-                classification=self.classification_result,
-                target_assessment=self.target_assessment,
-            )
-
-        # Incorporate Expert Overrides into plan (Case P)
-        if self.expert_overrides:
-            for ov in reversed(self.expert_overrides):
-                ov_vars = getattr(ov, "related_variables", []) or ([getattr(ov, "variable_expression")] if getattr(ov, "variable_expression", None) else [])
-                ov_recipe = "RECIPE_INCONSISTENT_RELATED_VARIABLES" if len(ov_vars) >= 2 else "RECIPE_UNEXPECTED_VARIABLE_CHANGES"
-                r_meta = self.recipe_registry.get_recipe(ov_recipe)
+        try:
+            if self.target_recipe:
+                r_meta = self.recipe_registry.get_recipe(self.target_recipe)
                 if r_meta:
-                    override_step = InvestigationStep(
-                        step_id=f"step_expert_{len(self.plan.steps)+1:02d}",
-                        recipe_id=ov_recipe,
-                        recipe_name=f"[Expert Override] {r_meta.name}",
-                        category=getattr(ov, "problem_category", None) or r_meta.problem_category,
+                    primary_step = InvestigationStep(
+                        step_id=f"step_{r_meta.recipe_id.lower()}_01",
+                        recipe_id=r_meta.recipe_id,
+                        recipe_name=r_meta.name,
+                        category=r_meta.problem_category,
                         domain=r_meta.domain,
-                        rationale=f"Expert override prioritization: targeting {ov_vars}",
+                        rationale=f"Targeted execution of diagnostic recipe {r_meta.name}",
                         priority=1,
-                        cost_score=0.95,
+                        cost_score=0.9,
                         safety_score=1.0,
-                        expected_info_gain=0.85,
-                        multi_factor_score=0.80,
+                        expected_info_gain=0.9,
+                        multi_factor_score=0.95,
                     )
-                    self.plan.steps.insert(0, override_step)
-            self.plan.total_steps = len(self.plan.steps)
+                    self.plan = InvestigationPlan(
+                        steps=[primary_step],
+                        total_steps=1,
+                        current_step_index=0,
+                        plan_rationale=f"Targeted execution of diagnostic recipe {r_meta.recipe_id}",
+                    )
 
-        self._mark_and_order_default_checks()
-        self._record_timeline_event("PLAN_GENERATED", {
-            "total_steps": self.plan.total_steps,
-            "rationale": self.plan.plan_rationale,
-            "has_expert_overrides": bool(self.expert_overrides),
-        })
-        self.state = STATE_COLLECTING
-        return {"action": "PLAN", "state": self.state, "plan": self.plan.to_dict()}
+            if not self.plan:
+                self.plan = self.planner.create_plan(
+                    classification=self.classification_result,
+                    target_assessment=self.target_assessment,
+                )
+
+            # Incorporate Expert Overrides into plan (Case P)
+            if self.expert_overrides:
+                for ov in reversed(self.expert_overrides):
+                    ov_vars = getattr(ov, "related_variables", []) or ([getattr(ov, "variable_expression")] if getattr(ov, "variable_expression", None) else [])
+                    ov_recipe = "RECIPE_INCONSISTENT_RELATED_VARIABLES" if len(ov_vars) >= 2 else "RECIPE_UNEXPECTED_VARIABLE_CHANGES"
+                    r_meta = self.recipe_registry.get_recipe(ov_recipe)
+                    if r_meta:
+                        override_step = InvestigationStep(
+                            step_id=f"step_expert_{len(self.plan.steps)+1:02d}",
+                            recipe_id=ov_recipe,
+                            recipe_name=f"[Expert Override] {r_meta.name}",
+                            category=getattr(ov, "problem_category", None) or r_meta.problem_category,
+                            domain=r_meta.domain,
+                            rationale=f"Expert override prioritization: targeting {ov_vars}",
+                            priority=1,
+                            cost_score=0.95,
+                            safety_score=1.0,
+                            expected_info_gain=0.85,
+                            multi_factor_score=0.80,
+                        )
+                        self.plan.steps.insert(0, override_step)
+                self.plan.total_steps = len(self.plan.steps)
+
+            self._mark_and_order_default_checks()
+            self._record_timeline_event("PLAN_GENERATED", {
+                "total_steps": self.plan.total_steps,
+                "rationale": self.plan.plan_rationale,
+                "has_expert_overrides": bool(self.expert_overrides),
+            })
+            self.state = STATE_COLLECTING
+            return {"action": "PLAN", "state": self.state, "plan": self.plan.to_dict()}
+        finally:
+            if hasattr(self, "perf_tracker"):
+                self.perf_tracker.metrics.plan_generation_s += max(0.0, time.monotonic() - _t_plan0)
+                if self.plan:
+                    self.perf_tracker.metrics.recipes_planned_count = len(self.plan.steps)
 
     # ---- time budget of the default checks (roadmap decision 6.1-2; extractor.check_budget) ----
     def _symptom_categories(self) -> List[str]:
@@ -1934,32 +1947,38 @@ class AdaptiveInvestigationSession:
         expensive new pick is decided with every other expensive new candidate: the one with most gain per expected
         second runs; those that cannot change the causes or the verdict, or whose gain is below their cost, are left
         out and the selector is asked again without them.  Returns (pick, log, rationale, evaluations, left out)."""
-        from .followup_value import choose
-        excluded: Set[str] = set()
-        evaluations: List[Dict[str, Any]] = []
-        ctx: Optional[Dict[str, Any]] = None
-        while True:
-            sel_rid, sel_log, sel_why = select(excluded)
-            if not sel_rid or sel_rid in plan_ids:
-                return sel_rid, sel_log, sel_why, evaluations, excluded
-            ctx = ctx or self._followup_context()
-            first = self._evaluate_followup(sel_rid, after_recipe, ctx)
-            if first is None:
-                return sel_rid, sel_log, sel_why, evaluations, excluded
-            evs = [first]
-            for entry in sel_log or []:
-                rid = entry.get("recipe_id")
-                if entry.get("eligible") and rid not in plan_ids and rid != sel_rid and rid not in excluded:
-                    e = self._evaluate_followup(rid, after_recipe, ctx)
-                    if e is not None:
-                        evs.append(e)
-            evaluations += evs
-            best = choose(evs)
-            if best is not None:
-                why = (f"Expected outcomes: {best['recipe_id']} separates {best['separates']} "
-                       f"(gain {best['gain']}, {best['expected_cost_s']} s): " + "; ".join(best["outcome_lines"]))
-                return best["recipe_id"], sel_log, why, evaluations, excluded
-            excluded.update(e["recipe_id"] for e in evs)
+        _t_replan0 = time.monotonic()
+        try:
+            from .followup_value import choose
+            excluded: Set[str] = set()
+            evaluations: List[Dict[str, Any]] = []
+            ctx: Optional[Dict[str, Any]] = None
+            while True:
+                sel_rid, sel_log, sel_why = select(excluded)
+                if not sel_rid or sel_rid in plan_ids:
+                    return sel_rid, sel_log, sel_why, evaluations, excluded
+                ctx = ctx or self._followup_context()
+                first = self._evaluate_followup(sel_rid, after_recipe, ctx)
+                if first is None:
+                    return sel_rid, sel_log, sel_why, evaluations, excluded
+                evs = [first]
+                for entry in sel_log or []:
+                    rid = entry.get("recipe_id")
+                    if entry.get("eligible") and rid not in plan_ids and rid != sel_rid and rid not in excluded:
+                        e = self._evaluate_followup(rid, after_recipe, ctx)
+                        if e is not None:
+                            evs.append(e)
+                evaluations += evs
+                best = choose(evs)
+                if best is not None:
+                    why = (f"Expected outcomes: {best['recipe_id']} separates {best['separates']} "
+                           f"(gain {best['gain']}, {best['expected_cost_s']} s): " + "; ".join(best["outcome_lines"]))
+                    return best["recipe_id"], sel_log, why, evaluations, excluded
+                excluded.update(e["recipe_id"] for e in evs)
+        finally:
+            if hasattr(self, "perf_tracker"):
+                self.perf_tracker.metrics.replanning_s += max(0.0, time.monotonic() - _t_replan0)
+                self.perf_tracker.record_replan()
 
     def _step_start_collection(self) -> Dict[str, Any]:
         return self._step_collect_next()
@@ -1973,6 +1992,12 @@ class AdaptiveInvestigationSession:
         enriched_ev: Dict[str, Any],
     ) -> str:
         """Records an authoritative or unverified EvidenceRecord into self.ledger via canonical EvidenceAdapter."""
+        _t_norm0 = time.monotonic()
+        payload_size = 0
+        try:
+            payload_size = len(json.dumps(enriched_ev, default=str).encode("utf-8", "replace"))
+        except Exception:
+            pass
         try:
             eff_pid = int(self.pid) if (self.pid is not None and self.pid > 0) else None
             t_ident: Dict[str, Any] = {}
@@ -2099,12 +2124,18 @@ class AdaptiveInvestigationSession:
             if rec_in_ledger and getattr(rec_in_ledger, "admission_state", None) == EvidenceAdmissionState.QUARANTINED:
                 return f"QUARANTINED: {rec_in_ledger.admission_reason or 'Record quarantined due to dangling lineage or unverified provenance'}"
 
+            res_status = "RECORDED"
             if prov_class in ("LIVE_RUNTIME_CAPTURE", "CONTROLLED_RUNTIME_REPRODUCTION") and hasattr(self.ledger, "accept_record"):
                 self.ledger.accept_record(ev_id)
-                return "ACCEPTED"
-
-            return "RECORDED"
+                res_status = "ACCEPTED"
+            if hasattr(self, "perf_tracker"):
+                _norm_dur = max(0.0, time.monotonic() - _t_norm0)
+                self.perf_tracker.record_evidence_normalization(recipe_id, _norm_dur, payload_size)
+            return res_status
         except Exception as le:
+            if hasattr(self, "perf_tracker"):
+                _norm_dur = max(0.0, time.monotonic() - _t_norm0)
+                self.perf_tracker.record_evidence_normalization(recipe_id, _norm_dur, 0)
             return f"FAILED: {type(le).__name__}: {le}"
 
     def _synthesize_collected_evidence_before_stop(self) -> None:
@@ -2156,6 +2187,8 @@ class AdaptiveInvestigationSession:
                 self._step_collect_next()
                 already_exec.add(step.recipe_id)
                 evaluated += 1
+                if hasattr(self, "perf_tracker"):
+                    self.perf_tracker.record_reused_observation()
         finally:
             self.budget_tracker = saved_bt
             self.evidence_provider.budget_tracker = saved_bt
@@ -2264,10 +2297,14 @@ class AdaptiveInvestigationSession:
         while self.plan.current_step_index < len(self.plan.steps):
             cand_step = self.plan.steps[self.plan.current_step_index]
             if cand_step.status == "SKIPPED":
+                if hasattr(self, "perf_tracker"):
+                    self.perf_tracker.metrics.recipes_skipped_count += 1
                 self.plan.current_step_index += 1
                 continue
             if cand_step.recipe_id in already_exec_recipes and not cand_step.step_id.startswith("step_override"):
                 cand_step.status = "SKIPPED"
+                if hasattr(self, "perf_tracker"):
+                    self.perf_tracker.metrics.recipes_skipped_count += 1
                 self.plan.current_step_index += 1
                 continue
             if cand_step.default_check and cand_step.status == "PENDING":
@@ -2276,6 +2313,8 @@ class AdaptiveInvestigationSession:
                     self.plan.steps.append(self.plan.steps.pop(self.plan.current_step_index))
                     continue
                 if decision == "skip":
+                    if hasattr(self, "perf_tracker"):
+                        self.perf_tracker.metrics.recipes_skipped_count += 1
                     self.plan.current_step_index += 1
                     continue
             break
@@ -2362,6 +2401,8 @@ class AdaptiveInvestigationSession:
             err_msg = f"{stage_label}: {type(err).__name__}: {err}"
             step.status = "FAILED"
             step.result = {"status": "ERROR", "error": err_msg}
+            if hasattr(self, "perf_tracker"):
+                self.perf_tracker.metrics.failed_recipes_count += 1
             diagnostic_check.complete(
                 status=CheckStatus.ERROR,
                 actual_observations={"error": err_msg},
@@ -2498,6 +2539,11 @@ class AdaptiveInvestigationSession:
             if isinstance(_er.raw_details, dict) and "duration_sec" not in _er.raw_details:
                 _er.raw_details["duration_sec"] = _collect_dur_sec
         self.collected_evidence_records.extend(ev_records)
+        if hasattr(self, "perf_tracker"):
+            self.perf_tracker.record_recipe_collection(recipe.recipe_id, _collect_dur_sec)
+            self.perf_tracker.metrics.recipes_executed_count += 1
+            if is_precollected:
+                self.perf_tracker.record_reused_observation()
 
         # Incorporate session temporal memory samples into recipe context
         if self.temporal_memory_samples:
@@ -2624,10 +2670,14 @@ class AdaptiveInvestigationSession:
                 **({"parent_evidence_ids": eff_parents} if eff_parents else {}),
                 **({"live_capture_receipt": rcpt_dict_payload} if rcpt_dict_payload else {}),
             }
+            _t_corr0 = time.monotonic()
             try:
                 correlated = self.correlator.correlate(ev_payload, target_pid=self.pid)
             except Exception:  # noqa: BLE001
                 correlated = {}
+            finally:
+                if hasattr(self, "perf_tracker"):
+                    self.perf_tracker.metrics.correlation_s += max(0.0, time.monotonic() - _t_corr0)
             enriched_ev = attach_typed_evidence({**ev_payload, "correlation": correlated, "step_id": step.step_id})
 
             ledger_status = self._record_authoritative_evidence_in_ledger(
@@ -2683,10 +2733,14 @@ class AdaptiveInvestigationSession:
                 **({"parent_evidence_ids": eff_contra_parents} if eff_contra_parents else {}),
                 **({"live_capture_receipt": rcpt_dict_payload} if rcpt_dict_payload else {}),
             }
+            _t_corr0 = time.monotonic()
             try:
                 correlated = self.correlator.correlate(ev_payload, target_pid=self.pid)
             except Exception:  # noqa: BLE001
                 correlated = {}
+            finally:
+                if hasattr(self, "perf_tracker"):
+                    self.perf_tracker.metrics.correlation_s += max(0.0, time.monotonic() - _t_corr0)
             enriched_ev = attach_typed_evidence({**ev_payload, "correlation": correlated, "step_id": step.step_id})
             enriched_ev["ledger_status"] = self._record_authoritative_evidence_in_ledger(
                 ev_id=contra_ev_id,
@@ -2730,10 +2784,14 @@ class AdaptiveInvestigationSession:
                 "provenance_class": eff_step_prov,
                 **({"live_capture_receipt": rcpt_dict_payload} if rcpt_dict_payload else {}),
             }
+            _t_corr0 = time.monotonic()
             try:
                 correlated = self.correlator.correlate(ev_payload, target_pid=self.pid)
             except Exception:  # noqa: BLE001
                 correlated = {}
+            finally:
+                if hasattr(self, "perf_tracker"):
+                    self.perf_tracker.metrics.correlation_s += max(0.0, time.monotonic() - _t_corr0)
             enriched_ev = attach_typed_evidence({**ev_payload, "correlation": correlated, "step_id": step.step_id})
             enriched_ev["ledger_status"] = self._record_authoritative_evidence_in_ledger(
                 ev_id=base_ev_id,
@@ -2974,6 +3032,7 @@ class AdaptiveInvestigationSession:
 
     def _step_analyze(self) -> Dict[str, Any]:
         """Synthesizes falsifiable hypotheses from collected observations and diagnostic rules."""
+        _t_an0 = time.monotonic()
         self.active_hypotheses.clear()
 
         # Group collected evidence by category
@@ -3082,6 +3141,11 @@ class AdaptiveInvestigationSession:
             "active_hypotheses_count": len(self.active_hypotheses),
         })
         self.state = STATE_VERIFYING
+        if hasattr(self, "perf_tracker"):
+            _an_dur = max(0.0, time.monotonic() - _t_an0)
+            self.perf_tracker.metrics.local_analysis_s += _an_dur
+            self.perf_tracker.metrics.time_spent_analyzing_s += _an_dur
+            self.perf_tracker.record_hypotheses_count(len(self.active_hypotheses))
         return {"action": "ANALYZE", "state": self.state, "hypotheses_count": len(self.active_hypotheses)}
 
     def _build_verification_criteria_for_category(self, category: str) -> List[Dict[str, Any]]:
@@ -3113,23 +3177,34 @@ class AdaptiveInvestigationSession:
 
     def _step_verify(self) -> Dict[str, Any]:
         """Runs executable verification criteria engine across all active hypotheses."""
-        for hyp in list(self.active_hypotheses):
-            self._execute_verification_for_hypothesis(hyp)
+        _t_ver0 = time.monotonic()
+        try:
+            for hyp in list(self.active_hypotheses):
+                self._execute_verification_for_hypothesis(hyp)
 
-        # Filter out refuted hypotheses
-        self.active_hypotheses = [h for h in self.active_hypotheses if h.status != "REFUTED"]
-        self._bind_competing_candidates()
-        self._record_timeline_event("HYPOTHESES_VERIFIED", {
-            "active_count": len(self.active_hypotheses),
-            "rejected_count": len(self.rejected_hypotheses),
-        })
-        self.state = STATE_NARROWING
-        return {"action": "VERIFY", "state": self.state}
+            # Filter out refuted hypotheses
+            self.active_hypotheses = [h for h in self.active_hypotheses if h.status != "REFUTED"]
+            self._bind_competing_candidates()
+            self._record_timeline_event("HYPOTHESES_VERIFIED", {
+                "active_count": len(self.active_hypotheses),
+                "rejected_count": len(self.rejected_hypotheses),
+            })
+            self.state = STATE_NARROWING
+            return {"action": "VERIFY", "state": self.state}
+        finally:
+            if hasattr(self, "perf_tracker"):
+                _ver_dur = max(0.0, time.monotonic() - _t_ver0)
+                self.perf_tracker.metrics.hypothesis_evaluation_s += _ver_dur
+                self.perf_tracker.metrics.local_analysis_s += _ver_dur
+                self.perf_tracker.metrics.time_spent_analyzing_s += _ver_dur
 
     def _bind_competing_candidates(self) -> None:
         """Stage 1, one hypothesis model: the verified hypotheses are the source of truth for the final verdict and
         for the report's competing candidates; each candidate becomes a view of the verified hypothesis that
         consumed its rules' evidence (competing_hypotheses.candidate_verdict_source)."""
+        if hasattr(self, "perf_tracker"):
+            eliminated = sum(1 for h in self.competing_hypotheses if getattr(h, "status", "") in ("REFUTED", "CONTRADICTED"))
+            self.perf_tracker.record_hypotheses_eliminated(eliminated)
         verified = list(self.active_hypotheses) + list(self.rejected_hypotheses)
         if not verified:
             return
@@ -4734,6 +4809,17 @@ class DiagnoseResult:
     symptom_interpretation: Dict[str, Any] = field(default_factory=dict)
     process_profile: Dict[str, Any] = field(default_factory=dict)
 
+    @property
+    def performance_metrics(self) -> Dict[str, Any]:
+        """Diagnostic performance baseline and resource metrics (Phase 1)."""
+        if not hasattr(self, "_performance_metrics"):
+            self._performance_metrics = {}
+        return self._performance_metrics
+
+    @performance_metrics.setter
+    def performance_metrics(self, value: Dict[str, Any]) -> None:
+        self._performance_metrics = dict(value or {})
+
     def to_dict(self) -> Dict[str, Any]:
         return json.loads(json.dumps(asdict(self), default=str))
 
@@ -5110,12 +5196,21 @@ def _diagnose_run(
     res.target.update(extra_target)
     nc = res.not_covered
     nc.extend(pre_nc)
+    session = None
+    fallback_tracker = DiagnosticPerformanceTracker()
 
     def _finish(summary: str) -> DiagnoseResult:
         res.summary = summary
         if not res.healthy_scope:
             res.healthy_scope = not_healthy_scope(nc, summary)
         res.duration_s = round(time.monotonic() - t0, 3)
+        trk = getattr(session, "perf_tracker", None) or fallback_tracker
+        perf_m = trk.finish(total_wall_clock_s=res.duration_s)
+        if hasattr(adapter, "get_performance_metrics"):
+            perf_m.merge_adapter_metrics(adapter.get_performance_metrics())
+        perf_m.target_impact = dict(res.collection_impact)
+        res.performance_metrics = perf_m.to_dict()
+        res.collection_impact["performance_metrics"] = res.performance_metrics
         return res
 
     try:
@@ -5295,8 +5390,11 @@ def _diagnose_run(
             return _finish("The investigation was planned but no check was executed, so no conclusion was reached.")
 
         stage = "build_diagnostic_report"
+        _t_rep0 = time.monotonic()
         try:
             report = session.build_diagnostic_report().to_dict()
+            if hasattr(session, "perf_tracker"):
+                session.perf_tracker.metrics.report_generation_s = round(max(0.0, time.monotonic() - _t_rep0), 4)
         except Exception as exc:  # noqa: BLE001
             nc.append({"kind": "stage_failed", "item": stage, "reason": f"{type(exc).__name__}: {exc}"})
             return _finish("The checks ran but the report could not be built. No conclusion was reached.")
@@ -5481,6 +5579,16 @@ def _diagnose_run(
         # of the evidence above, never a status or verdict input.
         from .object_relations import attach_object_relations
         attach_object_relations(res.findings, report)
+
+        # Performance baseline metrics (Phase 1)
+        if hasattr(session, "perf_tracker"):
+            perf_m = session.perf_tracker.finish(total_wall_clock_s=round(time.monotonic() - t0, 3))
+            if hasattr(adapter, "get_performance_metrics"):
+                perf_m.merge_adapter_metrics(adapter.get_performance_metrics())
+            perf_m.target_impact = dict(res.collection_impact)
+            res.performance_metrics = perf_m.to_dict()
+            res.collection_impact["performance_metrics"] = res.performance_metrics
+            report["performance_metrics"] = res.performance_metrics
 
         # Serialized once (C encoder; json.dump() runs the pure-Python one): the same text is the report file and,
         # when asked for, the returned copy.

@@ -27,7 +27,11 @@ def _ensure_cli_capture_key(corpus_dir: str) -> None:
         return
     try:
         cdir = os.path.abspath(corpus_dir)
-        os.makedirs(cdir, exist_ok=True)
+        os.makedirs(cdir, mode=0o700, exist_ok=True)
+        try:
+            os.chmod(cdir, 0o700)
+        except OSError:
+            pass
         key_path = os.path.join(cdir, ".capture_key")
         if not os.path.exists(key_path):
             fd = os.open(key_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
