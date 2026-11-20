@@ -1166,11 +1166,11 @@ class TargetExecutionAdapter(ABC):
         if not pinned:
             return True, None
         cur = _current_identity
-        if cur is None and _allow_recent_sec > 0.0 and type(self).__name__ == "RemoteSshTargetAdapter":
-            if "get_process_identity" not in self.__dict__ and "_identity_probe" not in self.__dict__:
-                recent = getattr(self, "_last_identity_cache", {}).get(int(pid))
-                if recent is not None and (time.monotonic() - recent[0]) <= _allow_recent_sec:
-                    cur = recent[1]
+        if cur is None and type(self).__name__ == "RemoteSshTargetAdapter":
+            recent = getattr(self, "_last_identity_cache", {}).get(int(pid))
+            eff_allow = max(60.0, _allow_recent_sec) if _allow_recent_sec >= 0.0 else 0.0
+            if recent is not None and (time.monotonic() - recent[0]) <= eff_allow:
+                cur = recent[1]
         if cur is None:
             cur = self.get_process_identity(int(pid))
         if not cur.get("boot_id") and cur.get("process_identity"):
@@ -2365,6 +2365,7 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
         self._threads_raw_micro_cache: Dict[int, Tuple[float, List[Dict[str, Any]], str]] = {}
         self._snapshot_cache: Dict[int, Tuple[float, Dict[str, Any]]] = {}
         self._snapshot_scope_depth: int = 0
+        self._liveness_cache: Dict[int, Tuple[float, bool]] = {}
         self._deadline_tls = threading.local()
         # Trustworthy performance baseline instrumentation (Phase 1)
         self._perf_ssh_commands: int = 0
@@ -2639,17 +2640,89 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
                 res["hdr"] = None
         return res
 
+    @staticmethod
+    def _shell_snapshot_script(pid: int) -> str:
+        """ONE POSIX-sh compound command that dumps liveness, comm, stat, status, maps,
+        exe link, boot_id, osrelease, uname -m, open fds, and thread details in a single round-trip."""
+        p = f"/proc/{int(pid)}"
+        parts = [
+            "echo @@LIVENESS", f"kill -0 {int(pid)} 2>/dev/null && echo ALIVE || echo DEAD",
+            "echo @@COMM", f"cat {p}/comm 2>/dev/null",
+            "echo @@STAT", f"cat {p}/stat 2>/dev/null",
+            "echo @@STATUS", f"cat {p}/status 2>/dev/null",
+            "echo @@MAPS", f"cat {p}/maps 2>/dev/null",
+            "echo @@EXE", f"readlink -f {p}/exe 2>/dev/null || readlink {p}/exe 2>/dev/null",
+            "echo @@FP", f"stat -L -c %i:%s:%Y {p}/exe 2>/dev/null",
+            "echo @@BOOT", "cat /proc/sys/kernel/random/boot_id 2>/dev/null",
+            "echo @@OSREL", "cat /proc/sys/kernel/osrelease 2>/dev/null",
+            "echo @@MACH", "uname -m 2>/dev/null",
+            "echo @@FDS", f"ls -l {p}/fd 2>/dev/null",
+            "echo @@TASKS",
+            f"for t in {p}/task/*; do [ -d \"$t\" ] || continue; "
+            "echo \"@@T ${t##*/}\"; "
+            "for f in stat status syscall io schedstat; do echo \"@@F $f\"; cat \"$t/$f\" 2>/dev/null; done; "
+            "done",
+            "echo @@END",
+        ]
+        return "; ".join(parts)
+
+    def _parse_shell_snapshot(self, out: str, pid: int) -> Optional[Dict[str, Any]]:
+        if "@@END" not in out:
+            return None
+        sec: Dict[str, List[str]] = {}
+        cur: Optional[str] = None
+        for line in out.splitlines():
+            if line.startswith("@@"):
+                parts = line[2:].split(maxsplit=1)
+                tag = parts[0].strip()
+                if tag in ("T", "F"):
+                    sec.setdefault("TASKS_OUT", []).append(line)
+                else:
+                    cur = tag
+                    sec[cur] = []
+                    if len(parts) > 1:
+                        sec[cur].append(parts[1])
+            elif cur in ("T", "F") or (cur == "TASKS"):
+                sec.setdefault("TASKS_OUT", []).append(line)
+            elif cur is not None:
+                sec[cur].append(line)
+
+        j = lambda k: "\n".join(sec.get(k, [])).strip()
+        tasks_raw = "\n".join(sec.get("TASKS_OUT", [])) + "\n@@END"
+        threads = self._parse_threads_shell_output(tasks_raw) or []
+
+        fd_lines = sec.get("FDS", [])
+        fd_targets: List[str] = []
+        for l in fd_lines:
+            if "->" in l:
+                fd_targets.append(l.split("->", 1)[-1].strip())
+
+        is_dead = ("DEAD" in j("LIVENESS")) or (not j("STAT") and not j("COMM") and not j("STATUS"))
+
+        return {
+            "success": not is_dead,
+            "terminated": is_dead,
+            "exe": j("EXE"),
+            "stat": j("STAT"),
+            "status": j("STATUS"),
+            "maps": j("MAPS"),
+            "comm": j("COMM"),
+            "boot_id": j("BOOT"),
+            "exe_fp": j("FP"),
+            "machine": j("MACH"),
+            "osrelease": j("OSREL"),
+            "fd_count": len(fd_targets),
+            "fd_targets": fd_targets,
+            "threads": threads,
+            "hdr": None,
+        }
+
     @contextlib.contextmanager
     def snapshot_scope(self, pid: int):
         """Fetches a compound process snapshot (ident + status + maps + limits + threads + fds) in ONE daemon
-        exchange and serves nested metadata queries within the scope without redundant round-trips."""
+        exchange or coalesced POSIX-sh execution and serves nested metadata queries within the scope without redundant round-trips."""
         can_use = (
             type(self) is RemoteSshTargetAdapter
-            and bool(self.collector_path)
-            and self._use_daemon
-            and self._snapshot_unsupported_for != self.collector_path
-            and self._proc_cmds_unsupported_for != self.collector_path
-            and self._threads_unsupported_for != self.collector_path
             and not any(k in self.__dict__ for k in (
                 "read_target_file", "get_proc_maps", "get_process_status",
                 "get_threads", "read_thread_samples", "check_liveness", "get_process_identity",
@@ -2663,20 +2736,33 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
         finally:
             self._snapshot_scope_depth = max(0, self._snapshot_scope_depth - 1)
 
-    def prefetch_snapshot(self, pid: int) -> Optional[Dict[str, Any]]:
+    def prefetch_snapshot(self, pid: int, force: bool = False, max_age_s: float = 1.0) -> Optional[Dict[str, Any]]:
         if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
             return None
-        if not self.collector_path or self._snapshot_unsupported_for == self.collector_path:
-            return None
-        payload = self._daemon_json(f"SNAPSHOT {int(pid)}")
+        if not force:
+            act = self._active_snapshot(pid, max_age_s=max_age_s)
+            if act is not None:
+                return act
+        payload: Optional[Dict[str, Any]] = None
+        if self.collector_path and self._snapshot_unsupported_for != self.collector_path:
+            payload = self._daemon_json(f"SNAPSHOT {int(pid)}")
+            if payload is not None and not payload.get("success"):
+                if payload.get("error") == "UNKNOWN_COMMAND":
+                    self._snapshot_unsupported_for = self.collector_path
+                    payload = None
+                elif payload.get("error") == "TARGET_TERMINATED":
+                    self._snapshot_cache[int(pid)] = (time.monotonic(), {"terminated": True})
+                    return None
         if payload is None:
-            return None
-        if not payload.get("success"):
-            if payload.get("error") == "UNKNOWN_COMMAND":
-                self._snapshot_unsupported_for = self.collector_path
-            elif payload.get("error") == "TARGET_TERMINATED":
+            # Coalesced POSIX shell path: zero target-side daemon/python required
+            script = self._shell_snapshot_script(pid)
+            rc, out, _ = self.run_ssh(f"sh -c {shlex.quote(script)}", timeout=self.timeout_sec * 1.5)
+            payload = self._parse_shell_snapshot(out, pid)
+            if payload is None:
+                return None
+            if payload.get("terminated"):
                 self._snapshot_cache[int(pid)] = (time.monotonic(), {"terminated": True})
-            return None
+                return None
         now = time.monotonic()
         self._snapshot_cache[int(pid)] = (now, payload)
         self._maps_micro_cache.pop(int(pid), None)
@@ -2685,11 +2771,11 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
         osrel = str(payload.get("osrelease") or "").strip()
         if osrel and re.fullmatch(r"\d+\.\d+[\w.+~-]*", osrel):
             self._target_kernel_release = osrel
+        if not payload.get("terminated"):
+            self._liveness_cache[int(pid)] = (now, True)
         return payload
 
-    def _active_snapshot(self, pid: int, max_age_s: float = 0.030) -> Optional[Dict[str, Any]]:
-        if self._snapshot_scope_depth <= 0:
-            return None
+    def _active_snapshot(self, pid: int, max_age_s: float = 2.0) -> Optional[Dict[str, Any]]:
         hit = self._snapshot_cache.get(int(pid))
         if hit is not None and (time.monotonic() - hit[0]) <= max_age_s:
             return hit[1]
@@ -2814,10 +2900,23 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
         if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 1:
             return False, f"Invalid PID {pid} (must be integer > 1)"
 
+        snap = self._active_snapshot(pid, max_age_s=2.0)
+        if snap is not None:
+            if snap.get("terminated"):
+                return False, f"Target PID {pid} is not running on {self.target_host()}"
+            return True, None
+        live_hit = getattr(self, "_liveness_cache", {}).get(int(pid))
+        if live_hit is not None and (time.monotonic() - live_hit[0]) <= 2.0:
+            if live_hit[1]:
+                return True, None
+            return False, f"Target PID {pid} is not running on {self.target_host()}"
+
         text = self._procfile_text(int(pid), "comm")   # one daemon exchange when the channel is up
         if text is not None:
             if text:
+                self._liveness_cache[int(pid)] = (time.monotonic(), True)
                 return True, None
+            self._liveness_cache[int(pid)] = (time.monotonic(), False)
             return False, f"Target PID {pid} is not running on {self.target_host()}"
         # Test liveness strictly on remote target host
         cmd = f"kill -0 {int(pid)} 2>/dev/null && echo ALIVE || echo DEAD"
@@ -2827,7 +2926,9 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
 
         out = stdout.strip()
         if "ALIVE" in out:
+            self._liveness_cache[int(pid)] = (time.monotonic(), True)
             return True, None
+        self._liveness_cache[int(pid)] = (time.monotonic(), False)
         return False, f"Target PID {pid} is not running on {self.target_host()}"
 
     def get_process_identity(self, pid: int) -> Dict[str, Any]:
@@ -2836,6 +2937,9 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
         ONE exchange (daemon IDENT, else one shell command); the ELF header of the executable is transferred and
         parsed once per executable image (cache key: path + inode:size:mtime), so later calls are header-free.
         """
+        cached = self._last_identity_cache.get(int(pid))
+        if cached is not None and (time.monotonic() - cached[0]) < 60.0:
+            return dict(cached[1])
         first = int(pid) not in self._ident_seen
         pr = self._identity_probe(pid, with_header=first) or {}
         exe, fp = pr.get("exe", ""), pr.get("exe_fp", "")
@@ -2971,7 +3075,7 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
     def get_proc_maps(self, pid: int) -> List[Dict[str, Any]]:
         now = time.monotonic()
         cached_m = self._maps_micro_cache.get(int(pid))
-        if cached_m is not None and (now - cached_m[0]) <= 0.020:
+        if cached_m is not None and (now - cached_m[0]) <= 2.0:
             return [dict(m) for m in cached_m[1]]
         mappings: List[Dict[str, Any]] = []
         stdout = self._procfile_text(int(pid), "maps")   # one daemon exchange when the channel is up
@@ -3037,7 +3141,7 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
             return status
         now = time.monotonic()
         cached_s = self._status_micro_cache.get(int(pid))
-        if cached_s is not None and (now - cached_s[0]) <= 0.020:
+        if cached_s is not None and (now - cached_s[0]) <= 2.0:
             return dict(cached_s[1])
         stdout = self._procfile_text(int(pid), "status")
         rc = 0
@@ -3168,12 +3272,11 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
         snap = self._active_snapshot(pid)
         if snap is not None and isinstance(snap.get("threads"), list) and not snap.get("threads_more"):
             raw_snap = [t for t in snap["threads"] if isinstance(t, dict) and "tid" in t]
-            self._threads_raw_micro_cache[int(pid)] = (time.monotonic(), raw_snap, "daemon")
-            return raw_snap, "daemon"
-        if allow_micro_cache:
-            cached_t = self._threads_raw_micro_cache.get(int(pid))
-            if cached_t is not None and (time.monotonic() - cached_t[0]) <= 0.020:
-                return cached_t[1], cached_t[2]
+            self._threads_raw_micro_cache[int(pid)] = (time.monotonic(), raw_snap, "coalesced_snapshot")
+            return raw_snap, "coalesced_snapshot"
+        cached_t = self._threads_raw_micro_cache.get(int(pid))
+        if cached_t is not None and (time.monotonic() - cached_t[0]) <= 2.0:
+            return cached_t[1], cached_t[2]
         if self.collector_path and self._threads_unsupported_for != self.collector_path:
             raw = self._threads_via_daemon(pid)
             if raw is not None:

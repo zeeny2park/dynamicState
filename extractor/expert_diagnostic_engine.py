@@ -1690,11 +1690,13 @@ class AdaptiveInvestigationSession:
         return {"action": "CLASSIFY", "state": self.state, "primary_category": self.classification_result.primary_category}
 
     def _step_assess(self) -> Dict[str, Any]:
-        self.target_assessment = self.assessor.assess(
-            pid=self.pid,
-            companion_elf=self.companion_elf,
-            adapter=self.adapter,
-        )
+        snap_ctx = self.adapter.snapshot_scope(self.pid) if (self.pid and hasattr(self.adapter, "snapshot_scope")) else contextlib.nullcontext()
+        with snap_ctx:
+            self.target_assessment = self.assessor.assess(
+                pid=self.pid,
+                companion_elf=self.companion_elf,
+                adapter=self.adapter,
+            )
         self._record_timeline_event("TARGET_ASSESSED", {
             "accessible": self.target_assessment.accessible,
             "thread_count": self.target_assessment.thread_count,
@@ -2004,12 +2006,20 @@ class AdaptiveInvestigationSession:
             if eff_pid:
                 t_ident["pid"] = eff_pid
 
+            # Single target identity lookup if not already in target_assessment
+            cached_ident: Optional[Dict[str, Any]] = None
+            if eff_pid and not (getattr(self.target_assessment, "process_identity", None) and getattr(self.target_assessment, "executable_identity", None) and getattr(self.target_assessment, "build_id", None)):
+                try:
+                    cached_ident = self.adapter.get_process_identity(eff_pid)
+                except Exception:
+                    cached_ident = None
+
             # Preserve real process_identity without fabrication
             proc_id = (
                 getattr(self.target_assessment, "process_identity", None)
                 or enriched_ev.get("process_identity")
                 or (enriched_ev.get("target_identity") or {}).get("process_identity")
-                or (self.adapter.get_process_identity(eff_pid).get("process_identity") if eff_pid else None)
+                or (cached_ident.get("process_identity") if cached_ident else None)
             )
             if proc_id:
                 t_ident["process_identity"] = proc_id
@@ -2020,7 +2030,7 @@ class AdaptiveInvestigationSession:
                 or enriched_ev.get("executable_identity")
                 or (enriched_ev.get("target_identity") or {}).get("executable_identity")
                 or self.companion_elf
-                or (self.adapter.get_process_identity(eff_pid).get("executable_identity") if eff_pid else None)
+                or (cached_ident.get("executable_identity") if cached_ident else None)
             )
             if exe_id:
                 t_ident["executable_identity"] = exe_id
@@ -2030,7 +2040,7 @@ class AdaptiveInvestigationSession:
                 getattr(self.target_assessment, "build_id", None)
                 or enriched_ev.get("build_id")
                 or (enriched_ev.get("target_identity") or {}).get("build_id")
-                or (self.adapter.get_process_identity(eff_pid).get("build_id") if eff_pid else None)
+                or (cached_ident.get("build_id") if cached_ident else None)
             )
             if bid:
                 t_ident["build_id"] = bid
@@ -2354,6 +2364,13 @@ class AdaptiveInvestigationSession:
         diagnostic_check.start()
 
         is_precollected = self.evidence_provider.has_precollected_data(recipe, self.pid, self.companion_elf)
+
+        # Prefetch coalesced target snapshot for live remote target (Phase 2 remote collection coalescing)
+        if not is_precollected and self.pid and self.pid > 0 and hasattr(self.adapter, "prefetch_snapshot"):
+            try:
+                self.adapter.prefetch_snapshot(self.pid)
+            except Exception:
+                pass
 
         # Record real temporal memory sample for session persistence (Section 4)
         if not is_precollected and self.pid and self.pid > 0:
@@ -5030,6 +5047,7 @@ def diagnose(
     t0 = time.monotonic()
     spec: Optional[TargetSpec] = None
     own_adapter: Optional[TargetExecutionAdapter] = None
+    _diag_bg_pool: Optional[Any] = None
     pre_nc: List[Dict[str, Any]] = []
     extra_target: Dict[str, Any] = {}
 

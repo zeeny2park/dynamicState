@@ -310,8 +310,7 @@ def detect_target_abi(
     ``probe_version=False`` skips the (local-only) scan of the libc file for the glibc version.
     """
     can_cache = (
-        maps is None
-        and type(adapter).__name__ == "RemoteSshTargetAdapter"
+        type(adapter).__name__ == "RemoteSshTargetAdapter"
         and "read_target_file" not in getattr(adapter, "__dict__", {})
         and "get_proc_maps" not in getattr(adapter, "__dict__", {})
     )
