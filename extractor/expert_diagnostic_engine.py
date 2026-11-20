@@ -1264,6 +1264,25 @@ def _is_ledger_admitted_evidence_entry(entry: Dict[str, Any]) -> bool:
     return prefix not in ("FAILED", "QUARANTINED", "REJECTED")
 
 
+def _recipe_snapshot_domains(recipe: Any) -> Set[str]:
+    """Computes the minimal set of snapshot domains needed for a recipe."""
+    domains = {"basic"}
+    if recipe is None:
+        return {"basic", "maps", "threads", "fds"}
+    r_id = getattr(recipe, "recipe_id", str(recipe)).upper()
+    r_domain = getattr(recipe, "domain", "").upper()
+    if "FD" in r_id or "FILE_DESCRIPTOR" in r_id:
+        domains.add("fds")
+    if any(k in r_id for k in ("THREAD", "LOCK", "DEADLOCK", "MUTEX", "CONTENTION")) or \
+       any(k in r_domain for k in ("CONCURRENCY", "THREAD", "LOCK")):
+        domains.add("threads")
+    if (any(k in r_id for k in ("MAP", "MEMORY", "HEAP", "CORRUPTION")) or \
+       (any(k in r_id for k in ("LEAK", "GROWTH")) and not any(k in r_id for k in ("THREAD", "FD"))) or \
+       any(k in r_domain for k in ("MEMORY", "HEAP"))) and not ("THREAD" in r_id or "FD" in r_id):
+        domains.add("maps")
+    return domains
+
+
 class AdaptiveInvestigationSession:
     """Represents a single active or completed expert investigation session."""
 
@@ -1690,7 +1709,7 @@ class AdaptiveInvestigationSession:
         return {"action": "CLASSIFY", "state": self.state, "primary_category": self.classification_result.primary_category}
 
     def _step_assess(self) -> Dict[str, Any]:
-        snap_ctx = self.adapter.snapshot_scope(self.pid) if (self.pid and hasattr(self.adapter, "snapshot_scope")) else contextlib.nullcontext()
+        snap_ctx = self.adapter.snapshot_scope(self.pid, domains={"basic", "maps", "threads"}) if (self.pid and hasattr(self.adapter, "snapshot_scope")) else contextlib.nullcontext()
         with snap_ctx:
             self.target_assessment = self.assessor.assess(
                 pid=self.pid,
@@ -1929,6 +1948,60 @@ class AdaptiveInvestigationSession:
         self._record_timeline_event("FOLLOWUP_EVALUATED", {k: ev[k] for k in ("recipe_id", "decision", "gain",
                                                                               "expected_cost_s", "after_recipe")})
         return ev
+
+    def _has_confirmed_fault_for_symptom(self) -> bool:
+        """True if the primary symptom hypothesis has been confirmed with high confidence (>= 0.85)."""
+        cls = self.classification_result
+        if cls is not None and (cls.is_vague or not getattr(cls, "understood", True)):
+            return any(
+                getattr(c, "status", None) == CheckStatus.FAIL and
+                bool(getattr(c, "decision_criteria", {}).get("confirmed_fault", False) or
+                     (isinstance(c.actual_observations, dict) and c.actual_observations.get("cycle_detected")))
+                for c in self.checks
+            )
+        cats = set(self._symptom_categories())
+        if not cats:
+            return False
+        for c in self.checks:
+            r = self.recipe_registry.get_recipe(c.recipe_id)
+            rcat = r.problem_category if r else ""
+            if rcat in cats and getattr(c, "status", None) == CheckStatus.FAIL:
+                return True
+        return False
+
+    def _inventory_reusable_evidence(self, recipe: Any) -> Tuple[Optional[Dict[str, Any]], List[RuntimeEvidenceRecord]]:
+        """Phase 3: Evidence Inventory First. Inventories already-collected records in session/ledger.
+        Reuses if valid, fresh (< 5.0s), matching target identity, and uncontradicted."""
+        if not self.pid or self.pid <= 0:
+            return None, []
+        r_id = getattr(recipe, "recipe_id", str(recipe))
+        if any(k in r_id for k in ("GROWTH", "TREND", "SERIES", "TEMPORAL")):
+            return None, []
+        
+        # Check target identity validity first
+        if hasattr(self.adapter, "verify_pinned_identity"):
+            ok, _ = self.adapter.verify_pinned_identity(self.pid)
+            if not ok:
+                return None, []
+                
+        matching = [
+            r for r in self.collected_evidence_records
+            if getattr(r, "target_pid", None) == self.pid
+            and getattr(r, "collection_method", "") == r_id
+            and getattr(r, "collection_status", "") == "SUCCESS"
+        ]
+        if not matching:
+            return None, []
+            
+        latest_rec = matching[-1]
+        rec_dur = getattr(latest_rec, "raw_details", {}).get("timestamp", 0.0) if isinstance(latest_rec.raw_details, dict) else 0.0
+        if rec_dur > 0 and (time.time() - rec_dur) > 5.0:
+            return None, []
+            
+        raw_obs = getattr(latest_rec, "raw_observation", None)
+        if isinstance(raw_obs, dict) and raw_obs:
+            return dict(raw_obs), [latest_rec]
+        return None, []
 
     def adaptive_stop_record(self) -> Optional[Dict[str, Any]]:
         """Why the loop stopped adding follow-ups: the expensive follow-ups left out (last decision per check, only
@@ -2305,12 +2378,11 @@ class AdaptiveInvestigationSession:
         while self.plan.current_step_index < len(self.plan.steps):
             cand_step = self.plan.steps[self.plan.current_step_index]
             if cand_step.status == "SKIPPED":
-                if hasattr(self, "perf_tracker"):
-                    self.perf_tracker.metrics.recipes_skipped_count += 1
                 self.plan.current_step_index += 1
                 continue
             if cand_step.recipe_id in already_exec_recipes and not cand_step.step_id.startswith("step_override"):
                 cand_step.status = "SKIPPED"
+                cand_step.not_run_reason = "already_executed_in_session"
                 if hasattr(self, "perf_tracker"):
                     self.perf_tracker.metrics.recipes_skipped_count += 1
                 self.plan.current_step_index += 1
@@ -2363,12 +2435,15 @@ class AdaptiveInvestigationSession:
         )
         diagnostic_check.start()
 
-        is_precollected = self.evidence_provider.has_precollected_data(recipe, self.pid, self.companion_elf)
+        # Phase 3: Evidence Inventory First - check for existing fresh valid evidence
+        inv_obs, inv_recs = self._inventory_reusable_evidence(recipe)
+        is_precollected = (inv_obs is not None) or self.evidence_provider.has_precollected_data(recipe, self.pid, self.companion_elf)
 
-        # Prefetch coalesced target snapshot for live remote target (Phase 2 remote collection coalescing)
+        # Prefetch targeted target snapshot for live remote target (Phase 3 targeted snapshot collection)
         if not is_precollected and self.pid and self.pid > 0 and hasattr(self.adapter, "prefetch_snapshot"):
             try:
-                self.adapter.prefetch_snapshot(self.pid)
+                recipe_req_domains = _recipe_snapshot_domains(recipe)
+                self.adapter.prefetch_snapshot(self.pid, domains=recipe_req_domains)
             except Exception:
                 pass
 
@@ -2476,45 +2551,49 @@ class AdaptiveInvestigationSession:
         # Open transaction & perform live acquisition within the per-step remote deadline
         step_tx = None
         _t0_collect = time.monotonic()
-        try:
-            with _step_deadline_ctx:
-                if not is_precollected and self.pid and self.pid > 0 and hasattr(self.adapter, "begin_capture_transaction"):
-                    try:
-                        step_tx = self.adapter.begin_capture_transaction(
-                            session_id=self.ledger.session_id,
-                            pid=int(self.pid),
-                            operation_type="diagnostic",
-                            snapshot_binding=f"snap_{self.investigation_id}_{step.step_id}",
-                            require_lifecycle_persistence=True,
-                        )
-                    except Exception as tx_begin_err:
-                        return _fail_step_and_continue(tx_begin_err, "Capture transaction failed")
+        if inv_obs is not None:
+            obs_data = inv_obs
+            ev_records = inv_recs
+        else:
+            try:
+                with _step_deadline_ctx:
+                    if not is_precollected and self.pid and self.pid > 0 and hasattr(self.adapter, "begin_capture_transaction"):
+                        try:
+                            step_tx = self.adapter.begin_capture_transaction(
+                                session_id=self.ledger.session_id,
+                                pid=int(self.pid),
+                                operation_type="diagnostic",
+                                snapshot_binding=f"snap_{self.investigation_id}_{step.step_id}",
+                                require_lifecycle_persistence=True,
+                            )
+                        except Exception as tx_begin_err:
+                            return _fail_step_and_continue(tx_begin_err, "Capture transaction failed")
 
-                cur_epoch = (self.plan.current_step_index + 1) if self.plan else 1
-                obs_data, ev_records = self.evidence_provider.collect_for_recipe(
-                    recipe=recipe,
-                    pid=self.pid,
-                    companion_elf=self.companion_elf,
-                    target_assessment=self.target_assessment,
-                    classification=self.classification_result,
-                    session_id=self.investigation_id,
-                    epoch_id=cur_epoch,
-                )
-        except (KeyboardInterrupt, SystemExit):
-            raise
-        except BaseException as collect_err:
-            if step_tx is not None:
-                from .capture_backend import OperationLifecycleState
-                terminal = (OperationLifecycleState.CANCELLED
-                            if type(collect_err).__name__ in ("CancelledError", "KeyboardInterrupt", "InterruptedError")
-                            else OperationLifecycleState.FAILED)
-                try:
-                    self.adapter.rollback_capture_transaction(
-                        step_tx, f"Collection {terminal.value.lower()}: {collect_err}", terminal_state=terminal
+                    cur_epoch = (self.plan.current_step_index + 1) if self.plan else 1
+                    obs_data, ev_records = self.evidence_provider.collect_for_recipe(
+                        recipe=recipe,
+                        pid=self.pid,
+                        companion_elf=self.companion_elf,
+                        target_assessment=self.target_assessment,
+                        classification=self.classification_result,
+                        session_id=self.investigation_id,
+                        epoch_id=cur_epoch,
                     )
-                except Exception:
-                    pass
-            return _fail_step_and_continue(collect_err, "Collection failed")
+            except (KeyboardInterrupt, SystemExit):
+                raise
+            except BaseException as collect_err:
+                if step_tx is not None:
+                    from .capture_backend import OperationLifecycleState
+                    terminal = (OperationLifecycleState.CANCELLED
+                                if type(collect_err).__name__ in ("CancelledError", "KeyboardInterrupt", "InterruptedError")
+                                else OperationLifecycleState.FAILED)
+                    try:
+                        self.adapter.rollback_capture_transaction(
+                            step_tx, f"Collection {terminal.value.lower()}: {collect_err}", terminal_state=terminal
+                        )
+                    except Exception:
+                        pass
+                return _fail_step_and_continue(collect_err, "Collection failed")
 
         step_rcpt = None
         if step_tx is not None:
@@ -2559,6 +2638,7 @@ class AdaptiveInvestigationSession:
             self.perf_tracker.metrics.recipes_executed_count += 1
             if is_precollected:
                 self.perf_tracker.record_reused_observation()
+                self.perf_tracker.metrics.remote_calls_avoided_count += 1
 
         # Incorporate session temporal memory samples into recipe context
         if self.temporal_memory_samples:
@@ -2941,7 +3021,11 @@ class AdaptiveInvestigationSession:
                     # Baseline checks are never skipped: a process can have two problems and the report must be
                     # able to say the other cheap checks were clean (or not).
                     if s.category != recipe.problem_category and s.recipe_id not in BASELINE_RECIPE_IDS:
-                        s.status = "SKIPPED"
+                        if s.status != "SKIPPED":
+                            s.status = "SKIPPED"
+                            s.not_run_reason = "early_stop_sufficient_evidence"
+                            if hasattr(self, "perf_tracker"):
+                                self.perf_tracker.metrics.recipes_skipped_count += 1
                 # IMP-004: dynamically scheduled growth follow-ups must still execute; otherwise keep the
                 # original early stop.  Baseline checks that have not run yet also keep the loop going.
                 # (IMP-008: also the follow-ups scheduled by an EARLIER growth step - a supported first follow-up
