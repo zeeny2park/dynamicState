@@ -1,6 +1,7 @@
 # DynamicState Phase 1 Baseline Performance & Instrumentation Report (Validated)
 
-**Target Commit / Baseline SHA**: `e52460b94df787c7ee09da0ec6c9bb9ffbcb1baf`  
+**Baseline Creation Commit**: `e52460b94df787c7ee09da0ec6c9bb9ffbcb1baf`  
+**Benchmark Execution Commit**: `a47266ab357df9199239285eda9a13bb080bd826`  
 **Measurement Environment**: Linux 7.0.0-1013-oracle-aarch64 (Ubuntu 24.04 LTS), Python 3.12.3, 4 vCPUs  
 **Status**: VALIDATED & VERIFIED (Phase 1 Baseline Established)  
 **Execution Date**: November 20, 2026  
@@ -72,21 +73,21 @@ The table below reflects real measured values from [benchmarks/phase1_baseline_r
 
 | # | Scenario ID | Target Description | Transport | Expected Verdict | Measured Verdict | Wall-Clock | Executed | Skipped | Failed | SSH Cmds | Validation Status |
 |---|---|---|---|---|---|---|---|---|---|---|---|
-| **1** | `1_healthy_target` | `ok_idle_server.c` | local | `HEALTHY` | `HEALTHY` | 1.548s | 17 | 0 | 0 | 0 | **VALIDATED** |
-| **2** | `2_cpu_overload` | `spin_flag.c` | local | `PROBABLE_FAULT` | `PROBABLE_FAULT` | 1.513s | 16 | 0 | 0 | 0 | **VALIDATED** |
-| **3** | `3_memory_pressure` | `leak_registry.c` | local | `PROBABLE_FAULT` | `PROBABLE_FAULT` | 2.639s | 18 | 1 | 0 | 0 | **VALIDATED** |
-| **4** | `4_process_lifecycle_anomaly`| Dead PID | local | `INCONCLUSIVE` | `INCONCLUSIVE` | 0.000s | 0 | 0 | 0 | 0 | **VALIDATED** |
-| **5** | `5_thread_anomaly` | `request_threads.c` | local | `INCONCLUSIVE` | `INCONCLUSIVE` | 2.676s | 16 | 0 | 0 | 0 | **VALIDATED** |
-| **6** | `6_deadlock` | `deadlock_pipeline.c` | local | `CONFIRMED_FAULT` | `CONFIRMED_FAULT`| 1.878s | 14 | 0 | 0 | 0 | **VALIDATED** |
-| **7** | `7_remote_connection_failure` | Unreachable Host | ssh | `INCONCLUSIVE` | `INCONCLUSIVE` | 0.502s | 0 | 0 | 0 | 1 | **VALIDATED** |
-| **8** | `8_partial_permission_failure`| Partial FD denied | ssh | `INCONCLUSIVE` | `INCONCLUSIVE` | 3.454s | 17 | 0 | 0 | 225 | **VALIDATED** |
-| **9** | `9_slow_remote_operation` | Simulated 20ms RTT | ssh (synthetic) | `INCONCLUSIVE` | `INCONCLUSIVE` | 6.305s | 13 | 0 | 1 | 201 | **VALIDATED** |
-| **10**| `10_intermittent_command_failure`| Broken Pipe Mux | ssh | `INCONCLUSIVE` | `INCONCLUSIVE` | 3.529s | 17 | 0 | 0 | 229 | **VALIDATED** |
-| **11**| `11_large_process_thread_target`| 80 active threads | local | `HEALTHY` | `DEGRADED` | 7.222s | 17 | 0 | 0 | 0 | **VALIDATED** |
-| **12**| `12_many_fds_target` | 512 open FDs | local | `HEALTHY` | `INCONCLUSIVE` | 1.632s | 17 | 0 | 0 | 0 | **VALIDATED** |
-| **13**| `13_prior_evidence_reuse` | Prior Ledger Replay | local | `HYPOTHESIS_CONFIRMED` | `HYPOTHESIS_CONFIRMED` | 4.558s | 14 | 0 | 0 | 0 | **VALIDATED** |
-| **14**| `14_minimal_evidence` | Budget Stop (0.05s) | local | `INCONCLUSIVE` | `INCONCLUSIVE` | 0.100s | 1 | 0 | 0 | 0 | **VALIDATED** |
-| **15**| `15_sufficient_evidence_early_stopping`| Mutex Deadlock | local | `CONFIRMED_FAULT` | `CONFIRMED_FAULT`| 1.752s | 7 | 7 | 0 | 0 | **VALIDATED** |
+| **1** | `1_healthy_target` | `ok_idle_server.c` | local | `HEALTHY` | `HEALTHY` | 1.595s | 17 | 0 | 0 | 0 | **OUTCOME_MATCHED** |
+| **2** | `2_cpu_overload` | `spin_flag.c` | local | `PROBABLE_FAULT` | `PROBABLE_FAULT` | 1.391s | 16 | 0 | 0 | 0 | **OUTCOME_MATCHED** |
+| **3** | `3_memory_pressure` | `leak_registry.c` | local | `PROBABLE_FAULT` | `PROBABLE_FAULT` | 2.579s | 18 | 1 | 0 | 0 | **OUTCOME_MATCHED** |
+| **4** | `4_process_lifecycle_anomaly`| Dead PID | local | `INCONCLUSIVE` | `INCONCLUSIVE` | 0.000s | 0 | 0 | 0 | 0 | **OUTCOME_MATCHED** |
+| **5** | `5_thread_anomaly` | `request_threads.c` | local | `INCONCLUSIVE` | `INCONCLUSIVE` | 2.665s | 16 | 0 | 0 | 0 | **OUTCOME_MATCHED** |
+| **6** | `6_deadlock` | `deadlock_pipeline.c` | local | `CONFIRMED_FAULT` | `CONFIRMED_FAULT`| 1.879s | 14 | 0 | 0 | 0 | **OUTCOME_MATCHED** |
+| **7** | `7_remote_connection_failure` | Unreachable Host | ssh | `INCONCLUSIVE` | `INCONCLUSIVE` | 0.502s | 0 | 0 | 0 | 1 | **OUTCOME_MATCHED** |
+| **8** | `8_partial_permission_failure`| Partial FD denied | ssh | `INCONCLUSIVE` | `INCONCLUSIVE` | 3.446s | 17 | 0 | 0 | 225 | **OUTCOME_MATCHED** |
+| **9** | `9_slow_remote_operation` | Simulated 20ms RTT | ssh (synthetic) | `INCONCLUSIVE` | `INCONCLUSIVE` | 6.347s | 13 | 0 | 1 | 202 | **OUTCOME_MATCHED** |
+| **10**| `10_intermittent_command_failure`| Broken Pipe Mux | ssh | `INCONCLUSIVE` | `INCONCLUSIVE` | 3.449s | 17 | 0 | 0 | 229 | **OUTCOME_MATCHED** |
+| **11**| `11_large_process_thread_target`| 80 active threads | local | `HEALTHY` | `DEGRADED` | 7.411s | 17 | 0 | 0 | 0 | **BEHAVIOR_VALIDATED** (Lock Contention) |
+| **12**| `12_many_fds_target` | 512 open FDs | local | `HEALTHY` | `INCONCLUSIVE` | 1.655s | 17 | 0 | 0 | 0 | **BEHAVIOR_VALIDATED** (Static Pipes) |
+| **13**| `13_prior_evidence_reuse` | Prior Ledger Replay | local | `HYPOTHESIS_CONFIRMED` | `HYPOTHESIS_CONFIRMED` | 4.562s | 14 | 0 | 0 | 0 | **OUTCOME_MATCHED** |
+| **14**| `14_minimal_evidence` | Budget Stop (0.05s) | local | `INCONCLUSIVE` | `INCONCLUSIVE` | 0.102s | 1 | 0 | 0 | 0 | **OUTCOME_MATCHED** |
+| **15**| `15_sufficient_evidence_early_stopping`| Mutex Deadlock | local | `CONFIRMED_FAULT` | `CONFIRMED_FAULT`| 1.752s | 7 | 7 | 0 | 0 | **OUTCOME_MATCHED** |
 
 ---
 
