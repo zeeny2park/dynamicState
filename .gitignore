@@ -25,6 +25,8 @@ tmp_*
 corpus/
 !benchmarks/investigation_quality/corpus/
 build/
+test-baseline/
+diagnosis-accuracy/
 
 # Snapshot and pilot report outputs
 snapshots/*.json

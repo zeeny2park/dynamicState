@@ -2004,6 +2004,7 @@ class AdaptiveInvestigationSession:
         if hasattr(self.adapter, "verify_pinned_identity"):
             ok, _ = self.adapter.verify_pinned_identity(self.pid, _allow_recent_sec=2.0)
             if not ok:
+                self._session_target_identity = None
                 return None, []
 
         raw_obs = getattr(latest_rec, "raw_observation", None)
@@ -2090,12 +2091,13 @@ class AdaptiveInvestigationSession:
             # Single target identity lookup if not already in target_assessment
             cached_ident: Optional[Dict[str, Any]] = None
             if eff_pid and not (getattr(self.target_assessment, "process_identity", None) and getattr(self.target_assessment, "executable_identity", None) and getattr(self.target_assessment, "build_id", None)):
-                if getattr(self, "_session_target_identity", None) is not None:
+                if getattr(self, "_session_target_identity", None) is not None and self._session_target_identity.get("pid") == eff_pid:
                     cached_ident = self._session_target_identity
                 else:
                     try:
                         cached_ident = self.adapter.get_process_identity(eff_pid)
-                        self._session_target_identity = cached_ident
+                        if isinstance(cached_ident, dict) and cached_ident.get("pid") == eff_pid:
+                            self._session_target_identity = cached_ident
                     except Exception:
                         cached_ident = None
 

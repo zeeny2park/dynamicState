@@ -21,6 +21,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 import errno
 import hashlib
+import inspect
 import json
 import os
 import atexit
@@ -70,6 +71,32 @@ def canonical_collector_arch(name: str) -> str:
         if n == canon or n in aliases:
             return canon
     return n
+
+
+def _invoke_get_process_identity(adapter: Any, pid: int, force: bool = False) -> Dict[str, Any]:
+    """Safely invokes get_process_identity across plain methods, mocks, autospecs, and subclasses."""
+    fn = getattr(adapter, "get_process_identity", None)
+    if fn is None:
+        raise AttributeError(f"{type(adapter).__name__} has no get_process_identity method")
+
+    if force:
+        supports_force = False
+        try:
+            sig = inspect.signature(fn)
+            params = sig.parameters
+            supports_force = ("force" in params) or any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
+        except (ValueError, TypeError):
+            supports_force = False
+
+        if supports_force:
+            try:
+                return fn(int(pid), force=True)
+            except TypeError:
+                return fn(int(pid))
+        else:
+            return fn(int(pid))
+    else:
+        return fn(int(pid))
 
 
 def collector_binary_version(data: bytes) -> Optional[str]:
@@ -1171,7 +1198,7 @@ class TargetExecutionAdapter(ABC):
             if recent is not None and (time.monotonic() - recent[0]) <= _allow_recent_sec:
                 cur = recent[1]
         if cur is None:
-            cur = self.get_process_identity(int(pid), force=(_allow_recent_sec <= 0.0)) if "force" in self.get_process_identity.__code__.co_varnames else self.get_process_identity(int(pid))
+            cur = _invoke_get_process_identity(self, int(pid), force=(_allow_recent_sec <= 0.0))
         if not cur.get("boot_id") and cur.get("process_identity"):
             parts = str(cur["process_identity"]).split(":")
             if len(parts) >= 3 and parts[2]:
@@ -1378,7 +1405,7 @@ class TargetExecutionAdapter(ABC):
         pass
 
     @abstractmethod
-    def get_process_identity(self, pid: int) -> Dict[str, Any]:
+    def get_process_identity(self, pid: int, force: bool = False) -> Dict[str, Any]:
         """Discovers executable path, architecture, build ID, and ELF type."""
         pass
 
@@ -1519,7 +1546,7 @@ class LocalTargetAdapter(TargetExecutionAdapter):
         except Exception as e:
             return False, f"Liveness check failed for PID {pid}: {e}"
 
-    def get_process_identity(self, pid: int) -> Dict[str, Any]:
+    def get_process_identity(self, pid: int, force: bool = False) -> Dict[str, Any]:
         runtime_exe = ""
         try:
             runtime_exe = os.path.realpath(f"/proc/{pid}/exe")
