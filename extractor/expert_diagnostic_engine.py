@@ -3790,7 +3790,7 @@ class AdaptiveInvestigationSession:
                 if ch.status == VERDICT_REFUTED:
                     what_was_determined.append(f"Hypothesis {ch.hypothesis_id} ({ch.title or ch.category}) was refuted by authoritative evidence.")
             for chk in all_checks:
-                if getattr(chk, "status", None) == CheckStatus.HEALTHY:
+                if getattr(chk, "status", None) == CheckStatus.PASS:
                     what_was_determined.append(f"Diagnostic check {chk.name} verified nominal / clean runtime state.")
 
             # 3. What remains unknown
