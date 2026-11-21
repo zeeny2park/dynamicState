@@ -2508,29 +2508,58 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
     def _default_command_runner(
         self, cmd_args: List[str], timeout: float, input_bytes: Optional[bytes] = None
     ) -> Tuple[int, str, str]:
+        proc: Optional[subprocess.Popen] = None
         try:
-            if input_bytes is not None:
-                res_b = subprocess.run(
-                    cmd_args,
-                    input=input_bytes,
-                    capture_output=True,
-                    timeout=timeout,
-                )
-                return (
-                    res_b.returncode,
-                    res_b.stdout.decode("utf-8", "replace"),
-                    res_b.stderr.decode("utf-8", "replace"),
-                )
-            res = subprocess.run(
-                cmd_args,
-                capture_output=True,
-                text=True,
-                timeout=timeout,
+            popen_kwargs: Dict[str, Any] = {
+                "stdin": subprocess.PIPE if input_bytes is not None else subprocess.DEVNULL,
+                "stdout": subprocess.PIPE,
+                "stderr": subprocess.PIPE,
+                "close_fds": True,
+            }
+            if os.name == "posix":
+                popen_kwargs["start_new_session"] = True
+            proc = subprocess.Popen(cmd_args, **popen_kwargs)
+            out_b, err_b = proc.communicate(input=input_bytes, timeout=timeout)
+            return (
+                proc.returncode if proc.returncode is not None else -1,
+                (out_b or b"").decode("utf-8", "replace"),
+                (err_b or b"").decode("utf-8", "replace"),
             )
-            return res.returncode, res.stdout, res.stderr
         except subprocess.TimeoutExpired:
-            return -1, "", f"SSH command timed out after {timeout:.1f}s"
+            if proc is not None:
+                if os.name == "posix":
+                    try:
+                        os.killpg(proc.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                    except Exception:  # noqa: BLE001
+                        try:
+                            proc.kill()
+                        except Exception:  # noqa: BLE001
+                            pass
+                else:
+                    try:
+                        proc.kill()
+                    except Exception:  # noqa: BLE001
+                        pass
+                try:
+                    proc.wait(timeout=0.5)
+                except Exception:  # noqa: BLE001
+                    pass
+                for stream in (proc.stdin, proc.stdout, proc.stderr):
+                    if stream is not None:
+                        try:
+                            stream.close()
+                        except Exception:  # noqa: BLE001
+                            pass
+            return -1, "", f"SSH command timed out after {timeout:.2f}s"
         except Exception as e:
+            if proc is not None and proc.poll() is None:
+                try:
+                    proc.kill()
+                    proc.wait(timeout=0.5)
+                except Exception:  # noqa: BLE001
+                    pass
             return -1, "", f"SSH execution error: {e}"
 
     def run_ssh(
@@ -2585,6 +2614,8 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
                         t_retry,
                         **({"input_bytes": input_bytes} if input_bytes is not None else {}),
                     )
+                except subprocess.TimeoutExpired:
+                    res = (-1, "", f"SSH command timed out after {t_retry:.2f}s")
                 except Exception as e:  # noqa: BLE001
                     res = (-1, "", f"SSH execution error: {e}")
             self._perf_retry_dur_s += max(0.0, time.monotonic() - t_retry_start)

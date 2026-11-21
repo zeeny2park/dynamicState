@@ -100,6 +100,26 @@ class TestRemoteDeadlineBoundaries(unittest.TestCase):
         self.assertLessEqual(seen[0], 0.31)
 
 
+
+    def test_real_subprocess_killed_within_deadline_including_grandchild(self):
+        """Real subprocess spawning a grandchild holding stdout must be killed via killpg within deadline."""
+        adapter = RemoteSshTargetAdapter(
+            host="10.0.0.1",
+            timeout_sec=5.0,
+            use_control_master=False,
+        )
+        t0 = time.monotonic()
+        with adapter.collection_deadline(0.15):
+            rc, out, err = adapter._default_command_runner(
+                ["sh", "-c", "sleep 10 & wait"],
+                timeout=adapter._bound_timeout(5.0),
+            )
+        elapsed = time.monotonic() - t0
+        self.assertEqual(rc, -1)
+        self.assertEqual(RemoteSshTargetAdapter.classify_remote_error(rc, err, out), "TIMEOUT")
+        self.assertLess(elapsed, 0.8, f"Real subprocess with grandchild exceeded deadline: {elapsed:.2f}s")
+
+
 class TestConfidenceAdversarialValidation(unittest.TestCase):
     """Section 4: Mathematical & adversarial confidence invariants."""
 
