@@ -2470,19 +2470,19 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
     @contextlib.contextmanager
     def collection_deadline(self, timeout_sec: Optional[float]):
         """Bounds all remote SSH / daemon operations inside this block to at most ``timeout_sec`` seconds."""
-        if timeout_sec is None or isinstance(timeout_sec, bool):
+        if timeout_sec is None:
             yield
             return
+        if isinstance(timeout_sec, bool):
+            raise ValueError(f"Invalid collection_deadline timeout_sec '{timeout_sec}': boolean is not allowed")
         try:
             t_val = float(timeout_sec)
-        except (TypeError, ValueError):
-            yield
-            return
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"Invalid collection_deadline timeout_sec '{timeout_sec}': must be positive finite number") from exc
         if not math.isfinite(t_val) or t_val <= 0:
-            yield
-            return
+            raise ValueError(f"Invalid collection_deadline timeout_sec '{timeout_sec}': must be positive finite number")
         prev = getattr(self._deadline_tls, "deadline", None)
-        new_dl = time.monotonic() + float(timeout_sec)
+        new_dl = time.monotonic() + t_val
         self._deadline_tls.deadline = min(prev, new_dl) if prev is not None else new_dl
         try:
             yield
@@ -2496,12 +2496,14 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
         return dl - time.monotonic()
 
     def _bound_timeout(self, requested: float) -> float:
+        if isinstance(requested, bool) or not math.isfinite(float(requested)) or float(requested) <= 0:
+            raise ValueError(f"Invalid requested timeout '{requested}': must be positive finite number")
         rem = self.remaining_deadline_sec()
         if rem is None:
-            return requested
+            return float(requested)
         if rem <= 0:
             raise TimeoutError("Remote collection step deadline exceeded")
-        return min(requested, max(0.2, rem))
+        return min(float(requested), rem)
 
     def _default_command_runner(
         self, cmd_args: List[str], timeout: float, input_bytes: Optional[bytes] = None
@@ -2542,6 +2544,8 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
         ``input_bytes`` (optional) is streamed to the remote command's stdin; custom command
         runners then receive it as the ``input_bytes`` keyword argument.
         """
+        if isinstance(timeout, bool):
+            return -1, "", f"Invalid non-positive SSH timeout: {timeout}"
         t = self.timeout_sec if timeout is None else float(timeout)
         if not math.isfinite(t) or t <= 0:
             return -1, "", f"Invalid non-positive SSH timeout: {t}"
@@ -2549,7 +2553,7 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
         if rem is not None:
             if rem <= 0:
                 return -1, "", "Remote collection step deadline exceeded"
-            t = min(t, max(0.2, rem))
+            t = min(t, rem)
         args = self._ssh_args(remote_shell_cmd, connect_timeout=t)
         t0 = time.monotonic()
         self._perf_ssh_commands += 1
@@ -2573,7 +2577,7 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
             self._perf_retries += 1
             t_retry_start = time.monotonic()
             rem_retry = self.remaining_deadline_sec()
-            t_retry = min(t, max(0.2, rem_retry)) if rem_retry is not None else t
+            t_retry = min(t, rem_retry) if rem_retry is not None else t
             if rem_retry is None or rem_retry > 0.5:
                 try:
                     res = self._command_runner(
@@ -2598,7 +2602,7 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
                         self._close_daemon_locked(graceful=False)
                 except Exception:  # noqa: BLE001
                     pass
-                t_retry = min(t, max(0.2, rem_retry)) if rem_retry is not None else t
+                t_retry = min(t, rem_retry) if rem_retry is not None else t
                 try:
                     res = self._command_runner(
                         self._ssh_args(remote_shell_cmd, connect_timeout=t_retry),

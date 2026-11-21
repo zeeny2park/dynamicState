@@ -1660,8 +1660,12 @@ class CompetingHypothesis:
         self.contradiction_records.append(crec)
 
         weight_key = evidence_id or f"contra:{contradiction}"
-        if rel and weight > 0.0:
-            self._contradiction_weights[weight_key] = float(weight)
+        try:
+            cw_val = float(weight) if not isinstance(weight, bool) else 0.0
+        except (TypeError, ValueError):
+            cw_val = 0.0
+        if rel and math.isfinite(cw_val) and cw_val > 0.0:
+            self._contradiction_weights[weight_key] = min(cw_val, 1.0)
 
         self.evaluate_verdict(ledger=eff_ledger)
         return True

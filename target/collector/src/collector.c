@@ -480,6 +480,9 @@ int collector_read_region(pid_t pid, int mem_fd, int backend, uint64_t start, si
             return 0;
         }
         int vm_err = errno;
+        if (vm_err == EINTR && g_collector_interrupted) {
+            return -1;
+        }
         if (vm_err == EINTR) {
             nread = process_vm_readv(pid, &local_iov, 1, &remote_iov, 1, 0);
             if (nread >= 0) {
@@ -500,6 +503,9 @@ int collector_read_region(pid_t pid, int mem_fd, int backend, uint64_t start, si
             return 0;
         }
         int pread_err = errno;
+        if (pread_err == EINTR && g_collector_interrupted) {
+            return -1;
+        }
         if (pread_err == EINTR) {
             nread = pread(mem_fd, buf, size, (off_t)start);
             if (nread >= 0) {

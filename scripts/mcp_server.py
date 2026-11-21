@@ -859,8 +859,7 @@ def runtime_diagnose_process(
     """
     try:
         import math
-        if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
-            return _format_watch_result({"success": False, "error": f"Invalid pid '{pid}': must be a positive integer", "error_code": "INVALID_PARAM"})
+        pid = _validate_mcp_pid(pid, allow_none=False)
         if isinstance(ssh_port, bool) or not isinstance(ssh_port, int) or not (1 <= ssh_port <= 65535):
             return _format_watch_result({"success": False, "error": f"Invalid ssh_port '{ssh_port}': must be integer in 1..65535", "error_code": "INVALID_PARAM"})
         if time_limit_s is not None:
@@ -1342,7 +1341,10 @@ def runtime_target_connect(
         from extractor.debug_image import inspect_elf
         from extractor.dwarf_indexer import DwarfIndexer
 
+        if isinstance(ssh_port, bool) or not isinstance(ssh_port, int) or not (1 <= ssh_port <= 65535):
+            return _format_watch_result({"success": False, "error": f"Invalid ssh_port '{ssh_port}': must be integer in 1..65535", "error_code": "INVALID_PARAM"})
         if pid is not None:
+            pid = _validate_mcp_pid(pid, allow_none=False)
             pid = _validate_mcp_pid(pid, allow_none=True)
 
         elf_auto_discovered = False

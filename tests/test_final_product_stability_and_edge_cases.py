@@ -309,15 +309,16 @@ class TestPillar7McpInputValidation(unittest.TestCase):
         except Exception:
             self.skipTest("mcp package not installed in this environment")
 
-        res_bad_pid = json.loads(mcp_srv.runtime_diagnose_process(pid=-5))
-        self.assertFalse(res_bad_pid["success"])
-        self.assertEqual(res_bad_pid["error_code"], "INVALID_PARAM")
+        for bad_pid in (-5, 0, 1, True, False, 1.5):
+            res_bad_pid = json.loads(mcp_srv.runtime_diagnose_process(pid=bad_pid))
+            self.assertFalse(res_bad_pid["success"], f"Expected failure for pid={bad_pid!r}")
+            self.assertEqual(res_bad_pid["error_code"], "INVALID_PID")
 
-        res_bad_port = json.loads(mcp_srv.runtime_diagnose_process(pid=1, ssh_port=99999))
+        res_bad_port = json.loads(mcp_srv.runtime_diagnose_process(pid=99999, ssh_port=99999))
         self.assertFalse(res_bad_port["success"])
         self.assertEqual(res_bad_port["error_code"], "INVALID_PARAM")
 
-        res_bad_tl = json.loads(mcp_srv.runtime_diagnose_process(pid=1, time_limit_s=float("nan")))
+        res_bad_tl = json.loads(mcp_srv.runtime_diagnose_process(pid=99999, time_limit_s=float("nan")))
         self.assertFalse(res_bad_tl["success"])
         self.assertEqual(res_bad_tl["error_code"], "INVALID_PARAM")
 

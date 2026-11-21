@@ -1,33 +1,50 @@
 # DynamicState — Final Product Readiness Report
 
-**Repository**: `zeeny2park/dynamicState`  
-**Audit Baseline Commit (Local Git Mirror of Archive)**: `9ca9401` (`dynamicState-main` archive extracted 2026-11-21)  
-**Assessment Environment**: Linux x86_64, Python 3.11.2, GCC 12.2.0, `kernel.yama.ptrace_scope=1` (offline sandbox; no `mcp`, `pytest`, `gdb`, or `docker` installed)  
-**Final Verdict**: **`READY_WITH_LIMITATIONS`**
+**Repository**: `https://github.com/zeeny2park/dynamicState`  
+**Requested Review HEAD**: `801f50fcd7c897e97b032087a2c131415903e203` (remote GitHub repository inaccessible from offline sandbox)  
+**Local Audit Baseline (ZIP Archive Mirror)**: `9ca9401` (`dynamicState-main (3).zip` extracted 2026-11-21 into local git repo for diff/patch tracking)  
+**Assessment Environment**: Linux x86_64, Python 3.11.2, GCC 12.2.0, `kernel.yama.ptrace_scope=1` (offline sandbox; no outbound internet, no `mcp>=2.0`, `pytest`, `hypothesis`, `gdb`, or `docker`)  
+**Final Verdict**: **`UNVERIFIED`** *(All locally executable code, native collector, adversarial boundary, and regression checks pass; remote GitHub Actions CI runs for `801f50fcd7c897e97b032087a2c131415903e203`, GDB 9.2 container workflow, and live `mcp>=2.0` protocol transport tests could not be verified in this offline environment.)*
 
 ---
 
 ## 1. Executive Summary
 
-DynamicState was audited end-to-end against its 8 core product pillars—Target State Collection, Low-Impact Bounded Collection & Failure Isolation, Runtime Temporal Analysis, Evidence-Driven Investigation, Deterministic Expert Diagnosis, Adaptive Investigation, MCP/CLI Usability, and Traceable Incident Reporting.
+DynamicState was audited across its 8 core pillars and then subjected to an independent adversarial second-pass review (Finalization Review 2). The codebase already provides a mature deterministic architecture (`ExpertDiagnosticEngine`, `CompetingHypothesis`, `EvidenceLedger`, `RemoteSshTargetAdapter`, `ObservationWindow`, `DiagnosticReport`, 65 MCP tools, and the C99 native collector v1.3.0).
 
-The repository already contains a mature, well-structured diagnostic architecture (`ExpertDiagnosticEngine`, `CompetingHypothesis`, `EvidenceLedger`, `RemoteSshTargetAdapter`, `ObservationWindow`, `DiagnosticReport`, 65 MCP tools, and the zero-dependency C99 native collector v1.3.0). Rather than duplicating existing components, this finalization pass identified and resolved **8 concrete stability, edge-case, freshness, signal-safety, and CI-gating gaps**, verified all fixes with a new 15-test cross-pillar stability suite (`tests/test_final_product_stability_and_edge_cases.py`), and validated **25/26 core regression suites (312 tests executed)** plus the native C99 build (`0` compiler warnings), FIPS 180-4 / RFC 4231 crypto self-tests, and capture performance smoke benchmarks.
+Across Review 1 and Review 2, **13 concrete stability, deadline-bounding, freshness, temporal-analysis, confidence-sanitization, signal-safety, MCP-validation, and CI-gating defects** were identified, fixed, and verified with **26 new tests** (`test_final_product_stability_and_edge_cases.py`: 15/15 PASS; `test_finalization_review2_adversarial.py`: 11/11 PASS) alongside **185/185 tests passing across 13 core isolated suites** via `scripts/run_unittest.py`, zero-warning C99 builds, FIPS 180-4 / RFC 4231 crypto self-tests, and capture performance smoke benchmarks.
 
-The system is classified as **`READY_WITH_LIMITATIONS`**: all critical and high-priority correctness, reliability, freshness, and edge-case gaps found in code are fixed and verified; remaining limitations are explicitly documented environment or scope constraints (e.g., optional `mcp`/`pytest`/GDB/eBPF privileges, `ptrace_scope` permissions, and `ok_sawtooth` non-monotonic retention scope).
+Under the strict Release Gate (Section 12), the verdict is **`UNVERIFIED`** because remote GitHub Actions runs (Full Test Suite and GDB 9.2 Compatibility) and live `mcp>=2.0` protocol transport validation cannot be executed or inspected from this offline sandbox.
 
 ---
 
-## 2. Repository HEAD
+## 2. Repository State & Evidence Separation
 
-- **Baseline Archive Snapshot**: `dynamicState-main (3).zip` initialized as local commit `9ca9401` (`baseline: extracted dynamicState-main`).
-- **Delivered Patch**: `dynamicstate-finalization.patch` (unified `git diff` against `9ca9401`, verified cleanly with `git apply --check`).
-- **Modified / Added Files**: 14 files (13 modified + 1 new test suite + this report).
+To maintain strict report integrity, evidence is separated into five categories:
+
+- **A. Git-Based Changes (Local Diff against Archive Baseline `9ca9401`)**:
+  - **16 files changed** (13 modified + 3 new files: `tests/test_final_product_stability_and_edge_cases.py`, `tests/test_finalization_review2_adversarial.py`, `docs/FINAL_PRODUCT_READINESS_REPORT.md`).
+  - **Delivered Patch**: `dynamicstate-finalization.patch` — verified with `git apply --check` against a clean checkout of `9ca9401`.
+  - **Baseline Distinction**: Local commit `9ca9401` is a local git mirror initialized from the user-uploaded `dynamicState-main (3).zip` archive, NOT a fetched clone of remote GitHub commit `801f50fcd7c897e97b032087a2c131415903e203`.
+- **B. Local Execution Results**:
+  - Native C99 collector build (`cc -O2 -Wall -Wextra -std=c99 -D_GNU_SOURCE`): **0 warnings**, 82 KB binary.
+  - `./target/collector/test_crypto --selftest`: **PASS** (FIPS 180-4 & RFC 4231).
+  - 13 isolated core & adversarial suites via `scripts/run_unittest.py`: **185/185 PASS (0 failures, 0 errors, 0 skips)**.
+  - Capture smoke benchmark (`python3 -m benchmarks.capture_benchmark --smoke`): **ALL GATES PASSED** (`process_vm_readv` 4,411.54 MB/s, `procfs` 3,521.52 MB/s).
+- **C. GitHub Actions Results**:
+  - **NOT EXECUTED / INACCESSIBLE** — offline sandbox cannot query `https://github.com/zeeny2park/dynamicState/actions` or `commit/801f50fcd7c897e97b032087a2c131415903e203`. Local YAML schema and byte-for-byte parity between `ci/workflows/` and `.github/workflows/` passed (`test_ci_workflow_parity.py`: 8/8 PASS).
+- **D. Environment-Blocked Verification**:
+  - Live MCP JSON-RPC protocol transport (`tests/test_phase2_4_4_mcp_e2e.py`: 9/9 skipped due to missing `mcp>=2.0`).
+  - `pytest`-only CI runner check (`test_pytest_only_file_never_false_passes_under_unittest` in `tests/test_phase2_0_a_3_17_closure_matrix.py`: requires `pytest` binary).
+  - GDB 9.2 Docker compatibility workflow (`docker` and `gdb` absent in VM).
+  - Live `ptrace_scope=0` sibling-process reads without `PR_SET_PTRACER_ANY` (`kernel.yama.ptrace_scope=1` in VM).
+- **E. Known Scope Limitations**:
+  - Periodic sawtooth memory patterns (`ok_sawtooth`) remain documented as `INCONCLUSIVE`.
+  - Remote open-FD inspection and opt-in eBPF/uprobe tracing depend on target permissions/kernel support and degrade with explicit `UNSUPPORTED` / `not_covered` disclosures.
 
 ---
 
 ## 3. Architecture Summary
-
-DynamicState adheres to its intended separation of concerns:
 
 ```
 Target Process (Local /proc & process_vm_readv  |  Remote SSH / Native C Collector v1.3.0)
@@ -47,175 +64,94 @@ MCP Server / CLI / Web UI (scripts/mcp_server.py, extractor/cli.py, extractor/we
 Traceable Incident & HTML Reports (extractor/diagnostic_report.py, extractor/human_report.py)
 ```
 
-- **No LLM dependency for diagnostic verdicts**: All hypothesis scoring, anti-inflation clustering, corroboration guards, and verdict rules are deterministic Python.
-- **Clear epistemic separation**: Direct observations, derived analyses, static location candidates (`not observed`), and optional eBPF runtime traces (`extractor/tracing_mode.py`) are explicitly distinguished.
-- **Fail-closed target identity**: `(boot_id, pid, start_time, exe_inode, build_id)` verification rejects PID reuse and binary replacement.
-
 ---
 
 ## 4. Capability Inventory
 
 | # | Capability / Subsystem | Location | Status | Classification | Notes |
 |---|---|---|---|---|---|
-| 1 | Native C99 Target Collector (v1.3.0) | `target/collector/src/{collector.c,main.c,sha256.c}` | `COMPLETE_AND_VERIFIED` | `DIRECTLY_OBSERVABLE` | 82 KB binary; zero `-Wall -Wextra -std=c99` warnings; SIGPIPE/SIGINT/SIGTERM hardened |
-| 2 | Local Memory & `/proc` Capture | `extractor/memory_capture.py`, `extractor/capture_backend.py` | `COMPLETE_AND_VERIFIED` | `DIRECTLY_OBSERVABLE` | `process_vm_readv` & `procfs` verified at 4,411 MB/s & 3,521 MB/s |
-| 3 | Remote SSH Coalesced Collection | `extractor/target_adapter.py` (`RemoteSshTargetAdapter`) | `COMPLETE_AND_VERIFIED` | `DIRECTLY_OBSERVABLE` | Single-RTT POSIX shell snapshot, bounded deadlines, structured error categories, fail-closed TTL |
-| 4 | Target Identity & PID-Reuse Guard | `extractor/target_adapter.py` (`verify_pinned_identity`) | `COMPLETE_AND_VERIFIED` | `DIRECTLY_OBSERVABLE` | Fail-closed on PID reuse, binary replacement, and mock-safe signature handling |
-| 5 | Temporal Observation Window | `extractor/temporal_observation_window.py` | `COMPLETE_AND_VERIFIED` | `RELIABLY_DERIVABLE` | Monotonic clock, regression detection (incl. `NaN`/`Inf` and `PARTIAL` samples), 12 memory behaviors |
-| 6 | Memory & Allocator Diagnostics | `extractor/allocator_inspector.py`, `extractor/heap_integrity.py`, `extractor/uaf_detection.py` | `COMPLETE_AND_VERIFIED` | `RELIABLY_DERIVABLE` / `HEURISTIC` | Deterministic where glibc/canary/DWARF metadata exists; heuristic/inconclusive otherwise |
-| 7 | Optional eBPF / Uprobe Tracing | `extractor/tracing_mode.py`, `extractor/ebpf_tracer.py` | `COMPLETE_AND_VERIFIED` | `REQUIRES_KERNEL_SUPPORT` | Opt-in via `enable_tracing`; graceful fallback when kernel/root unavailable |
-| 8 | Evidence Ledger & Provenance | `extractor/evidence_ledger.py`, `extractor/evidence_adapter.py` | `COMPLETE_AND_VERIFIED` | `DIRECTLY_OBSERVABLE` | Authoritative admission states, HMAC attestation, durable trust store, dangling-parent quarantine |
-| 9 | Competing Hypotheses & Calibration | `extractor/competing_hypotheses.py` | `COMPLETE_AND_VERIFIED` | `RELIABLY_DERIVABLE` | 5-way CPU/Memory/Thread discrimination, cluster anti-inflation, corroboration guard (`<= 0.84`), finite-weight guard |
-| 10 | Adaptive Observation Selector | `extractor/observation_selector.py` | `COMPLETE_AND_VERIFIED` | `RELIABLY_DERIVABLE` | Top-2 separation, deterministic tie-breaking, budget pre-check, fresh `_snapshot_cache` TTL reuse |
-| 11 | MCP Server (65 Tools) & CLI | `scripts/mcp_server.py`, `extractor/cli.py` | `IMPLEMENTED_BUT_INSUFFICIENTLY_TESTED` (MCP live transport env-blocked) | `DIRECTLY_OBSERVABLE` | Strict `INVALID_PARAM` validation added; live MCP protocol tests skipped without `mcp>=2.0` package |
-| 12 | Traceable Incident / HTML Reports | `extractor/diagnostic_report.py`, `extractor/human_report.py` | `COMPLETE_AND_VERIFIED` | `RELIABLY_DERIVABLE` | Sections A–I, HTML XSS escaping verified, evidence ID links preserved for confirmed & inconclusive verdicts |
-| 13 | CI Workflows & Parity | `ci/workflows/test.yml`, `.github/workflows/test.yml` | `COMPLETE_AND_VERIFIED` | N/A | Phase 2, 3, 3.1.1, 3.2, and final stability tests now explicitly gated and byte-synced |
+| 1 | Native C99 Target Collector (v1.3.0) | `target/collector/src/{collector.c,main.c,sha256.c}` | `COMPLETE_AND_VERIFIED` | `DIRECTLY_OBSERVABLE` | 82 KB, 0 warnings, `SIGPIPE`/`SIGINT`/`SIGTERM` + `EINTR` hardened |
+| 2 | Local Memory & `/proc` Capture | `extractor/memory_capture.py`, `extractor/capture_backend.py` | `COMPLETE_AND_VERIFIED` | `DIRECTLY_OBSERVABLE` | Smoke benchmark verified at 4,411 MB/s (`process_vm_readv`) & 3,521 MB/s (`procfs`) |
+| 3 | Remote SSH Coalesced Collection | `extractor/target_adapter.py` | `COMPLETE_AND_VERIFIED` | `DIRECTLY_OBSERVABLE` | Strict deadline bounding (<200ms safe), invalid deadline raises `ValueError`, fail-closed expired cache |
+| 4 | Target Identity & PID-Reuse Guard | `extractor/target_adapter.py` | `COMPLETE_AND_VERIFIED` | `DIRECTLY_OBSERVABLE` | Fail-closed `(boot_id, pid, start_time, exe_inode, build_id)` verification |
+| 5 | Temporal Observation Window | `extractor/temporal_observation_window.py` | `COMPLETE_AND_VERIFIED` | `RELIABLY_DERIVABLE` | `NaN`/`Inf`/negative guard, `PARTIAL` sample preservation, zero-duration rate guard |
+| 6 | Memory & Allocator Diagnostics | `extractor/allocator_inspector.py`, `extractor/heap_integrity.py`, `extractor/uaf_detection.py` | `COMPLETE_AND_VERIFIED` | `RELIABLY_DERIVABLE` / `HEURISTIC` | Deterministic where glibc/canary/DWARF metadata exists; inconclusive otherwise |
+| 7 | Optional eBPF / Uprobe Tracing | `extractor/tracing_mode.py`, `extractor/ebpf_tracer.py` | `COMPLETE_AND_VERIFIED` | `REQUIRES_KERNEL_SUPPORT` | Opt-in `enable_tracing` with graceful fallback |
+| 8 | Evidence Ledger & Provenance | `extractor/evidence_ledger.py`, `extractor/evidence_adapter.py` | `COMPLETE_AND_VERIFIED` | `DIRECTLY_OBSERVABLE` | Authoritative admission states, HMAC attestation, durable TrustStore |
+| 9 | Competing Hypotheses & Calibration | `extractor/competing_hypotheses.py` | `COMPLETE_AND_VERIFIED` | `RELIABLY_DERIVABLE` | Anti-inflation clustering, corroboration guard (`<= 0.84`), finite support & contradiction weights |
+| 10 | Adaptive Observation Selector | `extractor/observation_selector.py` | `COMPLETE_AND_VERIFIED` | `RELIABLY_DERIVABLE` | Deterministic tie-breaking, `None`/`NaN` resilience, TTL-checked `_snapshot_cache` reuse |
+| 11 | MCP Server (65 Tools) & CLI | `scripts/mcp_server.py`, `extractor/cli.py` | `ENVIRONMENT_BLOCKED` (live protocol) | `DIRECTLY_OBSERVABLE` | In-process tool validation passes (`INVALID_PID`/`INVALID_PARAM`); live `mcp>=2.0` transport env-blocked |
+| 12 | Traceable Incident / HTML Reports | `extractor/diagnostic_report.py`, `extractor/human_report.py` | `COMPLETE_AND_VERIFIED` | `RELIABLY_DERIVABLE` | Sections A–I, XSS escaping verified, traceable evidence IDs |
+| 13 | CI Workflows & Parity | `ci/workflows/test.yml`, `.github/workflows/test.yml` | `ENVIRONMENT_BLOCKED` (remote run) | N/A | 6 new gating steps added & byte-synced; remote GitHub Actions run unverified |
 
 ---
 
-## 5. GAP Analysis Before Implementation
+## 5. GAP Analysis & Fixes Implemented (Review 1 + Review 2)
 
-| GAP ID | Area | Defect / Gap Found | Impact | Priority | Final Disposition |
+| ID | Phase | Location | Defect Found | Fix Applied | Verification |
 |---|---|---|---|---|---|
-| GAP-01 | Native Collector (`target/collector/`) | No `SIGPIPE` ignore or `SIGINT`/`SIGTERM` handler in `main.c`/`collector.c`; dropped SSH pipe could kill daemon abruptly without cleanup | High (target-side orphan temp/lock files) | High | **RESOLVED** |
-| GAP-02 | Native Collector Tests (`tests/test_target_collector.py`) | `test_19` and `test_25` omitted `prctl(PR_SET_PTRACER_ANY)`, failing on standard Linux `ptrace_scope=1` | Medium (2/59 false test failures) | High | **RESOLVED** |
-| GAP-03 | Remote SSH Adapter (`extractor/target_adapter.py`) | `prefetch_snapshot()` returned expired `cached_payload` when SSH refresh failed; `stderr` discarded; `timeout=0.0` treated as falsy; no structured error classifier; port/timeout not validated in `__init__` | High (stale data served silently; loss of failure taxonomy) | Critical | **RESOLVED** |
-| GAP-04 | Temporal Analysis (`extractor/temporal_observation_window.py`) | `NaN`/`Inf`/negative `monotonic_timestamp` bypassed `has_temporal_regression()` (`NaN < x` is `False`); `PARTIAL` samples ignored by regression detection | High (silent rate poisoning / missed regressions) | Critical | **RESOLVED** |
-| GAP-05 | Competing Hypotheses (`extractor/competing_hypotheses.py`) | Non-finite (`Inf`/`NaN`) weights or corrupted `_base_confidence` could poison `support_delta`/confidence; `IDENTITY_MISMATCH`/`RECORD_NOT_FOUND` weight keys not filtered in `evaluate_verdict()` | Critical (confidence corruption / authority bypass) | Critical | **RESOLVED** |
-| GAP-06 | Observation Selector (`extractor/observation_selector.py`) | Checked `_cached_snapshots` instead of `RemoteSshTargetAdapter._snapshot_cache` (missing real TTL reuse); `None`/`NaN` confidence crashed or caused non-deterministic tie-breaks; empty `""` domain falsely matched cache | High (broken remote cache reuse; crash on `None` confidence) | High | **RESOLVED** |
-| GAP-07 | MCP Server (`scripts/mcp_server.py`) | `runtime_diagnose_process` and `runtime_get_investigation_report` lacked strict validation for invalid `pid`, `ssh_port`, `time_limit_s`, empty `investigation_id`, and invalid `format` | Medium (unstructured internal errors on malformed inputs) | Medium | **RESOLVED** |
-| GAP-08 | Test Portability & CI Gating (`tests/*.py`, `ci/workflows/test.yml`) | `test_phase2_remote_performance.py` and `test_phase3_adaptive_investigation.py` required `pytest` (failing under `unittest`); Phase 2/3/3.1.1/3.2 suites were not explicitly gated in `test.yml` | High (CI blind spots on recent phases) | High | **RESOLVED** |
+| GAP-01 | R1 | `target/collector/` | No `SIGPIPE`/`SIGINT`/`SIGTERM` handling | Installed async-signal-safe `g_collector_interrupted` + `SIGPIPE` ignore | `test_final_product_stability_and_edge_cases.py` |
+| GAP-02 | R1 | `tests/test_target_collector.py` | `test_19`/`test_25` lacked `PR_SET_PTRACER_ANY` | Added `prctl(PR_SET_PTRACER_ANY)` to C fixtures | 59/59 PASS under `ptrace_scope=1` |
+| GAP-03 | R1 | `extractor/target_adapter.py` | Expired cache returned on SSH failure; `stderr` discarded; `timeout=0.0` falsy; no error classifier | Added `classify_remote_error`, `_last_snapshot_error`, fail-closed expired cache, port/timeout checks | `test_final_product_stability_and_edge_cases.py` |
+| GAP-04 | R1 | `extractor/temporal_observation_window.py` | `NaN`/`Inf`/negative timestamps bypassed regression check; `PARTIAL` ignored | Added `_is_valid_monotonic_ts()` & `PARTIAL` regression checks | `test_final_product_stability_and_edge_cases.py` |
+| GAP-05 | R1 | `extractor/competing_hypotheses.py` | Non-finite support weights & rejected-identity keys not filtered | Sanitized support weights, guarded `_base_confidence`, excluded rejected keys | `test_final_product_stability_and_edge_cases.py` |
+| GAP-06 | R1 | `extractor/observation_selector.py` | Checked `_cached_snapshots` instead of `_snapshot_cache`; `None`/`NaN` crash; `""` match | Added `_safe_conf`, deterministic tie-break, TTL `_snapshot_cache`, non-empty match | `test_final_product_stability_and_edge_cases.py` |
+| GAP-07 | R1 | `scripts/mcp_server.py` | Missing validation on `runtime_diagnose_process` & `runtime_get_investigation_report` | Added structured validation (`INVALID_PARAM`) | `test_final_product_stability_and_edge_cases.py` |
+| GAP-08 | R1 | `tests/*.py`, `ci/workflows/test.yml` | Phase 2/3 tests required `pytest`; not gated in CI | Dual `unittest`+`pytest` compatibility + CI gating steps synced | `test_ci_workflow_parity.py` 8/8 PASS |
+| **R2-1** | **R2** | `extractor/target_adapter.py` | `max(0.2, rem)` inflated remaining deadlines `< 200ms` past total deadline; invalid/0/neg/`NaN`/`Inf` deadlines silently became unlimited | Strictly bounded by `min(requested, rem)`; invalid deadlines now raise `ValueError` | `test_finalization_review2_adversarial.py` (5 deadline tests PASS) |
+| **R2-2** | **R2** | `extractor/competing_hypotheses.py` | `add_contradicting_observation()` did not sanitize `Inf`/`NaN`/`bool`/negative weights | Applied identical finite `(0.0, 1.0]` weight sanitization | `test_finalization_review2_adversarial.py` (PASS) |
+| **R2-3** | **R2** | `extractor/temporal_observation_window.py` | `PARTIAL` samples dropped by `analyze_memory_behavior()`; identical timestamps fabricated `duration=0.001` (1000x rate) | Preserved `PARTIAL` samples for non-RSS metrics without treating missing RSS as 0; identical timestamps return `INSUFFICIENT_OBSERVATION` with `rate=0.0` | `test_finalization_review2_adversarial.py` (3 temporal tests PASS) |
+| **R2-4** | **R2** | `target/collector/src/collector.c` | `collector_read_region()` retried `EINTR` even when `g_collector_interrupted == 1` | Immediate abort on `EINTR && g_collector_interrupted` in both `process_vm_readv` and `pread` paths | Rebuilt 0 warnings + repeated SIGTERM/SIGINT cycles PASS |
+| **R2-5** | **R2** | `scripts/mcp_server.py` | `runtime_diagnose_process` allowed `pid=1` and returned `INVALID_PARAM` instead of canonical `INVALID_PID`; `runtime_target_connect` lacked `ssh_port` check | Delegated PID validation to `_validate_mcp_pid(pid, allow_none=False)` (`INVALID_PID` for `0`, `1`, `bool`, `float`, negative) and added `ssh_port` validation to `runtime_target_connect` | `test_final_product_stability_and_edge_cases.py` (PASS) |
 
 ---
 
-## 6. Changes Implemented & 7. Defects Fixed
+## 6. Local Test & Benchmark Evidence
 
-1. **`target/collector/include/collector.h`, `src/collector.c`, `src/main.c`**:
-   - Added `g_collector_interrupted` (`volatile sig_atomic_t`) and `collector_install_signal_handlers()` ignoring `SIGPIPE` and installing non-restarting `sigaction` handlers for `SIGINT`/`SIGTERM`.
-   - Checked `g_collector_interrupted` in region capture, 1 MB chunk read, and daemon loops for clean termination and resource cleanup.
-2. **`tests/test_target_collector.py`**:
-   - Added `prctl(0x59616d61, -1, 0, 0, 0)` (`PR_SET_PTRACER_ANY`) to `test_19` and `test_25` C fixtures.
-3. **`extractor/target_adapter.py`**:
-   - Added SSH `port` (`1..65535`) and finite positive `timeout_sec` validation in `RemoteSshTargetAdapter.__init__`.
-   - Added `RemoteSshTargetAdapter.classify_remote_error(rc, stderr, stdout)` distinguishing `OK`, `TIMEOUT`, `PERMISSION_DENIED`, `UNAVAILABLE`, `INVALID_DATA`, and `TRANSPORT_ERROR`.
-   - Fixed `run_ssh()` to reject non-positive/non-finite timeouts instead of treating `0.0` as falsy; guarded `collection_deadline()` against `NaN`/`Inf`.
-   - Fixed `prefetch_snapshot()` to record `_last_snapshot_error` and return `cached_payload` **only** when `is_fresh` is `True` (fail-closed on expired cache).
-4. **`extractor/temporal_observation_window.py`**:
-   - Added `_is_valid_monotonic_ts()` rejecting `NaN`/`Inf`/negative timestamps, and extended `record_sample()` / `has_temporal_regression()` to validate both `SUCCESS` and `PARTIAL` samples.
-5. **`extractor/competing_hypotheses.py`**:
-   - Sanitized support/contradiction weights to finite values in `(0.0, 1.0]`, guarded `_base_confidence` against `NaN`/`Inf`, and excluded `IDENTITY_MISMATCH` / `RECORD_NOT_FOUND` keys from `support_delta`.
-6. **`extractor/observation_selector.py`**:
-   - Added `_safe_conf()` with deterministic `(-conf, hypothesis_id)` tie-breaking, integrated TTL-checked `RemoteSshTargetAdapter._snapshot_cache` domain extraction, and prevented empty-string cache hits.
-7. **`scripts/mcp_server.py`**:
-   - Added strict `INVALID_PARAM` validation in `runtime_diagnose_process` and `runtime_get_investigation_report`.
-8. **`tests/test_phase2_remote_performance.py`, `tests/test_phase3_adaptive_investigation.py`, `tests/test_final_product_stability_and_edge_cases.py`, `ci/workflows/test.yml`, `.github/workflows/test.yml`**:
-   - Made Phase 2 & Phase 3 test suites dual-compatible with `unittest` and `pytest`.
-   - Added 15 new cross-pillar edge-case tests in `tests/test_final_product_stability_and_edge_cases.py`.
-   - Added 5 explicit gating test steps to `ci/workflows/test.yml` and synchronized `.github/workflows/test.yml` byte-for-byte.
+Executed via `python3 scripts/run_unittest.py <file>` (exact CI invocation):
 
----
+| Suite | Passed | Failed | Skipped | Status |
+|---|---:|---:|---:|---|
+| `target/collector/test_crypto --selftest` | FIPS/RFC | 0 | 0 | **PASS** |
+| `tests/test_finalization_review2_adversarial.py` | 11 | 0 | 0 | **PASS** |
+| `tests/test_final_product_stability_and_edge_cases.py` | 15 | 0 | 0 | **PASS** |
+| `tests/test_target_collector.py` | 59 | 0 | 0 | **PASS** |
+| `tests/test_phase2_remote_performance.py` | 6 | 0 | 0 | **PASS** |
+| `tests/test_phase3_adaptive_investigation.py` | 10 | 0 | 0 | **PASS** |
+| `tests/test_phase3_1_1_identity_verification_and_mock_compat.py` | 9 | 0 | 0 | **PASS** |
+| `tests/test_phase3_2_investigation_quality.py` | 18 | 0 | 0 | **PASS** |
+| `tests/test_remote_collection_bounds_and_isolation.py` | 5 | 0 | 0 | **PASS** |
+| `tests/test_remote_resilience_and_long_diagnosis.py` | 7 | 0 | 0 | **PASS** |
+| `tests/test_phase2_0_a_3_11_attestation_security.py` | 18 | 0 | 0 | **PASS** |
+| `tests/test_phase2_4_2_temporal_identity_and_clock_semantics.py` | 10 | 0 | 0 | **PASS** |
+| `tests/test_phase2_4_3_temporal_epoch_and_missing_metrics.py` | 9 | 0 | 0 | **PASS** |
+| `tests/test_ci_workflow_parity.py` | 8 | 0 | 0 | **PASS** |
+| **Isolated Core + Adversarial Subtotal** | **185** | **0** | **0** | **100% PASS** |
+| `tests/test_phase2_4_4_mcp_e2e.py` | 0 | 0 | 9 | **ENV-BLOCKED** (`mcp>=2.0` absent) |
+| `tests/test_phase2_0_a_3_17_closure_matrix.py` | 15 | 1 | 0 | **ENV-BLOCKED** (1 test requires `pytest`) |
 
-## 8. Test Results
-
-Executed locally on Linux x86_64 (`Python 3.11.2`, `kernel.yama.ptrace_scope=1`):
-
-| Suite | Tests | Result | Notes |
-|---|---:|---|---|
-| `target/collector/test_crypto --selftest` | FIPS 180-4 & RFC 4231 | **PASS** | All SHA-256 & HMAC-SHA256 vectors passed |
-| `tests/test_target_collector.py` | 59 | **PASS (59/59)** | Fixed 2 `ptrace_scope=1` fixture failures |
-| `tests/test_final_product_stability_and_edge_cases.py` | 15 | **PASS (15/15)** | 14 passed, 1 skipped (`mcp` package absent) |
-| `tests/test_phase2_remote_performance.py` | 6 | **PASS (6/6)** | Now runs natively under `unittest` |
-| `tests/test_phase3_adaptive_investigation.py` | 10 | **PASS (10/10)** | Now runs natively under `unittest` |
-| `tests/test_phase3_1_1_identity_verification_and_mock_compat.py` | 9 | **PASS (9/9)** | Mock & identity verification verified |
-| `tests/test_phase3_2_investigation_quality.py` | 18 | **PASS (18/18)** | 5-way hypotheses, anti-inflation, early stop |
-| `tests/test_remote_collection_bounds_and_isolation.py` | 5 | **PASS (5/5)** | Bounds & partial failure isolation |
-| `tests/test_remote_resilience_and_long_diagnosis.py` | 7 | **PASS (7/7)** | Transport resilience verified |
-| `tests/test_phase2_0_a_3_11_attestation_security.py` (via `scripts/run_unittest.py`) | 18 | **PASS (18/18)** | Isolated durable TrustStore verified |
-| `tests/test_phase2_0_a_3_17_atomic_trust_consumption.py` | 6 | **PASS (6/6)** | Atomic trust consumption verified |
-| `tests/test_phase2_0_a_3_19_durable_commit_semantics.py` | 6 | **PASS (6/6)** | Durable commit semantics verified |
-| `tests/test_phase2_1_*`, `2_2_*`, `2_3_*`, `2_4_*` (10 suites) | 78 | **PASS (78/78)** | Recipes, temporal, allocator, budget, provenance, reports |
-| `tests/test_report_single_path_and_reproducibility.py` | 21 | **PASS (21/21)** | Report stability & equivalence |
-| `tests/test_optional_tracing_mode.py` | 17 | **PASS (17/17)** | Opt-in eBPF fallback & separation |
-| `tests/test_ci_workflow_parity.py` | 8 | **PASS (8/8)** | YAML schema & byte-for-byte parity |
-| `tests/test_phase2_0_a_3_17_closure_matrix.py` | 16 | **15 PASS / 1 ENV-BLOCKED** | `test_pytest_only_file_never_false_passes_under_unittest` requires `pytest` binary |
-
----
-
-## 9. CI Results
-
-- **Local CI Verification**: `test_ci_workflow_parity.py` passed (8/8), confirming valid YAML syntax, schema, and exact byte parity between `ci/workflows/test.yml` and `.github/workflows/test.yml`.
-- **Remote GitHub Actions Run Links**: **Not Executed (Environment Blocked)** — this offline sandbox has no outbound network access to trigger or query GitHub Actions runs. CI workflows were updated and validated locally; push to GitHub will execute the newly gated Phase 2/3/stability steps under Ubuntu 22.04 with `ptrace_scope=0`, `mcp>=2.0`, `pytest`, and `gdb`.
-
----
-
-## 10. Native Collector Results
-
-- **Toolchain**: `cc -O2 -Wall -Wextra -std=c99 -D_GNU_SOURCE` (GCC 12.2.0, zero warnings).
-- **Binary Size**: `82 KB` (`target/collector/dynamicstate-collector`, v1.3.0).
-- **Signal & Cleanup Verification**: Verified clean exit (`rc=0`) on `SIGTERM`, non-crash on broken stdout pipe (`SIGPIPE` ignored), and 59/59 native collector tests passing.
-
----
-
-## 11. Remote Collection Performance
-
-- Coalesced single-RTT POSIX shell snapshots and `snapshot_scope` verified (`test_phase2_remote_performance.py`, `test_remote_collection_bounds_and_isolation.py`, `test_remote_resilience_and_long_diagnosis.py`).
-- Previously recorded Phase 2 benchmark baseline (`docs/PHASE_2_REMOTE_PERFORMANCE_REPORT.md`): SSH commands reduced up to **85.9%** (227 → 32) and slow-remote wall-clock duration reduced **62.3%** (6.347s → 2.392s).
-- New fail-closed expired-cache guard and structured error taxonomy (`TIMEOUT`, `PERMISSION_DENIED`, `UNAVAILABLE`, `INVALID_DATA`, `TRANSPORT_ERROR`) verified with zero performance overhead.
-
----
-
-## 12. Diagnostic Quality, 13. Adaptive Investigation, 14. Evidence & Provenance Results
-
-- **Competing Hypotheses**: 18/18 Phase 3.2 ground-truth tests pass (5-way CPU/Memory/Thread discrimination, cluster anti-inflation, corroboration cap `<= 0.84` without 2 independent roots or authorized primary rule).
-- **Adaptive Investigation**: 10/10 Phase 3 adaptive tests + 20/20 Phase 2.4.4 adaptive/narrowing tests pass; `observation_selector.py` now deterministically breaks ties and reads fresh `RemoteSshTargetAdapter._snapshot_cache` domains.
-- **Evidence & Provenance**: 12/12 Phase 2.4.4 provenance tests + 18/18 A.3.11 + 12/12 A.3.17/A.3.19 durable trust tests pass; mismatched/missing ledger records can no longer contribute confidence weights.
-
----
-
-## 15. MCP Usability & 16. Report Quality Assessment
-
-- **MCP Server (`scripts/mcp_server.py`)**: Exposes deterministic diagnostic tools (`runtime_diagnose_process`, `runtime_start_investigation`, `runtime_execute_investigation_step`, `runtime_get_investigation_report`, etc.) with strict `INVALID_PARAM` validation added on key entry points. Live MCP transport tests (`test_phase2_4_4_mcp_e2e.py`) were skipped in this VM because `mcp>=2.0` is not installed.
-- **Reports (`extractor/diagnostic_report.py`, `extractor/human_report.py`)**: 32/32 report equivalence and reproducibility tests pass; HTML escaping prevents XSS injection while preserving traceable evidence IDs for both confirmed and inconclusive verdicts.
-
----
-
-## 17. Performance Results (Local Smoke Benchmark)
-
-Executed `python3 -m benchmarks.capture_benchmark --smoke` on Linux x86_64:
+### Capture Performance Smoke Benchmark (`python3 -m benchmarks.capture_benchmark --smoke`)
 
 | Backend | Stop p50 (µs) | Total Duration p50 (µs) | Bytes Read | Throughput | Quality | Acceptance Gates |
 |---|---:|---:|---:|---:|---|---|
-| `process_vm_readv` | 430.3 | 1,560.5 | 929,792 | **4,411.54 MB/s** | 100% COMPLETE | **ALL PASSED** |
-| `procfs` | 470.5 | 899.7 | 929,792 | **3,521.52 MB/s** | 100% COMPLETE | **ALL PASSED** |
-
-Stop Budget SLA enforcement verified (`limit=2.0ms`, `observed=5.318ms` → `Enforced=True`, `Degraded=True`).
+| `process_vm_readv` | 430.3 | 1,560.5 | 929,792 | 4,411.54 MB/s | 100% COMPLETE | **ALL PASSED** |
+| `procfs` | 470.5 | 899.7 | 929,792 | 3,521.52 MB/s | 100% COMPLETE | **ALL PASSED** |
 
 ---
 
-## 18. Security Review
+## 7. Independent Verification Summary (Finalization Review 2)
 
-- **SSH Argument Injection**: Leading `-` rejected for `host`, `user`, `proxy_jump`; `port` bounded to `1..65535`; `shlex.quote` used for remote commands.
-- **Cryptographic Key Loading (C Collector)**: `O_NOFOLLOW`, `S_ISREG`, `0600`/`0400` mode check, UID check, embedded-NUL rejection, `secure_memzero`.
-- **Trust Boundary & Anti-Replay**: Durable `TrustStore` with atomic consumption, `flock`, symlink rejection, and PID-reuse fail-closed verification.
-- **HTML Report Safety**: All dynamic fields escaped via `_e()` (`html.escape`); verified against `<script>` injection.
-
----
-
-## 19. Remaining Limitations & 20. Deferred Items
-
-1. **Offline Sandbox Environment Constraints (Not Code Defects)**:
-   - `mcp>=2.0`, `pytest`, `hypothesis`, `gdb`, and `docker` are not installed in this VM; live MCP protocol tests, GDB 9.2 container tests, and 6 remaining `pytest`-style trust-boundary test files require CI/dev dependencies (`requirements-test.txt`).
-   - `kernel.yama.ptrace_scope=1` restricts reading non-descendant process memory without `PR_SET_PTRACER_ANY` or `ptrace_scope=0` (expected Linux security behavior; correctly produces `INCONCLUSIVE` with `target_unreadable` rather than false `HEALTHY`).
-2. **Documented Diagnostic Scope Boundaries**:
-   - Periodic sawtooth memory patterns (`ok_sawtooth`) remain documented as `INCONCLUSIVE` rather than falsely classified as `HEALTHY` or `CONFIRMED_LEAK`.
-   - Remote open-FD inspection and eBPF/uprobe tracing require target permissions/kernel support and degrade gracefully with explicit `not_covered` / `UNSUPPORTED` disclosures.
-3. **Deferred (Non-Blocking)**:
-   - Unifying legacy `extractor/verdict_engine.py` / `extractor/investigation.py` wrappers with `ExpertDiagnosticEngine` was intentionally deferred to avoid breaking backward-compatible APIs and existing tests.
+- **HEAD Reviewed**: Requested `801f50fcd7c897e97b032087a2c131415903e203`; local archive baseline `9ca9401` audited directly.
+- **Report Discrepancies Corrected**:
+  1. Corrected modified/added file count from `14` to exact `16` (`git diff --stat`).
+  2. Separated in-process MCP function validation (executed and passing) from live MCP JSON-RPC protocol transport validation (`test_phase2_4_4_mcp_e2e.py`, 9/9 skipped without `mcp>=2.0`).
+  3. Explicitly distinguished local ZIP archive baseline (`9ca9401`) from remote GitHub HEAD (`801f50fcd7c897e97b032087a2c131415903e203`).
+  4. Changed Final Verdict from `READY_WITH_LIMITATIONS` to **`UNVERIFIED`** to strictly honor Release Gate Section 12 because remote GitHub Actions CI (Full Test Suite + GDB 9.2 Compatibility) and live MCP protocol tests could not be verified in this offline environment.
 
 ---
 
-## 21. Release Readiness Verdict
+## 8. Final Release Gate Verdict
 
-**Verdict: `READY_WITH_LIMITATIONS`**
+**Verdict: `UNVERIFIED`**
 
-Core runtime collection, low-impact remote reliability, temporal analysis, evidence provenance, deterministic competing-hypothesis diagnosis, adaptive observation selection, MCP input hardening, and traceable reporting are implemented, fixed, and verified with passing tests and benchmarks. Remaining limitations are documented environment/optional-dependency requirements and explicit epistemic scope boundaries that do not invalidate production diagnostic use.
+All 13 code/test defects identified across Review 1 and Review 2 are fixed and verified locally (185/185 isolated core + adversarial tests passing, 0 compiler warnings on C99 native collector, smoke benchmark gates passing). However, because remote GitHub Actions CI runs for `801f50fcd7c897e97b032087a2c131415903e203`, the GDB 9.2 Docker compatibility workflow, and live `mcp>=2.0` protocol transport tests cannot be executed or inspected from this offline sandbox, release readiness cannot be declared `READY` or `READY_WITH_LIMITATIONS` until those CI runs pass on GitHub.

@@ -229,8 +229,13 @@ class ObservationWindow:
 
     def analyze_memory_behavior(self) -> MemoryAnalysisResult:
         """Executes strict multi-metric evaluation adhering to Phase 2.1.4 requirements."""
-        valid_samples = [s for s in self.samples if s.collection_status == "SUCCESS"]
+        valid_samples = [s for s in self.samples if s.collection_status in ("SUCCESS", "PARTIAL")]
+        partial_count = sum(1 for s in valid_samples if s.collection_status == "PARTIAL")
         current_limitations = list(self.limitations)
+        if partial_count > 0:
+            current_limitations.append(
+                f"{partial_count} of {len(valid_samples)} usable temporal samples are PARTIAL; missing metrics are excluded rather than treated as zero"
+            )
 
         if self.failed_samples_count > 0:
             current_limitations.append(
@@ -287,7 +292,25 @@ class ObservationWindow:
 
         if duration <= 0:
             current_limitations.append("Identical timestamps across valid samples; elapsed duration is zero")
-            duration = 0.001
+            return MemoryAnalysisResult(
+                behavior=MemoryBehavior.INSUFFICIENT_OBSERVATION,
+                confidence=0.10,
+                rationale="Valid samples share identical monotonic timestamps (elapsed duration is zero); temporal rate cannot be established.",
+                rss_delta_kb=0,
+                rss_growth_rate_kb_per_sec=0.0,
+                heap_vma_delta_kb=0,
+                allocator_heap_delta_kb=0,
+                live_allocations_delta=0,
+                object_count_deltas={},
+                container_size_deltas={},
+                alloc_free_imbalance_ratio=None,
+                supporting_facts=[],
+                contradicting_facts=["Elapsed monotonic duration between samples is zero"],
+                retaining_containers=[],
+                next_recommended_action="Collect samples separated by at least 50ms of monotonic time.",
+                limitations=current_limitations,
+                details={"zero_elapsed_duration": True},
+            )
 
         # Check temporal separation & minimum observation duration
         has_insufficient_separation = any(
