@@ -162,8 +162,9 @@ def run_all_phase3_scenarios(output_json: Optional[str] = None) -> Dict[str, Any
 
     current_commit = _get_git_commit()
     tmpdir = tempfile.mkdtemp(prefix="dynstate_p3_bench_")
+    os.chmod(tmpdir, 0o700)
     corpus_dir = os.path.join(tmpdir, "corpus")
-    os.makedirs(corpus_dir, exist_ok=True)
+    os.makedirs(corpus_dir, mode=0o700, exist_ok=True)
 
     metadata: Dict[str, Any] = {
         "benchmark_phase": "Phase 3: Adaptive Evidence Collection & Diagnosis Efficiency",

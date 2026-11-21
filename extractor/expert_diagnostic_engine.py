@@ -1397,6 +1397,7 @@ class AdaptiveInvestigationSession:
         self.timeline: List[Dict[str, Any]] = []
 
         # Data artifacts
+        self._session_target_identity: Optional[Dict[str, Any]] = None
         self.classification_result: Optional[ProblemClassificationResult] = None
         self.target_assessment: Optional[TargetAssessmentResult] = None
         self.plan: Optional[InvestigationPlan] = None
@@ -1716,6 +1717,13 @@ class AdaptiveInvestigationSession:
                 companion_elf=self.companion_elf,
                 adapter=self.adapter,
             )
+            if self.target_assessment and getattr(self.target_assessment, "process_identity", None):
+                self._session_target_identity = {
+                    "pid": self.pid,
+                    "process_identity": self.target_assessment.process_identity,
+                    "executable_identity": self.target_assessment.executable_identity,
+                    "build_id": self.target_assessment.build_id,
+                }
         self._record_timeline_event("TARGET_ASSESSED", {
             "accessible": self.target_assessment.accessible,
             "thread_count": self.target_assessment.thread_count,
@@ -1978,12 +1986,6 @@ class AdaptiveInvestigationSession:
         if any(k in r_id for k in ("GROWTH", "TREND", "SERIES", "TEMPORAL")):
             return None, []
         
-        # Check target identity validity first
-        if hasattr(self.adapter, "verify_pinned_identity"):
-            ok, _ = self.adapter.verify_pinned_identity(self.pid)
-            if not ok:
-                return None, []
-                
         matching = [
             r for r in self.collected_evidence_records
             if getattr(r, "target_pid", None) == self.pid
@@ -1992,12 +1994,18 @@ class AdaptiveInvestigationSession:
         ]
         if not matching:
             return None, []
-            
+
         latest_rec = matching[-1]
         rec_dur = getattr(latest_rec, "raw_details", {}).get("timestamp", 0.0) if isinstance(latest_rec.raw_details, dict) else 0.0
         if rec_dur > 0 and (time.time() - rec_dur) > 5.0:
             return None, []
-            
+
+        # Validate target identity before reusing cached evidence (allow recent verified identity up to 2.0s)
+        if hasattr(self.adapter, "verify_pinned_identity"):
+            ok, _ = self.adapter.verify_pinned_identity(self.pid, _allow_recent_sec=2.0)
+            if not ok:
+                return None, []
+
         raw_obs = getattr(latest_rec, "raw_observation", None)
         if isinstance(raw_obs, dict) and raw_obs:
             return dict(raw_obs), [latest_rec]
@@ -2082,10 +2090,14 @@ class AdaptiveInvestigationSession:
             # Single target identity lookup if not already in target_assessment
             cached_ident: Optional[Dict[str, Any]] = None
             if eff_pid and not (getattr(self.target_assessment, "process_identity", None) and getattr(self.target_assessment, "executable_identity", None) and getattr(self.target_assessment, "build_id", None)):
-                try:
-                    cached_ident = self.adapter.get_process_identity(eff_pid)
-                except Exception:
-                    cached_ident = None
+                if getattr(self, "_session_target_identity", None) is not None:
+                    cached_ident = self._session_target_identity
+                else:
+                    try:
+                        cached_ident = self.adapter.get_process_identity(eff_pid)
+                        self._session_target_identity = cached_ident
+                    except Exception:
+                        cached_ident = None
 
             # Preserve real process_identity without fabrication
             proc_id = (
@@ -2450,7 +2462,13 @@ class AdaptiveInvestigationSession:
         # Record real temporal memory sample for session persistence (Section 4)
         if not is_precollected and self.pid and self.pid > 0:
             try:
-                p_st = self.adapter.get_process_status(self.pid)
+                p_st = None
+                if hasattr(self.adapter, "_active_snapshot"):
+                    active_snap = self.adapter._active_snapshot(self.pid, max_age_s=2.0)
+                    if isinstance(active_snap, dict) and isinstance(active_snap.get("status"), dict):
+                        p_st = active_snap["status"]
+                if p_st is None:
+                    p_st = self.adapter.get_process_status(self.pid)
                 sample_rss = int(p_st.get("VmRSS", 0)) if "VmRSS" in p_st else None
                 sample_vsz = int(p_st.get("VmSize", 0)) if "VmSize" in p_st else None
                 step_idx = self.plan.current_step_index if self.plan else 0

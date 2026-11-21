@@ -2764,7 +2764,7 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
         self,
         pid: int,
         force: bool = False,
-        max_age_s: float = 1.0,
+        max_age_s: float = 2.0,
         domains: Optional[Iterable[str]] = None,
     ) -> Optional[Dict[str, Any]]:
         if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
@@ -2836,9 +2836,12 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
 
         now = time.monotonic()
         self._snapshot_cache[int(pid)] = (now, payload, frozenset(cached_domains))
-        self._maps_micro_cache.pop(int(pid), None)
-        self._status_micro_cache.pop(int(pid), None)
-        self._threads_raw_micro_cache.pop(int(pid), None)
+        if "maps" in domains_to_fetch:
+            self._maps_micro_cache.pop(int(pid), None)
+        if "basic" in domains_to_fetch:
+            self._status_micro_cache.pop(int(pid), None)
+        if "threads" in domains_to_fetch:
+            self._threads_raw_micro_cache.pop(int(pid), None)
         osrel = str(payload.get("osrelease") or "").strip()
         if osrel and re.fullmatch(r"\d+\.\d+[\w.+~-]*", osrel):
             self._target_kernel_release = osrel

@@ -2690,13 +2690,6 @@ def get_default_trust_store() -> Optional[DurableTrustStore]:
         ts_env = os.environ.get("DYNAMICSTATE_TRUST_STORE_PATH")
         if ts_env:
             _DEFAULT_TRUST_STORE = DurableTrustStore(ts_env)
-        else:
-            ts_dir = os.path.expanduser("~/.dynamicstate/corpus")
-            try:
-                os.makedirs(ts_dir, mode=0o700, exist_ok=True)
-                _DEFAULT_TRUST_STORE = DurableTrustStore(os.path.join(ts_dir, "trust_store.json"))
-            except Exception:
-                pass
     return _DEFAULT_TRUST_STORE
 
 
