@@ -5,7 +5,9 @@ Adaptive Evidence Collection & Diagnosis Efficiency Optimization.
 
 import os
 import time
-import pytest
+from pathlib import Path
+import tempfile
+import unittest
 from typing import Any, Dict, List, Optional, Tuple
 
 from extractor.diagnostic_recipes import BASELINE_RECIPE_IDS
@@ -357,3 +359,38 @@ def test_partial_snapshot_failure_isolation():
     assert snap["maps"] is not None
     assert snap["fd_count"] == 0  # isolated, does not crash or corrupt maps/status
 
+
+
+class TestPhase3AdaptiveUnittest(unittest.TestCase):
+    def test_targeted_snapshot_omits_unneeded_domains(self):
+        test_targeted_snapshot_omits_unneeded_domains()
+
+    def test_targeted_snapshot_merges_subsequent_domains(self):
+        test_targeted_snapshot_merges_subsequent_domains()
+
+    def test_recipe_snapshot_domains_helper(self):
+        test_recipe_snapshot_domains_helper()
+
+    def test_evidence_inventory_reuses_valid_fresh_evidence(self):
+        test_evidence_inventory_reuses_valid_fresh_evidence()
+
+    def test_evidence_inventory_rejects_stale_evidence(self):
+        test_evidence_inventory_rejects_stale_evidence()
+
+    def test_pid_reuse_invalidates_snapshot_cache(self):
+        test_pid_reuse_invalidates_snapshot_cache()
+
+    def test_adaptive_early_stopping_on_confirmed_fault(self):
+        with tempfile.TemporaryDirectory() as td:
+            test_adaptive_early_stopping_on_confirmed_fault(Path(td))
+
+    def test_missing_evidence_cannot_produce_false_healthy(self):
+        with tempfile.TemporaryDirectory() as td:
+            test_missing_evidence_cannot_produce_false_healthy(Path(td))
+
+    def test_contradictory_evidence_preserves_ambiguity(self):
+        with tempfile.TemporaryDirectory() as td:
+            test_contradictory_evidence_preserves_ambiguity(Path(td))
+
+    def test_partial_snapshot_failure_isolation(self):
+        test_partial_snapshot_failure_isolation()

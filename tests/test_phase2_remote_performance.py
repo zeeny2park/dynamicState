@@ -13,14 +13,14 @@ import os
 import shlex
 import time
 from typing import Any, Dict, List, Optional, Tuple
-import pytest
+import unittest
 
 from extractor.target_adapter import RemoteSshTargetAdapter
 import extractor.target_abi as target_abi
 from extractor.diagnostic_performance import DiagnosticPerformanceTracker
 
 
-class TestRemoteCollectionCoalescing:
+class TestRemoteCollectionCoalescing(unittest.TestCase):
     """Verifies that RemoteSshTargetAdapter coalesces process metadata into a single round trip."""
 
     def test_coalesced_shell_snapshot_single_command(self):
@@ -120,7 +120,7 @@ class TestRemoteCollectionCoalescing:
             assert len(calls) == 1
 
 
-class TestEvidenceValidityAndFreshness:
+class TestEvidenceValidityAndFreshness(unittest.TestCase):
     """Verifies evidence validity TTL, refresh after expiration, and PID reuse detection."""
 
     def test_freshness_ttl_expiration_triggers_refresh(self):
@@ -196,7 +196,7 @@ class TestEvidenceValidityAndFreshness:
         assert "PID_REUSED" in err
 
 
-class TestRemoteFaultIsolation:
+class TestRemoteFaultIsolation(unittest.TestCase):
     """Verifies that partial collection failures isolate cleanly without corrupting other data."""
 
     def test_permission_denied_on_proc_fd_isolates_cleanly(self):
@@ -239,7 +239,7 @@ class TestRemoteFaultIsolation:
         assert fds == (0, [])
 
 
-class TestBudgetAndRetryAccounting:
+class TestBudgetAndRetryAccounting(unittest.TestCase):
     """Verifies that remote retries strictly deduct from remaining budget without deadline reset."""
 
     def test_retries_consume_remaining_deadline(self):

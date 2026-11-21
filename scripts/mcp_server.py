@@ -759,6 +759,12 @@ def runtime_get_investigation_report(investigation_id: str, format: str = "json"
         format: Desired report format ('json', 'markdown', or 'html').
     """
     try:
+        if not isinstance(investigation_id, str) or not investigation_id.strip():
+            return _format_watch_result({"success": False, "error": "investigation_id must be a non-empty string", "error_code": "INVALID_PARAM"})
+        fmt = str(format or "json").strip().lower()
+        if fmt not in ("json", "markdown", "html"):
+            return _format_watch_result({"success": False, "error": f"Unsupported report format '{format}': expected json, markdown, or html", "error_code": "INVALID_PARAM"})
+        format = fmt
         session = runtime.expert_diagnostic_engine.get_session(investigation_id)
         if session:
             return _format_watch_result({
@@ -852,6 +858,14 @@ def runtime_diagnose_process(
         examined remotely (thread-local storage, running-thread stacks, library symbols) is listed in not_covered.
     """
     try:
+        import math
+        if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
+            return _format_watch_result({"success": False, "error": f"Invalid pid '{pid}': must be a positive integer", "error_code": "INVALID_PARAM"})
+        if isinstance(ssh_port, bool) or not isinstance(ssh_port, int) or not (1 <= ssh_port <= 65535):
+            return _format_watch_result({"success": False, "error": f"Invalid ssh_port '{ssh_port}': must be integer in 1..65535", "error_code": "INVALID_PARAM"})
+        if time_limit_s is not None:
+            if isinstance(time_limit_s, bool) or not isinstance(time_limit_s, (int, float)) or not math.isfinite(time_limit_s) or time_limit_s <= 0:
+                return _format_watch_result({"success": False, "error": f"Invalid time_limit_s '{time_limit_s}': must be a positive finite number", "error_code": "INVALID_PARAM"})
         from extractor.human_report import diagnose_with_summary
         lang = "ko" if str(language or "en").strip().lower().startswith("ko") else "en"
         remote_target = None

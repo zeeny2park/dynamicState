@@ -15,6 +15,7 @@ Implements deterministic, authority-verified competing hypothesis reasoning:
   evaluation with machine-readable decision traces (Part A5, B1, B2).
 """
 
+import math
 from dataclasses import dataclass, field, asdict, fields
 import hmac
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
@@ -1533,8 +1534,12 @@ class CompetingHypothesis:
                 self.unverified_evidence_ids.append(evidence_id)
 
         weight_key = evidence_id or f"obs:{observation}"
-        if weight > 0.0:
-            self._support_weights[weight_key] = float(weight)
+        try:
+            w_val = float(weight) if not isinstance(weight, bool) else 0.0
+        except (TypeError, ValueError):
+            w_val = 0.0
+        if math.isfinite(w_val) and w_val > 0.0:
+            self._support_weights[weight_key] = min(w_val, 1.0)
 
         self.evaluate_verdict(ledger=eff_ledger)
         return True
@@ -1692,11 +1697,20 @@ class CompetingHypothesis:
         if not hasattr(self, "_base_confidence"):
             self.__post_init__()
 
-        # Detect if caller externally set self.confidence since last evaluation
-        if self._computed_confidence is not None and abs(self.confidence - self._computed_confidence) > 1e-6:
-            self._base_confidence = float(self.confidence)
+        # Detect if caller externally set self.confidence since last evaluation (guard against NaN/Inf)
+        try:
+            cur_conf = float(self.confidence)
+        except (TypeError, ValueError):
+            cur_conf = 0.50
+        if not math.isfinite(cur_conf):
+            cur_conf = 0.50
+            self.confidence = 0.50
+        if not math.isfinite(float(self._base_confidence)):
+            self._base_confidence = 0.50
+        if self._computed_confidence is not None and abs(cur_conf - self._computed_confidence) > 1e-6:
+            self._base_confidence = max(0.0, min(1.0, cur_conf))
         elif self._computed_confidence is None and not self._support_weights and not self._contradiction_weights:
-            self._base_confidence = float(self.confidence)
+            self._base_confidence = max(0.0, min(1.0, cur_conf))
 
         eff_ledger = ledger or self.ledger
         if eff_ledger is not None and self.ledger is None:
@@ -1864,6 +1878,11 @@ class CompetingHypothesis:
         # to prevent confidence inflation from duplicate or correlated observations
         cluster_weights: Dict[str, List[float]] = {}
         for k, w in sorted(self._support_weights.items()):
+            if not isinstance(w, (int, float)) or isinstance(w, bool) or not math.isfinite(w) or w <= 0.0:
+                continue
+            id_rec = self.identity_validation_records.get(k)
+            if isinstance(id_rec, dict) and id_rec.get("status") in ("IDENTITY_MISMATCH", "RECORD_NOT_FOUND"):
+                continue
             rec = self._lookup_record_in_ledger(eff_ledger, k) if eff_ledger is not None else None
             if rec is not None:
                 origin_key = self._extract_capture_origin_key(rec, k)
@@ -1886,7 +1905,9 @@ class CompetingHypothesis:
         irrelevant_keys = {ic.evidence_id for ic in irrelevant_contradictions if ic.evidence_id} | {
             "contra:" + str(ic.contradiction) for ic in irrelevant_contradictions}
         contra_delta = sum(
-            w for k, w in sorted(self._contradiction_weights.items()) if k not in irrelevant_keys
+            min(float(w), 1.0)
+            for k, w in sorted(self._contradiction_weights.items())
+            if k not in irrelevant_keys and isinstance(w, (int, float)) and not isinstance(w, bool) and math.isfinite(w) and w > 0.0
         )
 
         incomplete_penalty = 0.0

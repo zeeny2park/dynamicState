@@ -13,6 +13,7 @@ Enforces strict temporal observation semantics:
 
 from dataclasses import dataclass, field, asdict
 from enum import Enum
+import math
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -153,6 +154,10 @@ class ObservationWindow:
         self.failed_samples_count: int = 0
         self.limitations: List[str] = []
 
+    @staticmethod
+    def _is_valid_monotonic_ts(ts: Any) -> bool:
+        return isinstance(ts, (int, float)) and not isinstance(ts, bool) and math.isfinite(ts) and ts >= 0.0
+
     def record_sample(self, sample: MemorySample) -> None:
         """Records a sample while verifying monotonic ordering and detecting regressions."""
         self.requested_samples_count += 1
@@ -161,8 +166,18 @@ class ObservationWindow:
             self.samples.append(sample)
             return
 
+        if not self._is_valid_monotonic_ts(sample.monotonic_timestamp):
+            self.limitations.append(
+                f"Invalid non-finite or negative monotonic timestamp ({sample.monotonic_timestamp}) on sample {sample.epoch_id}"
+            )
+            self.samples.append(sample)
+            return
+
         if self.samples:
-            last_valid = next((s for s in reversed(self.samples) if s.collection_status == "SUCCESS"), None)
+            last_valid = next(
+                (s for s in reversed(self.samples) if s.collection_status in ("SUCCESS", "PARTIAL") and self._is_valid_monotonic_ts(s.monotonic_timestamp)),
+                None,
+            )
             if last_valid:
                 # Check for duplicate epoch ID
                 if sample.epoch_id == last_valid.epoch_id:
@@ -203,9 +218,12 @@ class ObservationWindow:
         return valid[-1].monotonic_timestamp - valid[0].monotonic_timestamp
 
     def has_temporal_regression(self) -> bool:
-        valid_samples = [s for s in self.samples if s.collection_status == "SUCCESS"]
-        for i in range(len(valid_samples) - 1):
-            if valid_samples[i + 1].monotonic_timestamp < valid_samples[i].monotonic_timestamp:
+        non_failed = [s for s in self.samples if s.collection_status in ("SUCCESS", "PARTIAL")]
+        for s in non_failed:
+            if not self._is_valid_monotonic_ts(s.monotonic_timestamp):
+                return True
+        for i in range(len(non_failed) - 1):
+            if non_failed[i + 1].monotonic_timestamp < non_failed[i].monotonic_timestamp:
                 return True
         return False
 

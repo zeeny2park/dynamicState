@@ -9,6 +9,8 @@ runs, and record why it won over the runner-up.  It works on the observations ea
 
 from __future__ import annotations
 
+import math
+import time
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 # Hypothesis states that are settled: an observation can no longer change them.
@@ -66,21 +68,44 @@ def select_discriminating_recipe(
     if not unresolved:
         return None, log, "no unresolved competing hypothesis"
 
-    # Identify top 2 competing hypotheses by confidence / priority to evaluate separation power
+    def _safe_conf(h: Any) -> float:
+        raw = getattr(h, "confidence", 0.50)
+        try:
+            val = float(raw) if raw is not None and not isinstance(raw, bool) else 0.50
+        except (TypeError, ValueError):
+            return 0.50
+        return val if math.isfinite(val) else 0.50
+
+    # Identify top 2 competing hypotheses by confidence with deterministic ID tie-breaking
     sorted_unresolved = sorted(
         unresolved_list,
-        key=lambda h: float(getattr(h, "confidence", 0.50)),
-        reverse=True,
+        key=lambda h: (-_safe_conf(h), str(getattr(h, "hypothesis_id", ""))),
     )
     top1_hid = sorted_unresolved[0].hypothesis_id if sorted_unresolved else None
     top2_hid = sorted_unresolved[1].hypothesis_id if len(sorted_unresolved) > 1 else None
 
-    # Available cached domains/observations
-    c_domains = set(cached_domains or ())
+    # Available cached domains/observations (strictly non-empty and fresh)
+    c_domains = {str(d).strip() for d in (cached_domains or ()) if isinstance(d, str) and d.strip()}
     if target_adapter is not None:
         c_cache = getattr(target_adapter, "_cached_snapshots", None)
         if isinstance(c_cache, dict):
-            c_domains.update(c_cache.keys())
+            c_domains.update(str(k).strip() for k in c_cache.keys() if isinstance(k, str) and k.strip())
+        snap_cache = getattr(target_adapter, "_snapshot_cache", None)
+        if isinstance(snap_cache, dict):
+            now_mono = time.monotonic()
+            for entry_val in snap_cache.values():
+                if isinstance(entry_val, tuple) and len(entry_val) >= 2:
+                    ts, payload = entry_val[0], entry_val[1]
+                    doms = entry_val[2] if len(entry_val) > 2 else ()
+                    if (
+                        isinstance(ts, (int, float))
+                        and (now_mono - ts) <= 2.0
+                        and isinstance(payload, dict)
+                        and not payload.get("terminated")
+                    ):
+                        for d in doms:
+                            if isinstance(d, str) and d.strip():
+                                c_domains.add(d.strip())
 
     feasible = []
     for rec in sorted(candidate_recipes or [], key=lambda r: r.recipe_id):
@@ -111,11 +136,9 @@ def select_discriminating_recipe(
         rec_dom_upper = str(rec_domain).upper()
         c_domains_upper = {str(d).upper() for d in c_domains}
         if (
-            rec_domain in c_domains
-            or rec_cat in c_domains
-            or rec_dom_upper in c_domains_upper
-            or any(k in c_domains for k in obs)
-            or any(str(k).upper() in c_domains_upper for k in obs)
+            (bool(rec_domain) and (rec_domain in c_domains or rec_dom_upper in c_domains_upper))
+            or (bool(rec_cat) and (rec_cat in c_domains or str(rec_cat).upper() in c_domains_upper))
+            or any(bool(k) and (k in c_domains or str(k).upper() in c_domains_upper) for k in obs)
         ):
             has_cached_evidence = True
             est_bytes = 0

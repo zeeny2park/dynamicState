@@ -4,6 +4,7 @@
 #include <stdint.h>
 #include <stddef.h>
 #include <sys/types.h>
+#include <signal.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -80,6 +81,8 @@ typedef struct {
     char receipt_id[64];
 } collector_stats_t;
 
+extern volatile sig_atomic_t g_collector_interrupted;
+void collector_install_signal_handlers(void);
 void collector_init_config(collector_config_t *cfg);
 int collector_get_exe_path(pid_t pid, char *buf, size_t buf_size);
 int collector_get_process_starttime(pid_t pid, uint64_t *starttime_out);

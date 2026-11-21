@@ -515,7 +515,9 @@ int main() {
             f.write(r"""
 #include <stdio.h>
 #include <unistd.h>
+#include <sys/prctl.h>
 int main() {
+    prctl(0x59616d61, -1, 0, 0, 0); /* PR_SET_PTRACER_ANY */
     while (1) sleep(1);
     return 0;
 }
@@ -560,7 +562,9 @@ int main() {
             f.write(r"""
 #include <stdio.h>
 #include <unistd.h>
+#include <sys/prctl.h>
 int main() {
+    prctl(0x59616d61, -1, 0, 0, 0); /* PR_SET_PTRACER_ANY */
     while (1) sleep(1);
     return 0;
 }
@@ -755,7 +759,7 @@ int main() {
         target_src = os.path.join(self.tmp_dir, "target_path.c")
         target_bin = os.path.join(self.tmp_dir, "target_path_app")
         with open(target_src, "w") as f:
-            f.write("int main() { while (1); return 0; }\n")
+            f.write("#include <sys/prctl.h>\nint main() { prctl(0x59616d61, -1, 0, 0, 0); while (1); return 0; }\n")
         subprocess.run(["gcc", target_src, "-o", target_bin], check=True)
         p = fixture_popen([target_bin])
         try:
@@ -779,7 +783,7 @@ int main() {
         target_src = os.path.join(self.tmp_dir, "target_maps_fail.c")
         target_bin = os.path.join(self.tmp_dir, "target_maps_fail_app")
         with open(target_src, "w") as f:
-            f.write("int main() { while (1); return 0; }\n")
+            f.write("#include <sys/prctl.h>\nint main() { prctl(0x59616d61, -1, 0, 0, 0); while (1); return 0; }\n")
         subprocess.run(["gcc", target_src, "-o", target_bin], check=True)
         p = fixture_popen([target_bin])
         try:
@@ -808,7 +812,7 @@ int main() {
         target_src = os.path.join(self.tmp_dir, "target_stale.c")
         target_bin = os.path.join(self.tmp_dir, "target_stale_app")
         with open(target_src, "w") as f:
-            f.write("int main() { while (1); return 0; }\n")
+            f.write("#include <sys/prctl.h>\nint main() { prctl(0x59616d61, -1, 0, 0, 0); while (1); return 0; }\n")
         subprocess.run(["gcc", target_src, "-o", target_bin], check=True)
         p = fixture_popen([target_bin])
         out_dir = os.path.join(self.tmp_dir, "stale_snap_dir")

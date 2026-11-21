@@ -268,6 +268,7 @@ static void print_usage(const char *prog) {
 static const char collector_version_marker[] = "DS_COLLECTOR_VERSION=" COLLECTOR_VERSION;
 
 int main(int argc, char *argv[]) {
+    collector_install_signal_handlers();
     if (argc == 2 && (strcmp(argv[1], "--version") == 0 || strcmp(argv[1], "version") == 0)) {
         printf("dynamicstate-collector %s\n", collector_version_marker + sizeof("DS_COLLECTOR_VERSION=") - 1);
         return 0;

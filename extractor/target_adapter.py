@@ -23,6 +23,7 @@ import errno
 import hashlib
 import inspect
 import json
+import math
 import os
 import atexit
 import re
@@ -2344,9 +2345,14 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
             raise ValueError(f"Invalid SSH user '{user}': leading dash prohibited")
         if proxy_jump is not None and (not isinstance(proxy_jump, str) or proxy_jump.strip().startswith("-")):
             raise ValueError(f"Invalid SSH proxy_jump '{proxy_jump}': leading dash prohibited")
+        if isinstance(port, bool) or not isinstance(port, int) or not (1 <= port <= 65535):
+            raise ValueError(f"Invalid SSH port '{port}': must be integer in 1..65535")
+        if isinstance(timeout_sec, bool) or not math.isfinite(float(timeout_sec)) or float(timeout_sec) <= 0:
+            raise ValueError(f"Invalid timeout_sec '{timeout_sec}': must be positive finite number")
         self.host = host.strip()
         self.user = user.strip() if isinstance(user, str) and user.strip() else None
         self.port = int(port)
+        self._last_snapshot_error: Optional[Dict[str, Any]] = None
         self.key_file = key_file
         self.proxy_jump = proxy_jump
         self.proxy_command = proxy_command
@@ -2435,10 +2441,44 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
         p = f":{self.port}" if self.port != 22 else ""
         return f"{u}{self.host}{p}"
 
+    @staticmethod
+    def classify_remote_error(rc: int, stderr: str = "", stdout: str = "") -> str:
+        """Classifies remote SSH/command outcomes into structured error categories."""
+        if rc == 0:
+            return "OK"
+        err_l = (stderr or "").lower()
+        if "timed out" in err_l or "deadline exceeded" in err_l or "operation timed out" in err_l:
+            return "TIMEOUT"
+        if "permission denied" in err_l or "operation not permitted" in err_l or "publickey" in err_l:
+            return "PERMISSION_DENIED"
+        if (
+            "connection refused" in err_l
+            or "connection reset" in err_l
+            or "no route to host" in err_l
+            or "could not resolve" in err_l
+            or "broken pipe" in err_l
+            or "shared connection" in err_l
+            or rc == 255
+        ):
+            return "TRANSPORT_ERROR"
+        if "no such file" in err_l or "not found" in err_l or "no such process" in err_l:
+            return "UNAVAILABLE"
+        if stdout and "@@END" not in stdout:
+            return "INVALID_DATA"
+        return "TRANSPORT_ERROR" if rc < 0 else "UNAVAILABLE"
+
     @contextlib.contextmanager
     def collection_deadline(self, timeout_sec: Optional[float]):
         """Bounds all remote SSH / daemon operations inside this block to at most ``timeout_sec`` seconds."""
-        if timeout_sec is None or timeout_sec <= 0:
+        if timeout_sec is None or isinstance(timeout_sec, bool):
+            yield
+            return
+        try:
+            t_val = float(timeout_sec)
+        except (TypeError, ValueError):
+            yield
+            return
+        if not math.isfinite(t_val) or t_val <= 0:
             yield
             return
         prev = getattr(self._deadline_tls, "deadline", None)
@@ -2502,7 +2542,9 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
         ``input_bytes`` (optional) is streamed to the remote command's stdin; custom command
         runners then receive it as the ``input_bytes`` keyword argument.
         """
-        t = timeout or self.timeout_sec
+        t = self.timeout_sec if timeout is None else float(timeout)
+        if not math.isfinite(t) or t <= 0:
+            return -1, "", f"Invalid non-positive SSH timeout: {t}"
         rem = self.remaining_deadline_sec()
         if rem is not None:
             if rem <= 0:
@@ -2830,10 +2872,18 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
         if payload is None:
             # Coalesced targeted POSIX shell path: zero target-side daemon/python required
             script = self._shell_snapshot_script(pid, domains=domains_to_fetch)
-            rc, out, _ = self.run_ssh(f"sh -c {shlex.quote(script)}", timeout=self.timeout_sec * 1.5)
+            rc, out, err = self.run_ssh(f"sh -c {shlex.quote(script)}", timeout=self.timeout_sec * 1.5)
             new_data = self._parse_shell_snapshot(out, pid)
             if new_data is None:
-                return cached_payload
+                self._last_snapshot_error = {
+                    "category": self.classify_remote_error(rc, err, out) if rc != 0 else "INVALID_DATA",
+                    "rc": rc,
+                    "stderr": (err or "")[:300],
+                    "pid": int(pid),
+                    "timestamp": time.monotonic(),
+                }
+                return cached_payload if is_fresh else None
+            self._last_snapshot_error = None
             if new_data.get("terminated"):
                 self._snapshot_cache[int(pid)] = (now, {"terminated": True}, self.ALL_SNAPSHOT_DOMAINS)
                 return None

@@ -84,6 +84,24 @@ static int secure_open_temp_file(int dir_fd, const char *dir, const char *prefix
     return -1;
 }
 
+volatile sig_atomic_t g_collector_interrupted = 0;
+
+static void collector_signal_handler(int sig) {
+    (void)sig;
+    g_collector_interrupted = 1;
+}
+
+void collector_install_signal_handlers(void) {
+    signal(SIGPIPE, SIG_IGN);
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = collector_signal_handler;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0; /* No SA_RESTART so blocked I/O returns EINTR */
+    sigaction(SIGINT, &sa, NULL);
+    sigaction(SIGTERM, &sa, NULL);
+}
+
 void collector_init_config(collector_config_t *cfg) {
     if (!cfg) return;
     memset(cfg, 0, sizeof(*cfg));
@@ -799,6 +817,11 @@ int collector_run(const collector_config_t *cfg, collector_stats_t *stats_out) {
         parsed_region_t *r = &regions[i];
         if (!r->is_selected) continue;
 
+        if (g_collector_interrupted) {
+            stats.timed_out = 1;
+            break;
+        }
+
         /* Enforce timeout if configured */
         if (cfg->timeout_ms > 0) {
             int64_t now_ns = get_time_ns();
@@ -834,6 +857,10 @@ int collector_run(const collector_config_t *cfg, collector_stats_t *stats_out) {
         int read_error = 0;
 
         while (total_nread < to_read) {
+            if (g_collector_interrupted) {
+                stats.timed_out = 1;
+                break;
+            }
             if (cfg->timeout_ms > 0) {
                 int64_t now_ns = get_time_ns();
                 int64_t elapsed_ms = (now_ns - stats.capture_start_ns) / 1000000LL;
@@ -2133,7 +2160,7 @@ int collector_daemon_loop(int backend, void *in_file, void *out_file) {
     FILE *out = out_file ? (FILE *)out_file : stdout;
     char line[8192];
 
-    while (fgets(line, sizeof(line), in)) {
+    while (!g_collector_interrupted && fgets(line, sizeof(line), in)) {
         size_t len = strlen(line);
         while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r')) {
             line[--len] = '\0';
