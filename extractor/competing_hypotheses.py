@@ -597,6 +597,10 @@ class CompetingHypothesis:
     ledger: Optional[Any] = None
     strict_ledger: bool = True
     details: Dict[str, Any] = field(default_factory=dict)
+    supporting_patterns: List[str] = field(default_factory=list)
+    refuting_patterns: List[str] = field(default_factory=list)
+    minimum_required_evidence: List[str] = field(default_factory=list)
+    distinction_from_related: str = ""
     # Stage 1 (one hypothesis model): when an investigation has verified its hypotheses, a candidate is a view of
     # the verified hypothesis (extractor.expert_diagnostic_engine.ExpertHypothesis) that consumed the evidence of
     # its discriminating rules: status / confidence / basis come from there (bind_verdict).  Empty for a
@@ -1856,14 +1860,60 @@ class CompetingHypothesis:
                 trusted_partial.append(c)
 
         # 5. Compute deterministic base + delta confidence (insertion-order independent!)
-        support_delta = sum(w for _, w in sorted(self._support_weights.items()))
+        # Cluster correlated evidence by capture origin, metric key, and domain
+        # to prevent confidence inflation from duplicate or correlated observations
+        cluster_weights: Dict[str, List[float]] = {}
+        for k, w in sorted(self._support_weights.items()):
+            rec = self._lookup_record_in_ledger(eff_ledger, k) if eff_ledger is not None else None
+            if rec is not None:
+                origin_key = self._extract_capture_origin_key(rec, k)
+                det = _record_details(rec)
+                metric_key = det.get("metric_key") or det.get("domain") or getattr(rec, "evidence_type", "") or "default"
+                cluster_key = f"{origin_key}:{metric_key}"
+            else:
+                cluster_key = f"unbound:{k}"
+            cluster_weights.setdefault(cluster_key, []).append(w)
+
+        support_delta = 0.0
+        for c_key in sorted(cluster_weights.keys()):
+            weights = cluster_weights[c_key]
+            # Max weight in cluster + diminishing returns for duplicate observations
+            max_w = max(weights)
+            diminishing = min(0.02, 0.005 * (len(weights) - 1))
+            support_delta += max_w + diminishing
+
         # weight keys of irrelevant contradictions (an evidence id, or "contra:" + the observation for one without)
         irrelevant_keys = {ic.evidence_id for ic in irrelevant_contradictions if ic.evidence_id} | {
             "contra:" + str(ic.contradiction) for ic in irrelevant_contradictions}
         contra_delta = sum(
             w for k, w in sorted(self._contradiction_weights.items()) if k not in irrelevant_keys
         )
-        computed_conf = max(0.05, min(0.99, round(self._base_confidence + support_delta - contra_delta, 6)))
+
+        incomplete_penalty = 0.0
+        if self.missing_evidence:
+            incomplete_penalty += 0.15 * len(self.missing_evidence)
+        if self.unresolved_assumptions:
+            incomplete_penalty += 0.05 * len(self.unresolved_assumptions)
+
+        computed_conf = max(0.05, min(0.99, round(self._base_confidence + support_delta - contra_delta - incomplete_penalty, 6)))
+
+        # Evaluate primary evidence rule for single-evidence confirmation capability
+        can_single_confirm = False
+        if num_independent == 1 and self.primary_evidence_rule:
+            is_valid, reason = self.validate_primary_evidence_rule(
+                self.primary_evidence_rule, ledger=eff_ledger
+            )
+            if is_valid:
+                can_single_confirm = True
+                self.satisfied_primary_rule = self.primary_evidence_rule
+            else:
+                self.satisfied_primary_rule = None
+                self.primary_rule_rejection_reason = reason
+
+        # Corroboration requirement: Confidence >= 0.85 requires at least 2 independent sources
+        # unless an authorized primary evidence rule explicitly allows single-source confirmation.
+        if eff_ledger is not None and num_independent < 2 and not can_single_confirm:
+            computed_conf = min(computed_conf, 0.84)
 
         decision_rule_applied = ""
         decision_explanation = ""
@@ -1935,17 +1985,6 @@ class CompetingHypothesis:
                 decision_rule_applied = "RULE_INCONCLUSIVE_ZERO_INDEPENDENT_ROOTS"
                 decision_explanation = "Zero authoritative independent root evidence sources available."
             else:
-                can_single_confirm = False
-                if num_independent == 1 and self.primary_evidence_rule:
-                    is_valid, reason = self.validate_primary_evidence_rule(
-                        self.primary_evidence_rule, ledger=eff_ledger
-                    )
-                    if is_valid:
-                        can_single_confirm = True
-                        self.satisfied_primary_rule = self.primary_evidence_rule
-                    else:
-                        self.satisfied_primary_rule = None
-                        self.primary_rule_rejection_reason = reason
 
                 if (
                     (num_independent >= 2 or (num_independent >= 1 and can_single_confirm))
@@ -2106,6 +2145,9 @@ CANDIDATES_LEAK = "LEAK"
 CANDIDATES_CORRUPTION = "CORRUPTION"
 CANDIDATES_CONCURRENCY = "CONCURRENCY"
 CANDIDATES_INSTABILITY = "INSTABILITY"
+CANDIDATES_CPU = "CPU"
+CANDIDATES_MEMORY_PRESSURE = "MEMORY_PRESSURE"
+CANDIDATES_THREAD_ANOMALIES = "THREAD_ANOMALIES"
 CANDIDATES_GENERAL = "GENERAL"
 SYMPTOM_CANDIDATE_SET: Dict[str, str] = {
     "MEMORY_LEAK": CANDIDATES_LEAK, "FD_LEAK": CANDIDATES_LEAK, "THREAD_LEAK": CANDIDATES_LEAK,
@@ -2117,6 +2159,13 @@ SYMPTOM_CANDIDATE_SET: Dict[str, str] = {
     "LOCK_CONTENTION": CANDIDATES_CONCURRENCY, "THREAD_DEADLOCK": CANDIDATES_CONCURRENCY,
     "CONCURRENCY": CANDIDATES_CONCURRENCY,
     "PROCESS_INSTABILITY": CANDIDATES_INSTABILITY, "RESOURCE_EXHAUSTION": CANDIDATES_INSTABILITY,
+    # Phase 3.2 specialized categories
+    "CPU_OVERLOAD": CANDIDATES_CPU, "CPU_SATURATION": CANDIDATES_CPU, "CPU_PRESSURE": CANDIDATES_CPU,
+    "SCHEDULER_STARVATION": CANDIDATES_CPU, "RUN_QUEUE_CONTENTION": CANDIDATES_CPU,
+    "MEMORY_PRESSURE": CANDIDATES_MEMORY_PRESSURE, "MEMORY_EXHAUSTION": CANDIDATES_MEMORY_PRESSURE,
+    "ALLOCATION_CHURN": CANDIDATES_MEMORY_PRESSURE,
+    "THREAD_ANOMALIES": CANDIDATES_THREAD_ANOMALIES, "THREAD_STARVATION": CANDIDATES_THREAD_ANOMALIES,
+    "EXCESSIVE_BLOCKING": CANDIDATES_THREAD_ANOMALIES,
     # GENERAL: ABNORMAL_VARIABLE_CHANGES, DATA_RACE_INDICATORS, FUNCTIONAL_STATE_INCONSISTENCY, HEAP_RETENTION,
     # ORPHAN_LOCK, UNEXPECTED_STATE_TRANSITIONS and anything not listed
 }
@@ -2236,10 +2285,235 @@ class CompetingHypothesisManager:
     ) -> List[CompetingHypothesis]:
         """Generates domain-specific competing candidate hypotheses for a reported symptom."""
         ctx = initial_context or {}
-        candidate_set = SYMPTOM_CANDIDATE_SET.get(str(symptom_category or "GENERAL"), CANDIDATES_GENERAL)
+        symptom_key = str(symptom_category or "GENERAL")
+        candidate_set = ctx.get("candidate_set")
+        if candidate_set is None:
+            candidate_set = SYMPTOM_CANDIDATE_SET.get(symptom_key, CANDIDATES_GENERAL)
         hypotheses: List[CompetingHypothesis] = []
 
-        if candidate_set == CANDIDATES_LEAK:
+        if candidate_set == CANDIDATES_CPU:
+            hypotheses = [
+                CompetingHypothesis(
+                    hypothesis_id="HYP_CPU_SATURATION",
+                    title="Compute Bound CPU Saturation",
+                    category="RESOURCE_EXHAUSTION",
+                    domain="CPU_UTILIZATION",
+                    required_observations=["cpu_utilization_aggregate", "thread_run_state_samples"],
+                    applicable_diagnostic_rules=["RECIPE_THREAD_STATE_ANOMALIES", "RECIPE_UNEXPECTED_VARIABLE_CHANGES"],
+                    discriminating_actions=["RECIPE_THREAD_STATE_ANOMALIES"],
+                    confidence_basis="Process threads consume aggregate CPU near core capacity in active user computation.",
+                    supporting_patterns=["cpu_usage_total >= 90%", "user_or_sys_time_dominant", "runnable_thread_executing"],
+                    refuting_patterns=["cpu_usage_total < 25%", "threads_predominantly_sleeping", "high_iowait_percentage"],
+                    minimum_required_evidence=["cpu_utilization_aggregate", "thread_run_state_samples"],
+                    distinction_from_related="Process is actively burning CPU cycles on core compute rather than waiting on locks, I/O, or scheduler queues.",
+                ),
+                CompetingHypothesis(
+                    hypothesis_id="HYP_RUN_QUEUE_CONTENTION",
+                    title="CPU Scheduler Run Queue Contention",
+                    category="RESOURCE_EXHAUSTION",
+                    domain="CPU_SCHEDULING",
+                    required_observations=["scheduler_run_queue_metrics", "context_switch_rates"],
+                    applicable_diagnostic_rules=["RECIPE_THREAD_STATE_ANOMALIES", "RECIPE_LONG_RUNNING_BLOCKED_THREADS"],
+                    discriminating_actions=["RECIPE_THREAD_STATE_ANOMALIES"],
+                    confidence_basis="Runnable threads exceed physical CPU core allotment with high involuntary context switching.",
+                    supporting_patterns=["run_queue_length > cpu_core_count", "involuntary_context_switches_elevated"],
+                    refuting_patterns=["run_queue_depth <= 1", "involuntary_context_switches_nominal"],
+                    minimum_required_evidence=["scheduler_run_queue_metrics", "context_switch_rates"],
+                    distinction_from_related="Many runnable threads are competing for fewer available physical CPU cores, causing scheduling latency.",
+                ),
+                CompetingHypothesis(
+                    hypothesis_id="HYP_SPIN_LOCK_CONTENTION",
+                    title="Spinlock / Active Polling Contention",
+                    category="CONCURRENCY",
+                    domain="CPU_SYNCHRONIZATION",
+                    required_observations=["lock_contention_traces", "cpu_profile_spin_symbols"],
+                    applicable_diagnostic_rules=["RECIPE_LOCK_CONTENTION_HOTSPOTS", "RECIPE_POTENTIAL_DEADLOCK_PATTERNS"],
+                    discriminating_actions=["RECIPE_LOCK_CONTENTION_HOTSPOTS"],
+                    confidence_basis="CPU cycles are burned in spinlock loops or busy-wait polling functions without productive forward progress.",
+                    supporting_patterns=["high_cpu_in_lock_or_spin_functions", "elevated_lock_acquisition_cycles"],
+                    refuting_patterns=["zero_lock_contention_events", "cpu_consumed_in_application_logic"],
+                    minimum_required_evidence=["lock_contention_traces", "cpu_profile_spin_symbols"],
+                    distinction_from_related="CPU cycles are wasted in spin-wait loops or lock contention rather than executing productive work.",
+                ),
+                CompetingHypothesis(
+                    hypothesis_id="HYP_IO_WAIT_SATURATION",
+                    title="Storage or Socket I/O Wait Saturation",
+                    category="RESOURCE_EXHAUSTION",
+                    domain="IO_STORAGE",
+                    required_observations=["thread_task_states", "system_io_wait_metrics"],
+                    applicable_diagnostic_rules=["RECIPE_THREAD_STATE_ANOMALIES", "RECIPE_LONG_RUNNING_BLOCKED_THREADS"],
+                    discriminating_actions=["RECIPE_THREAD_STATE_ANOMALIES"],
+                    confidence_basis="Threads are stalled in uninterruptible disk or socket sleep (state D) with elevated iowait.",
+                    supporting_patterns=["high_iowait_percentage", "threads_in_task_uninterruptible_d_state"],
+                    refuting_patterns=["iowait_percentage == 0", "zero_threads_in_d_state"],
+                    minimum_required_evidence=["thread_task_states", "system_io_wait_metrics"],
+                    distinction_from_related="Threads appear unresponsive because they are blocked waiting on storage or block devices, not compute saturation.",
+                ),
+                CompetingHypothesis(
+                    hypothesis_id="HYP_SCHEDULER_STARVATION",
+                    title="Cgroup Throttling or Priority Starvation",
+                    category="RESOURCE_EXHAUSTION",
+                    domain="CPU_QUOTA",
+                    required_observations=["cgroup_cpu_stat_throttled", "process_scheduler_shares"],
+                    applicable_diagnostic_rules=["RECIPE_THREAD_STATE_ANOMALIES"],
+                    discriminating_actions=["RECIPE_THREAD_STATE_ANOMALIES"],
+                    confidence_basis="Target process threads are runnable but throttled by container CFS quota or starved by higher-priority tasks.",
+                    supporting_patterns=["cgroup_nr_throttled_positive", "throttled_time_accumulating"],
+                    refuting_patterns=["cgroup_nr_throttled == 0", "quota_period_ratio_unconstrained"],
+                    minimum_required_evidence=["cgroup_cpu_stat_throttled", "process_scheduler_shares"],
+                    distinction_from_related="Process is artificially constrained by cgroup CFS bandwidth limits or higher-priority tasks, not by internal deadlock or lack of work.",
+                ),
+            ]
+
+        elif candidate_set == CANDIDATES_MEMORY_PRESSURE:
+            hypotheses = [
+                CompetingHypothesis(
+                    hypothesis_id="HYP_MEMORY_EXHAUSTION",
+                    title="RSS Memory Limit Approaching Exhaustion",
+                    category="RESOURCE_EXHAUSTION",
+                    domain="MEMORY_CONSUMPTION",
+                    required_observations=["process_rss_gauge", "memory_limit_cgroup_status"],
+                    applicable_diagnostic_rules=["RECIPE_PROCESS_MEMORY_GROWTH", "RECIPE_HEAP_GROWTH"],
+                    discriminating_actions=["RECIPE_PROCESS_MEMORY_GROWTH"],
+                    confidence_basis="Process resident memory usage approaches or breaches container / host memory threshold.",
+                    supporting_patterns=["rss_usage_ratio > 0.90", "cgroup_memory_usage_near_limit"],
+                    refuting_patterns=["rss_usage_ratio < 0.60", "cgroup_memory_headroom_ample"],
+                    minimum_required_evidence=["process_rss_gauge", "memory_limit_cgroup_status"],
+                    distinction_from_related="Total resident set size is nearing system or container quota, risking termination even without monotonic leak.",
+                ),
+                CompetingHypothesis(
+                    hypothesis_id="HYP_MEMORY_LEAK",
+                    title="Unbounded Monotonic Memory Leak",
+                    category="MEMORY_LEAK",
+                    domain="MEMORY_GROWTH",
+                    required_observations=["temporal_heap_samples", "allocation_counter_trend"],
+                    applicable_diagnostic_rules=["RECIPE_HEAP_GROWTH", "RECIPE_PROCESS_MEMORY_GROWTH", "RECIPE_ALLOCATION_FREE_IMBALANCE"],
+                    discriminating_actions=["RECIPE_HEAP_GROWTH", "RECIPE_ALLOCATION_FREE_IMBALANCE"],
+                    confidence_basis="Heap memory accumulates monotonically over observation epochs with zero reclamation.",
+                    supporting_patterns=["monotonic_heap_growth_across_epochs", "net_allocated_chunks_increasing"],
+                    refuting_patterns=["bounded_memory_plateau", "periodic_allocation_reclamation_cycles"],
+                    minimum_required_evidence=["temporal_heap_samples", "allocation_counter_trend"],
+                    distinction_from_related="Memory consumption grows steadily and unbounded across time without being reclaimed by free/delete.",
+                ),
+                CompetingHypothesis(
+                    hypothesis_id="HYP_EXCESSIVE_CACHE",
+                    title="Bounded Cache or Buffer Pool Retention",
+                    category="RESOURCE_EXHAUSTION",
+                    domain="CACHE_RETENTION",
+                    required_observations=["container_capacity_metrics", "cache_hit_eviction_stats"],
+                    applicable_diagnostic_rules=["RECIPE_LARGE_CONTAINER_RETENTION", "RECIPE_LONG_LIVED_OBJECT_ACCUMULATION"],
+                    discriminating_actions=["RECIPE_LARGE_CONTAINER_RETENTION"],
+                    confidence_basis="Memory is held in valid application cache or buffer containers with bounded capacities and eviction policies.",
+                    supporting_patterns=["large_container_element_count", "cache_hit_rate_high", "rss_stabilized_at_high_plateau"],
+                    refuting_patterns=["cache_element_count_low", "monotonic_growth_past_cache_cap"],
+                    minimum_required_evidence=["container_capacity_metrics", "cache_hit_eviction_stats"],
+                    distinction_from_related="High memory usage is deliberate cached data with an upper bound or eviction policy, not an unreferenced memory leak.",
+                ),
+                CompetingHypothesis(
+                    hypothesis_id="HYP_ALLOCATION_FAILURE",
+                    title="Memory Allocation Failure (OOM / NULL Return)",
+                    category="RESOURCE_EXHAUSTION",
+                    domain="ALLOCATION_FAILURE",
+                    required_observations=["kernel_oom_event_records", "allocator_failure_logs"],
+                    applicable_diagnostic_rules=["RECIPE_PROCESS_MEMORY_GROWTH", "RECIPE_INVALID_MEMORY_ACCESS"],
+                    discriminating_actions=["RECIPE_PROCESS_MEMORY_GROWTH"],
+                    confidence_basis="Target process encounters fatal errors or crashes due to kernel OOM killer or malloc returning NULL.",
+                    supporting_patterns=["kernel_oom_killer_invocations", "malloc_returned_null_logs"],
+                    refuting_patterns=["zero_oom_events", "all_allocations_succeeding"],
+                    minimum_required_evidence=["kernel_oom_event_records", "allocator_failure_logs"],
+                    distinction_from_related="Target encounters fatal runtime failures because allocations cannot be satisfied, regardless of whether target is the primary consumer.",
+                ),
+                CompetingHypothesis(
+                    hypothesis_id="HYP_ALLOCATION_CHURN",
+                    title="High Allocation Churn and Fragmentation",
+                    category="RESOURCE_EXHAUSTION",
+                    domain="ALLOCATOR_ARENA",
+                    required_observations=["alloc_free_rate_counters", "arena_chunk_fragmentation_gauge"],
+                    applicable_diagnostic_rules=["RECIPE_ALLOCATION_FREE_IMBALANCE", "RECIPE_HEAP_GROWTH"],
+                    discriminating_actions=["RECIPE_ALLOCATION_FREE_IMBALANCE"],
+                    confidence_basis="High allocation and deallocation rates cause allocator arena fragmentation and CPU overhead without monotonic leak.",
+                    supporting_patterns=["high_allocation_rate_balanced_by_frees", "arena_fragmentation_ratio_elevated"],
+                    refuting_patterns=["nominal_allocation_rate", "tight_arena_packing"],
+                    minimum_required_evidence=["alloc_free_rate_counters", "arena_chunk_fragmentation_gauge"],
+                    distinction_from_related="Net memory is not leaking, but high allocation throughput causes allocator fragmentation and CPU cache thrashing.",
+                ),
+            ]
+
+        elif candidate_set == CANDIDATES_THREAD_ANOMALIES:
+            hypotheses = [
+                CompetingHypothesis(
+                    hypothesis_id="HYP_DEADLOCK",
+                    title="Circular Mutex Wait Dependency (Deadlock)",
+                    category="DEADLOCK_INDICATORS",
+                    domain="CONCURRENCY",
+                    required_observations=["authoritative_lock_wait_graph", "thread_lock_ownership_table"],
+                    applicable_diagnostic_rules=["RECIPE_POTENTIAL_DEADLOCK_PATTERNS", "RECIPE_SUSPICIOUS_LOCK_OWNERSHIP"],
+                    discriminating_actions=["RECIPE_POTENTIAL_DEADLOCK_PATTERNS"],
+                    confidence_basis="Two or more threads form a closed circular wait dependency on mutually held locks.",
+                    supporting_patterns=["circular_wait_chain_in_lock_graph", "threads_blocked_on_held_locks"],
+                    refuting_patterns=["acyclic_lock_graph", "no_threads_blocked_on_locks"],
+                    minimum_required_evidence=["authoritative_lock_wait_graph", "thread_lock_ownership_table"],
+                    distinction_from_related="Closed directed cycle exists in lock wait-for graph: Thread A holds L1 waiting for L2, while Thread B holds L2 waiting for L1.",
+                ),
+                CompetingHypothesis(
+                    hypothesis_id="HYP_THREAD_STARVATION",
+                    title="Lock Acquisition or Work Queue Thread Starvation",
+                    category="CONCURRENCY",
+                    domain="THREAD_FAIRNESS",
+                    required_observations=["per_thread_cpu_progress_trend", "thread_wait_time_variance"],
+                    applicable_diagnostic_rules=["RECIPE_LONG_RUNNING_BLOCKED_THREADS", "RECIPE_LOCK_CONTENTION_HOTSPOTS"],
+                    discriminating_actions=["RECIPE_LONG_RUNNING_BLOCKED_THREADS"],
+                    confidence_basis="Individual threads make zero forward progress while other threads continuously acquire work or locks.",
+                    supporting_patterns=["specific_thread_blocked_excessively", "other_threads_making_progress"],
+                    refuting_patterns=["fair_progress_across_all_threads", "all_threads_blocked_together"],
+                    minimum_required_evidence=["per_thread_cpu_progress_trend", "thread_wait_time_variance"],
+                    distinction_from_related="Specific threads are starved of execution because higher-priority or greedy threads repeatedly re-acquire resources without circular deadlock.",
+                ),
+                CompetingHypothesis(
+                    hypothesis_id="HYP_EXCESSIVE_BLOCKING",
+                    title="Excessive Blocking on External I/O or Synchronization",
+                    category="CONCURRENCY",
+                    domain="THREAD_SYNCHRONIZATION",
+                    required_observations=["thread_wait_channel_inspections", "syscall_blocking_durations"],
+                    applicable_diagnostic_rules=["RECIPE_LONG_RUNNING_BLOCKED_THREADS", "RECIPE_THREAD_STATE_ANOMALIES"],
+                    discriminating_actions=["RECIPE_LONG_RUNNING_BLOCKED_THREADS"],
+                    confidence_basis="Threads are blocked in kernel futex or epoll waiting on external systems without circular locking.",
+                    supporting_patterns=["threads_blocked_in_futex_or_epoll_long", "no_circular_wait_cycle"],
+                    refuting_patterns=["short_blocking_durations", "active_compute_progress"],
+                    minimum_required_evidence=["thread_wait_channel_inspections", "syscall_blocking_durations"],
+                    distinction_from_related="Threads are blocked waiting on slow external events, databases, or timers, with no cyclic internal dependencies.",
+                ),
+                CompetingHypothesis(
+                    hypothesis_id="HYP_UNEXPECTED_TERMINATION",
+                    title="Unexpected Thread Exit or Unhandled Abort",
+                    category="PROCESS_INSTABILITY",
+                    domain="THREAD_LIFECYCLE",
+                    required_observations=["thread_count_temporal_history", "thread_exit_status_codes"],
+                    applicable_diagnostic_rules=["RECIPE_THREAD_STATE_ANOMALIES", "RECIPE_PROCESS_MEMORY_GROWTH"],
+                    discriminating_actions=["RECIPE_THREAD_STATE_ANOMALIES"],
+                    confidence_basis="Worker threads terminate abnormally or unexpectedly, abandoning active workloads.",
+                    supporting_patterns=["thread_count_decreased_abruptly", "unhandled_exception_in_worker"],
+                    refuting_patterns=["stable_thread_count", "clean_thread_join_recorded"],
+                    minimum_required_evidence=["thread_count_temporal_history", "thread_exit_status_codes"],
+                    distinction_from_related="Worker threads terminate abnormally, leaving shared work queues abandoned or stalled.",
+                ),
+                CompetingHypothesis(
+                    hypothesis_id="HYP_NORMAL_IDLE_THREADS",
+                    title="Normal Idle Worker Threads (Healthy Condition)",
+                    category="FUNCTIONAL_STATE_INCONSISTENCY",
+                    domain="NORMAL_OPERATION",
+                    required_observations=["clean_lock_graph_evidence", "empty_work_queue_metrics"],
+                    applicable_diagnostic_rules=["RECIPE_POTENTIAL_DEADLOCK_PATTERNS", "RECIPE_THREAD_STATE_ANOMALIES"],
+                    discriminating_actions=["RECIPE_POTENTIAL_DEADLOCK_PATTERNS"],
+                    confidence_basis="Worker threads are idle waiting for incoming requests; lock graph is acyclic and application is healthy.",
+                    supporting_patterns=["threads_waiting_on_epoll_or_empty_queue", "lock_graph_completely_clean", "zero_errors_or_leaks"],
+                    refuting_patterns=["work_items_queued_unprocessed", "circular_lock_wait"],
+                    minimum_required_evidence=["clean_lock_graph_evidence", "empty_work_queue_metrics"],
+                    distinction_from_related="Threads are idle by design waiting for incoming client requests; this is normal healthy behavior, not a hang or deadlock.",
+                ),
+            ]
+
+        elif candidate_set == CANDIDATES_LEAK:
             hypotheses = [
                 CompetingHypothesis(
                     hypothesis_id="HYP_HEAP_ALLOC_LEAK",

@@ -1191,6 +1191,30 @@ class EvidenceToSourceCorrelator:
 # 8. Adaptive Investigation Session & State Machine
 # -----------------------------------------------------------------------------
 
+_INCONCLUSIVE_BUDGET_STOP_REASONS = frozenset({
+    "BUDGET_EXHAUSTED",
+    "STEP_BUDGET_REACHED",
+    "RECIPE_BUDGET_EXHAUSTED",
+    "COLLECTION_BUDGET_EXHAUSTED",
+})
+
+_INCONCLUSIVE_UNRESPONSIVE_STOP_REASONS = frozenset({
+    "TARGET_INACCESSIBLE",
+    "REMOTE_CONNECTION_LOST",
+    "TARGET_UNRESPONSIVE",
+    "TARGET_EXITED",
+    "PROCESS_DIED",
+    "PID_REUSE",
+    "IDENTITY_MISMATCH",
+    "TARGET_UNREACHABLE",
+})
+
+_INCONCLUSIVE_CONFLICTING_STOP_REASONS = frozenset({
+    "CONFLICTING_EVIDENCE",
+    "CONTRADICTION_DISPUTE",
+})
+
+
 @dataclass
 class DiagnosticConclusion:
     """Final diagnostic report bundle."""
@@ -1209,6 +1233,14 @@ class DiagnosticConclusion:
     diagnostic_limitations: List[str]
     completed_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
     overall_verdict: Optional[str] = None
+    inconclusive_reason: Optional[str] = None
+    what_was_determined: List[str] = field(default_factory=list)
+    what_remains_unknown: List[str] = field(default_factory=list)
+    missing_evidence_needed: List[str] = field(default_factory=list)
+    early_stop_rationale: Optional[Dict[str, Any]] = None
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
 
 
 # States in which a session without any executed check still has a truthful report: it says why nothing ran.
@@ -1409,6 +1441,7 @@ class AdaptiveInvestigationSession:
         self.verified_checks_count: int = 0
         self.methodology: Optional[DiagnosticMethodology] = None
         self.checks: List[DiagnosticCheck] = []
+        self.early_stop_rationale: Optional[Dict[str, Any]] = None
 
         self._record_timeline_event("SESSION_CREATED", {"investigation_id": investigation_id, "pid": pid})
         if _persist_on_create:
@@ -3035,8 +3068,17 @@ class AdaptiveInvestigationSession:
             self.plan.steps = self.plan.steps[:self.plan.current_step_index + 1] + related_steps + unrelated_steps
             self.plan.total_steps = len(self.plan.steps)
 
+            # Phase 3.2 Principled Evidence Sufficiency & Early Stop Criteria
             # Early stop condition: if definitive fault confirmed with high confidence (>= 0.90) and no contradiction
             if eval_result.confidence >= 0.90 and not eval_result.contradicting_facts:
+                leading_hyp = None
+                for ch in self.competing_hypotheses:
+                    if recipe.recipe_id in ch.applicable_diagnostic_rules or ch.category == recipe.problem_category:
+                        leading_hyp = ch
+                        break
+
+                num_indep = len(leading_hyp.get_independent_root_sources(ledger=self.ledger)) if leading_hyp else 1
+                skipped_rids = []
                 for s in remaining_steps:
                     # Baseline checks are never skipped: a process can have two problems and the report must be
                     # able to say the other cheap checks were clean (or not).
@@ -3044,8 +3086,33 @@ class AdaptiveInvestigationSession:
                         if s.status != "SKIPPED":
                             s.status = "SKIPPED"
                             s.not_run_reason = "early_stop_sufficient_evidence"
+                            skipped_rids.append(s.recipe_id)
                             if hasattr(self, "perf_tracker"):
                                 self.perf_tracker.metrics.recipes_skipped_count += 1
+
+                self.early_stop_rationale = {
+                    "verdict": getattr(leading_hyp, "status", "CONFIRMED") if leading_hyp else "CONFIRMED",
+                    "leading_hypothesis_id": leading_hyp.hypothesis_id if leading_hyp else recipe.problem_category,
+                    "leading_hypothesis_title": getattr(leading_hyp, "title", recipe.problem_category),
+                    "confidence_at_termination": float(eval_result.confidence),
+                    "independent_roots_count": num_indep,
+                    "evidence_supporting_stop": [primary_ev_id] if primary_ev_id else [],
+                    "remaining_hypotheses_disposition": {
+                        h.hypothesis_id: {
+                            "status": h.status,
+                            "confidence": h.confidence,
+                            "disposition": "RULED_OUT" if h.status == "REFUTED" else "SUBORDINATE",
+                        }
+                        for h in self.competing_hypotheses if h != leading_hyp
+                    },
+                    "skipped_recipes": skipped_rids,
+                    "why_skipped_recipes_cannot_change_verdict": (
+                        f"Primary fault '{recipe.problem_category}' confirmed with confidence {eval_result.confidence:.2f} "
+                        f"and sufficient independent corroboration; remaining skipped recipes test orthogonal or ruled-out categories."
+                    ),
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                }
+
                 # IMP-004: dynamically scheduled growth follow-ups must still execute; otherwise keep the
                 # original early stop.  Baseline checks that have not run yet also keep the loop going.
                 # (IMP-008: also the follow-ups scheduled by an EARLIER growth step - a supported first follow-up
@@ -3683,19 +3750,93 @@ class AdaptiveInvestigationSession:
         )
 
         remediations: List[str] = []
-        if (
+        inconclusive_reason: Optional[str] = None
+        what_was_determined: List[str] = []
+        what_remains_unknown: List[str] = []
+        missing_evidence_needed: List[str] = []
+
+        is_inconclusive = (
             agg.overall_result in (VERDICT_INCONCLUSIVE, VERDICT_ABORTED)
             or self.state in (STATE_INCONCLUSIVE, STATE_BLOCKED, STATE_FAILED, STATE_BUDGET_EXHAUSTED)
-        ):
-            remediations.append(
-                "Investigation inconclusive due to insufficient evidence or collection failures; "
-                "verify target permissions, debug symbols, and process accessibility before re-running."
-            )
+            or (self.active_hypotheses and self.active_hypotheses[0].status == "INCONCLUSIVE")
+        )
+
+        if is_inconclusive:
+            # 1. Distinguish inconclusive reason (Phase 3.2 Section 6)
+            if self.state == STATE_BUDGET_EXHAUSTED or stop_reason in _INCONCLUSIVE_BUDGET_STOP_REASONS:
+                inconclusive_reason = "BUDGET_EXHAUSTED"
+            elif (
+                stop_reason in _INCONCLUSIVE_UNRESPONSIVE_STOP_REASONS
+                or (self.target_assessment and (not getattr(self.target_assessment, "accessible", True) or not getattr(self.target_assessment, "memory_readable", True)))
+            ):
+                inconclusive_reason = "TARGET_UNRESPONSIVE"
+            elif (
+                stop_reason in _INCONCLUSIVE_CONFLICTING_STOP_REASONS
+                or any(getattr(ch, "is_disputed", False) for ch in self.competing_hypotheses)
+                or any(len(getattr(ch, "contradicting_evidence_ids", [])) > 0 and len(getattr(ch, "supporting_evidence_ids", [])) > 0 for ch in self.competing_hypotheses)
+            ):
+                inconclusive_reason = "CONFLICTING_EVIDENCE"
+            elif len(self.competing_hypotheses) >= 2 and all(ch.status not in (VERDICT_CONFIRMED, VERDICT_REFUTED) for ch in self.competing_hypotheses):
+                confs = [ch.confidence for ch in self.competing_hypotheses if ch.is_viable]
+                if len(confs) >= 2 and max(confs) - min(confs) < 0.20 and max(confs) >= 0.50:
+                    inconclusive_reason = "AMBIGUOUS_EVIDENCE"
+                else:
+                    inconclusive_reason = "INSUFFICIENT_EVIDENCE"
+            else:
+                inconclusive_reason = "INSUFFICIENT_EVIDENCE"
+
+            # 2. What was determined
+            for ch in self.competing_hypotheses:
+                if ch.status == VERDICT_REFUTED:
+                    what_was_determined.append(f"Hypothesis {ch.hypothesis_id} ({ch.title or ch.category}) was refuted by authoritative evidence.")
+            for chk in all_checks:
+                if getattr(chk, "status", None) == CheckStatus.HEALTHY:
+                    what_was_determined.append(f"Diagnostic check {chk.name} verified nominal / clean runtime state.")
+
+            # 3. What remains unknown
+            for ch in self.competing_hypotheses:
+                if ch.status not in (VERDICT_REFUTED, VERDICT_NOT_APPLICABLE):
+                    what_remains_unknown.append(
+                        f"Hypothesis {ch.hypothesis_id} ({ch.title or ch.category}) remains unresolved (confidence {ch.confidence:.2f})."
+                    )
+
+            # 4. Missing evidence needed
+            for ch in self.competing_hypotheses:
+                if ch.status not in (VERDICT_REFUTED, VERDICT_NOT_APPLICABLE):
+                    for req in ch.required_observations:
+                        if req not in missing_evidence_needed:
+                            missing_evidence_needed.append(req)
+            for lim in limitations:
+                if lim not in missing_evidence_needed:
+                    missing_evidence_needed.append(lim)
+
+            # 5. Tailored remediations
+            if inconclusive_reason == "TARGET_UNRESPONSIVE":
+                remediations.append(
+                    "Target process terminated or became unreachable during investigation; capture core dump or launch with GDB / supervisor for persistent tracing."
+                )
+            elif inconclusive_reason == "CONFLICTING_EVIDENCE":
+                remediations.append(
+                    "Authoritative evidence sources contradict; collect higher-fidelity kernel trace or core dump to resolve lock/heap state discrepancy."
+                )
+            elif inconclusive_reason == "AMBIGUOUS_EVIDENCE":
+                remediations.append(
+                    "Multiple competing failure modes are equally plausible; execute targeted discriminating recipes or provide debug symbols to separate them."
+                )
+            elif inconclusive_reason == "BUDGET_EXHAUSTED":
+                remediations.append(
+                    "Resource or step budget reached before complete discrimination; re-run with increased time/byte budget or targeted recipe profile."
+                )
+            else:
+                remediations.append(
+                    "Investigation inconclusive due to insufficient evidence or collection failures; verify target permissions, debug symbols, and process accessibility before re-running."
+                )
         elif primary_finding and self.active_hypotheses:
             # by the leading hypothesis's category (stage 1: never by the words of the finding text)
             top = self.active_hypotheses[0]
             fam = criteria_family(top.category)
             if top.status == "INCONCLUSIVE" or top.category == "UNKNOWN":
+                inconclusive_reason = "INSUFFICIENT_EVIDENCE"
                 remediations.append(
                     "Investigation inconclusive due to insufficient evidence or collection failures; "
                     "verify target permissions, debug symbols, and process accessibility before re-running."
@@ -3735,6 +3876,11 @@ class AdaptiveInvestigationSession:
             recommended_remediations=remediations,
             diagnostic_limitations=limitations,
             overall_verdict=agg.overall_result,
+            inconclusive_reason=inconclusive_reason,
+            what_was_determined=what_was_determined,
+            what_remains_unknown=what_remains_unknown,
+            missing_evidence_needed=missing_evidence_needed,
+            early_stop_rationale=self.early_stop_rationale,
         )
         self._record_timeline_event("CONCLUSION_SEALED", {
             "status": self.state,
