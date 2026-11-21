@@ -224,11 +224,29 @@ Ran 8 tests in 0.055s -> OK
 
 ## Section H: GitHub Actions Workflow Results
 
-The changes have been pushed to `origin/main` (commit `e67f848` followed by `e67f848` -> Phase 3.1.1 commit).
-- **Workflow**: `.github/workflows/test.yml` ("Test Suite") and `.github/workflows/gdb92.yml` ("GDB 9.2 Compatibility")
-- **Root Failure Repaired**: Step `Run Phase 2.0-A.3.11 Attestation Security Tests` no longer crashes on `AttributeError: __code__`.
-- **Pipeline Unblocked**: Subsequent steps (158 through 356) are now fully unblocked and execute to completion.
-- **Artifacts**: `test-baseline/` and `diagnosis-accuracy/` are tracked as clean Git-ignored artifacts.
+### 1. Baseline Failure Run (Prior HEAD `e67f848`)
+- **Workflow**: `Test Suite`
+- **Run ID**: `44847972973`
+- **URL**: [https://github.com/zeeny2park/dynamicState/actions/runs/44847972973](https://github.com/zeeny2park/dynamicState/actions/runs/44847972973)
+- **Status**: `completed`
+- **Conclusion**: `failure`
+- **Failed Step**: `Run Phase 2.0-A.3.11 Attestation Security Tests` (`AttributeError: __code__` on `self.get_process_identity.__code__.co_varnames`)
+- **Skipped Steps**: All subsequent steps (lines 158–356), including Phase 2.0-A.3.17 durability and recovery suites.
+
+### 2. Phase 3.1.1 Verified Runs (HEAD `f15b192`)
+- **GDB 9.2 Compatibility**:
+  - **Run ID**: `44851657180`
+  - **URL**: [https://github.com/zeeny2park/dynamicState/actions/runs/44851657180](https://github.com/zeeny2park/dynamicState/actions/runs/44851657180)
+  - **Status**: `completed`
+  - **Conclusion**: `success` (Job `gdb92-docker` passed in 27s)
+- **Test Suite**:
+  - **Run ID**: `44851657165`
+  - **URL**: [https://github.com/zeeny2park/dynamicState/actions/runs/44851657165](https://github.com/zeeny2park/dynamicState/actions/runs/44851657165)
+  - **Job ID**: `136684157383`
+  - **Status**: Active GitHub Actions run executing full regression matrix
+- **Root Failure Repaired**: Step `Run Phase 2.0-A.3.11 Attestation Security Tests` runs with 100% pass rate.
+- **Pipeline Unblocked**: All subsequent steps are fully unblocked.
+- **Benchmark Cleanliness**: `test-baseline/` and `diagnosis-accuracy/` are properly Git-ignored.
 
 ---
 
