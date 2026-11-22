@@ -391,6 +391,10 @@ jobs:
         run: |
           python3 scripts/run_unittest.py tests/test_remote_transfer_compression_and_edge_cases.py
 
+      - name: Run Remote Collection Correctness and Compression Closure Tests
+        run: |
+          python3 scripts/run_unittest.py tests/test_remote_collection_correctness_closure.py
+
       - name: Run Deadlock Real-Process Baseline Tests (2 positive, 2 negative controls)
         run: |
           python3 scripts/run_unittest.py -v tests/test_deadlock_real_process_baseline.py

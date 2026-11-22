@@ -111,10 +111,15 @@ class RemoteImageResolver:
             transient_error = True
             self.skipped[path] = f"fetch failed: {type(exc).__name__}"
         if not data:
-            if transient_error:
-                # Do not poison global cache for 30s on a transient SSH timeout/transport exception
+            last_err = getattr(self.adapter, "_last_file_read_error", None)
+            err_cat = str(last_err.get("category", "")).upper() if isinstance(last_err, dict) else ""
+            if transient_error or err_cat in ("TIMEOUT", "TRANSPORT_ERROR", "CANCELLED"):
+                self.skipped[path] = f"transient fetch failure ({err_cat or 'EXCEPTION'})"
+                # Do not poison global cache for 30s on transient SSH timeout/transport failures
                 return None
-            return self._remember(key, stat, None, now, self.skipped.get(path) or "could not be read from the target")
+            # Only negative-cache confirmed permanent failures (FILE_MISSING, PERMISSION_DENIED, INVALID_DATA, etc.)
+            permanent_reason = self.skipped.get(path) or (f"permanent remote error: {err_cat}" if err_cat else "could not be read from the target")
+            return self._remember(key, stat, None, now, permanent_reason)
         if len(data) > self.max_bytes:
             return self._remember(key, stat, None, now, f"image exceeds the {self.max_bytes} byte cap")
         if data[:4] != b"\x7fELF":

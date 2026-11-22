@@ -2355,6 +2355,7 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
         self.user = user.strip() if isinstance(user, str) and user.strip() else None
         self.port = int(port)
         self._last_snapshot_error: Optional[Dict[str, Any]] = None
+        self._last_file_read_error: Optional[Dict[str, Any]] = None
         self._auth_failed_reason: Optional[str] = None
         self._permanent_transport_error: Optional[Tuple[str, str]] = None
         self._state_lock = threading.RLock()
@@ -3308,35 +3309,77 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
                 text = self._procfile_text(int(m.group(1)), m.group(2))
                 if text is not None:
                     return text.encode("utf-8", "replace")[:max(0, int(max_bytes))]
+        self._last_file_read_error = None
         n_bytes = max(0, int(max_bytes))
         if n_bytes == 0:
             return b""
         q_path = shlex.quote(p_str)
+        precheck = (
+            f"if [ ! -e {q_path} ]; then echo @@ERR:FILE_MISSING; exit 0; fi; "
+            f"if [ ! -r {q_path} ]; then echo @@ERR:PERMISSION_DENIED; exit 0; fi; "
+            f"if [ -d {q_path} ]; then echo @@ERR:PIPELINE_FAIL; exit 0; fi; "
+            f"head -c 1 {q_path} >/dev/null 2>&1 || {{ echo @@ERR:PIPELINE_FAIL; exit 0; }}; "
+        )
         if n_bytes >= 8192:
             cmd = (
-                f"if command -v gzip >/dev/null 2>&1; then "
-                f"echo @@GZ; head -c {n_bytes} {q_path} 2>/dev/null | gzip -c 2>/dev/null | base64; "
-                f"else echo @@RAW; head -c {n_bytes} {q_path} 2>/dev/null | base64; fi"
+                precheck
+                + f"if command -v gzip >/dev/null 2>&1; then "
+                + f"b=$(head -c {n_bytes} {q_path} 2>/dev/null | gzip -1 -c 2>/dev/null | base64 | tr -d '\\n') "
+                + f"&& [ -n \"$b\" ] && printf '@@GZ\\n%s\\n' \"$b\" || echo @@ERR:PIPELINE_FAIL; "
+                + f"else "
+                + f"b=$(head -c {n_bytes} {q_path} 2>/dev/null | base64 | tr -d '\\n') "
+                + f"&& if [ -n \"$b\" ]; then printf '@@RAW\\n%s\\n' \"$b\"; else echo @@EMPTY; fi "
+                + f"|| echo @@ERR:PIPELINE_FAIL; fi"
             )
         else:
-            cmd = f"head -c {n_bytes} {q_path} 2>/dev/null | base64"
-        rc, out, _ = self.run_ssh(cmd, timeout=self.timeout_sec * 1.5)
+            cmd = (
+                precheck
+                + f"b=$(head -c {n_bytes} {q_path} 2>/dev/null | base64 | tr -d '\\n') "
+                + f"&& if [ -n \"$b\" ]; then printf '@@RAW\\n%s\\n' \"$b\"; else echo @@EMPTY; fi "
+                + f"|| echo @@ERR:PIPELINE_FAIL"
+            )
+        rc, out, err = self.run_ssh(f"sh -c {shlex.quote(cmd)}", timeout=self.timeout_sec * 1.5)
         stripped = out.strip() if out else ""
-        if rc != 0 or not stripped:
+        if rc != 0:
+            cat = self.classify_remote_error(rc, err, out)
+            self._last_file_read_error = {"category": cat, "path": p_str, "rc": rc, "stderr": (err or "")[:300]}
+            return None
+        if not stripped:
+            self._last_file_read_error = {"category": "INVALID_DATA", "path": p_str, "rc": rc, "stderr": "empty remote output"}
+            return None
+        if stripped == "@@EMPTY":
+            self._last_file_read_error = None
+            return b""
+        if stripped.startswith("@@ERR:"):
+            err_tag = stripped[6:].strip() or "UNAVAILABLE"
+            cat_map = {
+                "FILE_MISSING": "FILE_MISSING",
+                "PERMISSION_DENIED": "PERMISSION_DENIED",
+                "PIPELINE_FAIL": "INVALID_DATA",
+            }
+            self._last_file_read_error = {
+                "category": cat_map.get(err_tag, "UNAVAILABLE"),
+                "path": p_str,
+                "rc": rc,
+                "stderr": err_tag,
+            }
             return None
         try:
             if stripped.startswith("@@GZ"):
                 b64_body = stripped[4:].strip()
                 if not b64_body:
+                    self._last_file_read_error = {"category": "INVALID_DATA", "path": p_str, "rc": rc, "stderr": "empty gzip payload"}
                     return None
                 return gzip.decompress(base64.b64decode(b64_body))[:n_bytes]
             if stripped.startswith("@@RAW"):
                 b64_body = stripped[5:].strip()
                 if not b64_body:
+                    self._last_file_read_error = {"category": "INVALID_DATA", "path": p_str, "rc": rc, "stderr": "empty raw payload"}
                     return None
                 return base64.b64decode(b64_body)[:n_bytes]
             return base64.b64decode(stripped)[:n_bytes]
-        except Exception:  # noqa: BLE001
+        except Exception as exc:  # noqa: BLE001
+            self._last_file_read_error = {"category": "INVALID_DATA", "path": p_str, "rc": rc, "stderr": str(exc)[:200]}
             return None
 
     def stat_target_file(self, pid: int, path: str) -> Optional[Tuple[int, int]]:
@@ -3959,12 +4002,41 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
         slices: List[Tuple[int, int]],
         max_gap: int = 256,
         max_merged_size: int = COLLECTOR_MAX_SLICE,
+        mappings: Optional[List[Dict[str, Any]]] = None,
     ) -> Tuple[List[Tuple[int, int]], List[Tuple[int, int, int]]]:
-        """Merges duplicate, overlapping, or closely adjacent positive-size slices to minimize remote reads.
+        """Merges duplicate, overlapping, or safely adjacent positive-size slices.
 
-        Returns (merged_slices, mapping) where mapping[i] = (merged_idx, offset_in_merged, orig_size)
-        for each original slice i (merged_idx = -1 when orig_size <= 0).
+        Mapping-boundary safety:
+        - When ``mappings`` is provided, a positive gap (0 < gap <= max_gap) is merged ONLY if both
+          slices reside within the exact same readable mapping interval (never crossing guard pages,
+          unmapped holes, or different VMAs).
+        - When ``mappings`` is unavailable or empty, gap merging is disabled (gap_limit = 0): only
+          duplicate, overlapping, or strictly contiguous slices are coalesced (zero speculative over-read).
         """
+        readable_ranges: List[Tuple[int, int]] = []
+        if mappings:
+            for m in mappings:
+                if not isinstance(m, dict):
+                    continue
+                is_r = m.get("is_readable")
+                if is_r is None:
+                    is_r = "r" in str(m.get("permissions") or "")
+                if not is_r:
+                    continue
+                s_i = m.get("start_int")
+                e_i = m.get("end_int")
+                if isinstance(s_i, int) and isinstance(e_i, int) and e_i > s_i:
+                    readable_ranges.append((s_i, e_i))
+            readable_ranges.sort()
+
+        def _mapping_for(start: int, end: int) -> Optional[Tuple[int, int]]:
+            for ms, me in readable_ranges:
+                if ms <= start and end <= me:
+                    return (ms, me)
+                if ms > start:
+                    break
+            return None
+
         indexed = []
         for orig_idx, (addr, sz) in enumerate(slices):
             a_int = int(addr)
@@ -3977,6 +4049,7 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
         mapping: List[Tuple[int, int, int]] = [(-1, 0, max(0, int(sz))) for _, sz in slices]
         cur_start: Optional[int] = None
         cur_end: int = 0
+        cur_vma: Optional[Tuple[int, int]] = None
         cur_members: List[Tuple[int, int, int]] = []
 
         def _flush() -> None:
@@ -3988,27 +4061,105 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
                 mapping[o_idx] = (m_idx, o_addr - cur_start, o_sz)
 
         for a_start, a_end, o_idx, o_sz in indexed:
+            a_vma = _mapping_for(a_start, a_end) if readable_ranges else None
             if cur_start is None:
-                cur_start, cur_end = a_start, a_end
+                cur_start, cur_end, cur_vma = a_start, a_end, a_vma
                 cur_members = [(o_idx, a_start, o_sz)]
-            else:
-                new_end = max(cur_end, a_end)
-                if a_start <= cur_end + max_gap and (new_end - cur_start) <= max_merged_size:
+                continue
+
+            new_end = max(cur_end, a_end)
+            within_size = (new_end - cur_start) <= max_merged_size
+            if a_start <= cur_end and within_size:
+                # Duplicate, overlapping, or contiguous: safe when within same mapping (or mappings unknown)
+                same_or_unknown = (not readable_ranges) or (cur_vma is not None and cur_vma == a_vma)
+                if same_or_unknown:
                     cur_end = new_end
                     cur_members.append((o_idx, a_start, o_sz))
-                else:
-                    _flush()
-                    cur_start, cur_end = a_start, a_end
-                    cur_members = [(o_idx, a_start, o_sz)]
+                    continue
+            elif (
+                readable_ranges
+                and max_gap > 0
+                and cur_vma is not None
+                and cur_vma == a_vma
+                and a_start <= cur_end + max_gap
+                and within_size
+            ):
+                # Positive gap merge strictly within the exact same readable VMA
+                cur_end = new_end
+                cur_members.append((o_idx, a_start, o_sz))
+                continue
+
+            _flush()
+            cur_start, cur_end, cur_vma = a_start, a_end, a_vma
+            cur_members = [(o_idx, a_start, o_sz)]
         _flush()
         return merged, mapping
+
+    def _cached_readable_mappings(self, pid: int) -> Optional[List[Dict[str, Any]]]:
+        """Returns cached /proc/pid/maps entries without issuing any extra SSH round-trip."""
+        now = time.monotonic()
+        cached_m = self._maps_micro_cache.get(int(pid))
+        if cached_m is not None and (now - cached_m[0]) <= 2.0 and cached_m[1]:
+            return cached_m[1]
+        return None
+
+    def _read_batch_raw_shell(
+        self,
+        pid: int,
+        target_slices: List[Tuple[int, int]],
+    ) -> Tuple[Optional[List[Tuple[Optional[bytes], str, Optional[str]]]], bool]:
+        """Executes a single-SSH batched dd/base64 read for target_slices.
+
+        Returns (results, transport_failed).
+        """
+        cmds = []
+        for idx, (addr, sz) in enumerate(target_slices):
+            pipeline = self._dd_block_pipeline(pid, int(addr), int(sz))
+            cmds.append(f"b=$({pipeline} | base64 | tr -d '\\n'); echo \"{idx}|$b\"")
+        remote_script = "; ".join(cmds)
+        rc, stdout, stderr = self.run_ssh(f"sh -c {shlex.quote(remote_script)}")
+        if rc != 0:
+            err_cls = self.classify_remote_error(rc, stderr, stdout)
+            if rc == -1 or err_cls in ("TIMEOUT", "PERMISSION_DENIED", "HOST_KEY_ERROR", "TRANSPORT_ERROR"):
+                return [(None, "UNAVAILABLE", f"SSH batch read failed ({err_cls}): {stderr.strip()}") for _ in target_slices], True
+            alive, live_err = self.check_liveness(pid)
+            if not alive:
+                st = "UNAVAILABLE" if (live_err and ("transport" in live_err.lower() or "timed out" in live_err.lower())) else "TARGET_TERMINATED"
+                return [(None, st, live_err or "Remote process terminated") for _ in target_slices], True
+            return [(None, "UNAVAILABLE", f"SSH batch read failed: {stderr.strip()}") for _ in target_slices], True
+
+        by_idx: Dict[int, str] = {}
+        for line in stdout.splitlines():
+            if "|" in line:
+                k_str, val_b64 = line.strip().split("|", 1)
+                if k_str.isdigit():
+                    by_idx[int(k_str)] = val_b64.strip()
+
+        out: List[Tuple[Optional[bytes], str, Optional[str]]] = []
+        for idx, (addr, sz) in enumerate(target_slices):
+            b64_str = by_idx.get(idx, "")
+            if not b64_str:
+                out.append((None, "UNAVAILABLE", f"Address 0x{int(addr):x} is not mapped or inaccessible on {self.target_host()}"))
+                continue
+            try:
+                raw_b = base64.b64decode(b64_str)
+                if len(raw_b) == sz:
+                    out.append((raw_b, "OBSERVED", None))
+                elif len(raw_b) > 0:
+                    out.append((raw_b, "PARTIAL", f"Partial read: {len(raw_b)}/{sz} bytes"))
+                else:
+                    out.append((None, "UNAVAILABLE", f"Zero bytes returned at 0x{int(addr):x}"))
+            except Exception as e:
+                out.append((None, "UNAVAILABLE", f"Base64 decode failure: {e}"))
+        return out, False
 
     def read_memory_batch(
         self,
         pid: int,
         slices: List[Tuple[int, int]],
     ) -> List[Tuple[Optional[bytes], str, Optional[str]]]:
-        """Reads multiple memory slices in a single SSH roundtrip with automatic slice coalescing."""
+        """Reads multiple memory slices in a single SSH roundtrip with mapping-aware coalescing
+        and bounded individual-slice fallback when a merged read partially or fully fails."""
         if not slices:
             return []
         self._ensure_tracking_state()
@@ -4022,79 +4173,80 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
         if len(slices) == 1 and not self.collector_path:
             return [self.read_memory(pid, slices[0][0], slices[0][1])]
 
-        merged_slices, slice_map = self._coalesce_memory_slices(slices)
-
-        def _unpack_merged(
-            merged_res: List[Tuple[Optional[bytes], str, Optional[str]]],
-        ) -> List[Tuple[Optional[bytes], str, Optional[str]]]:
-            out_list: List[Tuple[Optional[bytes], str, Optional[str]]] = []
-            for orig_i, (orig_addr, orig_sz) in enumerate(slices):
-                m_idx, off, s_sz = slice_map[orig_i]
-                if m_idx < 0 or s_sz <= 0:
-                    out_list.append((b"", "OBSERVED", None))
-                    continue
-                m_data, m_st, m_err = merged_res[m_idx]
-                if m_data is None:
-                    out_list.append((None, m_st, m_err))
-                    continue
-                sub = m_data[off : off + s_sz]
-                if len(sub) == s_sz:
-                    out_list.append((sub, "OBSERVED", None))
-                elif len(sub) > 0:
-                    out_list.append((sub, "PARTIAL", f"Partial read: {len(sub)}/{s_sz} bytes"))
-                else:
-                    out_list.append((None, "UNAVAILABLE", f"Address 0x{int(orig_addr):x} is not mapped or inaccessible on {self.target_host()}"))
-            return out_list
-
-        if self.collector_path and merged_slices:
-            coll_res = self._read_slices_via_collector(pid, merged_slices)
-            if coll_res is not None and len(coll_res) == len(merged_slices):
-                return _unpack_merged(coll_res)
-
+        cached_maps = self._cached_readable_mappings(pid)
+        merged_slices, slice_map = self._coalesce_memory_slices(slices, mappings=cached_maps)
         if not merged_slices:
             return [(b"", "OBSERVED", None) for _ in slices]
 
-        # Single-SSH batched shell read over coalesced slices
-        cmds = []
-        for idx, (addr, sz) in enumerate(merged_slices):
-            pipeline = self._dd_block_pipeline(pid, int(addr), int(sz))
-            cmds.append(f"b=$({pipeline} | base64 | tr -d '\\n'); echo \"{idx}|$b\"")
-        remote_script = "; ".join(cmds)
-        rc, stdout, stderr = self.run_ssh(f"sh -c {shlex.quote(remote_script)}")
-        if rc != 0:
-            err_cls = self.classify_remote_error(rc, stderr, stdout)
-            if rc == -1 or err_cls in ("TIMEOUT", "PERMISSION_DENIED", "HOST_KEY_ERROR", "TRANSPORT_ERROR"):
-                return [(None, "UNAVAILABLE", f"SSH batch read failed ({err_cls}): {stderr.strip()}") for _ in slices]
-            alive, live_err = self.check_liveness(pid)
-            if not alive:
-                st = "UNAVAILABLE" if (live_err and ("transport" in live_err.lower() or "timed out" in live_err.lower())) else "TARGET_TERMINATED"
-                return [(None, st, live_err or "Remote process terminated") for _ in slices]
-            return [(None, "UNAVAILABLE", f"SSH batch read failed: {stderr.strip()}") for _ in slices]
+        # Count how many original slices map to each merged slice
+        members_per_merged: Dict[int, List[int]] = {}
+        for orig_i, (m_idx, _, _) in enumerate(slice_map):
+            if m_idx >= 0:
+                members_per_merged.setdefault(m_idx, []).append(orig_i)
 
-        by_idx: Dict[int, str] = {}
-        for line in stdout.splitlines():
-            if "|" in line:
-                k_str, val_b64 = line.strip().split("|", 1)
-                if k_str.isdigit():
-                    by_idx[int(k_str)] = val_b64.strip()
+        merged_results: Optional[List[Tuple[Optional[bytes], str, Optional[str]]]] = None
+        transport_failed = False
 
-        merged_results: List[Tuple[Optional[bytes], str, Optional[str]]] = []
-        for idx, (addr, sz) in enumerate(merged_slices):
-            b64_str = by_idx.get(idx, "")
-            if not b64_str:
-                merged_results.append((None, "UNAVAILABLE", f"Address 0x{int(addr):x} is not mapped or inaccessible on {self.target_host()}"))
+        if self.collector_path:
+            coll_res = self._read_slices_via_collector(pid, merged_slices)
+            if coll_res is not None and len(coll_res) == len(merged_slices):
+                merged_results = coll_res
+
+        if merged_results is None:
+            merged_results, transport_failed = self._read_batch_raw_shell(pid, merged_slices)
+
+        out_list: List[Tuple[Optional[bytes], str, Optional[str]]] = []
+        fallback_orig_indices: List[int] = []
+        for orig_i, (orig_addr, orig_sz) in enumerate(slices):
+            m_idx, off, s_sz = slice_map[orig_i]
+            if m_idx < 0 or s_sz <= 0:
+                out_list.append((b"", "OBSERVED", None))
                 continue
-            try:
-                raw_b = base64.b64decode(b64_str)
-                if len(raw_b) == sz:
-                    merged_results.append((raw_b, "OBSERVED", None))
-                elif len(raw_b) > 0:
-                    merged_results.append((raw_b, "PARTIAL", f"Partial read: {len(raw_b)}/{sz} bytes"))
-                else:
-                    merged_results.append((None, "UNAVAILABLE", f"Zero bytes returned at 0x{int(addr):x}"))
-            except Exception as e:
-                merged_results.append((None, "UNAVAILABLE", f"Base64 decode failure: {e}"))
-        return _unpack_merged(merged_results)
+            m_data, m_st, m_err = merged_results[m_idx]
+            if m_data is None:
+                out_list.append((None, m_st, m_err))
+                if not transport_failed and len(members_per_merged.get(m_idx, ())) > 1:
+                    fallback_orig_indices.append(orig_i)
+                continue
+            sub = m_data[off : off + s_sz]
+            if len(sub) == s_sz:
+                out_list.append((sub, "OBSERVED", None))
+            elif len(sub) > 0:
+                out_list.append((sub, "PARTIAL", f"Partial read: {len(sub)}/{s_sz} bytes"))
+                if not transport_failed and len(members_per_merged.get(m_idx, ())) > 1:
+                    fallback_orig_indices.append(orig_i)
+            else:
+                out_list.append((None, "UNAVAILABLE", f"Address 0x{int(orig_addr):x} is not mapped or inaccessible on {self.target_host()}"))
+                if not transport_failed and len(members_per_merged.get(m_idx, ())) > 1:
+                    fallback_orig_indices.append(orig_i)
+
+        # Bounded single-pass individual fallback (max 32 slices, no recursion) so readable slices
+        # are never silently lost when a merged read hits an unmapped/guard boundary.
+        max_fallback = 32
+        if fallback_orig_indices and not transport_failed:
+            rem_dl = self.remaining_deadline_sec()
+            if rem_dl is None or rem_dl > 0.05:
+                fb_indices = fallback_orig_indices[:max_fallback]
+                fb_slices = [(int(slices[i][0]), max(0, int(slices[i][1]))) for i in fb_indices]
+                fb_res: Optional[List[Tuple[Optional[bytes], str, Optional[str]]]] = None
+                if self.collector_path:
+                    coll_fb = self._read_slices_via_collector(pid, fb_slices)
+                    if coll_fb is not None and len(coll_fb) == len(fb_slices):
+                        fb_res = coll_fb
+                if fb_res is None:
+                    fb_res, _ = self._read_batch_raw_shell(pid, fb_slices)
+                if fb_res is not None and len(fb_res) == len(fb_indices):
+                    for idx_pos, orig_i in enumerate(fb_indices):
+                        out_list[orig_i] = fb_res[idx_pos]
+
+        # Accurate physical-read accounting for observed/partial results
+        for orig_i, (res_data, res_st, _) in enumerate(out_list):
+            if res_data and res_st in ("OBSERVED", "PARTIAL"):
+                self._record_physical_read(
+                    len(res_data), 1, data=res_data, pid=pid,
+                    address=int(slices[orig_i][0]), requested_size=max(0, int(slices[orig_i][1])), status=res_st,
+                )
+        return out_list
 
     def read_memory(self, pid: int, address: int, size: int) -> Tuple[Optional[bytes], str, Optional[str]]:
         self._ensure_tracking_state()

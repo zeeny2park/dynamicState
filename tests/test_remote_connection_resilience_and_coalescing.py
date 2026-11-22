@@ -32,7 +32,8 @@ class TestRemoteSliceCoalescingAndResilience(unittest.TestCase):
             (0x9000, 32),     # separate region
             (0x2000, 0),      # zero-length
         ]
-        merged, mapping = RemoteSshTargetAdapter._coalesce_memory_slices(slices)
+        vmas = [{'start_int': 0x1000, 'end_int': 0x2000, 'is_readable': True, 'permissions': 'rw-p'}, {'start_int': 0x9000, 'end_int': 0xa000, 'is_readable': True, 'permissions': 'rw-p'}]
+        merged, mapping = RemoteSshTargetAdapter._coalesce_memory_slices(slices, mappings=vmas)
         self.assertEqual(len(merged), 2)
         self.assertEqual(merged[0], (0x1000, 0x68))
         self.assertEqual(merged[1], (0x9000, 32))
@@ -57,6 +58,10 @@ class TestRemoteSliceCoalescingAndResilience(unittest.TestCase):
 
         adapter = RemoteSshTargetAdapter(host="10.0.0.1", command_runner=runner, use_control_master=False)
         adapter.verify_pinned_identity = lambda pid, **kw: (True, None)
+        adapter._maps_micro_cache[1234] = (time.monotonic(), [
+            {'start_int': 0x1000, 'end_int': 0x2000, 'is_readable': True, 'permissions': 'rw-p'},
+            {'start_int': 0x9000, 'end_int': 0xa000, 'is_readable': True, 'permissions': 'rw-p'},
+        ])
 
         slices = [(0x1000, 8), (0x1000, 8), (0x1004, 12), (0x1060, 8), (0x9000, 32)]
         res = adapter.read_memory_batch(1234, slices)
