@@ -343,3 +343,132 @@ class TestRemoteFileTransferPipelineIntegrity(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestTransferProtocolIntegrity(unittest.TestCase):
+    """Strict RAW/GZIP wire-protocol integrity: mandatory @@END, single gzip member,
+    zero trailing data, marker duplication rejection, and bounded size enforcement.
+    """
+
+    def _adapter_for(self, out_str, rc=0, err_str=""):
+        return RemoteSshTargetAdapter(
+            host="10.0.0.20",
+            command_runner=lambda args, t: (rc, out_str, err_str),
+            use_control_master=False,
+        )
+
+    def test_raw_protocol_mandatory_end_empty_truncation_and_size_bounds(self):
+        payload = b"0123456789ABCDEF"  # 16 bytes -> clean 24-char base64
+        b64_full = base64.b64encode(payload).decode("ascii")
+        # Truncated at a valid 4-char Base64 encoding boundary (first 12 chars -> 9 valid bytes)
+        b64_valid_boundary_trunc = b64_full[:12]
+
+        # 1. Valid RAW with @@END -> succeeds
+        ad = self._adapter_for(f"@@RAW\n{b64_full}\n@@END\n")
+        self.assertEqual(ad.read_target_file(100, "/f", 16), payload)
+        self.assertIsNone(ad._last_file_read_error)
+
+        # 2. Empty RAW with @@END -> valid 0-byte empty file
+        ad_empty = self._adapter_for("@@RAW\n@@END\n")
+        self.assertEqual(ad_empty.read_target_file(100, "/f", 4096), b"")
+        self.assertIsNone(ad_empty._last_file_read_error)
+
+        # 3. Invalid/unterminated/oversized RAW cases -> all must return None + INVALID_DATA
+        invalid_cases = [
+            # RAW without @@END
+            (f"@@RAW\n{b64_full}\n", 64),
+            # Base64 truncated at valid 4-char boundary without @@END
+            (f"@@RAW\n{b64_valid_boundary_trunc}\n", 64),
+            # Empty RAW without @@END
+            ("@@RAW\n", 64),
+            # Output truncated before terminator (partial @@EN)
+            (f"@@RAW\n{b64_full}\n@@EN\n", 64),
+            # RAW payload exceeding max_bytes (16 bytes > max_bytes=15)
+            (f"@@RAW\n{b64_full}\n@@END\n", 15),
+        ]
+        for out_str, max_b in invalid_cases:
+            ad_bad = self._adapter_for(out_str)
+            self.assertIsNone(ad_bad.read_target_file(100, "/f", max_b), f"Must reject {out_str!r}")
+            self.assertEqual(ad_bad._last_file_read_error["category"], "INVALID_DATA")
+
+    def test_gzip_protocol_mandatory_end_single_member_trailing_data_bomb_and_empty(self):
+        payload = b"\x7fELF" + b"G" * 10000  # 10,004 bytes
+        gz_single = gzip.compress(payload, compresslevel=1)
+        gz_b64 = base64.b64encode(gz_single).decode("ascii")
+
+        # 1. Valid single-member gzip with @@END -> succeeds
+        ad_ok = self._adapter_for(f"@@GZ\n{gz_b64}\n@@END\n")
+        self.assertEqual(ad_ok.read_target_file(100, "/f", len(payload)), payload)
+        self.assertIsNone(ad_ok._last_file_read_error)
+
+        # 2. Valid empty gzip stream with @@END -> returns b""
+        gz_empty_b64 = base64.b64encode(gzip.compress(b"", compresslevel=1)).decode("ascii")
+        ad_empty = self._adapter_for(f"@@GZ\n{gz_empty_b64}\n@@END\n")
+        self.assertEqual(ad_empty.read_target_file(100, "/f", 16384), b"")
+        self.assertIsNone(ad_empty._last_file_read_error)
+
+        # 3. Gzip with trailing garbage bytes (decomp.unused_data != b"") -> INVALID_DATA
+        gz_trailing = gz_single + b"TRAILING_GARBAGE"
+        gz_trailing_b64 = base64.b64encode(gz_trailing).decode("ascii")
+
+        # 4. Concatenated multi-member gzip -> INVALID_DATA (single-member contract)
+        gz_concat = gzip.compress(b"part1", compresslevel=1) + gzip.compress(b"part2", compresslevel=1)
+        gz_concat_b64 = base64.b64encode(gz_concat).decode("ascii")
+
+        # 5. Decompression bomb (2 MB of zeros compressed to ~2 KB, requested max_bytes=8192)
+        gz_bomb = gzip.compress(b"\x00" * (2 * 1024 * 1024), compresslevel=9)
+        gz_bomb_b64 = base64.b64encode(gz_bomb).decode("ascii")
+
+        # 6. Truncated gzip stream
+        gz_trunc_b64 = base64.b64encode(gz_single[:-8]).decode("ascii")
+
+        invalid_gz_cases = [
+            # Missing @@END
+            (f"@@GZ\n{gz_b64}\n", 16384),
+            # Truncated gzip with @@END
+            (f"@@GZ\n{gz_trunc_b64}\n@@END\n", 16384),
+            # Gzip with trailing garbage
+            (f"@@GZ\n{gz_trailing_b64}\n@@END\n", 16384),
+            # Concatenated gzip members
+            (f"@@GZ\n{gz_concat_b64}\n@@END\n", 16384),
+            # Decompression bomb (bounded memory, rejected)
+            (f"@@GZ\n{gz_bomb_b64}\n@@END\n", 8192),
+            # Exact max_bytes + 1 (10004 > 10003)
+            (f"@@GZ\n{gz_b64}\n@@END\n", len(payload) - 1),
+            # Corrupt base64 inside @@GZ
+            ("@@GZ\nAAAA!!!corrupt\n@@END\n", 16384),
+            # Empty @@GZ body with @@END (gzip stream cannot be 0 bytes)
+            ("@@GZ\n@@END\n", 16384),
+        ]
+        for out_str, max_b in invalid_gz_cases:
+            ad_bad = self._adapter_for(out_str)
+            self.assertIsNone(ad_bad.read_target_file(100, "/f", max_b), f"Must reject {out_str[:30]!r}")
+            self.assertEqual(ad_bad._last_file_read_error["category"], "INVALID_DATA")
+
+    def test_protocol_framing_anomalies_and_remote_exit_failures(self):
+        b64_ok = base64.b64encode(b"ABCD").decode("ascii")
+        malformed_cases = [
+            # Missing protocol header (bare valid base64 must NOT be silently accepted)
+            f"{b64_ok}\n",
+            # Missing header with @@END
+            f"{b64_ok}\n@@END\n",
+            # Duplicated @@RAW header
+            f"@@RAW\n@@RAW\n{b64_ok}\n@@END\n",
+            # Duplicated @@END terminator
+            f"@@RAW\n{b64_ok}\n@@END\n@@END\n",
+            # Unexpected data after @@END
+            f"@@RAW\n{b64_ok}\n@@END\nextra_trailing_line\n",
+            # Unexpected protocol marker inside payload
+            f"@@RAW\n{b64_ok}\n@@UNEXPECTED\n@@END\n",
+            # Output truncated right after header
+            "@@GZ\n",
+        ]
+        for out_str in malformed_cases:
+            ad = self._adapter_for(out_str)
+            self.assertIsNone(ad.read_target_file(100, "/f", 4096), f"Must reject {out_str!r}")
+            self.assertEqual(ad._last_file_read_error["category"], "INVALID_DATA")
+
+        # Remote non-zero exit status even if stdout looks framed -> must fail
+        ad_rc1 = self._adapter_for(f"@@RAW\n{b64_ok}\n@@END\n", rc=1, err_str="remote command failed")
+        self.assertIsNone(ad_rc1.read_target_file(100, "/f", 4096))
+        self.assertIsNotNone(ad_rc1._last_file_read_error)

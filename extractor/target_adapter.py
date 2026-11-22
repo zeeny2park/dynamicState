@@ -3357,12 +3357,8 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
         if not lines:
             self._last_file_read_error = {"category": "INVALID_DATA", "path": p_str, "rc": rc, "stderr": "empty remote output"}
             return None
-        # Check for structured error markers either as sole output (precheck) or trailer (post-precheck pipeline failure)
-        err_line = None
-        if lines[0].startswith("@@ERR:"):
-            err_line = lines[0]
-        elif lines[-1].startswith("@@ERR:"):
-            err_line = lines[-1]
+        # Any structured error marker anywhere in the response takes precedence over payload decoding
+        err_line = next((ln for ln in lines if ln.startswith("@@ERR:")), None)
         if err_line is not None:
             err_tag = err_line[6:].strip() or "UNAVAILABLE"
             cat_map = {
@@ -3380,18 +3376,40 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
                 "stderr": err_tag,
             }
             return None
-        if lines[0] == "@@EMPTY":
-            self._last_file_read_error = None
-            return b""
+        header = lines[0]
+        if header not in ("@@GZ", "@@RAW"):
+            self._last_file_read_error = {
+                "category": "INVALID_DATA",
+                "path": p_str,
+                "rc": rc,
+                "stderr": f"missing or unexpected protocol header: {header[:40]}",
+            }
+            return None
+        if len(lines) < 2 or lines[-1] != "@@END":
+            self._last_file_read_error = {
+                "category": "INVALID_DATA",
+                "path": p_str,
+                "rc": rc,
+                "stderr": "missing mandatory @@END terminator",
+            }
+            return None
+        body_lines = lines[1:-1]
+        if any(ln.startswith("@@") for ln in body_lines):
+            self._last_file_read_error = {
+                "category": "INVALID_DATA",
+                "path": p_str,
+                "rc": rc,
+                "stderr": "duplicate or unexpected protocol marker inside payload",
+            }
+            return None
         try:
-            if lines[0] == "@@GZ":
-                has_end = len(lines) >= 2 and lines[-1] == "@@END"
-                body_lines = lines[1:-1] if has_end else lines[1:]
-                b64_compact = "".join("".join(body_lines).split())
+            b64_compact = "".join("".join(body_lines).split())
+            if header == "@@GZ":
                 if not b64_compact:
                     self._last_file_read_error = {"category": "INVALID_DATA", "path": p_str, "rc": rc, "stderr": "empty gzip payload"}
                     return None
                 raw_gz = base64.b64decode(b64_compact, validate=True)
+                # Single gzip member contract: bounded to n_bytes + 1, must reach EOF with zero trailing bytes
                 decomp = zlib.decompressobj(16 + zlib.MAX_WBITS)
                 data = decomp.decompress(raw_gz, n_bytes + 1)
                 if len(data) > n_bytes or decomp.unconsumed_tail:
@@ -3421,20 +3439,30 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
                         "stderr": "truncated gzip stream",
                     }
                     return None
-                return data
-            if lines[0] == "@@RAW":
-                has_end = len(lines) >= 2 and lines[-1] == "@@END"
-                body_lines = lines[1:-1] if has_end else lines[1:]
-                b64_compact = "".join("".join(body_lines).split())
-                if not b64_compact:
-                    if has_end:
-                        self._last_file_read_error = None
-                        return b""
-                    self._last_file_read_error = {"category": "INVALID_DATA", "path": p_str, "rc": rc, "stderr": "empty raw payload"}
+                if decomp.unused_data:
+                    self._last_file_read_error = {
+                        "category": "INVALID_DATA",
+                        "path": p_str,
+                        "rc": rc,
+                        "stderr": "unexpected trailing data after gzip stream",
+                    }
                     return None
-                return base64.b64decode(b64_compact, validate=True)[:n_bytes]
-            b64_compact = "".join("".join(lines).split())
-            return base64.b64decode(b64_compact, validate=True)[:n_bytes]
+                return data
+            # header == "@@RAW"
+            if not b64_compact:
+                # Valid 0-byte empty file explicitly terminated by @@END
+                self._last_file_read_error = None
+                return b""
+            data = base64.b64decode(b64_compact, validate=True)
+            if len(data) > n_bytes:
+                self._last_file_read_error = {
+                    "category": "INVALID_DATA",
+                    "path": p_str,
+                    "rc": rc,
+                    "stderr": "raw payload exceeds max_bytes",
+                }
+                return None
+            return data
         except Exception as exc:  # noqa: BLE001
             self._last_file_read_error = {"category": "INVALID_DATA", "path": p_str, "rc": rc, "stderr": str(exc)[:200]}
             return None

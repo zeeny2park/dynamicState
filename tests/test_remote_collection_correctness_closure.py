@@ -113,7 +113,7 @@ class TestFinding2RemoteElfImageNegativeCache(unittest.TestCase):
             if calls[0] <= 2:
                 # Transient SSH timeout returning None via read_target_file (NOT raising)
                 return -1, "", "SSH command timed out after 5.0s"
-            return 0, f"@@RAW\n{base64.b64encode(elf_bytes).decode()}\n", ""
+            return 0, f"@@RAW\n{base64.b64encode(elf_bytes).decode()}\n@@END\n", ""
 
         adapter = RemoteSshTargetAdapter(host="10.0.0.5", command_runner=runner, use_control_master=False)
         resolver = RemoteImageResolver(adapter, 1234, None, None)
@@ -142,7 +142,7 @@ class TestFinding2RemoteElfImageNegativeCache(unittest.TestCase):
             if "secret.so" in cmd:
                 return 0, "@@ERR:PERMISSION_DENIED\n", ""
             if "notelf.so" in cmd:
-                return 0, f"@@RAW\n{base64.b64encode(b'NOT_AN_ELF' * 6).decode()}\n", ""
+                return 0, f"@@RAW\n{base64.b64encode(b'NOT_AN_ELF' * 6).decode()}\n@@END\n", ""
             return 0, "@@ERR:FILE_MISSING\n", ""
 
         adapter = RemoteSshTargetAdapter(host="10.0.0.6", command_runner=runner, use_control_master=False)
@@ -164,7 +164,7 @@ class TestFinding2RemoteElfImageNegativeCache(unittest.TestCase):
             if "stat -c" in cmd:
                 return 0, f"{len(elf_bytes)} 1700000000\n", ""
             time.sleep(0.01)
-            return 0, f"@@RAW\n{base64.b64encode(elf_bytes).decode()}\n", ""
+            return 0, f"@@RAW\n{base64.b64encode(elf_bytes).decode()}\n@@END\n", ""
 
         adapter = RemoteSshTargetAdapter(host="10.0.0.7", command_runner=runner, use_control_master=False)
         resolver = RemoteImageResolver(adapter, 1234, None, None)

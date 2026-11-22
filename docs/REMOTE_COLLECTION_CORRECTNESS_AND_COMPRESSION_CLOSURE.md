@@ -269,3 +269,72 @@ Added `tests/test_remote_file_transfer_pipeline_integrity.py` (11 tests, execute
 
 **CONDITIONAL GO — Remote Collection Integrity Closure Complete Locally (`SOURCE VERIFIED`, `TEST VERIFIED`).**
 All post-precheck pipeline masking, unbounded decompression, non-strict base64, and transient read/truncation negative-cache gaps are closed and verified by 232/232 passing local tests. Final release sign-off requires applying `dynamicstate-final-remote-integrity-closure.patch` to `zeeny2park/dynamicState` at `e3c7ad3931e23dc2cca8fd55380e8c980737f30e` and confirming green GitHub Actions CI runs.
+
+
+---
+
+## 15. Final Transfer Protocol Integrity Closure (Baseline `64206828c927ad9bcf1a0f6fae7eb95ae4d92721`)
+
+This final narrowly scoped audit inspected the wire framing, termination, trailing-data handling, and size-limit parity of `RemoteSshTargetAdapter.read_target_file()` on baseline `64206828c927ad9bcf1a0f6fae7eb95ae4d92721` (local mirror `7298d51`).
+
+### 15.1 Findings & Severity (`SOURCE VERIFIED`)
+
+1. **HIGH — Unterminated `@@RAW` and `@@GZ` Payloads Silently Accepted (`extractor/target_adapter.py`):**
+   - Although the parser checked `has_end = lines[-1] == "@@END"`, non-empty `@@RAW` and `@@GZ` bodies were still decoded when `has_end` was `False`. A `@@RAW` transfer truncated by transport at any 4-character Base64 boundary could therefore be accepted as a complete read.
+2. **HIGH — Unchecked `decomp.unused_data` in Gzip Decompression (`extractor/target_adapter.py`):**
+   - `zlib.decompressobj(16 + zlib.MAX_WBITS)` stops at the end of the first gzip member and places trailing garbage or concatenated gzip members in `decomp.unused_data`. Because `decomp.unused_data` was not checked, trailing garbage and unexpected multi-member streams were silently ignored.
+3. **MEDIUM — Unframed Base64 Fallback, Duplicate Markers, and Unchecked RAW Size Excess (`extractor/target_adapter.py`):**
+   - Arbitrary non-protocol stdout that happened to be valid Base64 fell through to plain decoding; duplicated/embedded `@@` markers inside payload lines were not rejected; and RAW payloads larger than `n_bytes` were silently sliced rather than rejected as `INVALID_DATA`.
+
+### 15.2 Explicit Transfer Protocol & Read Contract (`SOURCE VERIFIED`, `TEST VERIFIED`)
+
+#### Wire Format & Mandatory Terminator Rules
+- **Valid framed responses:**
+  - `@@RAW\n<base64 lines>\n@@END\n` (or `@@RAW\n@@END\n` for a valid 0-byte empty file)
+  - `@@GZ\n<base64 lines of single gzip member>\n@@END\n`
+  - `@@ERR:<TAG>\n` (sole line on precheck failure or trailer line on post-precheck pipeline failure)
+- **Strict framing policy (no silent unframed legacy fallback):**
+  - Because `read_target_file()` emits its own target POSIX `sh` script over SSH in lockstep with the host parser, both sides always speak the framed protocol.
+  - Any response missing a valid `@@RAW`/`@@GZ` header, missing the final `@@END` terminator, containing duplicate/embedded `@@` markers, or containing trailing lines after `@@END` is rejected as `INVALID_DATA`.
+  - Any `@@ERR:<TAG>` line anywhere in the output takes precedence over payload decoding.
+
+#### Gzip Trailing-Data & Multi-Member Policy
+- **Single gzip member, zero trailing bytes:** The target script pipes a single `head -c N` stream into a single `gzip -1 -c` invocation, which always produces exactly one gzip member.
+- Host decompression uses `zlib.decompressobj(16 + zlib.MAX_WBITS)` bounded to `n_bytes + 1` bytes and requires `decomp.eof == True`, `decomp.unconsumed_tail == b""`, `decomp.unused_data == b""`, and `len(data) <= n_bytes`. Truncated gzip streams, trailing garbage, concatenated multi-member gzip streams, and decompression bombs are all deterministically rejected as `INVALID_DATA`.
+
+#### Read Semantics Contract (Identical for RAW and GZIP)
+
+| Scenario | Behavior | `_last_file_read_error` |
+| --- | --- | --- |
+| Read up to `N` bytes (`file < N`, normal EOF) | Returns full file bytes | `None` |
+| File exactly `N` bytes | Returns exact `N` bytes | `None` |
+| File larger than `N` bytes | `head -c N` reads exact `N`-byte prefix; `RemoteImageResolver` requests `max_bytes + 1` and rejects oversized binaries | `None` (in `read_target_file`); negative-cached as oversized in resolver |
+| Valid 0-byte empty file | `@@RAW\n@@END` or empty single-member `@@GZ` + `@@END` -> returns `b""` | `None` |
+| `/proc` virtual file (`st_size == 0`) | Does not depend on `stat` size; `head -c N` reads virtual content cleanly | `None` |
+| Missing file (`[ ! -e ]`) | `@@ERR:FILE_MISSING` -> returns `None` | `FILE_MISSING` |
+| Permission denied (`[ ! -r ]`) | `@@ERR:PERMISSION_DENIED` -> returns `None` | `PERMISSION_DENIED` |
+| Partial read / I/O failure (`head` exits non-zero) | `@@ERR:READ_FAIL` -> returns `None` (partial bytes discarded) | `READ_FAILED` (not negative-cached) |
+| File mutation/truncation during read | `RemoteImageResolver` detects `stat[0] != len(data)` -> returns `None` | Skipped as truncated/mutated (not negative-cached; retryable) |
+| `gzip` / `base64` failure | `@@ERR:GZIP_FAIL` / `@@ERR:B64_FAIL` -> returns `None` | `PIPELINE_FAIL` (not negative-cached) |
+| Missing `@@END`, corrupt Base64, truncated/trailing/bomb gzip, raw `> N` bytes | Returns `None` | `INVALID_DATA` |
+| SSH timeout / connection reset / cancellation | Non-zero SSH exit -> returns `None` | `TIMEOUT` / `TRANSPORT_ERROR` / `CANCELLED` (not negative-cached) |
+
+### 15.3 Adversarial Tests Added & Regression Results (`TEST VERIFIED`)
+
+Added `TestTransferProtocolIntegrity` (3 comprehensive test methods covering all RAW, GZIP, and protocol framing edge cases) to `tests/test_remote_file_transfer_pipeline_integrity.py` (14 tests total) and updated the 5 framed mock lines in `tests/test_remote_transfer_compression_and_edge_cases.py` and `tests/test_remote_collection_correctness_closure.py` to include `@@END`.
+
+| Verification Scope | Result | Classification |
+| --- | --- | --- |
+| `tests/test_remote_file_transfer_pipeline_integrity.py` (all RAW, GZIP, pipeline & framing adversarial tests) | 14/14 PASS (0.073 s) | `TEST VERIFIED` |
+| Core 13 remote, coalescing, resilience, scheduler, performance, compression, collector, adversarial & CI parity modules | 171/171 PASS (17.350 s, 0 skipped) | `TEST VERIFIED` |
+| Phase 2.0-A.3.17 / A.3.18 / A.3.19 durability & trust modules (9 modules) | 64/64 PASS (2.935 s, 0 skipped) | `TEST VERIFIED` |
+| Native C collector (`make -C target/collector all`, `./target/collector/test_crypto --selftest`) & `py_compile` | PASS (0 warnings, 0 errors) | `TEST VERIFIED` |
+| **Combined Verified Regression Total (22 modules)** | **235/235 PASS (0 failed, 0 errors, 0 skipped)** | `TEST VERIFIED` |
+| Remote GitHub Actions CI (`Full Test Suite`, `GDB 9.2 Compatibility`) & live ARM64/WAN target latency | Offline sandbox — not executed | `NOT VERIFIED` |
+
+*(Note: An exploratory run of legacy `test_imp011_remote_thread_info.py` and `test_imp022_remote_command_cost.py` confirmed all `read_target_file()` assertions pass; unrelated pre-existing thread-micro-cache assertions from an earlier optimization pass failed and were left untouched per narrow scope.)*
+
+### 15.4 Final GO / NO-GO Decision
+
+**CONDITIONAL GO — Transfer Protocol Integrity Closure Complete Locally (`SOURCE VERIFIED`, `TEST VERIFIED`).**
+RAW and GZIP transfers now share identical strict framing (`@@END` mandatory), single-member zero-trailing-data gzip validation, bounded memory decompression, and symmetric `max_bytes` enforcement with zero regressions across all 235 verified local tests. Apply `dynamicstate-final-transfer-protocol-closure.patch` to `zeeny2park/dynamicState` at `64206828c927ad9bcf1a0f6fae7eb95ae4d92721` and verify green GitHub Actions CI to complete release sign-off.

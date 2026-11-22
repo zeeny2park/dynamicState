@@ -27,7 +27,7 @@ class TestRemoteTransferCompressionAndEdgeCases(unittest.TestCase):
         seen_cmds = []
         ad_gz = RemoteSshTargetAdapter(
             host="10.0.0.1",
-            command_runner=lambda args, t: (seen_cmds.append(args[-1]), (0, f"@@GZ\n{gz_b64}\n", ""))[1],
+            command_runner=lambda args, t: (seen_cmds.append(args[-1]), (0, f"@@GZ\n{gz_b64}\n@@END\n", ""))[1],
             use_control_master=False,
         )
         got_gz = ad_gz.read_target_file(1234, "/lib/libc.so.6", 65536)
@@ -38,7 +38,7 @@ class TestRemoteTransferCompressionAndEdgeCases(unittest.TestCase):
         # 2. Raw fallback path (target without gzip)
         ad_raw = RemoteSshTargetAdapter(
             host="10.0.0.2",
-            command_runner=lambda args, t: (0, f"@@RAW\n{raw_b64}\n", ""),
+            command_runner=lambda args, t: (0, f"@@RAW\n{raw_b64}\n@@END\n", ""),
             use_control_master=False,
         )
         got_raw = ad_raw.read_target_file(1234, "/lib/libc.so.6", 65536)
