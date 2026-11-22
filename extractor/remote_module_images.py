@@ -82,6 +82,15 @@ class RemoteImageResolver:
         stat: Optional[Tuple[int, int]] = None
         if hit is not None and (now - hit[3]) <= REVALIDATE_SEC:
             return self._usable(path, hit[2])
+        rem_fn = getattr(self.adapter, "remaining_deadline_sec", None)
+        if callable(rem_fn):
+            try:
+                rem_s = rem_fn()
+                if rem_s is not None and rem_s <= 0:
+                    self.skipped[path] = "collection deadline exceeded before module fetch"
+                    return None
+            except Exception:  # noqa: BLE001
+                pass
         stat_fn = getattr(self.adapter, "stat_target_file", None)
         if callable(stat_fn):
             try:
@@ -94,12 +103,17 @@ class RemoteImageResolver:
             return self._usable(path, hit[2])
         if stat is not None and stat[0] > self.max_bytes:
             return self._remember(key, stat, None, now, f"image is {stat[0]} bytes, above the {self.max_bytes} byte cap")
+        transient_error = False
         try:
             data = self.adapter.read_target_file(self.pid, path, self.max_bytes + 1)
         except Exception as exc:  # noqa: BLE001
             data = None
+            transient_error = True
             self.skipped[path] = f"fetch failed: {type(exc).__name__}"
         if not data:
+            if transient_error:
+                # Do not poison global cache for 30s on a transient SSH timeout/transport exception
+                return None
             return self._remember(key, stat, None, now, self.skipped.get(path) or "could not be read from the target")
         if len(data) > self.max_bytes:
             return self._remember(key, stat, None, now, f"image exceeds the {self.max_bytes} byte cap")

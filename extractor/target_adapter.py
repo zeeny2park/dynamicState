@@ -15,6 +15,7 @@ Enforces:
 
 from abc import ABC, abstractmethod
 import base64
+import gzip
 import contextlib
 import contextvars
 from dataclasses import dataclass, field
@@ -3307,12 +3308,34 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
                 text = self._procfile_text(int(m.group(1)), m.group(2))
                 if text is not None:
                     return text.encode("utf-8", "replace")[:max(0, int(max_bytes))]
-        cmd = f"head -c {int(max_bytes)} {shlex.quote(p_str)} 2>/dev/null | base64"
+        n_bytes = max(0, int(max_bytes))
+        if n_bytes == 0:
+            return b""
+        q_path = shlex.quote(p_str)
+        if n_bytes >= 8192:
+            cmd = (
+                f"if command -v gzip >/dev/null 2>&1; then "
+                f"echo @@GZ; head -c {n_bytes} {q_path} 2>/dev/null | gzip -c 2>/dev/null | base64; "
+                f"else echo @@RAW; head -c {n_bytes} {q_path} 2>/dev/null | base64; fi"
+            )
+        else:
+            cmd = f"head -c {n_bytes} {q_path} 2>/dev/null | base64"
         rc, out, _ = self.run_ssh(cmd, timeout=self.timeout_sec * 1.5)
-        if rc != 0 or not out.strip():
+        stripped = out.strip() if out else ""
+        if rc != 0 or not stripped:
             return None
         try:
-            return base64.b64decode(out.strip())
+            if stripped.startswith("@@GZ"):
+                b64_body = stripped[4:].strip()
+                if not b64_body:
+                    return None
+                return gzip.decompress(base64.b64decode(b64_body))[:n_bytes]
+            if stripped.startswith("@@RAW"):
+                b64_body = stripped[5:].strip()
+                if not b64_body:
+                    return None
+                return base64.b64decode(b64_body)[:n_bytes]
+            return base64.b64decode(stripped)[:n_bytes]
         except Exception:  # noqa: BLE001
             return None
 
@@ -4183,11 +4206,16 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
         results.sort(key=lambda r: (1 if r.get("exact_name_match") else 0, r.get("pid", 0)), reverse=True)
         if target_bid:
             for cand in results[:5]:
+                rem = self.remaining_deadline_sec()
+                if rem is not None and rem <= 0:
+                    break
                 ident = self.get_process_identity(cand["pid"])
                 bid = ident.get("build_id")
                 cand["build_id"] = bid
                 if bid and bid.lower() == target_bid:
                     cand["build_id_match"] = True
+                    if cand.get("exact_name_match"):
+                        break
             results.sort(key=lambda r: (
                 1 if r.get("build_id_match") else 0,
                 1 if r.get("exact_name_match") else 0,
@@ -4222,7 +4250,16 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
                 dests.append(d)
 
         # Target architecture (also used to pick the local binary).
-        rc_u, out_u, _ = self.run_ssh("uname -m 2>/dev/null")
+        rc_u, out_u, err_u = self.run_ssh("uname -m 2>/dev/null")
+        if rc_u != 0:
+            err_cls = self.classify_remote_error(rc_u, err_u, out_u)
+            if rc_u == -1 or err_cls in ("TIMEOUT", "PERMISSION_DENIED", "HOST_KEY_ERROR", "TRANSPORT_ERROR"):
+                return {
+                    "deployed": False,
+                    "status": "FALLBACK_SHELL",
+                    "collector_path": None,
+                    "reason": f"Remote target unreachable during collector probe ({err_cls}): {(err_u or '').strip()}",
+                }
         rem_arch_raw = out_u.strip().lower() if rc_u == 0 else ""
         rem_canon = canonical_collector_arch(rem_arch_raw)
 
