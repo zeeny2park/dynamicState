@@ -97,6 +97,8 @@ def _stats(samples: List[float]) -> Dict[str, float]:
         "p50_s": round(statistics.median(s), 5),
         "p90_s": round(pct(0.90), 5),
         "p95_s": round(pct(0.95), 5),
+        "p99_s": round(pct(0.99), 5),
+        "tail_latency_reliable": len(s) >= 20,
         "min_s": round(s[0], 5),
         "max_s": round(s[-1], 5),
         "mean_s": round(statistics.mean(s), 5),
@@ -369,7 +371,8 @@ def _run_scenario_g(mode: str, runs: int) -> Dict[str, Any]:
             "maps": n_maps,
             "threads": 200,
             "payload_bytes": payload_bytes,
-            "throughput_mb_s": round((payload_bytes / (1024 * 1024)) / max(med, 1e-6), 2),
+            "local_parsing_throughput_mb_s": round((payload_bytes / (1024 * 1024)) / max(med, 1e-6), 2),
+            "measurement_type": "LOCAL_PARSING_WITH_SYNTHETIC_RTT_5MS",
             "timing": _stats(durs),
         }
     return {"scenario": "G_large_collection", "mode": mode, "sizes": sizes}
@@ -384,6 +387,8 @@ def main() -> int:
 
     results = {
         "mode": args.mode,
+        "baseline_methodology": "simulated_sequential_baseline" if args.mode == "baseline" else "optimized_bounded_parallel",
+        "network_model": "synthetic_deterministic_rtt_except_scenario_F_real_subprocess",
         "runs": args.runs,
         "environment": {
             "os": platform.platform(),
@@ -413,7 +418,7 @@ def main() -> int:
     print(f"  E (Auth Failure):  p50={results['scenarios']['E']['timing']['p50_s']:.4f}s, ssh={results['scenarios']['E']['ssh_commands_per_run']}")
     print(f"  F (Timeout 0.12s): p50={results['scenarios']['F']['timing']['p50_s']:.4f}s")
     g1000 = results["scenarios"]["G"]["sizes"]["1000"]
-    print(f"  G (1000 maps):     p50={g1000['timing']['p50_s']:.4f}s, payload={g1000['payload_bytes']}B, throughput={g1000['throughput_mb_s']} MB/s")
+    print(f"  G (1000 maps):     p50={g1000['timing']['p50_s']:.4f}s, payload={g1000['payload_bytes']}B, throughput={g1000['local_parsing_throughput_mb_s']} MB/s")
     return 0
 
 

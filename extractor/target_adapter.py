@@ -29,6 +29,7 @@ import atexit
 import re
 import select
 import shlex
+import signal
 import shutil
 import subprocess
 import tempfile
@@ -2492,10 +2493,20 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
             self._deadline_tls.deadline = prev
 
     def remaining_deadline_sec(self) -> Optional[float]:
+        deadlines: List[float] = []
         dl = getattr(self._deadline_tls, "deadline", None)
-        if dl is None:
+        if dl is not None:
+            deadlines.append(dl)
+        try:
+            from extractor.remote_scheduler import get_active_execution_context
+            sched_dl, _, _ = get_active_execution_context()
+            if sched_dl is not None:
+                deadlines.append(sched_dl)
+        except Exception:  # noqa: BLE001
+            pass
+        if not deadlines:
             return None
-        return dl - time.monotonic()
+        return min(deadlines) - time.monotonic()
 
     def _bound_timeout(self, requested: float) -> float:
         if isinstance(requested, bool) or not math.isfinite(float(requested)) or float(requested) <= 0:
@@ -2511,6 +2522,36 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
         self, cmd_args: List[str], timeout: float, input_bytes: Optional[bytes] = None
     ) -> Tuple[int, str, str]:
         proc: Optional[subprocess.Popen] = None
+        unregister_hook: Optional[Callable[[], None]] = None
+        cancel_event = None
+        register_hook = None
+        try:
+            from extractor.remote_scheduler import get_active_execution_context
+            _, cancel_event, register_hook = get_active_execution_context()
+        except Exception:  # noqa: BLE001
+            pass
+        if cancel_event is not None and cancel_event.is_set():
+            return -1, "", "SSH command cancelled before start"
+
+        def _kill_proc_group(p: subprocess.Popen) -> None:
+            if p.poll() is not None:
+                return
+            if os.name == "posix":
+                try:
+                    os.killpg(p.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                except Exception:  # noqa: BLE001
+                    try:
+                        p.kill()
+                    except Exception:  # noqa: BLE001
+                        pass
+            else:
+                try:
+                    p.kill()
+                except Exception:  # noqa: BLE001
+                    pass
+
         try:
             popen_kwargs: Dict[str, Any] = {
                 "stdin": subprocess.PIPE if input_bytes is not None else subprocess.DEVNULL,
@@ -2521,7 +2562,11 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
             if os.name == "posix":
                 popen_kwargs["start_new_session"] = True
             proc = subprocess.Popen(cmd_args, **popen_kwargs)
+            if register_hook is not None:
+                unregister_hook = register_hook(lambda p=proc: _kill_proc_group(p))
             out_b, err_b = proc.communicate(input=input_bytes, timeout=timeout)
+            if cancel_event is not None and cancel_event.is_set():
+                return -1, "", "SSH command cancelled"
             return (
                 proc.returncode if proc.returncode is not None else -1,
                 (out_b or b"").decode("utf-8", "replace"),
@@ -2584,6 +2629,12 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
                         except Exception:  # noqa: BLE001
                             pass
             return -1, "", f"SSH execution error: {e}"
+        finally:
+            if unregister_hook is not None:
+                try:
+                    unregister_hook()
+                except Exception:  # noqa: BLE001
+                    pass
 
     def reset_auth_failure(self) -> None:
         """Clears cached permanent SSH authentication failure state (e.g. after credential update)."""
