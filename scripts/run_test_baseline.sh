@@ -159,6 +159,9 @@ PY
         status="INFRA_FAILURE"
     elif [ "$rc" -eq 0 ] && [ "${tests_ran}" -gt 0 ]; then
         status="PASSED"
+    elif [ "${fw}" = "pytest" ] && [ "${HAS_PYTEST}" -eq 0 ]; then
+        status="FAILED"
+        rc=5
     elif [ "${tests_ran}" -eq 0 ]; then
         status="FAILED"
         rc=5

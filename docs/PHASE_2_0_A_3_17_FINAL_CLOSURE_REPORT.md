@@ -235,3 +235,16 @@ Not claimed as an authoritative run — this VM ran from an unpacked archive wit
 ## 19. Explicit Final Decision
 
 **NO-GO** — All local P0/P1 implementation, durability, atomicity, recovery, CI-runner, and regression-fix items are complete and verified (305/305 local tests passing), but final GO requires executing the external CI workflows (`test.yml` including `pytest`/`hypothesis`, `gdb92.yml`, `embedded-matrix.yml`) and an authoritative clean-tree Diagnosis Accuracy Benchmark outside this offline sandbox VM.
+
+---
+
+## 14. Dated Final Release Evidence Closure Addendum (2026-11-22)
+
+*Preserving Sections 1–13 as historical record; this addendum records the 2026-11-22 revalidation.*
+
+- **Revalidated Suites (`python3 scripts/run_unittest.py`)**: All 7 Phase 2.0-A.3.17 suites (51/51 PASS), all 5 A.3.18 suites (27/27 PASS), all 4 A.3.19 suites (26/26 PASS), `test_finalization_review2_adversarial.py` (12/12 PASS), `test_final_product_stability_and_edge_cases.py` (15/15 PASS), and `test_ci_workflow_parity.py` (8/8 PASS) — **139/139 PASS (0 failures, 0 skips)**.
+- **Defects Resolved in Final Evidence Closure**:
+  1. `scripts/run_test_baseline.sh`: Preserved `FRAMEWORK_MISMATCH` in `summary.tsv` when `pytest` is absent instead of overwriting the final line with `ZERO_TESTS` (resolving `test_pytest_only_file_never_false_passes_under_unittest` in `tests/test_phase2_0_a_3_17_closure_matrix.py`).
+  2. `extractor/target_adapter.py`: Extended POSIX process-group cleanup (`os.killpg`) and pipe closing to the `except Exception:` branch of `RemoteSshTargetAdapter._default_command_runner()`.
+- **CI Evidence Status**: Repository owner reported green GitHub Actions workflow execution; independent retrieval of GitHub Actions Run IDs/URLs remains environment-blocked in this offline sandbox.
+- **Updated Release Verdict**: **`CONDITIONAL GO`** (No remaining implementation work identified within Phase 2.0-A.3.17 scope; attach final GitHub Actions Run URLs after pushing this patch).

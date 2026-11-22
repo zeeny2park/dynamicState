@@ -2554,12 +2554,33 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
                             pass
             return -1, "", f"SSH command timed out after {timeout:.2f}s"
         except Exception as e:
-            if proc is not None and proc.poll() is None:
-                try:
-                    proc.kill()
-                    proc.wait(timeout=0.5)
-                except Exception:  # noqa: BLE001
-                    pass
+            if proc is not None:
+                if proc.poll() is None:
+                    if os.name == "posix":
+                        try:
+                            os.killpg(proc.pid, signal.SIGKILL)
+                        except ProcessLookupError:
+                            pass
+                        except Exception:  # noqa: BLE001
+                            try:
+                                proc.kill()
+                            except Exception:  # noqa: BLE001
+                                pass
+                    else:
+                        try:
+                            proc.kill()
+                        except Exception:  # noqa: BLE001
+                            pass
+                    try:
+                        proc.wait(timeout=0.5)
+                    except Exception:  # noqa: BLE001
+                        pass
+                for stream in (proc.stdin, proc.stdout, proc.stderr):
+                    if stream is not None:
+                        try:
+                            stream.close()
+                        except Exception:  # noqa: BLE001
+                            pass
             return -1, "", f"SSH execution error: {e}"
 
     def run_ssh(
