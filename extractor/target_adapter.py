@@ -16,6 +16,7 @@ Enforces:
 from abc import ABC, abstractmethod
 import base64
 import gzip
+import zlib
 import contextlib
 import contextvars
 from dataclasses import dataclass, field
@@ -3317,45 +3318,60 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
         precheck = (
             f"if [ ! -e {q_path} ]; then echo @@ERR:FILE_MISSING; exit 0; fi; "
             f"if [ ! -r {q_path} ]; then echo @@ERR:PERMISSION_DENIED; exit 0; fi; "
-            f"if [ -d {q_path} ]; then echo @@ERR:PIPELINE_FAIL; exit 0; fi; "
-            f"head -c 1 {q_path} >/dev/null 2>&1 || {{ echo @@ERR:PIPELINE_FAIL; exit 0; }}; "
+            f"if [ -d {q_path} ]; then echo @@ERR:READ_FAIL; exit 0; fi; "
+            f"exec 3>&1; "
+        )
+        gz_branch = (
+            f"printf '@@GZ\\n'; "
+            f"st=$( {{ {{ {{ head -c {n_bytes} {q_path} 2>/dev/null; printf ' H=%d ' \"$?\" >&4; }} "
+            f"| {{ gzip -1 -c 2>/dev/null; printf ' G=%d ' \"$?\" >&4; }} "
+            f"| {{ base64 2>/dev/null; printf ' B=%d ' \"$?\" >&4; }}; }} >&3; }} 4>&1 ); "
+            f"st=\" $st \"; "
+            f"case \"$st\" in *' B=0 '*) ;; *) printf '\\n@@ERR:B64_FAIL\\n'; exit 0;; esac; "
+            f"case \"$st\" in *' G=0 '*) ;; *) printf '\\n@@ERR:GZIP_FAIL\\n'; exit 0;; esac; "
+            f"case \"$st\" in *' H=0 '*) ;; *) printf '\\n@@ERR:READ_FAIL\\n'; exit 0;; esac; "
+            f"printf '\\n@@END\\n'"
+        )
+        raw_branch = (
+            f"printf '@@RAW\\n'; "
+            f"st=$( {{ {{ {{ head -c {n_bytes} {q_path} 2>/dev/null; printf ' H=%d ' \"$?\" >&4; }} "
+            f"| {{ base64 2>/dev/null; printf ' B=%d ' \"$?\" >&4; }}; }} >&3; }} 4>&1 ); "
+            f"st=\" $st \"; "
+            f"case \"$st\" in *' B=0 '*) ;; *) printf '\\n@@ERR:B64_FAIL\\n'; exit 0;; esac; "
+            f"case \"$st\" in *' H=0 '*) ;; *) printf '\\n@@ERR:READ_FAIL\\n'; exit 0;; esac; "
+            f"printf '\\n@@END\\n'"
         )
         if n_bytes >= 8192:
             cmd = (
                 precheck
-                + f"if command -v gzip >/dev/null 2>&1; then "
-                + f"b=$(head -c {n_bytes} {q_path} 2>/dev/null | gzip -1 -c 2>/dev/null | base64 | tr -d '\\n') "
-                + f"&& [ -n \"$b\" ] && printf '@@GZ\\n%s\\n' \"$b\" || echo @@ERR:PIPELINE_FAIL; "
-                + f"else "
-                + f"b=$(head -c {n_bytes} {q_path} 2>/dev/null | base64 | tr -d '\\n') "
-                + f"&& if [ -n \"$b\" ]; then printf '@@RAW\\n%s\\n' \"$b\"; else echo @@EMPTY; fi "
-                + f"|| echo @@ERR:PIPELINE_FAIL; fi"
+                + f"if command -v gzip >/dev/null 2>&1; then {gz_branch}; else {raw_branch}; fi"
             )
         else:
-            cmd = (
-                precheck
-                + f"b=$(head -c {n_bytes} {q_path} 2>/dev/null | base64 | tr -d '\\n') "
-                + f"&& if [ -n \"$b\" ]; then printf '@@RAW\\n%s\\n' \"$b\"; else echo @@EMPTY; fi "
-                + f"|| echo @@ERR:PIPELINE_FAIL"
-            )
+            cmd = precheck + raw_branch
         rc, out, err = self.run_ssh(f"sh -c {shlex.quote(cmd)}", timeout=self.timeout_sec * 1.5)
-        stripped = out.strip() if out else ""
         if rc != 0:
             cat = self.classify_remote_error(rc, err, out)
             self._last_file_read_error = {"category": cat, "path": p_str, "rc": rc, "stderr": (err or "")[:300]}
             return None
-        if not stripped:
+        lines = [ln.strip() for ln in (out or "").splitlines() if ln.strip()]
+        if not lines:
             self._last_file_read_error = {"category": "INVALID_DATA", "path": p_str, "rc": rc, "stderr": "empty remote output"}
             return None
-        if stripped == "@@EMPTY":
-            self._last_file_read_error = None
-            return b""
-        if stripped.startswith("@@ERR:"):
-            err_tag = stripped[6:].strip() or "UNAVAILABLE"
+        # Check for structured error markers either as sole output (precheck) or trailer (post-precheck pipeline failure)
+        err_line = None
+        if lines[0].startswith("@@ERR:"):
+            err_line = lines[0]
+        elif lines[-1].startswith("@@ERR:"):
+            err_line = lines[-1]
+        if err_line is not None:
+            err_tag = err_line[6:].strip() or "UNAVAILABLE"
             cat_map = {
                 "FILE_MISSING": "FILE_MISSING",
                 "PERMISSION_DENIED": "PERMISSION_DENIED",
-                "PIPELINE_FAIL": "INVALID_DATA",
+                "READ_FAIL": "READ_FAILED",
+                "GZIP_FAIL": "PIPELINE_FAIL",
+                "B64_FAIL": "PIPELINE_FAIL",
+                "PIPELINE_FAIL": "PIPELINE_FAIL",
             }
             self._last_file_read_error = {
                 "category": cat_map.get(err_tag, "UNAVAILABLE"),
@@ -3364,20 +3380,61 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
                 "stderr": err_tag,
             }
             return None
+        if lines[0] == "@@EMPTY":
+            self._last_file_read_error = None
+            return b""
         try:
-            if stripped.startswith("@@GZ"):
-                b64_body = stripped[4:].strip()
-                if not b64_body:
+            if lines[0] == "@@GZ":
+                has_end = len(lines) >= 2 and lines[-1] == "@@END"
+                body_lines = lines[1:-1] if has_end else lines[1:]
+                b64_compact = "".join("".join(body_lines).split())
+                if not b64_compact:
                     self._last_file_read_error = {"category": "INVALID_DATA", "path": p_str, "rc": rc, "stderr": "empty gzip payload"}
                     return None
-                return gzip.decompress(base64.b64decode(b64_body))[:n_bytes]
-            if stripped.startswith("@@RAW"):
-                b64_body = stripped[5:].strip()
-                if not b64_body:
+                raw_gz = base64.b64decode(b64_compact, validate=True)
+                decomp = zlib.decompressobj(16 + zlib.MAX_WBITS)
+                data = decomp.decompress(raw_gz, n_bytes + 1)
+                if len(data) > n_bytes or decomp.unconsumed_tail:
+                    self._last_file_read_error = {
+                        "category": "INVALID_DATA",
+                        "path": p_str,
+                        "rc": rc,
+                        "stderr": "decompressed output exceeds max_bytes",
+                    }
+                    return None
+                tail = decomp.flush()
+                if tail:
+                    data += tail
+                    if len(data) > n_bytes:
+                        self._last_file_read_error = {
+                            "category": "INVALID_DATA",
+                            "path": p_str,
+                            "rc": rc,
+                            "stderr": "decompressed output exceeds max_bytes",
+                        }
+                        return None
+                if not decomp.eof:
+                    self._last_file_read_error = {
+                        "category": "INVALID_DATA",
+                        "path": p_str,
+                        "rc": rc,
+                        "stderr": "truncated gzip stream",
+                    }
+                    return None
+                return data
+            if lines[0] == "@@RAW":
+                has_end = len(lines) >= 2 and lines[-1] == "@@END"
+                body_lines = lines[1:-1] if has_end else lines[1:]
+                b64_compact = "".join("".join(body_lines).split())
+                if not b64_compact:
+                    if has_end:
+                        self._last_file_read_error = None
+                        return b""
                     self._last_file_read_error = {"category": "INVALID_DATA", "path": p_str, "rc": rc, "stderr": "empty raw payload"}
                     return None
-                return base64.b64decode(b64_body)[:n_bytes]
-            return base64.b64decode(stripped)[:n_bytes]
+                return base64.b64decode(b64_compact, validate=True)[:n_bytes]
+            b64_compact = "".join("".join(lines).split())
+            return base64.b64decode(b64_compact, validate=True)[:n_bytes]
         except Exception as exc:  # noqa: BLE001
             self._last_file_read_error = {"category": "INVALID_DATA", "path": p_str, "rc": rc, "stderr": str(exc)[:200]}
             return None

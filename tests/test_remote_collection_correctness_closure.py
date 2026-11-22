@@ -237,7 +237,7 @@ class TestFinding3GzipPipelineErrorSemantics(unittest.TestCase):
 
     def test_pipeline_failure_and_corrupt_base64_and_ssh_failure_return_none_with_category(self):
         for out_str, rc, err_str, expected_cat in (
-            ("@@ERR:PIPELINE_FAIL\n", 0, "", "INVALID_DATA"),
+            ("@@ERR:PIPELINE_FAIL\n", 0, "", "PIPELINE_FAIL"),
             ("@@RAW\n!!!not-base64!!!\n", 0, "", "INVALID_DATA"),
             ("@@GZ\n" + base64.b64encode(b"not_gzip_bytes").decode() + "\n", 0, "", "INVALID_DATA"),
             ("", -1, "SSH command timed out after 5.0s", "TIMEOUT"),

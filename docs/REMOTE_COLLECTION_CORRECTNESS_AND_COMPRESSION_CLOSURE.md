@@ -193,3 +193,79 @@ git apply dynamicstate-remote-correctness-closure.patch
 
 **Conditional Closure — Ready to Apply and Run Remote CI (`SOURCE VERIFIED`, `TEST VERIFIED`).**
 All three audited correctness defects (VMA-unsafe memory slice coalescing, transient negative-cache poisoning in `RemoteImageResolver`, and silent `b""` masking in the POSIX `sh` gzip transfer pipeline) are fixed and verified by 221/221 passing local tests plus native C collector self-tests. Final sign-off requires applying the incremental patch to `zeeny2park/dynamicState` and confirming green GitHub Actions runs (`Full Test Suite` and `GDB 9.2 Compatibility`).
+
+
+---
+
+## 14. Final Remote Collection Integrity Closure (Baseline `e3c7ad3931e23dc2cca8fd55380e8c980737f30e`)
+
+This final audit inspected `RemoteSshTargetAdapter.read_target_file()`, RAW/GZIP transfer paths, Base64 decoding, `RemoteImageResolver`, and error classification on baseline `e3c7ad3931e23dc2cca8fd55380e8c980737f30e` (local mirror `8ad461e`) to verify whether failures occurring **after** initial file prechecks could be silently masked as successful reads.
+
+### 14.1 Defect Assessment & Root Cause (`SOURCE VERIFIED`)
+
+Five concrete defects were confirmed in the audited baseline:
+
+1. **CRITICAL — POSIX `sh` Pipeline Exit-Status Masking & Shell-Variable RAM Buffering (`extractor/target_adapter.py`):**
+   - Both GZIP and RAW transfer paths executed `b=$(head -c N path | [gzip -1 -c |] base64 | tr -d '\n')`. Without Bash `pipefail`, POSIX `sh` returns only `tr`'s exit code (`0`).
+   - If `head` failed after precheck (file unlinked between precheck and read, `EIO` mid-read, or partial read), `gzip` compressed 0 bytes (or partial bytes) and exited `0`, causing `read_target_file()` to silently return `b""` (or truncated bytes) as a successful read.
+   - If `base64` failed or was absent on the RAW path, `b=""` caused `sh` to emit `@@EMPTY`, silently returning `b""`.
+   - Assigning `b=$(...)` also buffered up to ~44 MB of base64 text inside a target POSIX shell variable in embedded RAM.
+2. **HIGH — Unbounded Host Gzip Decompression (`extractor/target_adapter.py`):**
+   - `gzip.decompress(base64.b64decode(b64_body))[:n_bytes]` decompressed the entire stream into host RAM before slicing, allowing a corrupted or oversized stream to exceed `max_bytes` in memory.
+3. **MEDIUM — Non-Strict Base64 Decoding (`extractor/target_adapter.py`):**
+   - `base64.b64decode(b64_body)` defaulted to `validate=False`, silently discarding corrupted non-base64 characters instead of rejecting invalid payloads.
+4. **MEDIUM — Transient Read/Mutation Negative Caching (`extractor/remote_module_images.py`):**
+   - `RemoteImageResolver.__call__()` negative-cached `READ_FAILED`, `PIPELINE_FAIL`, and mid-read size mismatches (`stat[0] != len(data)`) in the global 30-second `_CACHE`, preventing immediate retry after transient mid-read mutation or I/O errors.
+5. **LOW/MEDIUM — Redundant `head -c 1` Precheck Double-Open (`extractor/target_adapter.py`):**
+   - Running `head -c 1` before `head -c N` double-opened target files unnecessarily.
+
+### 14.2 Fix Implemented (`SOURCE VERIFIED`, `TEST VERIFIED`)
+
+- **Pure POSIX `sh` Per-Stage Exit-Status Propagation (`extractor/target_adapter.py`):**
+  - Replaced `b=$(... | tr -d '\n')` with a zero-temp-file, zero-`pipefail`, streaming FD-3/FD-4 POSIX `sh` pipeline (`exec 3>&1`, per-stage `printf ' H=%d ' "$?" >&4` / `G=%d` / `B=%d`, `base64` streaming directly to `>&3`, eliminating `tr` and target shell-variable buffering).
+  - Checked downstream-to-upstream (`B=0`, `G=0`, `H=0`) so downstream failures causing upstream `SIGPIPE` still report the exact failing stage (`@@ERR:B64_FAIL`, `@@ERR:GZIP_FAIL`, `@@ERR:READ_FAIL`), and emitted `@@END` only when every pipeline stage succeeded.
+  - Removed redundant `head -c 1` double-open while preserving `[ ! -e ]` (`FILE_MISSING`), `[ ! -r ]` (`PERMISSION_DENIED`), `[ -d ]` (`READ_FAIL`), optional `gzip` fallback to `@@RAW`, 8 KB threshold, and backwards compatibility with existing `@@GZ`/`@@RAW` protocol consumers.
+- **Bounded Decompression & Strict Base64 (`extractor/target_adapter.py`):**
+  - Replaced `gzip.decompress(...)[:n_bytes]` with `zlib.decompressobj(16 + zlib.MAX_WBITS)` capped at `n_bytes + 1` bytes, rejecting streams that exceed `max_bytes` or terminate with `decomp.eof == False` (`INVALID_DATA`).
+  - Enabled `base64.b64decode(compact, validate=True)` after whitespace stripping so corrupt characters always fail with `INVALID_DATA`.
+- **Transient Read/Truncation Cache Protection (`extractor/remote_module_images.py`):**
+  - Excluded `READ_FAILED`, `PIPELINE_FAIL`, and `stat[0] != len(data)` mid-read truncation/mutation from 30-second global `_CACHE` negative caching while preserving permanent negative caching for `FILE_MISSING`, `PERMISSION_DENIED`, oversized images, and non-ELF binaries.
+
+### 14.3 Deterministic Adversarial Tests Added (`TEST VERIFIED`)
+
+Added `tests/test_remote_file_transfer_pipeline_integrity.py` (11 tests, executed against real `/bin/sh` with deterministic `PATH` wrappers and zero timing races) and registered it in both `ci/workflows/test.yml` and `.github/workflows/test.yml`:
+
+- `test_precheck_succeeds_but_head_fails_in_both_gzip_and_raw_paths`
+- `test_file_disappears_between_precheck_and_read`
+- `test_partial_read_failure_never_silently_returns_partial_bytes`
+- `test_gzip_command_failure_returns_none_with_pipeline_fail`
+- `test_base64_command_failure_returns_none_with_pipeline_fail_not_empty`
+- `test_empty_file_and_proc_virtual_file_and_raw_and_gzip_valid_paths`
+- `test_gzip_unavailable_falls_back_to_raw_over_real_sh`
+- `test_corrupt_gzip_truncated_gzip_gzip_bomb_and_corrupt_base64`
+- `test_max_bytes_exact_boundary_and_max_bytes_plus_one`
+- `test_truncated_elf_and_file_mutated_during_read_not_negative_cached`
+- `test_transport_timeout_reset_cancellation_and_retry_recovery`
+
+### 14.4 Commands Executed & Verification Results (`TEST VERIFIED`)
+
+| Command / Suite | Result | Classification |
+| --- | --- | --- |
+| `python3 -m py_compile extractor/target_adapter.py extractor/remote_module_images.py tests/test_remote_collection_correctness_closure.py tests/test_remote_file_transfer_pipeline_integrity.py` | PASS | `SOURCE VERIFIED` |
+| `make -C target/collector all && ./target/collector/test_crypto --selftest` | PASS (0 warnings; FIPS 180-4 & RFC 4231) | `TEST VERIFIED` |
+| `python3 -m unittest -v tests/test_remote_file_transfer_pipeline_integrity.py` | 11/11 PASS (0.098 s) | `TEST VERIFIED` |
+| `python3 scripts/run_unittest.py` (13 core remote, coalescing, resilience, scheduler, performance, compression, collector, adversarial, CI parity modules) | 168/168 PASS (17.480 s, 0 skipped) | `TEST VERIFIED` |
+| `python3 scripts/run_unittest.py` (9 Phase 2.0-A.3.17 / A.3.18 / A.3.19 durability & trust modules) | 64/64 PASS (2.882 s, 0 skipped) | `TEST VERIFIED` |
+| **Combined Local Regression Total (22 modules)** | **232/232 PASS (0 failed, 0 errors, 0 skipped)** | `TEST VERIFIED` |
+| Remote GitHub Actions (`Full Test Suite`, `GDB 9.2 Compatibility`) | Offline sandbox — not triggered | `NOT VERIFIED` |
+| Live ARM64 / WAN SSH target latency | Offline sandbox — not measured | `NOT VERIFIED` |
+
+### 14.5 Remaining Limitations (`NOT VERIFIED`)
+
+- Remote GitHub Actions CI runs and live embedded ARM64/WAN target measurements remain `NOT VERIFIED` in this offline sandbox (`mcp>=2.0`, `pytest`, `hypothesis`, `gdb`, `docker` unavailable locally).
+- No regression in SSH round-trip count (still 1 SSH exchange per `read_target_file`), target disk impact (zero temp files), or target memory (improved from O(file_size) shell variable buffering to O(pipe_buffer) streaming).
+
+### 14.6 Final Closure Declaration & GO / NO-GO
+
+**CONDITIONAL GO — Remote Collection Integrity Closure Complete Locally (`SOURCE VERIFIED`, `TEST VERIFIED`).**
+All post-precheck pipeline masking, unbounded decompression, non-strict base64, and transient read/truncation negative-cache gaps are closed and verified by 232/232 passing local tests. Final release sign-off requires applying `dynamicstate-final-remote-integrity-closure.patch` to `zeeny2park/dynamicState` at `e3c7ad3931e23dc2cca8fd55380e8c980737f30e` and confirming green GitHub Actions CI runs.

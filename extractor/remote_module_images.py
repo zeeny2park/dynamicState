@@ -113,9 +113,9 @@ class RemoteImageResolver:
         if not data:
             last_err = getattr(self.adapter, "_last_file_read_error", None)
             err_cat = str(last_err.get("category", "")).upper() if isinstance(last_err, dict) else ""
-            if transient_error or err_cat in ("TIMEOUT", "TRANSPORT_ERROR", "CANCELLED"):
+            if transient_error or err_cat in ("TIMEOUT", "TRANSPORT_ERROR", "CANCELLED", "READ_FAILED", "PIPELINE_FAIL"):
                 self.skipped[path] = f"transient fetch failure ({err_cat or 'EXCEPTION'})"
-                # Do not poison global cache for 30s on transient SSH timeout/transport failures
+                # Do not poison global cache for 30s on transient SSH/transport/read/pipeline failures
                 return None
             # Only negative-cache confirmed permanent failures (FILE_MISSING, PERMISSION_DENIED, INVALID_DATA, etc.)
             permanent_reason = self.skipped.get(path) or (f"permanent remote error: {err_cat}" if err_cat else "could not be read from the target")
@@ -125,7 +125,9 @@ class RemoteImageResolver:
         if data[:4] != b"\x7fELF":
             return self._remember(key, stat, None, now, "fetched bytes are not an ELF image")
         if stat is not None and stat[0] != len(data):
-            return self._remember(key, stat, None, now, f"fetched {len(data)} bytes, target reports {stat[0]} (truncated)")
+            self.skipped[path] = f"fetched {len(data)} bytes, target reports {stat[0]} (truncated or mutated during read)"
+            # Do not negative-cache transient mid-read mutation or truncation
+            return None
         fd, local = tempfile.mkstemp(prefix="img_", suffix=".so", dir=_cache_dir())
         with os.fdopen(fd, "wb") as fh:
             fh.write(data)
