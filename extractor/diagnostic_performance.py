@@ -10,7 +10,38 @@ from __future__ import annotations
 import contextlib
 from dataclasses import asdict, dataclass, field
 import time
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
+
+
+@dataclass
+class CollectionOperationRecord:
+    """Structured per-operation telemetry record using monotonic timestamps (zero secrets logged)."""
+    operation_name: str
+    target_identity: str
+    collection_type: str
+    start_monotonic: float
+    end_monotonic: float
+    elapsed_s: float
+    status: str
+    retry_count: int = 0
+    payload_bytes: int = 0
+    result_count: int = 0
+    error_classification: str = "OK"
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "operation_name": self.operation_name,
+            "target_identity": self.target_identity,
+            "collection_type": self.collection_type,
+            "start_monotonic": round(float(self.start_monotonic), 6),
+            "end_monotonic": round(float(self.end_monotonic), 6),
+            "elapsed_s": round(float(self.elapsed_s), 6),
+            "status": self.status,
+            "retry_count": int(self.retry_count),
+            "payload_bytes": int(self.payload_bytes),
+            "result_count": int(self.result_count),
+            "error_classification": self.error_classification,
+        }
 
 
 @dataclass
@@ -33,6 +64,11 @@ class DiagnosticPerformanceMetrics:
     replanning_s: float = 0.0
     checkpoint_s: float = 0.0
     report_generation_s: float = 0.0
+    transfer_s: float = 0.0
+    parsing_s: float = 0.0
+    timeout_s: float = 0.0
+    recovery_s: float = 0.0
+    collection_operations: List[CollectionOperationRecord] = field(default_factory=list)
 
     # Remote costs
     ssh_commands_count: int = 0
@@ -119,6 +155,11 @@ class DiagnosticPerformanceMetrics:
             "replanning_s": round(float(self.replanning_s), 4),
             "checkpoint_s": round(float(self.checkpoint_s), 4),
             "report_generation_s": round(float(self.report_generation_s), 4),
+            "transfer_s": round(float(self.transfer_s), 4),
+            "parsing_s": round(float(self.parsing_s), 4),
+            "timeout_s": round(float(self.timeout_s), 4),
+            "recovery_s": round(float(self.recovery_s), 4),
+            "collection_operations": [op.to_dict() for op in self.collection_operations],
             "ssh_commands_count": int(self.ssh_commands_count),
             "ssh_connections_count": int(self.ssh_connections_count),
             "control_master_reconnects_count": int(self.control_master_reconnects_count),
@@ -220,3 +261,27 @@ class DiagnosticPerformanceTracker:
 
     def to_dict(self) -> Dict[str, Any]:
         return self.finish().to_dict()
+
+    def record_operation(self, op: CollectionOperationRecord) -> None:
+        self.metrics.collection_operations.append(op)
+        self.metrics.collection_operations_count += 1
+
+    def performance_summary(self, top_n: int = 5) -> Dict[str, Any]:
+        """Returns machine-readable slowest stages and operations for bottleneck identification."""
+        stage_fields = (
+            "remote_connection_establishment_s", "ssh_command_execution_s", "remote_command_s",
+            "transfer_s", "parsing_s", "retry_s", "timeout_s", "recovery_s",
+            "evidence_normalization_s", "correlation_s", "hypothesis_evaluation_s",
+            "replanning_s", "local_analysis_s", "report_generation_s",
+        )
+        stages = sorted(
+            ((name, round(float(getattr(self.metrics, name, 0.0)), 6)) for name in stage_fields),
+            key=lambda x: x[1],
+            reverse=True,
+        )
+        ops = sorted(self.metrics.collection_operations, key=lambda o: o.elapsed_s, reverse=True)
+        return {
+            "total_wall_clock_s": round(float(self.metrics.total_wall_clock_s), 6),
+            "slowest_stages": [{"stage": k, "elapsed_s": v} for k, v in stages[:top_n] if v > 0.0],
+            "slowest_operations": [o.to_dict() for o in ops[:top_n]],
+        }

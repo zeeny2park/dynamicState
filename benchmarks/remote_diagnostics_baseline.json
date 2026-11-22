@@ -1,0 +1,214 @@
+{
+  "mode": "baseline",
+  "runs": 5,
+  "environment": {
+    "os": "Linux-6.12.105+-x86_64-with-glibc2.36",
+    "arch": "x86_64",
+    "python": "3.11.2",
+    "cpu_count": 2
+  },
+  "scenarios": {
+    "A": {
+      "scenario": "A_normal_remote_diagnostic",
+      "mode": "baseline",
+      "ssh_commands_per_run": 4,
+      "bytes_per_run": 15428,
+      "timing": {
+        "runs": 5,
+        "p50_s": 0.08069,
+        "p90_s": 0.081,
+        "p95_s": 0.081,
+        "min_s": 0.08065,
+        "max_s": 0.081,
+        "mean_s": 0.08076,
+        "stddev_s": 0.00015
+      }
+    },
+    "B": {
+      "scenario": "B_multi_target_scaling",
+      "mode": "baseline",
+      "scaling": {
+        "1": {
+          "target_count": 1,
+          "ssh_commands_total": 1,
+          "timing": {
+            "runs": 5,
+            "p50_s": 0.02517,
+            "p90_s": 0.02522,
+            "p95_s": 0.02522,
+            "min_s": 0.02515,
+            "max_s": 0.02522,
+            "mean_s": 0.02518,
+            "stddev_s": 3e-05
+          }
+        },
+        "2": {
+          "target_count": 2,
+          "ssh_commands_total": 2,
+          "timing": {
+            "runs": 5,
+            "p50_s": 0.05036,
+            "p90_s": 0.05039,
+            "p95_s": 0.05039,
+            "min_s": 0.0503,
+            "max_s": 0.05039,
+            "mean_s": 0.05036,
+            "stddev_s": 3e-05
+          }
+        },
+        "5": {
+          "target_count": 5,
+          "ssh_commands_total": 5,
+          "timing": {
+            "runs": 5,
+            "p50_s": 0.12588,
+            "p90_s": 0.12594,
+            "p95_s": 0.12594,
+            "min_s": 0.12583,
+            "max_s": 0.12594,
+            "mean_s": 0.12589,
+            "stddev_s": 4e-05
+          }
+        },
+        "10": {
+          "target_count": 10,
+          "ssh_commands_total": 10,
+          "timing": {
+            "runs": 5,
+            "p50_s": 0.2521,
+            "p90_s": 0.25238,
+            "p95_s": 0.25238,
+            "min_s": 0.25179,
+            "max_s": 0.25238,
+            "mean_s": 0.25206,
+            "stddev_s": 0.00024
+          }
+        }
+      }
+    },
+    "C": {
+      "scenario": "C_slow_remote_target",
+      "mode": "baseline",
+      "total_timing": {
+        "runs": 5,
+        "p50_s": 0.2812,
+        "p90_s": 0.28124,
+        "p95_s": 0.28124,
+        "min_s": 0.28106,
+        "max_s": 0.28124,
+        "mean_s": 0.28116,
+        "stddev_s": 9e-05
+      },
+      "all_fast_targets_completed_timing": {
+        "runs": 5,
+        "p50_s": 0.2812,
+        "p90_s": 0.28124,
+        "p95_s": 0.28124,
+        "min_s": 0.28105,
+        "max_s": 0.28124,
+        "mean_s": 0.28116,
+        "stddev_s": 9e-05
+      }
+    },
+    "D": {
+      "scenario": "D_partial_collection_failure",
+      "mode": "baseline",
+      "preserved_results_median": 3,
+      "status": "PARTIAL",
+      "timing": {
+        "runs": 5,
+        "p50_s": 0.101,
+        "p90_s": 0.10121,
+        "p95_s": 0.10121,
+        "min_s": 0.1009,
+        "max_s": 0.10121,
+        "mean_s": 0.10102,
+        "stddev_s": 0.00012
+      }
+    },
+    "E": {
+      "scenario": "E_ssh_auth_failure",
+      "mode": "baseline",
+      "ssh_commands_per_run": 4,
+      "timing": {
+        "runs": 5,
+        "p50_s": 0.12058,
+        "p90_s": 0.12079,
+        "p95_s": 0.12079,
+        "min_s": 0.12054,
+        "max_s": 0.12079,
+        "mean_s": 0.12063,
+        "stddev_s": 0.0001
+      }
+    },
+    "F": {
+      "scenario": "F_timeout_real_subprocess",
+      "mode": "baseline",
+      "deadline_s": 0.12,
+      "timing": {
+        "runs": 5,
+        "p50_s": 0.12192,
+        "p90_s": 0.1224,
+        "p95_s": 0.1224,
+        "min_s": 0.12182,
+        "max_s": 0.1224,
+        "mean_s": 0.12201,
+        "stddev_s": 0.00023
+      }
+    },
+    "G": {
+      "scenario": "G_large_collection",
+      "mode": "baseline",
+      "sizes": {
+        "100": {
+          "maps": 100,
+          "threads": 200,
+          "payload_bytes": 33350,
+          "throughput_mb_s": 5.56,
+          "timing": {
+            "runs": 5,
+            "p50_s": 0.00572,
+            "p90_s": 0.00598,
+            "p95_s": 0.00598,
+            "min_s": 0.00562,
+            "max_s": 0.00598,
+            "mean_s": 0.00577,
+            "stddev_s": 0.00015
+          }
+        },
+        "500": {
+          "maps": 500,
+          "threads": 200,
+          "payload_bytes": 57750,
+          "throughput_mb_s": 9.6,
+          "timing": {
+            "runs": 5,
+            "p50_s": 0.00574,
+            "p90_s": 0.00582,
+            "p95_s": 0.00582,
+            "min_s": 0.00573,
+            "max_s": 0.00582,
+            "mean_s": 0.00576,
+            "stddev_s": 5e-05
+          }
+        },
+        "1000": {
+          "maps": 1000,
+          "threads": 200,
+          "payload_bytes": 88250,
+          "throughput_mb_s": 14.5,
+          "timing": {
+            "runs": 5,
+            "p50_s": 0.0058,
+            "p90_s": 0.00591,
+            "p95_s": 0.00591,
+            "min_s": 0.00577,
+            "max_s": 0.00591,
+            "mean_s": 0.00583,
+            "stddev_s": 7e-05
+          }
+        }
+      }
+    }
+  }
+}

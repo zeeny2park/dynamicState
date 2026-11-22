@@ -2353,6 +2353,8 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
         self.user = user.strip() if isinstance(user, str) and user.strip() else None
         self.port = int(port)
         self._last_snapshot_error: Optional[Dict[str, Any]] = None
+        self._auth_failed_reason: Optional[str] = None
+        self._state_lock = threading.RLock()
         self.key_file = key_file
         self.proxy_jump = proxy_jump
         self.proxy_command = proxy_command
@@ -2583,6 +2585,11 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
                             pass
             return -1, "", f"SSH execution error: {e}"
 
+    def reset_auth_failure(self) -> None:
+        """Clears cached permanent SSH authentication failure state (e.g. after credential update)."""
+        with self._state_lock:
+            self._auth_failed_reason = None
+
     def run_ssh(
         self,
         remote_shell_cmd: str,
@@ -2594,6 +2601,9 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
         ``input_bytes`` (optional) is streamed to the remote command's stdin; custom command
         runners then receive it as the ``input_bytes`` keyword argument.
         """
+        with self._state_lock:
+            if self._auth_failed_reason is not None:
+                return -1, "", f"Permission denied (cached permanent SSH auth failure): {self._auth_failed_reason}"
         if isinstance(timeout, bool):
             return -1, "", f"Invalid non-positive SSH timeout: {timeout}"
         t = self.timeout_sec if timeout is None else float(timeout)
@@ -2621,6 +2631,9 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
         except Exception as e:
             res = (-1, "", f"SSH execution error: {e}")
         err_text = res[2] or ""
+        if res[0] == 255 and re.search(r"permission denied\s*\(|authentication failed|too many authentication failures", err_text, re.I):
+            with self._state_lock:
+                self._auth_failed_reason = err_text.strip()[:200]
         if (self._cm_used and not self._cm_disabled and res[0] == 255
                 and re.search(r"bad configuration option|unknown percent|unsupported option", err_text, re.I)):
             self._cm_disabled = True   # this ssh cannot do connection sharing: plain connections from now on
