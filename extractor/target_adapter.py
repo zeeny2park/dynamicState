@@ -2355,6 +2355,7 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
         self.port = int(port)
         self._last_snapshot_error: Optional[Dict[str, Any]] = None
         self._auth_failed_reason: Optional[str] = None
+        self._permanent_transport_error: Optional[Tuple[str, str]] = None
         self._state_lock = threading.RLock()
         self.key_file = key_file
         self.proxy_jump = proxy_jump
@@ -2452,6 +2453,8 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
         err_l = (stderr or "").lower()
         if "timed out" in err_l or "deadline exceeded" in err_l or "operation timed out" in err_l:
             return "TIMEOUT"
+        if "host key verification failed" in err_l or "remote host identification has changed" in err_l:
+            return "HOST_KEY_ERROR"
         if "permission denied" in err_l or "operation not permitted" in err_l or "publickey" in err_l:
             return "PERMISSION_DENIED"
         if (
@@ -2637,9 +2640,14 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
                     pass
 
     def reset_auth_failure(self) -> None:
-        """Clears cached permanent SSH authentication failure state (e.g. after credential update)."""
+        """Clears cached permanent SSH authentication/transport failure state."""
         with self._state_lock:
             self._auth_failed_reason = None
+            self._permanent_transport_error = None
+
+    def reset_transport_failure(self) -> None:
+        """Alias to clear cached permanent SSH failure state after host/key/DNS recovery."""
+        self.reset_auth_failure()
 
     def run_ssh(
         self,
@@ -2655,6 +2663,9 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
         with self._state_lock:
             if self._auth_failed_reason is not None:
                 return -1, "", f"Permission denied (cached permanent SSH auth failure): {self._auth_failed_reason}"
+            if self._permanent_transport_error is not None:
+                err_cat, err_msg = self._permanent_transport_error
+                return -1, "", f"{err_cat} (cached permanent SSH failure): {err_msg}"
         if isinstance(timeout, bool):
             return -1, "", f"Invalid non-positive SSH timeout: {timeout}"
         t = self.timeout_sec if timeout is None else float(timeout)
@@ -2682,9 +2693,16 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
         except Exception as e:
             res = (-1, "", f"SSH execution error: {e}")
         err_text = res[2] or ""
-        if res[0] == 255 and re.search(r"permission denied\s*\(|authentication failed|too many authentication failures", err_text, re.I):
-            with self._state_lock:
-                self._auth_failed_reason = err_text.strip()[:200]
+        if res[0] == 255:
+            if re.search(r"permission denied\s*\(|authentication failed|too many authentication failures", err_text, re.I):
+                with self._state_lock:
+                    self._auth_failed_reason = err_text.strip()[:200]
+            elif re.search(r"host key verification failed|remote host identification has changed", err_text, re.I):
+                with self._state_lock:
+                    self._permanent_transport_error = ("Host key verification failed", err_text.strip()[:200])
+            elif re.search(r"could not resolve hostname|name or service not known", err_text, re.I):
+                with self._state_lock:
+                    self._permanent_transport_error = ("Could not resolve hostname", err_text.strip()[:200])
         if (self._cm_used and not self._cm_disabled and res[0] == 255
                 and re.search(r"bad configuration option|unknown percent|unsupported option", err_text, re.I)):
             self._cm_disabled = True   # this ssh cannot do connection sharing: plain connections from now on
@@ -3772,6 +3790,12 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
         """
         if not self._use_daemon or not self.collector_path:
             return None
+        with self._state_lock:
+            if self._auth_failed_reason is not None or self._permanent_transport_error is not None:
+                return None
+        rem_pre = self.remaining_deadline_sec()
+        if rem_pre is not None and rem_pre <= 0:
+            return None
         with self._daemon_lock:
             path = self.collector_path
             if self._daemon_unsupported_for == path:
@@ -3788,7 +3812,7 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
                         self._open_daemon_locked()
                     self.daemon_stats["requests"] += 1
                     return fn(self._daemon)
-                except (DaemonChannelError, OSError, ValueError) as exc:
+                except (DaemonChannelError, TimeoutError, OSError, ValueError) as exc:
                     self._close_daemon_locked(graceful=False)
                     if self.daemon_stats["opens"] == 0:
                         self._daemon_unsupported_for = path  # never worked: remember for the session
@@ -3907,12 +3931,61 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
             f" | tail -c +{page_off + 1} | head -c {n}"
         )
 
+    @staticmethod
+    def _coalesce_memory_slices(
+        slices: List[Tuple[int, int]],
+        max_gap: int = 256,
+        max_merged_size: int = COLLECTOR_MAX_SLICE,
+    ) -> Tuple[List[Tuple[int, int]], List[Tuple[int, int, int]]]:
+        """Merges duplicate, overlapping, or closely adjacent positive-size slices to minimize remote reads.
+
+        Returns (merged_slices, mapping) where mapping[i] = (merged_idx, offset_in_merged, orig_size)
+        for each original slice i (merged_idx = -1 when orig_size <= 0).
+        """
+        indexed = []
+        for orig_idx, (addr, sz) in enumerate(slices):
+            a_int = int(addr)
+            s_int = max(0, int(sz))
+            if s_int > 0:
+                indexed.append((a_int, a_int + s_int, orig_idx, s_int))
+        indexed.sort(key=lambda x: (x[0], -x[1]))
+
+        merged: List[Tuple[int, int]] = []
+        mapping: List[Tuple[int, int, int]] = [(-1, 0, max(0, int(sz))) for _, sz in slices]
+        cur_start: Optional[int] = None
+        cur_end: int = 0
+        cur_members: List[Tuple[int, int, int]] = []
+
+        def _flush() -> None:
+            if cur_start is None:
+                return
+            m_idx = len(merged)
+            merged.append((cur_start, cur_end - cur_start))
+            for o_idx, o_addr, o_sz in cur_members:
+                mapping[o_idx] = (m_idx, o_addr - cur_start, o_sz)
+
+        for a_start, a_end, o_idx, o_sz in indexed:
+            if cur_start is None:
+                cur_start, cur_end = a_start, a_end
+                cur_members = [(o_idx, a_start, o_sz)]
+            else:
+                new_end = max(cur_end, a_end)
+                if a_start <= cur_end + max_gap and (new_end - cur_start) <= max_merged_size:
+                    cur_end = new_end
+                    cur_members.append((o_idx, a_start, o_sz))
+                else:
+                    _flush()
+                    cur_start, cur_end = a_start, a_end
+                    cur_members = [(o_idx, a_start, o_sz)]
+        _flush()
+        return merged, mapping
+
     def read_memory_batch(
         self,
         pid: int,
         slices: List[Tuple[int, int]],
     ) -> List[Tuple[Optional[bytes], str, Optional[str]]]:
-        """Reads multiple memory slices in a single SSH roundtrip (via C99 collector or batched POSIX shell)."""
+        """Reads multiple memory slices in a single SSH roundtrip with automatic slice coalescing."""
         if not slices:
             return []
         self._ensure_tracking_state()
@@ -3926,24 +3999,49 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
         if len(slices) == 1 and not self.collector_path:
             return [self.read_memory(pid, slices[0][0], slices[0][1])]
 
-        if self.collector_path:
-            coll_res = self._read_slices_via_collector(pid, slices)
-            if coll_res is not None:
-                return coll_res
+        merged_slices, slice_map = self._coalesce_memory_slices(slices)
 
-        # Single-SSH batched shell read with page-aligned dd fallback for 64-bit BusyBox offsets
+        def _unpack_merged(
+            merged_res: List[Tuple[Optional[bytes], str, Optional[str]]],
+        ) -> List[Tuple[Optional[bytes], str, Optional[str]]]:
+            out_list: List[Tuple[Optional[bytes], str, Optional[str]]] = []
+            for orig_i, (orig_addr, orig_sz) in enumerate(slices):
+                m_idx, off, s_sz = slice_map[orig_i]
+                if m_idx < 0 or s_sz <= 0:
+                    out_list.append((b"", "OBSERVED", None))
+                    continue
+                m_data, m_st, m_err = merged_res[m_idx]
+                if m_data is None:
+                    out_list.append((None, m_st, m_err))
+                    continue
+                sub = m_data[off : off + s_sz]
+                if len(sub) == s_sz:
+                    out_list.append((sub, "OBSERVED", None))
+                elif len(sub) > 0:
+                    out_list.append((sub, "PARTIAL", f"Partial read: {len(sub)}/{s_sz} bytes"))
+                else:
+                    out_list.append((None, "UNAVAILABLE", f"Address 0x{int(orig_addr):x} is not mapped or inaccessible on {self.target_host()}"))
+            return out_list
+
+        if self.collector_path and merged_slices:
+            coll_res = self._read_slices_via_collector(pid, merged_slices)
+            if coll_res is not None and len(coll_res) == len(merged_slices):
+                return _unpack_merged(coll_res)
+
+        if not merged_slices:
+            return [(b"", "OBSERVED", None) for _ in slices]
+
+        # Single-SSH batched shell read over coalesced slices
         cmds = []
-        for idx, (addr, sz) in enumerate(slices):
-            a_int = int(addr)
-            s_int = max(0, int(sz))
-            if s_int == 0:
-                cmds.append(f"echo '{idx}|'")
-                continue
-            pipeline = self._dd_block_pipeline(pid, a_int, s_int)
+        for idx, (addr, sz) in enumerate(merged_slices):
+            pipeline = self._dd_block_pipeline(pid, int(addr), int(sz))
             cmds.append(f"b=$({pipeline} | base64 | tr -d '\\n'); echo \"{idx}|$b\"")
         remote_script = "; ".join(cmds)
         rc, stdout, stderr = self.run_ssh(f"sh -c {shlex.quote(remote_script)}")
         if rc != 0:
+            err_cls = self.classify_remote_error(rc, stderr, stdout)
+            if rc == -1 or err_cls in ("TIMEOUT", "PERMISSION_DENIED", "HOST_KEY_ERROR", "TRANSPORT_ERROR"):
+                return [(None, "UNAVAILABLE", f"SSH batch read failed ({err_cls}): {stderr.strip()}") for _ in slices]
             alive, live_err = self.check_liveness(pid)
             if not alive:
                 st = "UNAVAILABLE" if (live_err and ("transport" in live_err.lower() or "timed out" in live_err.lower())) else "TARGET_TERMINATED"
@@ -3957,26 +4055,23 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
                 if k_str.isdigit():
                     by_idx[int(k_str)] = val_b64.strip()
 
-        results: List[Tuple[Optional[bytes], str, Optional[str]]] = []
-        for idx, (addr, sz) in enumerate(slices):
-            if sz <= 0:
-                results.append((b"", "OBSERVED", None))
-                continue
+        merged_results: List[Tuple[Optional[bytes], str, Optional[str]]] = []
+        for idx, (addr, sz) in enumerate(merged_slices):
             b64_str = by_idx.get(idx, "")
             if not b64_str:
-                results.append((None, "UNAVAILABLE", f"Address 0x{int(addr):x} is not mapped or inaccessible on {self.target_host()}"))
+                merged_results.append((None, "UNAVAILABLE", f"Address 0x{int(addr):x} is not mapped or inaccessible on {self.target_host()}"))
                 continue
             try:
                 raw_b = base64.b64decode(b64_str)
                 if len(raw_b) == sz:
-                    results.append((raw_b, "OBSERVED", None))
+                    merged_results.append((raw_b, "OBSERVED", None))
                 elif len(raw_b) > 0:
-                    results.append((raw_b, "PARTIAL", f"Partial read: {len(raw_b)}/{sz} bytes"))
+                    merged_results.append((raw_b, "PARTIAL", f"Partial read: {len(raw_b)}/{sz} bytes"))
                 else:
-                    results.append((None, "UNAVAILABLE", f"Zero bytes returned at 0x{int(addr):x}"))
+                    merged_results.append((None, "UNAVAILABLE", f"Zero bytes returned at 0x{int(addr):x}"))
             except Exception as e:
-                results.append((None, "UNAVAILABLE", f"Base64 decode failure: {e}"))
-        return results
+                merged_results.append((None, "UNAVAILABLE", f"Base64 decode failure: {e}"))
+        return _unpack_merged(merged_results)
 
     def read_memory(self, pid: int, address: int, size: int) -> Tuple[Optional[bytes], str, Optional[str]]:
         self._ensure_tracking_state()
@@ -4010,9 +4105,11 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
 
         encoded = stdout.strip()
         if not encoded:
-            # If 0 bytes returned, verify if process is still alive
+            # If 0 bytes returned, verify if process is still alive (do not misclassify SSH failure as TARGET_TERMINATED)
             alive, live_err = self.check_liveness(pid)
             if not alive:
+                if live_err and ("transport" in live_err.lower() or "timed out" in live_err.lower() or "permission denied" in live_err.lower()):
+                    return None, "UNAVAILABLE", f"SSH transport failure at 0x{address:x}: {live_err}"
                 return None, "TARGET_TERMINATED", live_err or "Remote process terminated"
             return None, "UNAVAILABLE", f"Address 0x{address:x} is not mapped or inaccessible on {self.target_host()}"
 

@@ -383,6 +383,10 @@ jobs:
         run: |
           python3 scripts/run_unittest.py tests/test_remote_scheduler_deadline_and_cancellation.py
 
+      - name: Run Remote Connection Resilience and Slice Coalescing Tests
+        run: |
+          python3 scripts/run_unittest.py tests/test_remote_connection_resilience_and_coalescing.py
+
       - name: Run Deadlock Real-Process Baseline Tests (2 positive, 2 negative controls)
         run: |
           python3 scripts/run_unittest.py -v tests/test_deadlock_real_process_baseline.py
