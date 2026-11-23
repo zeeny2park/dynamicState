@@ -1198,8 +1198,13 @@ class TargetExecutionAdapter(ABC):
             return True, None
         cur = _current_identity
         if cur is None and type(self).__name__ == "RemoteSshTargetAdapter" and _allow_recent_sec > 0.0:
+            eff_recent = float(_allow_recent_sec)
+            if getattr(self, "_hydrated_bundle_mode", False):
+                eff_recent = 3600.0
+            elif getattr(self, "_observed_rtt_s", 0.0) > 0.5:
+                eff_recent = min(30.0, max(eff_recent, float(self._observed_rtt_s) * 4.0))
             recent = getattr(self, "_last_identity_cache", {}).get(int(pid))
-            if recent is not None and (time.monotonic() - recent[0]) <= _allow_recent_sec:
+            if recent is not None and (time.monotonic() - recent[0]) <= eff_recent:
                 cur = recent[1]
         if cur is None:
             cur = _invoke_get_process_identity(self, int(pid), force=(_allow_recent_sec <= 0.0))
@@ -2405,6 +2410,8 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
         self._snapshot_cache: Dict[int, Tuple[float, Dict[str, Any]]] = {}
         self._snapshot_scope_depth: int = 0
         self._liveness_cache: Dict[int, Tuple[float, bool]] = {}
+        self._observed_rtt_s: float = 0.0
+        self._hydrated_bundle_mode: bool = False
         self._deadline_tls = threading.local()
         # Trustworthy performance baseline instrumentation (Phase 1)
         self._perf_ssh_commands: int = 0
@@ -2442,6 +2449,14 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
 
     def is_remote(self) -> bool:
         return True
+
+    def _effective_cache_ttl(self, base_ttl: float, *, max_ttl: float = 60.0) -> float:
+        """Scales micro-cache TTLs on high-latency multi-hop/xssh links (RTT > 0.5s) and hydrated bundles."""
+        if self._hydrated_bundle_mode:
+            return 3600.0
+        if self._observed_rtt_s > 0.5:
+            return min(float(max_ttl), max(float(base_ttl), self._observed_rtt_s * 6.0))
+        return float(base_ttl)
 
     def target_host(self) -> str:
         u = f"{self.user}@" if self.user else ""
@@ -2755,6 +2770,11 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
         self._perf_command_dur_s += cmd_elapsed
         if is_first_cmd:
             self._perf_conn_est_s = cmd_elapsed
+        if res[0] == 0 and cmd_elapsed > 0.0:
+            if self._observed_rtt_s <= 0.0:
+                self._observed_rtt_s = cmd_elapsed
+            else:
+                self._observed_rtt_s = (self._observed_rtt_s * 0.6) + (cmd_elapsed * 0.4)
         n_in = len(remote_shell_cmd.encode("utf-8", "replace")) + (len(input_bytes) if input_bytes else 0)
         n_out = len((res[1] or "").encode("utf-8", "replace")) + len((res[2] or "").encode("utf-8", "replace"))
         self._perf_bytes_transferred += (n_in + n_out)
@@ -2963,7 +2983,8 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
             ))
         )
         if can_use and self._snapshot_scope_depth == 0:
-            self.prefetch_snapshot(pid, domains=domains)
+            eff_domains = self.ALL_SNAPSHOT_DOMAINS if self._observed_rtt_s > 0.5 else domains
+            self.prefetch_snapshot(pid, domains=eff_domains)
         self._snapshot_scope_depth += 1
         try:
             yield
@@ -2984,7 +3005,8 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
         hit = self._snapshot_cache.get(int(pid))
         cached_payload = hit[1] if (hit and len(hit) > 1) else None
         cached_domains = hit[2] if (hit and len(hit) > 2) else (self.ALL_SNAPSHOT_DOMAINS if hit else frozenset())
-        is_fresh = bool(hit and (now - hit[0]) <= max_age_s)
+        eff_max_age = self._effective_cache_ttl(max_age_s)
+        is_fresh = bool(hit and (now - hit[0]) <= eff_max_age)
 
         if not force and is_fresh and cached_payload is not None:
             if cached_domains.issuperset(req_domains):
@@ -3065,6 +3087,29 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
             self._target_kernel_release = osrel
         if not payload.get("terminated"):
             self._liveness_cache[int(pid)] = (now, True)
+            # Refresh _last_identity_cache from snapshot basic fields to avoid redundant identify_probe round-trips
+            snap_stat = str(payload.get("stat") or "")
+            snap_exe = str(payload.get("exe") or "")
+            snap_boot = str(payload.get("boot_id") or "")
+            snap_st = self._start_time_from_stat(snap_stat)
+            if snap_st and snap_exe:
+                prev_id = self._last_identity_cache.get(int(pid))
+                base_id = dict(prev_id[1]) if prev_id else {}
+                base_id.update({
+                    "pid": int(pid),
+                    "executable": snap_exe,
+                    "executable_identity": f"{snap_exe}:remote",
+                    "start_time": snap_st,
+                    "boot_id": snap_boot or base_id.get("boot_id", ""),
+                    "process_identity": f"{int(pid)}:{snap_st}:{snap_boot or base_id.get('boot_id', '')}",
+                    "is_remote": True,
+                    "host": self.target_host(),
+                })
+                if payload.get("exe_fp"):
+                    base_id["exe_fingerprint"] = str(payload["exe_fp"])
+                if payload.get("machine") and not base_id.get("architecture"):
+                    base_id["architecture"] = str(payload["machine"]).strip()
+                self._last_identity_cache[int(pid)] = (now, base_id)
         return payload
 
     def _active_snapshot(
@@ -3073,14 +3118,106 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
         max_age_s: float = 2.0,
         required_domains: Optional[Iterable[str]] = None,
     ) -> Optional[Dict[str, Any]]:
+        eff_max_age = self._effective_cache_ttl(max_age_s)
         hit = self._snapshot_cache.get(int(pid))
-        if hit is not None and (time.monotonic() - hit[0]) <= max_age_s:
+        if hit is not None and (time.monotonic() - hit[0]) <= eff_max_age:
             if required_domains is not None:
                 cached_domains = hit[2] if len(hit) > 2 else self.ALL_SNAPSHOT_DOMAINS
                 if not set(required_domains).issubset(cached_domains):
                     return None
             return hit[1]
         return None
+
+    def collect_upfront_bundle(
+        self,
+        pid: int,
+        *,
+        delta_sample_interval_s: float = 0.0,
+        force: bool = False,
+    ) -> Optional[Dict[str, Any]]:
+        """Wave-1 single-transaction upfront collection for high-latency/xssh links.
+
+        Collects ALL snapshot domains (basic, maps, threads, fds) and process identity
+        in ONE remote execution, optionally capturing a second thread-stat delta sample
+        inside the same remote call when ``delta_sample_interval_s > 0``.
+        """
+        if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
+            return None
+        delta_s = max(0.0, min(2.0, float(delta_sample_interval_s)))
+        snap = None
+        delta_tasks_raw = None
+        if delta_s > 0.0:
+            base_script = self._shell_snapshot_script(pid, domains=self.ALL_SNAPSHOT_DOMAINS)
+            # Append bounded in-place T2 thread stat sample before final @@END (zero extra SSH exec)
+            t2_snippet = (
+                f"sleep {delta_s:.2f}; echo @@TASKS_T2; "
+                f"for t in /proc/{int(pid)}/task/[0-9]*; do "
+                "tid=${t##*/}; s=$(cat \"$t/stat\" 2>/dev/null); "
+                "[ -n \"$s\" ] && printf 'T2|%s|%s\\n' \"$tid\" \"$s\"; done; "
+            )
+            if "echo @@END" in base_script:
+                script = base_script.replace("echo @@END", t2_snippet + "echo @@END", 1)
+            else:
+                script = base_script + "; " + t2_snippet + "echo @@END"
+            rc, out, err = self.run_ssh(f"sh -c {shlex.quote(script)}", timeout=max(self.timeout_sec * 1.5, delta_s + 10.0))
+            if rc == 0 and out:
+                # Extract T2 lines before parsing main snapshot
+                t2_lines = []
+                in_t2 = False
+                for ln in out.splitlines():
+                    s = ln.strip()
+                    if s == "@@TASKS_T2":
+                        in_t2 = True
+                        continue
+                    if s.startswith("@@"):
+                        in_t2 = False
+                        continue
+                    if in_t2 and s.startswith("T2|"):
+                        t2_lines.append(s)
+                delta_tasks_raw = t2_lines
+                snap = self._parse_shell_snapshot(out, pid)
+                if snap is not None and not snap.get("terminated"):
+                    now = time.monotonic()
+                    self._snapshot_cache[int(pid)] = (now, snap, frozenset(self.ALL_SNAPSHOT_DOMAINS))
+                    self._liveness_cache[int(pid)] = (now, True)
+        if snap is None:
+            snap = self.prefetch_snapshot(pid, force=force, domains=self.ALL_SNAPSHOT_DOMAINS)
+        if snap is None or snap.get("terminated"):
+            return None
+        ident = self._last_identity_cache.get(int(pid))
+        ident_dict = dict(ident[1]) if ident else self.get_process_identity(pid, force=False)
+        return {
+            "host": self.target_host(),
+            "pid": int(pid),
+            "identity": ident_dict,
+            "snapshot": dict(snap),
+            "delta_tasks_t2": list(delta_tasks_raw or []),
+            "collected_at_epoch_s": time.time(),
+        }
+
+    def hydrate_from_bundle(self, bundle: Dict[str, Any]) -> bool:
+        """Hydrates adapter caches from a previously collected bundle so diagnosis can finish with zero SSH calls."""
+        if not isinstance(bundle, dict):
+            return False
+        snap = bundle.get("snapshot")
+        ident = bundle.get("identity")
+        kd = bundle.get("key") if isinstance(bundle.get("key"), dict) else {}
+        pid_val = bundle.get("pid") or kd.get("pid") or (ident.get("pid") if isinstance(ident, dict) else None)
+        if not pid_val or not isinstance(snap, dict) or not snap:
+            return False
+        pid = int(pid_val)
+        now = time.monotonic()
+        self._hydrated_bundle_mode = True
+        self._snapshot_cache[pid] = (now, dict(snap), frozenset(self.ALL_SNAPSHOT_DOMAINS))
+        self._liveness_cache[pid] = (now, not bool(snap.get("terminated")))
+        if isinstance(ident, dict) and ident:
+            self._last_identity_cache[pid] = (now, dict(ident))
+            self._ident_seen.add(pid)
+            self._pinned_identities[pid] = dict(ident)
+        osrel = str(snap.get("osrelease") or "").strip()
+        if osrel and re.fullmatch(r"\d+\.\d+[\w.+~-]*", osrel):
+            self._target_kernel_release = osrel
+        return True
 
     def _identity_probe(self, pid: int, with_header: bool = False) -> Optional[Dict[str, Any]]:
         """exe link, /proc/PID/stat, boot_id, exe fingerprint, uname -m (+ ELF header) in ONE exchange:
@@ -3202,14 +3339,15 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
         if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 1:
             return False, f"Invalid PID {pid} (must be integer > 1)"
 
-        if self._snapshot_scope_depth > 0:
+        if self._snapshot_scope_depth > 0 or self._observed_rtt_s > 0.5 or self._hydrated_bundle_mode:
             snap = self._active_snapshot(pid, max_age_s=2.0)
             if snap is not None:
                 if snap.get("terminated"):
                     return False, f"Target PID {pid} is not running on {self.target_host()}"
                 return True, None
+            live_ttl = self._effective_cache_ttl(2.0)
             live_hit = getattr(self, "_liveness_cache", {}).get(int(pid))
-            if live_hit is not None and (time.monotonic() - live_hit[0]) <= 2.0:
+            if live_hit is not None and (time.monotonic() - live_hit[0]) <= live_ttl:
                 if live_hit[1]:
                     return True, None
                 return False, f"Target PID {pid} is not running on {self.target_host()}"
@@ -3531,7 +3669,7 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
     def get_proc_maps(self, pid: int) -> List[Dict[str, Any]]:
         now = time.monotonic()
         cached_m = self._maps_micro_cache.get(int(pid))
-        if cached_m is not None and (now - cached_m[0]) <= 2.0:
+        if cached_m is not None and (now - cached_m[0]) <= self._effective_cache_ttl(2.0):
             return [dict(m) for m in cached_m[1]]
         mappings: List[Dict[str, Any]] = []
         stdout = self._procfile_text(int(pid), "maps")   # one daemon exchange when the channel is up
@@ -4486,8 +4624,18 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
             if d and d not in dests:
                 dests.append(d)
 
-        # Target architecture (also used to pick the local binary).
-        rc_u, out_u, err_u = self.run_ssh("uname -m 2>/dev/null")
+        # Coalesced single-exec probe: uname -m + all candidate dests + --version in ONE SSH call
+        dest_list_sh = " ".join(shlex.quote(d) for d in dests)
+        probe_script = (
+            "printf '@@PROBE_ARCH=%s\\n' \"$(uname -m 2>/dev/null)\"; "
+            f"for d in {dest_list_sh}; do "
+            "if [ -x \"$d\" ] && \"$d\" --help >/dev/null 2>&1; then "
+            "v=$(\"$d\" --version 2>/dev/null | head -n 1); "
+            "printf '@@PROBE_FOUND=%s|%s\\n' \"$d\" \"$v\"; "
+            "fi; done; "
+            "echo @@PROBE_DONE"
+        )
+        rc_u, out_u, err_u = self.run_ssh(f"sh -c {shlex.quote(probe_script)}")
         if rc_u != 0:
             err_cls = self.classify_remote_error(rc_u, err_u, out_u)
             if rc_u == -1 or err_cls in ("TIMEOUT", "PERMISSION_DENIED", "HOST_KEY_ERROR", "TRANSPORT_ERROR"):
@@ -4497,7 +4645,21 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
                     "collector_path": None,
                     "reason": f"Remote target unreachable during collector probe ({err_cls}): {(err_u or '').strip()}",
                 }
-        rem_arch_raw = out_u.strip().lower() if rc_u == 0 else ""
+        coalesced_probe_ok = (rc_u == 0 and "@@PROBE_DONE" in (out_u or ""))
+        probed_found: List[Tuple[str, Optional[str]]] = []
+        if coalesced_probe_ok:
+            rem_arch_raw = ""
+            for ln in (out_u or "").splitlines():
+                s = ln.strip()
+                if s.startswith("@@PROBE_ARCH="):
+                    rem_arch_raw = s[len("@@PROBE_ARCH="):].strip().lower()
+                elif s.startswith("@@PROBE_FOUND="):
+                    rest = s[len("@@PROBE_FOUND="):]
+                    d_path, _, ver_raw = rest.partition("|")
+                    m_ver = re.search(r"dynamicstate-collector\s+(\S+)", ver_raw)
+                    probed_found.append((d_path.strip(), m_ver.group(1) if m_ver else None))
+        else:
+            rem_arch_raw = out_u.strip().lower() if rc_u == 0 else ""
         rem_canon = canonical_collector_arch(rem_arch_raw)
 
         # Choose the local binary.
@@ -4531,35 +4693,48 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
             local_version = collector_binary_version(raw_bytes)
 
         # Is a current collector already present on the target (in any candidate location)?
-        for d in dests:
-            qd = shlex.quote(d)
-            check_cmd = f"[ -x {qd} ] && {qd} --help >/dev/null 2>&1 && echo READY || echo MISSING"
-            rc, stdout, stderr = self.run_ssh(f"sh -c {shlex.quote(check_cmd)}")
-            if rc != 0:
-                return {
-                    "deployed": False,
-                    "status": "SSH_ERROR",
-                    "collector_path": None,
-                    "reason": stderr.strip() or f"SSH exited with {rc}",
-                }
-            if "READY" not in stdout:
-                continue
-            remote_version = None
-            if local_version:
-                rc_v, out_v, _ = self.run_ssh(f"{qd} --version 2>/dev/null")
-                if rc_v == 0:
-                    m = re.search(r"dynamicstate-collector\s+(\S+)", out_v)
-                    remote_version = m.group(1) if m else None
-                if remote_version != local_version:
+        if coalesced_probe_ok:
+            for d_path, remote_version in probed_found:
+                if local_version and remote_version != local_version:
                     continue  # stale or unversioned collector: redeploy
-            self.collector_path = d
-            return {
-                "deployed": True,
-                "status": "ALREADY_PRESENT",
-                "collector_path": d,
-                "collector_version": remote_version,
-                "reason": "Collector binary already present and executable on target",
-            }
+                self.collector_path = d_path
+                return {
+                    "deployed": True,
+                    "status": "ALREADY_PRESENT",
+                    "collector_path": d_path,
+                    "collector_version": remote_version,
+                    "reason": "Collector binary already present and executable on target",
+                }
+        else:
+            for d in dests:
+                qd = shlex.quote(d)
+                check_cmd = f"[ -x {qd} ] && {qd} --help >/dev/null 2>&1 && echo READY || echo MISSING"
+                rc, stdout, stderr = self.run_ssh(f"sh -c {shlex.quote(check_cmd)}")
+                if rc != 0:
+                    return {
+                        "deployed": False,
+                        "status": "SSH_ERROR",
+                        "collector_path": None,
+                        "reason": stderr.strip() or f"SSH exited with {rc}",
+                    }
+                if "READY" not in stdout:
+                    continue
+                remote_version = None
+                if local_version:
+                    rc_v, out_v, _ = self.run_ssh(f"{qd} --version 2>/dev/null")
+                    if rc_v == 0:
+                        m = re.search(r"dynamicstate-collector\s+(\S+)", out_v)
+                        remote_version = m.group(1) if m else None
+                    if remote_version != local_version:
+                        continue  # stale or unversioned collector: redeploy
+                self.collector_path = d
+                return {
+                    "deployed": True,
+                    "status": "ALREADY_PRESENT",
+                    "collector_path": d,
+                    "collector_version": remote_version,
+                    "reason": "Collector binary already present and executable on target",
+                }
 
         if not raw_bytes:
             return {

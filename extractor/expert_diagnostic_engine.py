@@ -5265,6 +5265,7 @@ def diagnose(
     enable_tracing: Optional[bool] = None,
     resume_investigation_id: Optional[str] = None,
     continue_collected_only: bool = False,
+    force_fresh: bool = False,
 ) -> DiagnoseResult:
     """Diagnose live process ``pid`` end to end in one call and return a :class:`DiagnoseResult`.
 
@@ -5400,7 +5401,8 @@ def diagnose(
                              symptom_fields=symptom_fields, default_check_budget_s=default_check_budget_s,
                              default_check_max_s=default_check_max_s, enable_tracing=enable_tracing,
                              resume_investigation_id=resume_investigation_id,
-                             continue_collected_only=continue_collected_only)
+                             continue_collected_only=continue_collected_only,
+                             force_fresh=force_fresh)
     finally:
         if _diag_bg_pool is not None:
             try:
@@ -5464,6 +5466,7 @@ def _diagnose_run(
     enable_tracing: Optional[bool] = None,
     resume_investigation_id: Optional[str] = None,
     continue_collected_only: bool = False,
+    force_fresh: bool = False,
 ) -> DiagnoseResult:
     res = _new_diagnose_result(pid, debug_image)
     res.target.update(extra_target)
@@ -5484,11 +5487,66 @@ def _diagnose_run(
         perf_m.target_impact = dict(res.collection_impact)
         res.performance_metrics = perf_m.to_dict()
         res.collection_impact["performance_metrics"] = res.performance_metrics
+        # Persist collected remote Wave-1 bundle keyed by (host, pid, start_time, boot_id, build_id)
+        if remote and adapter is not None and pid and int(pid) > 0:
+            try:
+                from .remote_bundle_store import BundleIdentityKey, RemoteCollectedBundleStore
+                snap_hit = getattr(adapter, "_snapshot_cache", {}).get(int(pid))
+                ident_hit = getattr(adapter, "_last_identity_cache", {}).get(int(pid))
+                snap_dict = dict(snap_hit[1]) if (snap_hit and isinstance(snap_hit[1], dict)) else None
+                ident_dict = dict(ident_hit[1]) if (ident_hit and isinstance(ident_hit[1], dict)) else {}
+                bid = str(ident_dict.get("build_id") or local_build_id or "").strip().lower()
+                if snap_dict and not snap_dict.get("terminated"):
+                    b_key = BundleIdentityKey(
+                        host=str(adapter.target_host()) if hasattr(adapter, "target_host") else "",
+                        pid=int(pid),
+                        start_time=str(ident_dict.get("start_time") or ""),
+                        boot_id=str(ident_dict.get("boot_id") or ""),
+                        build_id=bid,
+                    )
+                    b_store = RemoteCollectedBundleStore(corpus_dir)
+                    b_store.save_bundle(
+                        b_key,
+                        snapshot=snap_dict,
+                        identity=ident_dict,
+                        investigation_id=res.investigation_id,
+                    )
+                    res.target["collected_bundle"] = {
+                        **b_key.to_dict(),
+                        "investigation_id": res.investigation_id,
+                        "can_complete_offline": True,
+                    }
+            except Exception:  # noqa: BLE001 - bundle persistence must never break diagnosis
+                pass
         return res
+
+    local_build_id = ""
+    if debug_image and os.path.isfile(debug_image):
+        try:
+            from .debug_image import inspect_elf
+            local_build_id = str(getattr(inspect_elf(debug_image), "build_id", "") or "").strip().lower()
+        except Exception:  # noqa: BLE001
+            local_build_id = ""
 
     try:
         adapter = adapter or LocalTargetAdapter()
-        if continue_collected_only and resume_investigation_id:
+        # Auto-discover matching collected bundle by (host, pid, build_id) for offline completion or reuse
+        if remote and pid and int(pid) > 0 and not force_fresh:
+            try:
+                from .remote_bundle_store import RemoteCollectedBundleStore
+                b_store = RemoteCollectedBundleStore(corpus_dir)
+                host_str = str(adapter.target_host()) if hasattr(adapter, "target_host") else ""
+                saved_bundle = b_store.find_latest(host=host_str, pid=int(pid), build_id=local_build_id)
+                if saved_bundle is not None:
+                    if continue_collected_only:
+                        if hasattr(adapter, "hydrate_from_bundle"):
+                            adapter.hydrate_from_bundle(saved_bundle)
+                        if not resume_investigation_id and saved_bundle.get("investigation_id"):
+                            resume_investigation_id = str(saved_bundle["investigation_id"])
+                        res.target["collected_bundle_reused"] = dict(saved_bundle.get("key") or {})
+            except Exception:  # noqa: BLE001
+                pass
+        if continue_collected_only and (resume_investigation_id or getattr(adapter, "_hydrated_bundle_mode", False)):
             name, bad = f"pid_{pid}", None
         else:
             name, bad = _preflight_target(pid, adapter)

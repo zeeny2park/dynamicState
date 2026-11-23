@@ -581,7 +581,9 @@ def main():
     dx_p.add_argument("--resume", "--resume-investigation-id", dest="resume_investigation_id", type=str, default=None,
                       help="Resume an existing investigation ID (reuses already-collected data)")
     dx_p.add_argument("--continue-collected-only", dest="continue_collected_only", action="store_true", default=False,
-                      help="When resuming with --resume, diagnose only from already-collected data without new target reads")
+                      help="Diagnose only from already-collected data (auto-matches saved bundle by host/pid/build_id or --resume)")
+    dx_p.add_argument("--refresh", dest="refresh", action="store_true", default=False,
+                      help="Bypass saved remote collected bundles and force fresh target collection")
 
     from .skill_cli import add_parsers as _add_skill_parsers, dispatch as _skill_dispatch
     _add_skill_parsers(subparsers)
@@ -946,7 +948,8 @@ def main():
         res = diagnose(args.pid, debug_image=args.debug_image, symptom=args.goal, include_report=True,
                        engine=ExpertDiagnosticEngine(corpus_dir=os.path.abspath(args.corpus)),
                        resume_investigation_id=getattr(args, "resume_investigation_id", None),
-                       continue_collected_only=bool(getattr(args, "continue_collected_only", False))).to_dict()
+                       continue_collected_only=bool(getattr(args, "continue_collected_only", False)),
+                       force_fresh=bool(getattr(args, "refresh", False))).to_dict()
         full = res.pop("report", None)
         summary = render_human_report(res, full)
         report = dict(res)
