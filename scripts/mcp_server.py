@@ -804,6 +804,9 @@ def runtime_diagnose_process(
     default_check_budget_s: Optional[float] = None,
     default_check_max_s: Optional[float] = None,
     enable_tracing: Optional[bool] = None,
+    resume_investigation_id: Optional[str] = None,
+    continue_collected_only: bool = False,
+    force_fresh: bool = False,
 ) -> str:
     """Diagnose a live Linux process end to end in ONE call and return the final verdict.
 
@@ -828,7 +831,7 @@ def runtime_diagnose_process(
             Defaults to a general health check.
         time_limit_s: Optional wall-clock observation budget in seconds.
         default_check_budget_s / default_check_max_s: Optional time budget (total / per check, seconds) for the
-            default checks the symptom did not ask for (default 6 / 2.5, or the DYNAMICSTATE_DEFAULT_CHECK_* environment;
+            default checks the symptom did not ask for (default 0 / disabled — opt-in via > 0 or DYNAMICSTATE_DEFAULT_CHECK_* env;
             <= 0: no limit). A default check left out is reported as not run and the verdict is then never HEALTHY.
         language: Language of human_summary: 'en' (default) or 'ko'. Pass the user's language.
         remote_host: Set this (SSH host name or IP) when the process runs on a REMOTE embedded Linux target
@@ -885,6 +888,9 @@ def runtime_diagnose_process(
             engine=runtime.expert_diagnostic_engine, lang=lang, target=remote_target,
             symptom_fields=symptom_fields, default_check_budget_s=default_check_budget_s,
             default_check_max_s=default_check_max_s, enable_tracing=enable_tracing,
+            resume_investigation_id=resume_investigation_id,
+            continue_collected_only=bool(continue_collected_only),
+            force_fresh=bool(force_fresh),
         )
         out["human_summary"] = summary
         return _format_watch_result(out)

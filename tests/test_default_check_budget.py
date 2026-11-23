@@ -32,7 +32,8 @@ class TestBudgetModel(unittest.TestCase):
     def test_configuration_explicit_then_environment_then_default_and_non_positive_disables(self):
         with mock.patch.dict(os.environ, {cb.ENV_TOTAL: "", cb.ENV_PER_CHECK: ""}):
             d = cb.DefaultCheckBudget.resolve()
-            self.assertEqual((d.total_s, d.per_check_s), (cb.DEFAULT_TOTAL_S, cb.DEFAULT_PER_CHECK_S))
+            self.assertTrue(math.isinf(d.total_s) and math.isinf(d.per_check_s),
+                            'DefaultCheckBudget must be disabled (opt-in) by default')
         with mock.patch.dict(os.environ, {cb.ENV_TOTAL: "4", cb.ENV_PER_CHECK: "0"}):
             d = cb.DefaultCheckBudget.resolve()
             self.assertEqual(d.total_s, 4.0)
@@ -82,6 +83,14 @@ class TestWebParameters(unittest.TestCase):
         bad = parse(object.__new__(WebApiAdapter), {"pid": 1234, "default_check_budget_s": "lots"})
         self.assertFalse(bad["success"])
         self.assertEqual(bad["error"]["code"], "INVALID_PARAM")
+        ok2 = parse(object.__new__(WebApiAdapter), {"pid": 1234, "continue_collected_only": True, "force_fresh": True})
+        self.assertTrue(ok2["success"], ok2)
+        self.assertTrue(ok2["args"]["continue_collected_only"])
+        self.assertTrue(ok2["args"]["force_fresh"])
+        with open(os.path.join(ROOT, "extractor", "web", "ui", "ui.js"), encoding="utf-8") as _fh:
+            ui_js = _fh.read()
+        for field in ("default_check_budget_s", "default_check_max_s", "continue_collected_only", "force_fresh"):
+            self.assertIn(field, ui_js)
 
 
 @unittest.skipUnless(shutil.which("gcc") and sys.platform.startswith("linux"), "gcc / Linux needed")

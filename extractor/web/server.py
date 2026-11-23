@@ -3424,12 +3424,14 @@ class WebApiAdapter:
                 return {"success": False, "error": {"code": "INVALID_PARAM", "message": "resume_investigation_id must be a non-empty string"}}
             resume_investigation_id = resume_investigation_id.strip()
         continue_collected_only = bool(params.get("continue_collected_only"))
+        force_fresh = bool(params.get("force_fresh"))
         return {"success": True, "args": {
             "pid": pid, "debug_image": debug_image, "symptom": symptom, "time_limit_s": time_limit_s,
             "language": language, "remote_target": remote_target, "symptom_fields": symptom_fields,
             "enable_tracing": enable_tracing,
             "resume_investigation_id": resume_investigation_id,
             "continue_collected_only": continue_collected_only,
+            "force_fresh": force_fresh,
             **check_budget}}
 
     def diagnose_api(self, params: Dict[str, Any]) -> Dict[str, Any]:
@@ -3455,6 +3457,7 @@ class WebApiAdapter:
                 enable_tracing=a.get("enable_tracing"),
                 resume_investigation_id=a.get("resume_investigation_id"),
                 continue_collected_only=bool(a.get("continue_collected_only")),
+                force_fresh=bool(a.get("force_fresh")),
             )
             return {"success": True, "result": _to_json_serializable({**result, "human_summary": summary})}
         except Exception as e:

@@ -421,6 +421,8 @@ class DiagnoseJobManager:
                     extra[k] = p[k]
             if p.get("continue_collected_only"):
                 extra["continue_collected_only"] = True
+            if p.get("force_fresh"):
+                extra["force_fresh"] = True
             result, summary = fn(
                 p["pid"], debug_image=p.get("debug_image"), symptom=p.get("symptom"), time_limit_s=p.get("time_limit_s"),
                 engine=engine, lang=job.language, target=p.get("remote_target"), symptom_fields=p.get("symptom_fields"),

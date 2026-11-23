@@ -35,8 +35,12 @@ ENV_PER_CHECK = "DYNAMICSTATE_DEFAULT_CHECK_MAX_S"
 # the rest < 0.2 s each) and the healthy benchmark controls' default checks stay below ~4 s even at load ~3.  The
 # total leaves room for that, so a quiet healthy target always completes its baseline (the HEALTHY rule needs every
 # baseline check); a many-thread target (cost grows with the thread count) is where default checks get left out.
-DEFAULT_TOTAL_S = 6.0
-DEFAULT_PER_CHECK_S = 2.5
+# Default disabled (0.0 = opt-in): prevents silent early cutoffs and confusing INCONCLUSIVE verdicts
+# on remote/high-latency targets while keeping overall time_limit_s as the primary safety net.
+# Users can explicitly opt in via Web UI, CLI (--default-check-budget/--default-check-max),
+# MCP (default_check_budget_s/default_check_max_s), or environment variables.
+DEFAULT_TOTAL_S = 0.0
+DEFAULT_PER_CHECK_S = 0.0
 
 # Collections shared by several recipes within one run: the first check that needs one pays it (base seconds,
 # seconds per target thread), later ones reuse it.  Measured on a quiet 4-core aarch64 host: the /proc observation

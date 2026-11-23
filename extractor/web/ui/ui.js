@@ -66,6 +66,8 @@
       copy: "요약 복사", copied: "요약을 복사했습니다.", again: "같은 대상 다시 진단",
       continue_live: "이어서 진단 (미실행 검사 포함)", continue_collected: "수집된 데이터로 계속 진단",
       resume_id_label: "이전 조사 ID (이어서 진단)", resume_id_ph: "예: inv_xxxxxxxxxxxx",
+      dcb_label: "기본 검사 조기 컷오프 (초, 비우면 끔)", dcb_max_label: "레시피당 상한 (초)",
+      collected_only_chk: "이미 수집된 데이터만으로 진단 완료", force_fresh_chk: "캐시 무시하고 새로 수집",
       impact: "수집이 대상에 준 영향: 정지 {stop} · 읽기 {bytes} · {time} · 쓰기 없음", method_detail: "수집 방법 상세 기록",
       no_report: "보고서 파일이 없습니다.",
       err_TARGET_NOT_FOUND: "프로세스를 찾을 수 없습니다: {target}. PID나 프로세스 이름을 확인하세요.",
@@ -101,6 +103,8 @@
       key_ph: "SSH key file path (optional)",
       opt_line: "Read-only · never stops the target · default time budget 20 s", advanced: "Advanced",
       budget_label: "Time budget (s)",
+      dcb_label: "Default check early cutoff (s, empty=off)", dcb_max_label: "Per-check cap (s)",
+      collected_only_chk: "Diagnose from already-collected data only", force_fresh_chk: "Force fresh collection (ignore bundle cache)",
       need_target: "Enter a PID or a process name.", need_host: "Enter the SSH host.",
       recent_h: "Recent diagnoses", examples_h: "Examples (replays of saved results)", recent_none: "No diagnoses yet.",
       recent_unreachable: "Could not reach the server, so recent diagnoses are not shown.",
@@ -861,7 +865,13 @@
       '<details id="adv"><summary>' + esc(tr(lang, "advanced")) + '</summary><label class="adv">' + esc(tr(lang, "budget_label")) +
       ' <input class="input mono" name="time_limit_s" type="number" min="1" max="120" step="1" placeholder="20" value="' + esc(f.time_limit_s || "") + '"></label>' +
       '<label class="adv" style="margin-left:12px">' + esc(tr(lang, "resume_id_label")) +
-      ' <input class="input mono" name="resume_investigation_id" type="text" placeholder="' + esc(tr(lang, "resume_id_ph")) + '" value="' + esc(f.resume_investigation_id || "") + '"></label></details></div>' +
+      ' <input class="input mono" name="resume_investigation_id" type="text" placeholder="' + esc(tr(lang, "resume_id_ph")) + '" value="' + esc(f.resume_investigation_id || "") + '"></label>' +
+      '<div style="margin-top:8px;display:flex;flex-wrap:wrap;gap:12px;align-items:center">' +
+      '<label class="adv">' + esc(tr(lang, "dcb_label")) + ' <input class="input mono" name="default_check_budget_s" type="number" min="0" max="600" step="0.5" placeholder="0" value="' + esc(f.default_check_budget_s || "") + '"></label>' +
+      '<label class="adv">' + esc(tr(lang, "dcb_max_label")) + ' <input class="input mono" name="default_check_max_s" type="number" min="0" max="300" step="0.5" placeholder="0" value="' + esc(f.default_check_max_s || "") + '"></label>' +
+      '<label class="adv"><input type="checkbox" name="continue_collected_only"' + (f.continue_collected_only ? " checked" : "") + '> ' + esc(tr(lang, "collected_only_chk")) + '</label>' +
+      '<label class="adv"><input type="checkbox" name="force_fresh"' + (f.force_fresh ? " checked" : "") + '> ' + esc(tr(lang, "force_fresh_chk")) + '</label>' +
+      '</div></details></div>' +
       (ui.formError ? '<div class="alert alert-tone tone-fail" role="alert">' + esc(ui.formError) + "</div>" : "") +
       "</form></div>" + '<div class="recent" id="recent">' + recent + "</div>";
   }
@@ -1100,7 +1110,10 @@
     var body = { language: ui.lang, symptom: req.symptom || undefined, debug_image: req.debug_image || undefined,
       time_limit_s: req.time_limit_s ? Number(req.time_limit_s) : undefined,
       resume_investigation_id: req.resume_investigation_id || undefined,
-      continue_collected_only: req.continue_collected_only ? true : undefined };
+      default_check_budget_s: (req.default_check_budget_s !== "" && req.default_check_budget_s != null) ? Number(req.default_check_budget_s) : undefined,
+      default_check_max_s: (req.default_check_max_s !== "" && req.default_check_max_s != null) ? Number(req.default_check_max_s) : undefined,
+      continue_collected_only: req.continue_collected_only ? true : undefined,
+      force_fresh: req.force_fresh ? true : undefined };
     if (req.mode === "ssh") {
       body.remote_host = req.remote_host; body.ssh_user = req.ssh_user || undefined;
       body.ssh_port = req.ssh_port ? Number(req.ssh_port) : undefined; body.ssh_key = req.ssh_key || undefined;
@@ -1200,7 +1213,7 @@
   function readForm() {
     var fm = document.getElementById("form");
     if (!fm) return ui.form;
-    Array.prototype.forEach.call(fm.querySelectorAll("input[name]"), function (n) { ui.form[n.name] = n.value.trim(); });
+    Array.prototype.forEach.call(fm.querySelectorAll("input[name]"), function (n) { ui.form[n.name] = (n.type === "checkbox") ? !!n.checked : n.value.trim(); });
     return ui.form;
   }
   function download(name, text, type) {

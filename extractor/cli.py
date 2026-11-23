@@ -558,10 +558,10 @@ def main():
     dx_p.add_argument("--time-limit", dest="time_limit_s", type=float, default=None, help="Wall-clock observation budget in seconds")
     dx_p.add_argument("--default-check-budget", dest="default_check_budget_s", type=float, default=None,
                       help="Time budget in seconds for the default checks the symptom did not ask for (env "
-                           "DYNAMICSTATE_DEFAULT_CHECK_BUDGET_S, default 6; <= 0: no limit)")
+                           "DYNAMICSTATE_DEFAULT_CHECK_BUDGET_S, default 0/disabled; set > 0 to enable early cutoff)")
     dx_p.add_argument("--default-check-max", dest="default_check_max_s", type=float, default=None,
                       help="Per-check limit in seconds for a default check (env DYNAMICSTATE_DEFAULT_CHECK_MAX_S, "
-                           "default 2.5; <= 0: no limit)")
+                           "default 0/disabled; set > 0 to enable per-check cutoff)")
     dx_p.add_argument("--enable-tracing", "--tracing", dest="enable_tracing", action="store_true", default=None,
                       help="Enable selective eBPF/uprobe dynamic event tracing mode (default: disabled, zero-stop read-only)")
     dx_p.add_argument("--corpus", type=str, default="corpus", help="State Corpus directory (reports are written under <corpus>/reports)")
