@@ -1238,6 +1238,9 @@ class DiagnosticConclusion:
     what_remains_unknown: List[str] = field(default_factory=list)
     missing_evidence_needed: List[str] = field(default_factory=list)
     early_stop_rationale: Optional[Dict[str, Any]] = None
+    progress_summary: Optional[Dict[str, Any]] = None
+    recipe_dispositions: List[Dict[str, Any]] = field(default_factory=list)
+    failure_classification: Optional[Dict[str, Any]] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -1415,6 +1418,8 @@ class AdaptiveInvestigationSession:
         )
         self.competing_hypotheses: List[CompetingHypothesis] = []
         self.observation_selection_log: List[Dict[str, Any]] = []  # discriminating-selector decisions (replanning)
+        from .investigation_progress import InvestigationProgressTracker
+        self.progress_tracker = InvestigationProgressTracker()
         # expensive optional follow-ups decided by their expected outcome (extractor.followup_value), in order
         self.followup_decisions: List[Dict[str, Any]] = []
         self.invariant_evaluator = InvariantEvaluator()
@@ -2556,6 +2561,13 @@ class AdaptiveInvestigationSession:
             self.checks.append(diagnostic_check)
             if self.methodology:
                 self.methodology.add_check(diagnostic_check)
+            if getattr(self, "progress_tracker", None) is not None:
+                self.progress_tracker.record_step(
+                    recipe_id=step.recipe_id,
+                    domain=getattr(recipe, "domain", getattr(step, "domain", "")),
+                    eval_status="ERROR",
+                    error=err_msg,
+                )
             self._record_timeline_event("STEP_FAILED", {
                 "step_id": step.step_id,
                 "recipe_id": step.recipe_id,
@@ -3187,6 +3199,81 @@ class AdaptiveInvestigationSession:
                 for s in remaining_steps:
                     if s.category == recipe.problem_category and s.recipe_id not in BASELINE_RECIPE_IDS:
                         s.status = "SKIPPED"
+
+        # Phase 3–5: Meaningful progress accounting, stagnation detection & evidence-driven replanning
+        if getattr(self, "progress_tracker", None) is not None:
+            _disc_ents: List[str] = []
+            for _k in ("affected_threads", "contended_locks", "leaking_symbols", "corrupted_objects", "subjects"):
+                _v = obs_data.get(_k) if isinstance(obs_data, dict) else None
+                if isinstance(_v, list):
+                    _disc_ents.extend(str(x) for x in _v[:8])
+            _ev_items = list(eval_result.supporting_evidence or []) + list(eval_result.contradicting_evidence or [])
+            _h_delta = {
+                "strengthened": 1 if eval_result.status == RECIPE_STATUS_SUPPORTED else 0,
+                "rejected": 1 if eval_result.status == RECIPE_STATUS_CONTRADICTED else 0,
+            }
+            self.progress_tracker.record_step(
+                recipe_id=recipe.recipe_id,
+                domain=recipe.domain,
+                eval_status=eval_result.status,
+                evidence_items=_ev_items,
+                discovered_entities=_disc_ents,
+                hypotheses_delta=_h_delta,
+                is_reused=bool(is_precollected),
+            )
+            _rem_pending = [
+                s for s in (self.plan.steps[self.plan.current_step_index + 1:] if self.plan else [])
+                if s.status == "PENDING"
+            ]
+            _rem_domains = [str(getattr(s, "domain", "") or "") for s in _rem_pending]
+            _planned_rids = {s.recipe_id for s in (self.plan.steps if self.plan else [])}
+            _unplanned_plannable = [
+                r for r in self.recipe_registry.list_recipes()
+                if r.recipe_id not in _planned_rids
+                and self.recipe_registry.get_plannable_recipe(r.recipe_id) is not None
+                and getattr(r, "domain", "") != recipe.domain
+            ]
+            _stag = self.progress_tracker.detect_stagnation(
+                remaining_domains=_rem_domains,
+                unplanned_eligible_count=len(_unplanned_plannable),
+            )
+            if _stag.is_stagnant and self.plan is not None:
+                if _stag.recommended_action == "SWITCH_DOMAIN" and _rem_pending:
+                    _alt = next((s for s in _rem_pending if str(getattr(s, "domain", "") or "") != _stag.stagnant_domain), None)
+                    if _alt is not None:
+                        _tail = list(self.plan.steps[self.plan.current_step_index + 1:])
+                        if _alt in _tail and _tail[0] is not _alt:
+                            _tail.remove(_alt)
+                            _tail.insert(0, _alt)
+                            self.plan.steps = self.plan.steps[:self.plan.current_step_index + 1] + _tail
+                            self.progress_tracker.record_replan(strategy_changed=True)
+                            self._record_timeline_event("STAGNATION_STRATEGY_CHANGE", {
+                                "from_domain": _stag.stagnant_domain,
+                                "to_recipe": _alt.recipe_id,
+                                "to_domain": getattr(_alt, "domain", ""),
+                                "reason": _stag.reason,
+                            })
+                elif _stag.recommended_action == "EXPAND_CANDIDATES" and _unplanned_plannable:
+                    _added = 0
+                    for _ur in _unplanned_plannable[:3]:
+                        _exp_step = self.planner.score_and_build_step(
+                            recipe=_ur,
+                            rel_weight=0.75,
+                            step_id=f"step_expand_{len(self.plan.steps) + 1:02d}",
+                            priority=len(self.plan.steps) + 1,
+                            target_assessment=self.target_assessment,
+                            rationale_override=f"Stagnation expansion: {_stag.reason}",
+                        )
+                        _exp_step.dynamic_followup = True
+                        self.plan.steps.append(_exp_step)
+                        _added += 1
+                    if _added > 0:
+                        self.plan.total_steps = len(self.plan.steps)
+                        self.progress_tracker.record_replan(strategy_changed=True, new_candidates=_added)
+                        self._record_timeline_event("PLAN_EXPANDED_ON_STAGNATION", {
+                            "added_count": _added,
+                            "reason": _stag.reason,
+                        })
 
         # Deduct actual consumed resources into budget_tracker
         if self.budget_tracker:
@@ -3861,6 +3948,22 @@ class AdaptiveInvestigationSession:
                 "Diagnostic inspection did not confirm a specific fault; review collected evidence and limitations."
             )
 
+        from .investigation_progress import build_recipe_dispositions, classify_diagnosis_failure
+        _recipe_disps = build_recipe_dispositions(
+            self.plan.steps if self.plan else [],
+            self.checks,
+            stop_reason=stop_reason,
+        )
+        _prog_sum = self.progress_tracker.to_dict() if getattr(self, "progress_tracker", None) is not None else None
+        _fail_cls = classify_diagnosis_failure(
+            verdict=agg.overall_result,
+            stop_reason=stop_reason,
+            dispositions=_recipe_disps,
+            progress=_prog_sum,
+            evidence_count=len(self.collected_evidence),
+            error_message=summary,
+        )
+
         self.conclusion = DiagnosticConclusion(
             investigation_id=self.investigation_id,
             target_pid=self.pid,
@@ -3881,6 +3984,9 @@ class AdaptiveInvestigationSession:
             what_remains_unknown=what_remains_unknown,
             missing_evidence_needed=missing_evidence_needed,
             early_stop_rationale=self.early_stop_rationale,
+            progress_summary=_prog_sum,
+            recipe_dispositions=_recipe_disps,
+            failure_classification=_fail_cls,
         )
         self._record_timeline_event("CONCLUSION_SEALED", {
             "status": self.state,

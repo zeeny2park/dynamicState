@@ -13,6 +13,7 @@ import re
 import subprocess
 import tempfile
 import threading
+import time
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 from .debug_image import BinaryIdentity, inspect_elf
@@ -141,6 +142,8 @@ class DwarfIndex:
     subprograms: List[DwarfSubprogram] = field(default_factory=list)
     subprograms_by_name: Dict[str, List[DwarfSubprogram]] = field(default_factory=dict)
     file_table: Dict[int, str] = field(default_factory=dict)
+    truncated: bool = False
+    truncation_reason: Optional[str] = None
 
     def get_type_by_die(self, die_offset: int) -> Optional[DwarfType]:
         return self.types_by_die.get(die_offset)
@@ -776,7 +779,17 @@ def parse_cfi_table(artifact_path: str, arch: str = "x86_64") -> Dict[int, Dict[
             fde_entry_cfa: Tuple[str, int] = ("sp", 0)
 
             assert proc.stdout is not None
+            _cfi_timeout_s = float(os.environ.get("DYNAMICSTATE_CFI_PARSE_TIMEOUT_S", "6.0"))
+            _cfi_deadline = time.monotonic() + max(1.0, _cfi_timeout_s)
+            _cfi_lines = 0
             for raw_line in proc.stdout:
+                _cfi_lines += 1
+                if (_cfi_lines & 1023) == 0 and time.monotonic() > _cfi_deadline:
+                    try:
+                        proc.terminate()
+                    except Exception:
+                        pass
+                    break
                 line = raw_line.rstrip("\r\n")
                 # Check CIE header
                 m_cie = cie_re.match(line)
@@ -949,7 +962,7 @@ class DwarfIndexer:
         with cls._lock:
             lock = cls._inflight_locks.get(cache_key)
             if lock is None:
-                lock = threading.Lock()
+                lock = threading.RLock()
                 cls._inflight_locks[cache_key] = lock
             return lock
 
@@ -1303,9 +1316,11 @@ class DwarfIndexer:
         attr_regex = re.compile(r"^\s*<([0-9a-fA-F]+)>\s*(DW_AT_[a-zA-Z0-9_]+)\s*:\s*(.*)$")
 
         max_dies = int(os.environ.get("DYNAMICSTATE_MAX_DWARF_DIES", "250000"))
+        info_timeout_s = float(os.environ.get("DYNAMICSTATE_DWARF_INFO_TIMEOUT_S", "8.0"))
+        info_deadline = time.monotonic() + max(1.0, info_timeout_s)
         dies: List[Dict[str, Any]] = []
 
-        # Stream readelf --debug-dump=info line-by-line without buffering full stdout in RAM
+        # Stream readelf --debug-dump=info line-by-line with strict wall-clock bound
         cmd = ["readelf", "--debug-dump=info", path]
         try:
             proc = subprocess.Popen(
@@ -1318,11 +1333,25 @@ class DwarfIndexer:
             )
             try:
                 assert proc.stdout is not None
+                _line_cnt = 0
                 for raw_line in proc.stdout:
+                    _line_cnt += 1
+                    if (_line_cnt & 1023) == 0 and time.monotonic() > info_deadline:
+                        index.truncated = True
+                        index.truncation_reason = f"dwarf_info_timeout_{info_timeout_s:.1f}s"
+                        try:
+                            proc.terminate()
+                        except Exception:
+                            pass
+                        break
+                    if "<" not in raw_line:
+                        continue
                     line = raw_line.rstrip("\r\n")
                     m_die = die_regex.match(line)
                     if m_die:
                         if len(dies) >= max_dies:
+                            index.truncated = True
+                            index.truncation_reason = f"max_dies_{max_dies}"
                             try:
                                 proc.terminate()
                             except Exception:
@@ -1349,7 +1378,14 @@ class DwarfIndexer:
                     proc.stdout.close()  # type: ignore[union-attr]
                 except Exception:
                     pass
-                rc = proc.wait(timeout=30)
+                try:
+                    rc = proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
+                    rc = proc.wait(timeout=2)
                 if rc != 0 and not dies:
                     return index
         except Exception:
@@ -1699,5 +1735,30 @@ class DwarfIndexer:
                         m_sz = m.byte_size or (m_t.byte_size if m_t else pointer_size)
                         max_end = max(max_end, m.offset + m_sz)
                     d_type.byte_size = max_end
+
+        if index.truncated:
+            try:
+                fast_syms = cls.get_fast_symbol_table(path, load_bias=0)
+                for sym in fast_syms:
+                    sname = str(sym.get("name") or "").strip()
+                    if sym.get("symbol_type") != "OBJECT":
+                        continue
+                    saddr = int(sym.get("link_time_address_int") or 0)
+                    if not sname or saddr <= 0:
+                        continue
+                    if sname not in index.variables_by_name:
+                        dv = DwarfVariable(
+                            die_offset=0,
+                            name=sname,
+                            type_offset=0,
+                            link_time_address=saddr,
+                            location_expr=f"DW_OP_addr: {saddr:x}",
+                            is_external=True,
+                        )
+                        index.variables.append(dv)
+                        index.global_variables.append(dv)
+                        index.variables_by_name.setdefault(sname, []).append(dv)
+            except Exception:  # noqa: BLE001
+                pass
 
         return index
