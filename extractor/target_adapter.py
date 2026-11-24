@@ -912,8 +912,17 @@ class TargetExecutionAdapter(ABC):
 
             cur_bid = cur_ident.get("build_id")
             if not cur_bid or cur_bid == "default_build_id":
-                self.rollback_capture_transaction(target_tx, "Target build_id missing or unavailable")
-                raise MissingIdentityFieldError(f"Mandatory build_id is missing or unavailable on target {target_tx.pid}")
+                # Allow binaries compiled without GNU Build-ID (e.g. -Wl,--build-id=none) when a real
+                # executable path or file fingerprint is observed; still fail closed on empty/corrupt identities.
+                _exe_path = str(cur_ident.get("executable") or "").strip()
+                _exe_fp = str(cur_ident.get("exe_fingerprint") or "").strip()
+                if _exe_path or _exe_fp:
+                    _fb_raw = f"{_exe_path}|{_exe_fp}".encode("utf-8", "replace")
+                    cur_bid = f"no-build-id:{hashlib.sha256(_fb_raw).hexdigest()[:24]}"
+                    target_tx.metadata["build_id_absent"] = True
+                else:
+                    self.rollback_capture_transaction(target_tx, "Target build_id missing or unavailable")
+                    raise MissingIdentityFieldError(f"Mandatory build_id is missing or unavailable on target {target_tx.pid}")
 
             p_start_raw = cur_ident.get("start_time")
             try:
@@ -2343,6 +2352,8 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
         collector_path: Optional[str] = None,
         stream_opener: Optional[Callable[[List[str]], "subprocess.Popen"]] = None,
         use_daemon: bool = True,
+        download_runner: Optional[Callable[[str, str, float], Tuple[int, str, str]]] = None,
+        download_cmd_template: Optional[str] = None,
     ):
         self._ensure_tracking_state()
         if not host or not isinstance(host, str) or not host.strip():
@@ -2412,6 +2423,12 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
         self._liveness_cache: Dict[int, Tuple[float, bool]] = {}
         self._observed_rtt_s: float = 0.0
         self._hydrated_bundle_mode: bool = False
+        self._download_runner = download_runner
+        self._download_cmd_template = (
+            download_cmd_template
+            if download_cmd_template is not None
+            else (os.environ.get("DYNAMICSTATE_XSSH_DOWNLOAD_CMD") or "").strip() or None
+        )
         self._deadline_tls = threading.local()
         # Trustworthy performance baseline instrumentation (Phase 1)
         self._perf_ssh_commands: int = 0
@@ -3218,6 +3235,129 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
         if osrel and re.fullmatch(r"\d+\.\d+[\w.+~-]*", osrel):
             self._target_kernel_release = osrel
         return True
+
+    def download_remote_file(
+        self,
+        remote_path: str,
+        local_path: str,
+        timeout: Optional[float] = None,
+    ) -> bool:
+        """Downloads a remote file in ONE call via injected download_runner (e.g. xssh download),
+        DYNAMICSTATE_XSSH_DOWNLOAD_CMD template, or single-exec read_target_file fallback."""
+        eff_t = float(timeout or max(15.0, self.timeout_sec * 2.0))
+        if self._download_runner is not None:
+            rc, _out, _err = self._download_runner(remote_path, local_path, eff_t)
+            return rc == 0 and os.path.isfile(local_path) and os.path.getsize(local_path) > 0
+        if self._download_cmd_template:
+            cmd_str = self._download_cmd_template.format(
+                host=shlex.quote(self.host),
+                user=shlex.quote(self.user or ""),
+                port=int(self.port),
+                remote_path=shlex.quote(remote_path),
+                local_path=shlex.quote(local_path),
+            )
+            try:
+                res = subprocess.run(cmd_str, shell=True, capture_output=True, text=True, timeout=eff_t)
+                return res.returncode == 0 and os.path.isfile(local_path) and os.path.getsize(local_path) > 0
+            except Exception:  # noqa: BLE001
+                return False
+        data = self.read_target_file(0, remote_path, 32 * 1024 * 1024)
+        if data is None:
+            return False
+        with open(local_path, "wb") as fh:
+            fh.write(data)
+        return True
+
+    def collect_and_download_bundle(
+        self,
+        pid: int,
+        *,
+        remote_bundle_path: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Single-exec upfront collection + single-download hydration for high-latency/xssh links.
+
+        * With collector + download channel (e.g. ``xssh download``):
+          1 ``exec`` (``collector --pid <PID> --snapshot-bundle <rpath>``) + 1 ``download`` -> hydrate.
+        * With collector + no separate download channel:
+          1 ``exec`` (``collector --pid <PID> --snapshot`` stdout JSON) -> hydrate (0 downloads).
+        * Without collector:
+          1 coalesced POSIX-sh snapshot ``exec`` -> hydrate.
+        """
+        if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
+            return None
+        has_dl_channel = bool(self._download_runner is not None or self._download_cmd_template)
+        snap_payload: Optional[Dict[str, Any]] = None
+
+        if self.collector_path:
+            qc = shlex.quote(self.collector_path)
+            if has_dl_channel:
+                rpath = remote_bundle_path or f"/tmp/ds_bundle_{int(pid)}_{os.getpid()}.json"
+                qr = shlex.quote(rpath)
+                rc, out, _err = self.run_ssh(
+                    f"{qc} --pid {int(pid)} --snapshot-bundle {qr}",
+                    timeout=max(15.0, self.timeout_sec * 2.0),
+                )
+                if rc == 0 and out and '"success":true' in out.replace(" ", ""):
+                    fd, local_tmp = tempfile.mkstemp(prefix="ds_dl_bundle_", suffix=".json")
+                    os.close(fd)
+                    try:
+                        if self.download_remote_file(rpath, local_tmp):
+                            with open(local_tmp, "r", encoding="utf-8", errors="replace") as fh:
+                                parsed = json.load(fh)
+                            if isinstance(parsed, dict) and parsed.get("success"):
+                                snap_payload = parsed
+                    except Exception:  # noqa: BLE001
+                        snap_payload = None
+                    finally:
+                        try:
+                            os.unlink(local_tmp)
+                        except OSError:
+                            pass
+            else:
+                rc, out, _err = self.run_ssh(
+                    f"{qc} --pid {int(pid)} --snapshot",
+                    timeout=max(15.0, self.timeout_sec * 2.0),
+                )
+                if rc == 0 and out:
+                    try:
+                        parsed = json.loads(out.strip().splitlines()[-1])
+                        if isinstance(parsed, dict) and parsed.get("success"):
+                            snap_payload = parsed
+                    except Exception:  # noqa: BLE001
+                        snap_payload = None
+
+        if snap_payload is None:
+            snap_payload = self.prefetch_snapshot(pid, force=True, domains=self.ALL_SNAPSHOT_DOMAINS)
+        if not isinstance(snap_payload, dict) or snap_payload.get("terminated"):
+            return None
+
+        snap_stat = str(snap_payload.get("stat") or "")
+        snap_exe = str(snap_payload.get("exe") or "")
+        snap_boot = str(snap_payload.get("boot_id") or "")
+        snap_fp = str(snap_payload.get("exe_fp") or "")
+        snap_st = self._start_time_from_stat(snap_stat)
+        ident_dict: Dict[str, Any] = {
+            "pid": int(pid),
+            "executable": snap_exe,
+            "executable_identity": f"{snap_exe}:remote" if snap_exe else "",
+            "exe_fingerprint": snap_fp,
+            "start_time": snap_st,
+            "boot_id": snap_boot,
+            "process_identity": f"{int(pid)}:{snap_st}:{snap_boot}" if snap_st else f"{int(pid)}::{snap_boot}",
+            "architecture": str(snap_payload.get("machine") or "unknown").strip(),
+            "build_id": None,
+            "is_remote": True,
+            "host": self.target_host(),
+        }
+        bundle = {
+            "host": self.target_host(),
+            "pid": int(pid),
+            "identity": ident_dict,
+            "snapshot": dict(snap_payload),
+            "collected_at_epoch_s": time.time(),
+        }
+        self.hydrate_from_bundle(bundle)
+        return bundle
 
     def _identity_probe(self, pid: int, with_header: bool = False) -> Optional[Dict[str, Any]]:
         """exe link, /proc/PID/stat, boot_id, exe fingerprint, uname -m (+ ELF header) in ONE exchange:

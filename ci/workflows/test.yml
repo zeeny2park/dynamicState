@@ -393,7 +393,7 @@ jobs:
 
       - name: Run Remote Collection Correctness and Compression Closure Tests
         run: |
-          python3 scripts/run_unittest.py tests/test_remote_collection_correctness_closure.py tests/test_remote_file_transfer_pipeline_integrity.py tests/test_remote_single_tx_prefetch_and_bundle_completion.py tests/test_large_target_investigation_closure.py
+          python3 scripts/run_unittest.py tests/test_remote_collection_correctness_closure.py tests/test_remote_file_transfer_pipeline_integrity.py tests/test_remote_single_tx_prefetch_and_bundle_completion.py tests/test_large_target_investigation_closure.py tests/test_build_id_optional_and_single_download_bundle.py
 
       - name: Run Deadlock Real-Process Baseline Tests (2 positive, 2 negative controls)
         run: |

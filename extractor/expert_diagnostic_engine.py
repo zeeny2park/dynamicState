@@ -5652,6 +5652,22 @@ def _diagnose_run(
                         res.target["collected_bundle_reused"] = dict(saved_bundle.get("key") or {})
             except Exception:  # noqa: BLE001
                 pass
+        # Single-exec upfront bundle capture for remote targets (cuts 40+ xssh exec calls to 1 exec + 1 download)
+        if (
+            remote
+            and not continue_collected_only
+            and pid
+            and int(pid) > 0
+            and type(adapter) is RemoteSshTargetAdapter
+            and hasattr(adapter, "collect_and_download_bundle")
+            and getattr(adapter, "collector_path", None)
+            and not getattr(adapter, "_hydrated_bundle_mode", False)
+            and not any(k in adapter.__dict__ for k in ("get_proc_maps", "get_process_identity", "check_liveness"))
+        ):
+            try:
+                adapter.collect_and_download_bundle(int(pid))
+            except Exception:  # noqa: BLE001 - fall back to normal preflight cleanly
+                pass
         if continue_collected_only and (resume_investigation_id or getattr(adapter, "_hydrated_bundle_mode", False)):
             name, bad = f"pid_{pid}", None
         else:

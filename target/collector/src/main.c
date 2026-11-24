@@ -255,6 +255,8 @@ static void print_usage(const char *prog) {
         "      --threads           With -p: print per-thread info (one JSON page); --after-tid <TID> continues\n"
         "      --test-crypto     Run cryptographic self-test against FIPS/RFC vectors\n"
         "      --version           Print collector version and exit\n"
+        "      --snapshot          Write full process snapshot bundle JSON to stdout (1-exec)\n"
+        "      --snapshot-bundle <FILE>  Write full process snapshot bundle JSON atomically to FILE\n"
         "  -h, --help              Show this help message\n\n"
         "Example:\n"
         "  %s -o /tmp/snapshot_1234 1234\n",
@@ -287,6 +289,8 @@ int main(int argc, char *argv[]) {
         {"daemon", no_argument, 0, 'd'},
         {"threads", no_argument, 0, 1002},
         {"after-tid", required_argument, 0, 1003},
+        {"snapshot", no_argument, 0, 1004},
+        {"snapshot-bundle", required_argument, 0, 1005},
         {"timeout-ms", required_argument, 0, 't'},
         {"json", no_argument, 0, 'j'},
         {"verbose", no_argument, 0, 'v'},
@@ -306,6 +310,8 @@ int main(int argc, char *argv[]) {
     const char *read_slices_spec = NULL;
     int daemon_mode = 0;
     int threads_mode = 0;
+    int snapshot_mode = 0;
+    const char *snapshot_bundle_path = NULL;
     long after_tid = 0;
     int opt;
     int option_index = 0;
@@ -395,6 +401,12 @@ int main(int argc, char *argv[]) {
                 }
                 break;
             }
+            case 1004:
+                snapshot_mode = 1;
+                break;
+            case 1005:
+                snapshot_bundle_path = optarg;
+                break;
             case 't':
                 timeout_str = optarg;
                 break;
@@ -522,6 +534,42 @@ int main(int argc, char *argv[]) {
             fflush(stdout);
         }
         return 1;
+    }
+
+    if (snapshot_bundle_path != NULL && snapshot_bundle_path[0] != '\0') {
+        char tmp_bundle[2048];
+        int n_tmp = snprintf(tmp_bundle, sizeof(tmp_bundle), "%s.tmp.%ld", snapshot_bundle_path, (long)getpid());
+        if (n_tmp <= 0 || (size_t)n_tmp >= sizeof(tmp_bundle)) {
+            fprintf(stdout, "{\"success\":false,\"error\":\"BUNDLE_PATH_TOO_LONG\"}\n");
+            return 1;
+        }
+        FILE *bf = fopen(tmp_bundle, "wb");
+        if (!bf) {
+            fprintf(stdout, "{\"success\":false,\"error\":\"BUNDLE_OPEN_FAILED\"}\n");
+            return 1;
+        }
+        int s_rc = collector_report_snapshot(cfg.pid, bf);
+        long b_size = ftell(bf);
+        int flush_rc = fflush(bf);
+        int close_rc = fclose(bf);
+        if (s_rc != 0 || flush_rc != 0 || close_rc != 0 || b_size <= 0) {
+            unlink(tmp_bundle);
+            fprintf(stdout, "{\"success\":false,\"error\":\"BUNDLE_WRITE_FAILED\"}\n");
+            return 1;
+        }
+        if (rename(tmp_bundle, snapshot_bundle_path) != 0) {
+            unlink(tmp_bundle);
+            fprintf(stdout, "{\"success\":false,\"error\":\"BUNDLE_RENAME_FAILED\"}\n");
+            return 1;
+        }
+        fprintf(stdout, "{\"success\":true,\"bundle_path\":\"%s\",\"bytes\":%ld,\"pid\":%d}\n",
+                snapshot_bundle_path, b_size, (int)cfg.pid);
+        fflush(stdout);
+        return 0;
+    }
+
+    if (snapshot_mode) {
+        return (collector_report_snapshot(cfg.pid, stdout) == 0) ? 0 : 1;
     }
 
     if (threads_mode) {
