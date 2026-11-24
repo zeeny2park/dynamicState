@@ -630,9 +630,16 @@ class LiveCaptureReceipt:
             if ":" in exp_exe and ":" in act_exe and act_exe != exp_exe:
                 return False, f"mismatched_executable_inode:expected={exp_exe},got={act_exe}"
 
-        # 7. Validate Build ID
+        # 7. Validate Build ID (allow synthetic no-build-id: marker to match absent build_id)
         if expected_build_id is not None and str(expected_build_id).strip():
-            if not self.build_id or str(self.build_id).strip().lower() != str(expected_build_id).strip().lower():
+            exp_b = str(expected_build_id).strip().lower()
+            got_b = str(self.build_id or "").strip().lower()
+            exp_absent = exp_b.startswith("no-build-id:")
+            got_absent = (not got_b) or got_b.startswith("no-build-id:")
+            if exp_absent and got_absent:
+                if got_b and got_b != exp_b:
+                    return False, f"mismatched_build_id:expected={expected_build_id},got={self.build_id}"
+            elif not got_b or got_b != exp_b:
                 return False, f"mismatched_build_id:expected={expected_build_id},got={self.build_id}"
 
         # 8. Validate snapshot binding

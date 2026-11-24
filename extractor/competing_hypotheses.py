@@ -849,18 +849,26 @@ class CompetingHypothesis:
                             f"Executable identity mismatch across target evidence: baseline {base_exe}, record {rec_exe}"
                         )
 
-            # 6. Executable Build ID check
-            if not rec_bid or not str(rec_bid).strip():
-                missing_fields.append("build_id")
-            else:
-                if exp_bid and str(exp_bid) != str(rec_bid):
+            # 6. Executable Build ID check (allow binaries genuinely compiled without GNU Build-ID)
+            rec_bid_norm = str(rec_bid or "").strip().lower()
+            exp_bid_norm = str(exp_bid or "").strip().lower()
+            base_bid_raw = baseline_identities.get("build_id") if baseline_identities is not None else None
+            base_bid_norm = str(base_bid_raw or "").strip().lower()
+            rec_absent = (not rec_bid_norm) or rec_bid_norm.startswith("no-build-id:")
+            exp_real = bool(exp_bid_norm) and not exp_bid_norm.startswith("no-build-id:")
+            base_real = bool(base_bid_norm) and not base_bid_norm.startswith("no-build-id:")
+            if rec_absent:
+                if exp_real or base_real:
+                    missing_fields.append("build_id")
+                elif rec_bid_norm and exp_bid_norm and rec_bid_norm != exp_bid_norm:
                     mismatches.append(f"Build ID mismatch: expected {exp_bid}, record {rec_bid}")
-                if baseline_identities is not None and baseline_identities.get("build_id"):
-                    base_bid = baseline_identities["build_id"]
-                    if str(base_bid) != str(rec_bid):
-                        mismatches.append(
-                            f"Build ID mismatch across target evidence: baseline {base_bid}, record {rec_bid}"
-                        )
+            else:
+                if exp_real and exp_bid_norm != rec_bid_norm:
+                    mismatches.append(f"Build ID mismatch: expected {exp_bid}, record {rec_bid}")
+                if base_real and base_bid_norm != rec_bid_norm:
+                    mismatches.append(
+                        f"Build ID mismatch across target evidence: baseline {base_bid_raw}, record {rec_bid}"
+                    )
 
             # 7. Snapshot identity & binding check
             if exp_snap:

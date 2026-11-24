@@ -913,11 +913,12 @@ class TargetExecutionAdapter(ABC):
             cur_bid = cur_ident.get("build_id")
             if not cur_bid or cur_bid == "default_build_id":
                 # Allow binaries compiled without GNU Build-ID (e.g. -Wl,--build-id=none) when a real
-                # executable path or file fingerprint is observed; still fail closed on empty/corrupt identities.
+                # executable path, executable_identity, or file fingerprint is observed; still fail closed on empty/corrupt identities.
                 _exe_path = str(cur_ident.get("executable") or "").strip()
                 _exe_fp = str(cur_ident.get("exe_fingerprint") or "").strip()
-                if _exe_path or _exe_fp:
-                    _fb_raw = f"{_exe_path}|{_exe_fp}".encode("utf-8", "replace")
+                _exe_id = str(cur_ident.get("executable_identity") or "").strip()
+                if _exe_path or _exe_fp or _exe_id:
+                    _fb_raw = f"{_exe_path or _exe_id}|{_exe_fp}".encode("utf-8", "replace")
                     cur_bid = f"no-build-id:{hashlib.sha256(_fb_raw).hexdigest()[:24]}"
                     target_tx.metadata["build_id_absent"] = True
                 else:
@@ -2354,6 +2355,7 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
         use_daemon: bool = True,
         download_runner: Optional[Callable[[str, str, float], Tuple[int, str, str]]] = None,
         download_cmd_template: Optional[str] = None,
+        use_snapshot_bundle: bool = True,
     ):
         self._ensure_tracking_state()
         if not host or not isinstance(host, str) or not host.strip():
@@ -2395,6 +2397,8 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
         self._cm_disabled = False
         self._cm_used = False
         self.collector_path = (collector_path or "").strip() or None
+        self.use_snapshot_bundle = bool(use_snapshot_bundle)
+        self._last_bundle_transport: Optional[str] = None
         # IMP-021: persistent daemon channel state.  ``stream_opener(args)`` returns a Popen with
         # stdin/stdout pipes; injectable so tests can run the "remote" side locally.
         self._stream_opener = stream_opener or self._default_stream_opener
@@ -3273,24 +3277,27 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
         pid: int,
         *,
         remote_bundle_path: Optional[str] = None,
+        use_snapshot_bundle: Optional[bool] = None,
     ) -> Optional[Dict[str, Any]]:
         """Single-exec upfront collection + single-download hydration for high-latency/xssh links.
 
-        * With collector + download channel (e.g. ``xssh download``):
-          1 ``exec`` (``collector --pid <PID> --snapshot-bundle <rpath>``) + 1 ``download`` -> hydrate.
-        * With collector + no separate download channel:
-          1 ``exec`` (``collector --pid <PID> --snapshot`` stdout JSON) -> hydrate (0 downloads).
+        * With collector and ``use_snapshot_bundle=True`` (default for remote MCP/Web UI):
+          1 ``exec`` (``collector --pid <PID> --snapshot-bundle <rpath>``) + 1 ``download``
+          (via ``download_runner`` / ``DYNAMICSTATE_XSSH_DOWNLOAD_CMD`` / ``read_target_file``) -> hydrate.
+          Falls back cleanly to ``--snapshot`` if the remote collector does not support ``--snapshot-bundle``.
+        * With collector and ``use_snapshot_bundle=False``:
+          1 ``exec`` (``collector --pid <PID> --snapshot`` stdout JSON) -> hydrate.
         * Without collector:
           1 coalesced POSIX-sh snapshot ``exec`` -> hydrate.
         """
         if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
             return None
-        has_dl_channel = bool(self._download_runner is not None or self._download_cmd_template)
+        eff_use_bundle = self.use_snapshot_bundle if use_snapshot_bundle is None else bool(use_snapshot_bundle)
         snap_payload: Optional[Dict[str, Any]] = None
 
         if self.collector_path:
             qc = shlex.quote(self.collector_path)
-            if has_dl_channel:
+            if eff_use_bundle:
                 rpath = remote_bundle_path or f"/tmp/ds_bundle_{int(pid)}_{os.getpid()}.json"
                 qr = shlex.quote(rpath)
                 rc, out, _err = self.run_ssh(
@@ -3306,6 +3313,7 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
                                 parsed = json.load(fh)
                             if isinstance(parsed, dict) and parsed.get("success"):
                                 snap_payload = parsed
+                                self._last_bundle_transport = "snapshot_bundle"
                     except Exception:  # noqa: BLE001
                         snap_payload = None
                     finally:
@@ -3313,7 +3321,7 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
                             os.unlink(local_tmp)
                         except OSError:
                             pass
-            else:
+            if snap_payload is None:
                 rc, out, _err = self.run_ssh(
                     f"{qc} --pid {int(pid)} --snapshot",
                     timeout=max(15.0, self.timeout_sec * 2.0),
@@ -3323,6 +3331,7 @@ class RemoteSshTargetAdapter(TargetExecutionAdapter):
                         parsed = json.loads(out.strip().splitlines()[-1])
                         if isinstance(parsed, dict) and parsed.get("success"):
                             snap_payload = parsed
+                            self._last_bundle_transport = "snapshot_stdout"
                     except Exception:  # noqa: BLE001
                         snap_payload = None
 

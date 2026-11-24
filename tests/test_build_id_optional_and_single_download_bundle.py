@@ -138,7 +138,7 @@ class TestBuildIdOptionalAndSingleDownloadBundle(unittest.TestCase):
             self.assertIsInstance(status, dict)
             self.assertEqual(len(exec_calls), 1, "Hydrated bundle must serve all metadata with 0 extra execs")
 
-    def test_collector_single_exec_stdout_snapshot_without_download_channel(self):
+    def test_collector_defaults_to_snapshot_bundle_even_without_download_channel(self):
         if not os.path.isfile(COLLECTOR_BIN):
             self.skipTest("native dynamicstate-collector not built")
         my_pid = os.getpid()
@@ -159,10 +159,115 @@ class TestBuildIdOptionalAndSingleDownloadBundle(unittest.TestCase):
         )
         bundle = ad.collect_and_download_bundle(my_pid)
         self.assertIsNotNone(bundle)
+        self.assertIn("--snapshot-bundle", exec_calls[0])
+        self.assertEqual(ad._last_bundle_transport, "snapshot_bundle")
+        before = len(exec_calls)
+        self.assertGreater(len(ad.get_proc_maps(my_pid)), 0)
+        self.assertEqual(len(exec_calls), before)
+
+    def test_collector_opt_out_snapshot_bundle_uses_stdout_snapshot(self):
+        if not os.path.isfile(COLLECTOR_BIN):
+            self.skipTest("native dynamicstate-collector not built")
+        my_pid = os.getpid()
+        exec_calls = []
+
+        def xssh_exec_runner(args, timeout):
+            cmd = args[-1]
+            exec_calls.append(cmd)
+            res = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=timeout)
+            return res.returncode, res.stdout, res.stderr
+
+        ad = RemoteSshTargetAdapter(
+            host="xssh-3hop",
+            collector_path=COLLECTOR_BIN,
+            command_runner=xssh_exec_runner,
+            use_control_master=False,
+            use_daemon=False,
+            use_snapshot_bundle=False,
+        )
+        bundle = ad.collect_and_download_bundle(my_pid)
+        self.assertIsNotNone(bundle)
         self.assertEqual(len(exec_calls), 1)
         self.assertIn("--snapshot", exec_calls[0])
-        self.assertGreater(len(ad.get_proc_maps(my_pid)), 0)
-        self.assertEqual(len(exec_calls), 1)
+        self.assertNotIn("--snapshot-bundle", exec_calls[0])
+        self.assertEqual(ad._last_bundle_transport, "snapshot_stdout")
+
+
+class TestBuildIdAbsentIdentityAndDebugCompatibility(unittest.TestCase):
+    def test_evidence_ledger_allows_no_build_id_marker_with_absent_expected(self):
+        from extractor.evidence_ledger import validate_controlled_execution_target_identity as validate_target_identity
+
+        exp = {
+            "pid": 1234,
+            "process_identity": "1234:999:boot-1",
+            "executable_identity": "/opt/app:remote",
+            "build_id": None,
+        }
+        rcpt_synthetic = {
+            "pid": 1234,
+            "process_identity": "1234:999:boot-1",
+            "executable_identity": "/opt/app:remote",
+            "build_id": "no-build-id:0123456789abcdef01234567",
+        }
+        ok, _ = validate_target_identity(exp, rcpt_synthetic)
+        self.assertTrue(ok)
+
+        # Real GNU Build-ID on receipt while expected lacks one must STILL fail closed
+        rcpt_real = dict(rcpt_synthetic, build_id="abcdef1234567890")
+        ok2, reason2 = validate_target_identity(exp, rcpt_real)
+        self.assertFalse(ok2)
+        self.assertIn("expected identity missing build_id", reason2)
+
+    def test_debug_image_compatible_when_both_lack_gnu_build_id(self):
+        from extractor.debug_image import DebugImageProvider, inspect_elf
+
+        with tempfile.TemporaryDirectory() as td:
+            c_src = os.path.join(td, "nobid.c")
+            elf_bin = os.path.join(td, "nobid_bin")
+            with open(c_src, "w", encoding="utf-8") as fh:
+                fh.write("int main(void) { return 0; }\n")
+            subprocess.check_call(["gcc", "-g", "-O0", "-Wl,--build-id=none", c_src, "-o", elf_bin])
+            self.assertIsNone(inspect_elf(elf_bin).build_id)
+
+            prov = DebugImageProvider(elf_bin)
+            compat = prov.verify(elf_bin)
+            self.assertTrue(compat.compatible, f"Expected compatible, got {compat.reason}")
+            self.assertEqual(compat.reason, "COMPATIBLE_NO_BUILD_ID")
+
+    def test_mcp_and_web_remote_defaults_enable_snapshot_bundle(self):
+        import inspect
+        import scripts.mcp_server as mcp_srv
+        from extractor.web.server import WebApiAdapter
+
+        sig = inspect.signature(mcp_srv.runtime_diagnose_process)
+        self.assertIs(sig.parameters["auto_deploy_collector"].default, True)
+        self.assertIs(sig.parameters["use_snapshot_bundle"].default, True)
+
+        sig_conn = inspect.signature(mcp_srv.runtime_target_connect)
+        self.assertIs(sig_conn.parameters["auto_deploy_collector"].default, True)
+
+        ws = WebApiAdapter.__new__(WebApiAdapter)
+        parsed = ws._parse_diagnose_request({
+            "pid": 1234,
+            "remote_host": "board.example",
+            "debug_image": "/tmp/app.debug",
+        })
+        self.assertTrue(parsed["success"])
+        rt = parsed["args"]["remote_target"]
+        self.assertIs(rt["auto_deploy_collector"], True)
+        self.assertIs(rt["use_snapshot_bundle"], True)
+
+        parsed_off = ws._parse_diagnose_request({
+            "pid": 1234,
+            "remote_host": "board.example",
+            "debug_image": "/tmp/app.debug",
+            "auto_deploy_collector": False,
+            "use_snapshot_bundle": False,
+        })
+        self.assertTrue(parsed_off["success"])
+        rt_off = parsed_off["args"]["remote_target"]
+        self.assertIs(rt_off["auto_deploy_collector"], False)
+        self.assertIs(rt_off["use_snapshot_bundle"], False)
 
 
 if __name__ == "__main__":

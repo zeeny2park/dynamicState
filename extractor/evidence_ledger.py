@@ -445,14 +445,19 @@ def validate_controlled_execution_target_identity(
     if exp_exe != rcpt_exe:
         return False, f"Target identity validation failed: executable_identity mismatch (expected='{exp_exe}', receipt='{rcpt_exe}')"
 
-    # 4. Build ID
+    # 4. Build ID (tolerate binaries genuinely compiled without GNU Build-ID, including synthetic no-build-id: markers)
     exp_bid = str(expected_tid.get("build_id") or expected_tid.get("target_build_id") or "").strip().lower()
     rcpt_bid = str(receipt_tid.get("build_id") or receipt_tid.get("target_build_id") or "").strip().lower()
-    if exp_bid and not rcpt_bid:
+    exp_absent = (not exp_bid) or exp_bid.startswith("no-build-id:")
+    rcpt_absent = (not rcpt_bid) or rcpt_bid.startswith("no-build-id:")
+    if exp_absent and rcpt_absent:
+        if exp_bid and rcpt_bid and exp_bid != rcpt_bid:
+            return False, f"Target identity validation failed: build_id mismatch (expected='{exp_bid}', receipt='{rcpt_bid}')"
+    elif not exp_absent and rcpt_absent:
         return False, f"Target identity validation failed: receipt missing build_id when expected='{exp_bid}'"
-    if rcpt_bid and not exp_bid:
+    elif not rcpt_absent and exp_absent:
         return False, f"Target identity validation failed: expected identity missing build_id when receipt='{rcpt_bid}'"
-    if exp_bid and rcpt_bid and exp_bid != rcpt_bid:
+    elif exp_bid != rcpt_bid:
         return False, f"Target identity validation failed: build_id mismatch (expected='{exp_bid}', receipt='{rcpt_bid}')"
 
     return True, "Target identity successfully verified"

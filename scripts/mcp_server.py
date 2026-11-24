@@ -794,8 +794,9 @@ def runtime_diagnose_process(
     ssh_port: int = 22,
     ssh_key: Optional[str] = None,
     ssh_proxy_jump: Optional[str] = None,
-    auto_deploy_collector: bool = False,
+    auto_deploy_collector: bool = True,
     collector_path: Optional[str] = None,
+    use_snapshot_bundle: bool = True,
     symptom_kind: Optional[str] = None,
     symptom_frequency: Optional[str] = None,
     symptom_duration: Optional[str] = None,
@@ -843,8 +844,9 @@ def runtime_diagnose_process(
         ssh_key: Path on THIS machine to the SSH private key (a path only; never pass key contents or a password).
         ssh_proxy_jump: Optional SSH jump host ('user@bastion').
         auto_deploy_collector: True to copy the small native collector (matching the target CPU) to the
-            target's /tmp (or a fallback directory) first; it makes memory reads much faster. Default False.
+            target's /tmp (or a fallback directory) first; enables single-exec --snapshot-bundle capture. Default True.
         collector_path: Path of an already installed collector on the target (remote only).
+        use_snapshot_bundle: True (default) to use collector ``--snapshot-bundle <path>`` + single download on remote targets.
         symptom_kind: Optional structured symptom. When given it decides the investigation plan instead of the
             free-text 'symptom'. One of: memory_growth, hang_deadlock, cpu_spin, crash_corruption, use_after_free,
             double_free, stack_corruption, data_race, thread_growth, fd_leak, slow_contended, process_instability,
@@ -874,7 +876,8 @@ def runtime_diagnose_process(
         if remote_host and str(remote_host).strip():
             remote_target = {"remote_host": remote_host, "ssh_user": ssh_user, "ssh_port": ssh_port,
                              "ssh_key": ssh_key, "ssh_proxy_jump": ssh_proxy_jump,
-                             "auto_deploy_collector": bool(auto_deploy_collector), "collector_path": collector_path}
+                             "auto_deploy_collector": bool(auto_deploy_collector), "collector_path": collector_path,
+                             "use_snapshot_bundle": bool(use_snapshot_bundle)}
         from extractor.symptom_interpretation import SymptomFieldError, fields_from_mapping
         try:
             symptom_fields = fields_from_mapping({
@@ -1327,7 +1330,7 @@ def runtime_target_connect(
     ssh_port: int = 22,
     ssh_key: Optional[str] = None,
     ssh_proxy_jump: Optional[str] = None,
-    auto_deploy_collector: bool = False,
+    auto_deploy_collector: bool = True,
 ) -> str:
     """Connect to a local or remote embedded target process by PID or process name,
     verify GNU Build ID against the host's non-stripped companion ELF, calculate ASLR load bias,
@@ -3210,7 +3213,8 @@ def runtime_explain_process_behavior(
         if remote_host and str(remote_host).strip():
             remote_target = {
                 "remote_host": remote_host, "ssh_user": ssh_user, "ssh_port": ssh_port,
-                "ssh_key": ssh_key, "ssh_proxy_jump": ssh_proxy_jump
+                "ssh_key": ssh_key, "ssh_proxy_jump": ssh_proxy_jump,
+                "auto_deploy_collector": True, "use_snapshot_bundle": True,
             }
         res = explain_process_behavior(
             report_dict=report_data,

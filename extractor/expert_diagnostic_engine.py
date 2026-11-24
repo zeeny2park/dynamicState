@@ -2128,7 +2128,7 @@ class AdaptiveInvestigationSession:
 
             # Single target identity lookup if not already in target_assessment
             cached_ident: Optional[Dict[str, Any]] = None
-            if eff_pid and not (getattr(self.target_assessment, "process_identity", None) and getattr(self.target_assessment, "executable_identity", None) and getattr(self.target_assessment, "build_id", None)):
+            if eff_pid and not (getattr(self.target_assessment, "process_identity", None) and getattr(self.target_assessment, "executable_identity", None) and (getattr(self.target_assessment, "build_id", None) or getattr(self.target_assessment, "build_id_check", None) is not None)):
                 if getattr(self, "_session_target_identity", None) is not None and self._session_target_identity.get("pid") == eff_pid:
                     cached_ident = self._session_target_identity
                 else:
@@ -5292,6 +5292,7 @@ class TargetSpec:
     ssh_proxy_jump: Optional[str] = None
     auto_deploy_collector: bool = False
     collector_path: Optional[str] = None
+    use_snapshot_bundle: bool = True
     timeout_s: Optional[float] = None
     command_runner: Any = None
     stream_opener: Any = None
@@ -5321,6 +5322,7 @@ class TargetSpec:
         if not (1 <= spec.ssh_port <= 65535):
             raise ValueError("ssh_port must be in 1..65535")
         spec.auto_deploy_collector = bool(spec.auto_deploy_collector)
+        spec.use_snapshot_bundle = bool(spec.use_snapshot_bundle)
         return spec
 
     def build_adapter(self) -> TargetExecutionAdapter:
@@ -5335,12 +5337,14 @@ class TargetSpec:
             kw["timeout_sec"] = float(self.timeout_s)
         return RemoteSshTargetAdapter(
             host=self.remote_host, user=self.ssh_user, port=self.ssh_port, key_file=self.ssh_key,
-            proxy_jump=self.ssh_proxy_jump, collector_path=self.collector_path, **kw)
+            proxy_jump=self.ssh_proxy_jump, collector_path=self.collector_path,
+            use_snapshot_bundle=self.use_snapshot_bundle, **kw)
 
     def describe(self) -> Dict[str, Any]:
         """Transport info for the result: host / user / port / jump host; never a key or a key path."""
         return {"transport": "ssh", "host": self.remote_host, "user": self.ssh_user, "port": self.ssh_port,
-                "proxy_jump": self.ssh_proxy_jump, "auto_deploy_collector": self.auto_deploy_collector}
+                "proxy_jump": self.ssh_proxy_jump, "auto_deploy_collector": self.auto_deploy_collector,
+                "use_snapshot_bundle": self.use_snapshot_bundle}
 
 
 def _new_diagnose_result(pid: Any, debug_image: Optional[str]) -> DiagnoseResult:
@@ -5665,7 +5669,10 @@ def _diagnose_run(
             and not any(k in adapter.__dict__ for k in ("get_proc_maps", "get_process_identity", "check_liveness"))
         ):
             try:
-                adapter.collect_and_download_bundle(int(pid))
+                adapter.collect_and_download_bundle(
+                    int(pid),
+                    use_snapshot_bundle=getattr(adapter, "use_snapshot_bundle", True),
+                )
             except Exception:  # noqa: BLE001 - fall back to normal preflight cleanly
                 pass
         if continue_collected_only and (resume_investigation_id or getattr(adapter, "_hydrated_bundle_mode", False)):

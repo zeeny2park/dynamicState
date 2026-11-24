@@ -3406,8 +3406,9 @@ class WebApiAdapter:
                 "remote_host": remote_host, "ssh_user": params.get("ssh_user") or None,
                 "ssh_port": int(str(raw_port).strip()) if raw_port is not None else 22,
                 "ssh_key": params.get("ssh_key") or None, "ssh_proxy_jump": params.get("ssh_proxy_jump") or None,
-                "auto_deploy_collector": params.get("auto_deploy_collector") is True,
+                "auto_deploy_collector": params.get("auto_deploy_collector") is not False,
                 "collector_path": params.get("collector_path") or None,
+                "use_snapshot_bundle": params.get("use_snapshot_bundle") is not False,
             }
         # Structured symptom input (optional): the same fields as the CLI and the MCP tool.
         from extractor.symptom_interpretation import SymptomFieldError, fields_from_mapping

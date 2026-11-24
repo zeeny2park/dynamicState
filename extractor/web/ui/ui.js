@@ -1117,6 +1117,8 @@
     if (req.mode === "ssh") {
       body.remote_host = req.remote_host; body.ssh_user = req.ssh_user || undefined;
       body.ssh_port = req.ssh_port ? Number(req.ssh_port) : undefined; body.ssh_key = req.ssh_key || undefined;
+      body.auto_deploy_collector = req.auto_deploy_collector !== false;
+      body.use_snapshot_bundle = req.use_snapshot_bundle !== false;
     }
     var fail = function (code, message) { ui.starting = false; ui.formError = errorText({ code: code, message: message }, ui.lang, req); draw(); };
     (req.continue_collected_only && /^\d+$/.test(String(req.target || "")) ? Promise.resolve(Number(req.target)) : resolvePid(req)).then(function (pid) {
