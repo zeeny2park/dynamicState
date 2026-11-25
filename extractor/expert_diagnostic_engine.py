@@ -5382,7 +5382,7 @@ def _populate_intelligence(
         from .diagnosis_baseline import (
             compare_diagnosis_baseline,
             extract_baseline_snapshot,
-            load_diagnosis_baseline,
+            resolve_diagnosis_baseline,
             save_diagnosis_baseline,
         )
         rd = {
@@ -5414,23 +5414,31 @@ def _populate_intelligence(
         effective_cdir = cdir
         if compare_baseline:
             t_info = r.target if isinstance(r.target, dict) else {}
-            prior = load_diagnosis_baseline(
+            abi_info = t_info.get("abi") if isinstance(t_info.get("abi"), dict) else {}
+            resolved = resolve_diagnosis_baseline(
                 effective_cdir,
                 compare_baseline,
                 process_name=t_info.get("process_name"),
                 binary_path=t_info.get("binary_path") or t_info.get("executable"),
                 build_id=t_info.get("build_id"),
                 host=t_info.get("host") or t_info.get("remote_host"),
+                arch=abi_info.get("architecture") or t_info.get("arch"),
                 exclude_investigation_id=r.investigation_id,
             )
-            if prior is not None:
+            if resolved.get("found") and resolved.get("baseline") is not None:
                 curr_snap = extract_baseline_snapshot(rd, prof, r.notable_observations)
-                r.baseline_diff = compare_diagnosis_baseline(curr_snap, prior)
+                r.baseline_diff = compare_diagnosis_baseline(
+                    curr_snap,
+                    resolved["baseline"],
+                    identity_match=resolved.get("identity_match"),
+                    prior_baselines=resolved.get("prior_baselines"),
+                )
             else:
                 r.baseline_diff = {
                     "available": False,
                     "selector": str(compare_baseline),
-                    "reason": "no_matching_baseline",
+                    "reason": str(resolved.get("reason") or "no_matching_baseline"),
+                    "identity_match": resolved.get("identity_match"),
                 }
         if save_baseline and prof.get("available"):
             save_diagnosis_baseline(effective_cdir, rd, prof, r.notable_observations)

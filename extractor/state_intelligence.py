@@ -19,8 +19,11 @@ Expands ``diagnose`` beyond binary fault detection by providing:
 
 from __future__ import annotations
 
+import ast
+import functools
+import os
 import shlex
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from .healthy_verdict import BLOCKING_KINDS, SCOPE_KINDS
 
@@ -356,18 +359,49 @@ def classify_coverage(
         elif kind not in ("verdict", "finding", "check_fail"):
             _push(blocking_gaps, kind, item, reason)
 
-    # Determine verdict_qualifier
+    # Determine verdict_qualifier with strict conservative semantics:
+    # Partial PASS must NEVER mask execution failures, blocking gaps, or failed checks.
     access_block_kinds = {"target_unreadable", "target_unreachable", "invalid_target", "missing_debug_image"}
+    exec_failure_kinds = {
+        "stage_failed", "unexpected_error", "abi_detection_failed", "budget_exhausted",
+        "not_executed", "limitation", "unattributed_finding", "symptom_question_unanswered",
+    }
     has_access_block = any(g["kind"] in access_block_kinds for g in blocking_gaps)
+    has_check_error = any(
+        str(c.get("status") or "").upper() in ("ERROR", "FAILED_TO_RUN", "ABORTED")
+        for c in checks_run
+    )
+    non_budget_blocking = [
+        g for g in blocking_gaps
+        if not (g["kind"] in ("baseline_check_missing", "baseline_check_not_run")
+                and g.get("not_run_reason") == "default_check_time_budget")
+    ]
+    has_execution_failure = has_check_error or any(
+        g["kind"] in exec_failure_kinds
+        or g["kind"].startswith("check_error")
+        or g["kind"].startswith("baseline_check_error")
+        or g["kind"] in ("baseline_check_inconclusive", "baseline_check_missing")
+        for g in non_budget_blocking
+    )
     meaningful_policy = [p for p in policy_skipped if p["kind"] != "recipes_not_planned"]
     has_limits = bool(meaningful_policy or mode_unsupported)
 
     if verdict == "HEALTHY":
-        qualifier = "LIMITED_OBSERVATION" if has_limits else "FULL_BASELINE"
+        # Guard: incomplete/failed coverage must never masquerade as full HEALTHY
+        if failed or non_budget_blocking or has_execution_failure:
+            qualifier = "INCONSISTENT_HEALTHY_CLAIM"
+        elif has_limits:
+            qualifier = "LIMITED_OBSERVATION"
+        else:
+            qualifier = "FULL_BASELINE"
     elif verdict == "INCONCLUSIVE":
         if has_access_block:
             qualifier = "BLOCKED_TARGET_ACCESS"
-        elif passed and not failed and not has_access_block:
+        elif failed or has_execution_failure or non_budget_blocking:
+            qualifier = "BLOCKED_EXECUTION"
+        elif passed and not failed and not undecided and not non_budget_blocking:
+            qualifier = "NO_FAULT_LIMITED_OBSERVATION"
+        elif passed and not failed and not has_execution_failure and not non_budget_blocking:
             qualifier = "NO_FAULT_LIMITED_OBSERVATION"
         else:
             qualifier = "BLOCKED_EXECUTION"
@@ -407,6 +441,7 @@ def classify_coverage(
 
     qual_label_en = {
         "FULL_BASELINE": "Healthy (full baseline coverage)",
+        "INCONSISTENT_HEALTHY_CLAIM": "Incomplete coverage (cannot confirm full healthy)",
         "LIMITED_OBSERVATION": "No fault found (limited observation)",
         "NO_FAULT_LIMITED_OBSERVATION": "No fault in executed checks (limited observation)",
         "BLOCKED_TARGET_ACCESS": "Inconclusive (target access or debug info missing)",
@@ -418,6 +453,7 @@ def classify_coverage(
 
     qual_label_ko = {
         "FULL_BASELINE": "정상 (기본 검사 전체 통과)",
+        "INCONSISTENT_HEALTHY_CLAIM": "불완전 관측 (전체 정상 확정 불가)",
         "LIMITED_OBSERVATION": "정상 (제한적 관측)",
         "NO_FAULT_LIMITED_OBSERVATION": "실행 검사 통과 (제한적 관측)",
         "BLOCKED_TARGET_ACCESS": "판단 불가 (대상 접근 또는 디버그 정보 누락)",
@@ -489,6 +525,137 @@ def _fmt_cmd(parts: List[str]) -> str:
     return " ".join(shlex.quote(str(p)) for p in parts)
 
 
+@functools.lru_cache(maxsize=1)
+def get_mcp_tool_registry() -> Dict[str, Dict[str, Any]]:
+    """Introspect registered ``@server.tool()`` functions in ``scripts/mcp_server.py`` via AST.
+
+    Returns ``{tool_name: {"required": [...], "params": {param_name: annotation_str}}}``.
+    Zero runtime side effects; cached per process.
+    """
+    mcp_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "scripts", "mcp_server.py")
+    if not os.path.isfile(mcp_path):
+        return {}
+    try:
+        with open(mcp_path, "r", encoding="utf-8") as fh:
+            tree = ast.parse(fh.read(), filename=mcp_path)
+    except (OSError, SyntaxError):
+        return {}
+
+    registry: Dict[str, Dict[str, Any]] = {}
+    for node in tree.body:
+        if not isinstance(node, ast.FunctionDef):
+            continue
+        is_tool = False
+        for dec in node.decorator_list:
+            if isinstance(dec, ast.Call) and isinstance(dec.func, ast.Attribute) and dec.func.attr == "tool":
+                is_tool = True
+                break
+        if not is_tool:
+            continue
+        all_args = [a.arg for a in node.args.args]
+        n_def = len(node.args.defaults)
+        required = all_args[: len(all_args) - n_def]
+        params: Dict[str, str] = {}
+        for a in node.args.args:
+            ann = ast.unparse(a.annotation) if a.annotation is not None else "Any"
+            params[a.arg] = ann
+        registry[node.name] = {"required": required, "params": params}
+    return registry
+
+
+def _check_arg_type(value: Any, annotation: str) -> bool:
+    ann = annotation.replace(" ", "")
+    if value is None:
+        return "Optional[" in ann or "None" in ann or ann == "Any"
+    if "Any" in ann:
+        return True
+    if "bool" in ann and isinstance(value, bool):
+        return True
+    if "int" in ann and isinstance(value, int) and not isinstance(value, bool):
+        return True
+    if "float" in ann and isinstance(value, (int, float)) and not isinstance(value, bool):
+        return True
+    if "str" in ann and isinstance(value, str):
+        return True
+    if "List[" in ann or "list[" in ann:
+        return isinstance(value, list)
+    return True
+
+
+def validate_suggested_action(
+    action: Dict[str, Any],
+    target: Optional[Dict[str, Any]] = None,
+    registry: Optional[Dict[str, Dict[str, Any]]] = None,
+) -> Dict[str, Any]:
+    """Validate a suggested action against the MCP tool registry, types, and target preconditions."""
+    reg = registry if registry is not None else get_mcp_tool_registry()
+    tgt = target if isinstance(target, dict) else {}
+    tool = str(action.get("mcp_tool") or "")
+    args = action.get("mcp_args") if isinstance(action.get("mcp_args"), dict) else {}
+    issues: List[str] = []
+    missing_inputs: List[str] = []
+    blocked_reasons: List[str] = []
+
+    if not tool:
+        issues.append("missing_mcp_tool")
+        blocked_reasons.append("no MCP tool specified")
+    elif reg and tool not in reg:
+        issues.append(f"unknown_mcp_tool:{tool}")
+        blocked_reasons.append(f"MCP tool '{tool}' is not registered")
+    elif reg and tool in reg:
+        spec = reg[tool]
+        params = spec["params"]
+        for req in spec["required"]:
+            if req not in args or args[req] is None:
+                issues.append(f"missing_required_arg:{req}")
+                missing_inputs.append(req)
+        for k, v in args.items():
+            if k not in params:
+                issues.append(f"unknown_arg:{k}")
+                blocked_reasons.append(f"parameter '{k}' is not accepted by {tool}")
+            elif not _check_arg_type(v, params[k]):
+                issues.append(f"type_mismatch:{k}")
+                blocked_reasons.append(f"parameter '{k}' has incompatible type for {params[k]}")
+            if isinstance(v, str) and v.startswith("<") and v.endswith(">"):
+                missing_inputs.append(k)
+                blocked_reasons.append(f"user must provide '{k}' ({v})")
+
+    # Remote / local & capability precondition checks
+    is_remote = bool(tgt.get("host") or tgt.get("remote_host") or args.get("remote_host"))
+    if is_remote:
+        has_elf = bool(args.get("debug_image") or args.get("companion_elf") or tgt.get("debug_image"))
+        elf_val = str(args.get("debug_image") or args.get("companion_elf") or "")
+        if not has_elf or (elf_val.startswith("<") and elf_val.endswith(">")):
+            if "debug_image" not in missing_inputs and "companion_elf" not in missing_inputs:
+                missing_inputs.append("debug_image")
+            blocked_reasons.append("remote target requires an unstripped ELF debug image on this host")
+        if args.get("enable_tracing") is True:
+            issues.append("remote_tracing_unsupported")
+            blocked_reasons.append("eBPF/uprobe selective tracing is only supported for local targets")
+
+    valid_schema = not any(
+        i.startswith(("unknown_mcp_tool", "unknown_arg", "type_mismatch", "missing_required_arg"))
+        for i in issues
+    )
+    executable = valid_schema and not missing_inputs and not blocked_reasons
+
+    enriched = dict(action)
+    enriched.setdefault("estimated_cost", "low")
+    enriched.setdefault("expected_evidence", enriched.get("expected_value_en") or "")
+    enriched.setdefault("risk_level", "read_only_zero_stop")
+    enriched.setdefault("requires_user_approval", bool(missing_inputs or enriched.get("risk_level") != "read_only_zero_stop"))
+    enriched["executable"] = executable
+    if blocked_reasons:
+        enriched["blocked_reason"] = "; ".join(dict.fromkeys(blocked_reasons))
+    if missing_inputs:
+        enriched["missing_inputs"] = list(dict.fromkeys(missing_inputs))
+    enriched["validation"] = {
+        "valid": valid_schema,
+        "issues": issues,
+    }
+    return enriched
+
+
 def build_suggested_actions(
     result: Dict[str, Any],
     report: Optional[Dict[str, Any]] = None,
@@ -514,7 +681,7 @@ def build_suggested_actions(
         aid = str(action.get("id") or "")
         if aid and aid not in seen:
             seen.add(aid)
-            actions.append(action)
+            actions.append(validate_suggested_action(action, target))
 
     if not pid:
         return actions
@@ -523,6 +690,9 @@ def build_suggested_actions(
     base_diagnose_args: Dict[str, Any] = {"pid": int(pid), **rm_mcp}
     if debug_image:
         base_diagnose_args["debug_image"] = str(debug_image)
+    base_narrow_args: Dict[str, Any] = {"pid": int(pid), **rm_mcp}
+    if debug_image:
+        base_narrow_args["companion_elf"] = str(debug_image)
 
     # A) Missing debug image -> provide unstripped ELF
     if any(g.get("kind") == "missing_debug_image" for g in detail.get("blocking_gaps") or []):
@@ -537,6 +707,10 @@ def build_suggested_actions(
             "reason_ko": "일치하는 디버그 이미지가 없어 심볼·변수·소스 라인을 해석하지 못했습니다.",
             "mcp_tool": "runtime_diagnose_process",
             "mcp_args": {**base_diagnose_args, "debug_image": "<path/to/unstripped.elf>"},
+            "estimated_cost": "medium",
+            "expected_evidence": "Full DWARF symbol, lock, variable, and source-line resolution",
+            "risk_level": "read_only_zero_stop",
+            "requires_user_approval": True,
             "cli_command": _fmt_cmd(cmd),
             "expected_value_en": "Unlocks full DWARF variable, lock, and call-stack resolution.",
             "expected_value_ko": "변수·락·콜스택의 DWARF 심볼 및 소스 위치 해석이 활성화됩니다.",
@@ -558,7 +732,11 @@ def build_suggested_actions(
             "reason_en": "Heap exceeded the baseline walk cap, so heap integrity/UAF/double-free checks were skipped.",
             "reason_ko": "힙 크기가 기본 검사 상한을 초과해 힙 무결성·UAF·이중 해제 순회가 정책상 생략되었습니다.",
             "mcp_tool": "runtime_heap_leak_candidates",
-            "mcp_args": {k: v for k, v in base_diagnose_args.items() if k in ("pid", "debug_image", "remote_host", "ssh_user", "ssh_port", "ssh_key")},
+            "mcp_args": dict(base_narrow_args),
+            "estimated_cost": "medium",
+            "expected_evidence": "Unreachable heap chunks and owning global/container symbol paths",
+            "risk_level": "read_only_zero_stop",
+            "requires_user_approval": False,
             "cli_command": _fmt_cmd(hl_cmd),
             "expected_value_en": "Identifies unreachable heap blocks and owning global/container paths.",
             "expected_value_ko": "미참조 힙 블록 및 소유 변수·컨테이너 경로를 직접 추적합니다.",
@@ -580,6 +758,10 @@ def build_suggested_actions(
             "reason_ko": "설정된 기본 검사 시간 예산으로 인해 일부 기본 검사가 생략되었습니다.",
             "mcp_tool": "runtime_diagnose_process",
             "mcp_args": {**base_diagnose_args, "default_check_budget_s": 0},
+            "estimated_cost": "medium",
+            "expected_evidence": "Completion of all baseline checks skipped by time budget",
+            "risk_level": "read_only_zero_stop",
+            "requires_user_approval": False,
             "cli_command": _fmt_cmd(cmd),
             "expected_value_en": "Completes all remaining baseline checks for full coverage.",
             "expected_value_ko": "생략된 기본 검사를 모두 완료해 전체 커버리지를 확보합니다.",
@@ -602,6 +784,10 @@ def build_suggested_actions(
             "reason_ko": "기본 메모리 읽기 전용 모드에서는 함수 트레이싱이 필요한 검사가 제외되었습니다.",
             "mcp_tool": "runtime_diagnose_process",
             "mcp_args": {**base_diagnose_args, "enable_tracing": True},
+            "estimated_cost": "high",
+            "expected_evidence": "Live eBPF/uprobe function entry/return call sites",
+            "risk_level": "tracing_overhead",
+            "requires_user_approval": True,
             "cli_command": _fmt_cmd(cmd),
             "expected_value_en": "Captures live call-site paths for allocation/lock transitions.",
             "expected_value_ko": "할당·락 전이의 실제 런타임 호출 지점을 추가로 확보합니다.",
@@ -626,7 +812,11 @@ def build_suggested_actions(
             "reason_en": "Lock contention or long-waiting threads were observed.",
             "reason_ko": "락 경합 또는 장기 대기 스레드가 관측되어 전체 콜스택 확인이 유용합니다.",
             "mcp_tool": "runtime_inspect_thread_callstack_and_locks",
-            "mcp_args": {k: v for k, v in base_diagnose_args.items() if k in ("pid", "debug_image", "remote_host", "ssh_user", "ssh_port", "ssh_key")},
+            "mcp_args": dict(base_narrow_args),
+            "estimated_cost": "low",
+            "expected_evidence": "Per-thread unwound call stacks and mutex owner/waiter edges",
+            "risk_level": "read_only_zero_stop",
+            "requires_user_approval": False,
             "cli_command": _fmt_cmd(cs_cmd),
             "expected_value_en": "Shows full stack frames and lock ownership chains per thread.",
             "expected_value_ko": "스레드별 전체 스택 프레임과 락 소유 체인을 확인합니다.",
@@ -649,7 +839,11 @@ def build_suggested_actions(
                 "reason_en": n.get("title_en") or "Over-allocated container detected.",
                 "reason_ko": n.get("title_ko") or "용량 과다 할당 컨테이너가 관측되었습니다.",
                 "mcp_tool": "runtime_eval_memory_path",
-                "mcp_args": {**{k: v for k, v in base_diagnose_args.items() if k in ("pid", "debug_image", "remote_host", "ssh_user", "ssh_port", "ssh_key")}, "expr": var},
+                "mcp_args": {**base_narrow_args, "expressions": [var]},
+                "estimated_cost": "low",
+                "expected_evidence": f"Live DWARF-decoded size, capacity, and fields of {var}",
+                "risk_level": "read_only_zero_stop",
+                "requires_user_approval": False,
                 "cli_command": _fmt_cmd(ev_cmd),
                 "expected_value_en": "Reads current size, capacity, and sample entries with 0ms stop.",
                 "expected_value_ko": "프로세스 중단 없이 현재 크기·용량·원소 상태를 확인합니다.",
@@ -672,6 +866,10 @@ def build_suggested_actions(
             "reason_ko": "단일 시점 진단은 현재 상태만 보여주므로 이전 스냅샷과 비교해 점진적 드리프트·회귀를 검증할 수 있습니다.",
             "mcp_tool": "runtime_diagnose_process",
             "mcp_args": {**base_diagnose_args, "compare_baseline": "latest"},
+            "estimated_cost": "low",
+            "expected_evidence": "Regression diff against last compatible baseline snapshot",
+            "risk_level": "read_only_zero_stop",
+            "requires_user_approval": False,
             "cli_command": _fmt_cmd(cmd),
             "expected_value_en": "Reports RSS, heap, thread, FD, and watchlist deltas against the last saved baseline.",
             "expected_value_ko": "이전 저장 기준선 대비 RSS·힙·스레드·FD·주의 항목 증감을 비교합니다.",
