@@ -28,7 +28,8 @@ def compute_gnu_debuglink_crc(file_path: str) -> int:
 class DebugArtifactProvider:
     """Manages debug artifact resolution and verification for runtime modules."""
 
-    def __init__(self, search_paths: Optional[List[str]] = None):
+    def __init__(self, search_paths: Optional[List[str]] = None, identity_policy: Optional[Any] = None):
+        self.identity_policy: Optional[Any] = identity_policy
         self.search_paths: List[str] = [
             os.path.abspath(p) for p in (search_paths or ["/usr/lib/debug", ".", "./debug"])
         ]
@@ -167,15 +168,64 @@ class DebugArtifactProvider:
                     verification_ms=round((time.monotonic() - t0) * 1000, 3)
                 )
 
-        # 3. Build ID compatibility
-        if module.build_id:
-            if not dbg_ident.build_id or module.build_id.lower() != dbg_ident.build_id.lower():
+        # 3. Build ID / Identity Policy compatibility (fail-closed)
+        from .adapters.identity_policy import DEFAULT_IDENTITY_POLICY, TargetIdentityPolicy
+        from .debug_image import compute_elf_sha256
+        _pol = getattr(self, "identity_policy", None) or DEFAULT_IDENTITY_POLICY
+        _mb_real = bool(
+            module.build_id
+            and str(module.build_id).strip()
+            and str(module.build_id).strip().lower() != "default_build_id"
+            and not TargetIdentityPolicy.is_synthetic_build_id(module.build_id)
+        )
+        _db_real = bool(
+            dbg_ident.build_id
+            and str(dbg_ident.build_id).strip()
+            and str(dbg_ident.build_id).strip().lower() != "default_build_id"
+            and not TargetIdentityPolicy.is_synthetic_build_id(dbg_ident.build_id)
+        )
+        compat_reason = "COMPATIBLE"
+        if _mb_real:
+            if not _db_real or str(module.build_id).strip().lower() != str(dbg_ident.build_id).strip().lower():
                 return CompatibilityResult(
                     compatible=False,
                     reason="DEBUG_IMAGE_MISMATCH",
                     debug_identity=dbg_ident,
                     verification_ms=round((time.monotonic() - t0) * 1000, 3)
                 )
+        elif module.debuglink and module.debuglink.get("filename") and not _db_real:
+            expected_name = module.debuglink.get("filename")
+            actual_name = os.path.basename(debug_artifact_path)
+            expected_crc = module.debuglink.get("crc")
+            crc_ok = True
+            if expected_crc is not None and os.path.isfile(debug_artifact_path):
+                crc_ok = (compute_gnu_debuglink_crc(debug_artifact_path) == expected_crc)
+            if expected_name == actual_name and crc_ok:
+                compat_reason = "COMPATIBLE_DEBUGLINK"
+            else:
+                return CompatibilityResult(
+                    compatible=False,
+                    reason="DEBUGLINK_CRC_MISMATCH" if (expected_name == actual_name and not crc_ok) else "BUILD_ID_NOT_AVAILABLE",
+                    debug_identity=dbg_ident,
+                    verification_ms=round((time.monotonic() - t0) * 1000, 3)
+                )
+        else:
+            r_fp = compute_elf_sha256(module.path)
+            d_fp = compute_elf_sha256(debug_artifact_path)
+            _compat_ok, _compat_reason = _pol.validate_debug_image_compatibility(
+                module.build_id,
+                dbg_ident.build_id,
+                runtime_fingerprint=r_fp,
+                debug_fingerprint=d_fp,
+            )
+            if not _compat_ok:
+                return CompatibilityResult(
+                    compatible=False,
+                    reason=_compat_reason,
+                    debug_identity=dbg_ident,
+                    verification_ms=round((time.monotonic() - t0) * 1000, 3)
+                )
+            compat_reason = _compat_reason
 
         # 4. Must contain debug info
         if not dbg_ident.has_debug_info:
@@ -188,7 +238,7 @@ class DebugArtifactProvider:
 
         return CompatibilityResult(
             compatible=True,
-            reason="COMPATIBLE",
+            reason=compat_reason,
             debug_identity=dbg_ident,
             verification_ms=round((time.monotonic() - t0) * 1000, 3)
         )

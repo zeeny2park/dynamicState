@@ -442,11 +442,15 @@ class OfflineMemoryAnalyzer:
         if main_module and dbg_path and os.path.exists(dbg_path):
             compat = artifact_provider.verify(main_module, dbg_path)
             if not compat.compatible:
-                raise ValueError(f"DEBUG_IMAGE_MISMATCH: {compat.reason}")
+                _r = str(compat.reason or "")
+                _tag = "DEBUG_IMAGE_UNVERIFIABLE" if ("UNVERIFIABLE" in _r or "NOT_AVAILABLE" in _r or "STRICT_BUILD_ID_REQUIRED" in _r) else "DEBUG_IMAGE_MISMATCH"
+                raise ValueError(f"{_tag}: {compat.reason}")
         elif hasattr(debug_image, "verify") and callable(debug_image.verify):
             compat = debug_image.verify(raw_snap.binary)
             if hasattr(compat, "compatible") and not compat.compatible:
-                raise ValueError(f"DEBUG_IMAGE_MISMATCH: {compat.reason}")
+                _r = str(getattr(compat, "reason", "") or "")
+                _tag = "DEBUG_IMAGE_UNVERIFIABLE" if ("UNVERIFIABLE" in _r or "NOT_AVAILABLE" in _r or "STRICT_BUILD_ID_REQUIRED" in _r) else "DEBUG_IMAGE_MISMATCH"
+                raise ValueError(f"{_tag}: {compat.reason}")
 
         # 4. Extract symbols & types via DebugInfoProvider
         if optional_symbol_context:

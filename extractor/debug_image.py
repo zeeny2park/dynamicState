@@ -5,6 +5,7 @@ from DWARF symbol resolution, verifying build-id and architecture compatibility.
 """
 
 import copy
+import hashlib
 from dataclasses import asdict, dataclass, field
 import os
 import struct
@@ -44,6 +45,27 @@ def get_last_elf_bytes_read() -> int:
     or ELFInspectionError.
     """
     return getattr(_thread_local, "last_bytes_read", 0)
+
+
+def compute_elf_sha256(path: Optional[str]) -> Optional[str]:
+    """Compute an independent ``sha256:<hex>`` content digest for an existing ELF file.
+
+    Returns ``None`` if ``path`` does not refer to a readable regular file.
+    Never fabricates a fingerprint from paths or metadata.
+    """
+    if not path or not isinstance(path, str) or not os.path.isfile(path):
+        return None
+    try:
+        h = hashlib.sha256()
+        with open(path, "rb") as fh:
+            while True:
+                chunk = fh.read(65536)
+                if not chunk:
+                    break
+                h.update(chunk)
+        return f"sha256:{h.hexdigest()}"
+    except OSError:
+        return None
 
 
 @dataclass
@@ -414,7 +436,8 @@ class DebugImageProvider:
     sharing the exact same GNU Build ID and ELF architecture characteristics.
     """
 
-    def __init__(self, debug_image_path: Optional[str] = None):
+    def __init__(self, debug_image_path: Optional[str] = None, identity_policy: Optional[Any] = None):
+        self.identity_policy: Optional[Any] = identity_policy
         self.debug_image_path: Optional[str] = None
         self.debug_identity: Optional[BinaryIdentity] = None
         self.runtime_identity: Optional[BinaryIdentity] = None
@@ -503,9 +526,24 @@ class DebugImageProvider:
             self.verification_ms = res.verification_ms
             return res
 
-        # 2. Build ID comparison (Strongest authority)
-        if runtime_id.build_id:
-            if not debug_id.build_id or runtime_id.build_id != debug_id.build_id:
+        # 2. Build ID / Identity Policy verification (Strongest authority, fail-closed)
+        from .adapters.identity_policy import DEFAULT_IDENTITY_POLICY, TargetIdentityPolicy
+        _pol = getattr(self, "identity_policy", None) or DEFAULT_IDENTITY_POLICY
+        _rb_real = bool(
+            runtime_id.build_id
+            and str(runtime_id.build_id).strip()
+            and str(runtime_id.build_id).strip().lower() != "default_build_id"
+            and not TargetIdentityPolicy.is_synthetic_build_id(runtime_id.build_id)
+        )
+        _db_real = bool(
+            debug_id.build_id
+            and str(debug_id.build_id).strip()
+            and str(debug_id.build_id).strip().lower() != "default_build_id"
+            and not TargetIdentityPolicy.is_synthetic_build_id(debug_id.build_id)
+        )
+
+        if _rb_real:
+            if not _db_real or str(runtime_id.build_id).strip().lower() != str(debug_id.build_id).strip().lower():
                 res = CompatibilityResult(
                     compatible=False,
                     reason="BUILD_ID_MISMATCH",
@@ -516,18 +554,23 @@ class DebugImageProvider:
                 self.compatibility = res
                 self.verification_ms = res.verification_ms
                 return res
-            # Matching Build ID
+            # Matching real GNU Build ID
             reason = "COMPATIBLE"
-        elif runtime_id.debuglink and self.debug_image_path:
-            # Fallback to .gnu_debuglink if build ID missing in either
+        elif runtime_id.debuglink and self.debug_image_path and not _db_real:
+            # Fallback to .gnu_debuglink if Build ID is absent
             expected_name = runtime_id.debuglink.get("filename")
             actual_name = os.path.basename(self.debug_image_path)
-            if expected_name == actual_name:
+            expected_crc = runtime_id.debuglink.get("crc")
+            crc_ok = True
+            if expected_crc is not None and os.path.isfile(self.debug_image_path):
+                from .debug_artifacts import compute_gnu_debuglink_crc
+                crc_ok = (compute_gnu_debuglink_crc(self.debug_image_path) == expected_crc)
+            if expected_name == actual_name and crc_ok:
                 reason = "COMPATIBLE_DEBUGLINK"
             else:
                 res = CompatibilityResult(
                     compatible=False,
-                    reason="BUILD_ID_NOT_AVAILABLE",
+                    reason="DEBUGLINK_CRC_MISMATCH" if (expected_name == actual_name and not crc_ok) else "BUILD_ID_NOT_AVAILABLE",
                     runtime_identity=runtime_id,
                     debug_identity=debug_id,
                     verification_ms=round((time.monotonic() - t0) * 1000, 3)
@@ -535,34 +578,29 @@ class DebugImageProvider:
                 self.compatibility = res
                 self.verification_ms = res.verification_ms
                 return res
-        elif not debug_id.build_id:
-            from .adapters.identity_policy import DEFAULT_IDENTITY_POLICY
-            _pol = getattr(self, "identity_policy", None) or DEFAULT_IDENTITY_POLICY
-            _compat_ok, _compat_reason = _pol.validate_debug_image_compatibility(runtime_id.build_id, debug_id.build_id)
+        else:
+            # Delegate absent / synthetic / mismatched Build ID cases to identity policy.
+            # Compute independent cryptographic SHA-256 fingerprints only from actual readable files.
+            r_fp = compute_elf_sha256(runtime_binary_path)
+            d_fp = compute_elf_sha256(self.debug_image_path)
+            _compat_ok, _compat_reason = _pol.validate_debug_image_compatibility(
+                runtime_id.build_id,
+                debug_id.build_id,
+                runtime_fingerprint=r_fp,
+                debug_fingerprint=d_fp,
+            )
             if not _compat_ok:
                 res = CompatibilityResult(
                     compatible=False,
                     reason=_compat_reason,
                     runtime_identity=runtime_id,
                     debug_identity=debug_id,
-                    verification_ms=round((time.perf_counter() - t0) * 1000.0, 2),
+                    verification_ms=round((time.monotonic() - t0) * 1000, 3),
                 )
                 self.compatibility = res
                 self.verification_ms = res.verification_ms
                 return res
             reason = _compat_reason
-        else:
-            # Runtime lacks Build ID while debug image has one (no debuglink match): fail closed.
-            res = CompatibilityResult(
-                compatible=False,
-                reason="BUILD_ID_NOT_AVAILABLE",
-                runtime_identity=runtime_id,
-                debug_identity=debug_id,
-                verification_ms=round((time.monotonic() - t0) * 1000, 3)
-            )
-            self.compatibility = res
-            self.verification_ms = res.verification_ms
-            return res
 
         # 3. Ensure debug image actually contains debug info or symbols
         if not debug_id.has_debug_info and debug_id.stripped:
@@ -618,7 +656,9 @@ class DebugImageProvider:
                 "source": "external" if (not self.runtime_identity or self.debug_identity.path != self.runtime_identity.path) else "embedded",
                 "verified": bool(self.compatibility and self.compatibility.compatible),
                 "compatible": bool(self.compatibility and self.compatibility.compatible),
-                "reason": self.compatibility.reason if self.compatibility else None
+                "reason": self.compatibility.reason if self.compatibility else None,
+                "identity_policy_id": getattr(getattr(self, "identity_policy", None), "policy_id", "default-optional-build-id"),
+                "identity_policy_version": getattr(getattr(self, "identity_policy", None), "policy_version", "1.0"),
             }
 
         return {

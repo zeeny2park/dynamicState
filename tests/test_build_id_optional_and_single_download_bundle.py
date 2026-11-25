@@ -231,8 +231,8 @@ class TestBuildIdAbsentIdentityAndDebugCompatibility(unittest.TestCase):
 
             prov = DebugImageProvider(elf_bin)
             compat = prov.verify(elf_bin)
-            self.assertTrue(compat.compatible, f"Expected compatible, got {compat.reason}")
-            self.assertEqual(compat.reason, "COMPATIBLE_NO_BUILD_ID")
+            self.assertTrue(compat.compatible, f"Expected compatible via SHA-256 fingerprint match, got {compat.reason}")
+            self.assertEqual(compat.reason, "FINGERPRINT_MATCH")
 
     def test_mcp_and_web_remote_defaults_enable_snapshot_bundle(self):
         import inspect

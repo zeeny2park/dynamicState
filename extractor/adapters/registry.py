@@ -15,8 +15,35 @@ _SECRET_KEY_NAMES = frozenset({
 })
 
 
+def _redact_uri_secrets(uri: str, secret_keys: frozenset) -> str:
+    """Strip secret query parameters and userinfo passwords from a URI string."""
+    if "://" not in uri:
+        return uri
+    try:
+        from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+        parts = urlsplit(uri)
+        netloc = parts.netloc
+        if "@" in netloc:
+            userinfo, hostport = netloc.rsplit("@", 1)
+            if ":" in userinfo:
+                user_only = userinfo.split(":", 1)[0]
+                netloc = f"{user_only}@{hostport}"
+        if parts.query:
+            kept = [
+                (k, v)
+                for k, v in parse_qsl(parts.query, keep_blank_values=True)
+                if str(k).strip().lower() not in secret_keys
+            ]
+            query = urlencode(kept)
+        else:
+            query = parts.query
+        return urlunsplit((parts.scheme, netloc, parts.path, query, parts.fragment))
+    except Exception:
+        return uri.split("?", 1)[0]
+
+
 def _redact_secrets(obj: Any, extra_secret_keys: Iterable[str] = ()) -> Any:
-    """Recursively strip secret keys from transport descriptions (defense-in-depth)."""
+    """Recursively strip secret keys and URI query/userinfo secrets from transport descriptions."""
     secrets = _SECRET_KEY_NAMES | {str(k).strip().lower() for k in extra_secret_keys if k}
     if isinstance(obj, dict):
         return {
@@ -26,6 +53,8 @@ def _redact_secrets(obj: Any, extra_secret_keys: Iterable[str] = ()) -> Any:
         }
     if isinstance(obj, list):
         return [_redact_secrets(v, secrets) for v in obj]
+    if isinstance(obj, str) and "://" in obj:
+        return _redact_uri_secrets(obj, secrets)
     return obj
 
 

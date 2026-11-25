@@ -8,8 +8,26 @@ custom adapters can override identity rules without modifying core engine code.
 from __future__ import annotations
 
 import hashlib
+import re
 from abc import ABC, abstractmethod
 from typing import Any, Dict, Optional, Tuple
+
+
+_SHA256_FP_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
+
+
+def normalize_sha256_fingerprint(fp: Optional[str]) -> Optional[str]:
+    """Validate and normalize an independent cryptographic SHA-256 file fingerprint.
+
+    Only explicit ``sha256:<64-hex>`` digests derived from actual binary bytes are
+    accepted. File paths, synthetic markers, or arbitrary strings are rejected.
+    """
+    if not fp or not isinstance(fp, str):
+        return None
+    norm = fp.strip().lower()
+    if _SHA256_FP_RE.match(norm):
+        return norm
+    return None
 
 
 class TargetIdentityPolicy(ABC):
@@ -63,8 +81,15 @@ class TargetIdentityPolicy(ABC):
         self,
         runtime_build_id: Optional[str],
         debug_build_id: Optional[str],
+        *,
+        runtime_fingerprint: Optional[str] = None,
+        debug_fingerprint: Optional[str] = None,
     ) -> Tuple[bool, str]:
-        """Validate build-id compatibility between runtime ELF and companion debug ELF."""
+        """Validate identity compatibility between runtime ELF and companion debug ELF.
+
+        Must fail closed (return ``False``) whenever sufficient independent identity
+        evidence is unavailable.
+        """
 
 
 class DefaultTargetIdentityPolicy(TargetIdentityPolicy):
@@ -134,18 +159,36 @@ class DefaultTargetIdentityPolicy(TargetIdentityPolicy):
         self,
         runtime_build_id: Optional[str],
         debug_build_id: Optional[str],
+        *,
+        runtime_fingerprint: Optional[str] = None,
+        debug_fingerprint: Optional[str] = None,
     ) -> Tuple[bool, str]:
         rb = str(runtime_build_id or "").strip().lower()
         db = str(debug_build_id or "").strip().lower()
-        rb_absent = (not rb) or rb.startswith("no-build-id:")
-        db_absent = (not db) or db.startswith("no-build-id:")
+        rb_absent = (not rb) or rb == "default_build_id" or rb.startswith("no-build-id:")
+        db_absent = (not db) or db == "default_build_id" or db.startswith("no-build-id:")
+
+        # 1. Both have real GNU Build IDs: authoritative match / mismatch
         if not rb_absent and not db_absent:
             if rb == db:
                 return True, "BUILD_ID_MATCH"
             return False, "BUILD_ID_MISMATCH"
-        if rb_absent and db_absent:
-            return True, "COMPATIBLE_NO_BUILD_ID"
-        return False, "BUILD_ID_NOT_AVAILABLE"
+
+        # 2. Exactly one side has a real GNU Build ID: cannot verify compatibility
+        if rb_absent != db_absent:
+            return False, "BUILD_ID_NOT_AVAILABLE"
+
+        # 3. Both lack a real GNU Build ID (missing or synthetic):
+        #    NEVER approve automatically. Require independent cryptographic
+        #    SHA-256 content fingerprints of both ELF files.
+        rfp = normalize_sha256_fingerprint(runtime_fingerprint)
+        dfp = normalize_sha256_fingerprint(debug_fingerprint)
+        if rfp and dfp:
+            if rfp == dfp:
+                return True, "FINGERPRINT_MATCH"
+            return False, "FINGERPRINT_MISMATCH"
+
+        return False, "UNKNOWN_IDENTITY_UNVERIFIABLE"
 
 
 class StrictBuildIdIdentityPolicy(DefaultTargetIdentityPolicy):
@@ -189,10 +232,19 @@ class StrictBuildIdIdentityPolicy(DefaultTargetIdentityPolicy):
         self,
         runtime_build_id: Optional[str],
         debug_build_id: Optional[str],
+        *,
+        runtime_fingerprint: Optional[str] = None,
+        debug_fingerprint: Optional[str] = None,
     ) -> Tuple[bool, str]:
+        # Strict policy requires real GNU Build IDs on both ELF binaries;
+        # independent file fingerprints do not relax this requirement.
         rb = str(runtime_build_id or "").strip().lower()
         db = str(debug_build_id or "").strip().lower()
-        if not rb or not db or rb.startswith("no-build-id:") or db.startswith("no-build-id:"):
+        if (
+            not rb or not db
+            or rb == "default_build_id" or db == "default_build_id"
+            or rb.startswith("no-build-id:") or db.startswith("no-build-id:")
+        ):
             return False, "STRICT_BUILD_ID_REQUIRED"
         return (rb == db), ("BUILD_ID_MATCH" if rb == db else "BUILD_ID_MISMATCH")
 

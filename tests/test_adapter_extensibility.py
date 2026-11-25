@@ -244,8 +244,8 @@ class TestTargetIdentityPolicyHook(unittest.TestCase):
         ok_empty, _ = default_ad.get_identity_policy().validate_build_id_match(bid, "")
         self.assertFalse(ok_empty)
         ok_compat, reason_compat = default_ad.get_identity_policy().validate_debug_image_compatibility(None, None)
-        self.assertTrue(ok_compat)
-        self.assertEqual(reason_compat, "COMPATIBLE_NO_BUILD_ID")
+        self.assertFalse(ok_compat)
+        self.assertEqual(reason_compat, "UNKNOWN_IDENTITY_UNVERIFIABLE")
 
         # Strict policy rejects absent build-id debug image compatibility
         ok_strict, reason_strict = strict_ad.get_identity_policy().validate_debug_image_compatibility(None, None)
