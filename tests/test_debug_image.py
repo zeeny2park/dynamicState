@@ -115,37 +115,48 @@ class DebugImageProviderTests(unittest.TestCase):
             di_module.inspect_elf = old_inspect
 
     def test_verify_debuglink_fallback(self):
-        """When Build ID is missing in runtime binary, fallback to .gnu_debuglink matching."""
-        self.provider.debug_image_path = "/opt/debug/app.debug"
-        self.provider.debug_identity = BinaryIdentity(
-            path="/opt/debug/app.debug",
-            elf_class="ELF64",
-            architecture="aarch64",
-            endianness="little",
-            build_id=None,
-            has_debug_info=True
-        )
+        """When Build ID is missing in runtime binary, fallback to .gnu_debuglink with verified CRC-32."""
+        import os, tempfile
+        from extractor.debug_artifacts import compute_gnu_debuglink_crc
 
-        def mock_inspect(path):
-            return BinaryIdentity(
-                path=path,
+        with tempfile.TemporaryDirectory() as td:
+            dbg_path = os.path.join(td, "app.debug")
+            with open(dbg_path, "wb") as fh:
+                fh.write(b"\x7fELF_FAKE_DEBUG_CONTENT_FOR_CRC_CHECK")
+            real_crc = compute_gnu_debuglink_crc(dbg_path)
+
+            self.provider.debug_image_path = dbg_path
+            self.provider.debug_identity = BinaryIdentity(
+                path=dbg_path,
                 elf_class="ELF64",
                 architecture="aarch64",
                 endianness="little",
                 build_id=None,
-                debuglink={"filename": "app.debug", "crc": 0x1234},
-                stripped=True
+                has_debug_info=True
             )
 
-        import extractor.debug_image as di_module
-        old_inspect = di_module.inspect_elf
-        di_module.inspect_elf = mock_inspect
-        try:
-            res = self.provider.verify("/opt/bin/app")
-            self.assertTrue(res.compatible)
-            self.assertEqual(res.reason, "COMPATIBLE_DEBUGLINK")
-        finally:
-            di_module.inspect_elf = old_inspect
+            def mock_inspect(path):
+                return BinaryIdentity(
+                    path=path,
+                    elf_class="ELF64",
+                    architecture="aarch64",
+                    endianness="little",
+                    build_id=None,
+                    debuglink={"filename": "app.debug", "crc": real_crc},
+                    stripped=True
+                )
+
+            import extractor.debug_image as di_module
+            old_inspect = di_module.inspect_elf
+            di_module.inspect_elf = mock_inspect
+            try:
+                res = self.provider.verify("/opt/bin/app")
+                self.assertTrue(res.compatible)
+                self.assertEqual(res.reason, "COMPATIBLE_DEBUGLINK")
+                self.assertEqual(res.verification_method, "gnu_debuglink_crc32")
+                self.assertEqual(res.verification_result, "VERIFIED")
+            finally:
+                di_module.inspect_elf = old_inspect
 
     def test_verify_stripped_debug_image_rejected(self):
         """A debug image that lacks debug information must be rejected."""

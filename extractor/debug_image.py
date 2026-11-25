@@ -104,6 +104,11 @@ class CompatibilityResult:
     runtime_identity: Optional[BinaryIdentity] = None
     debug_identity: Optional[BinaryIdentity] = None
     verification_ms: float = 0.0
+    verification_method: str = "none"
+    identity_policy_id: Optional[str] = None
+    identity_policy_version: Optional[str] = None
+    verification_result: Optional[str] = None
+    verification_reason: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -112,6 +117,11 @@ class CompatibilityResult:
             "runtime_identity": self.runtime_identity.to_dict() if self.runtime_identity else None,
             "debug_identity": self.debug_identity.to_dict() if self.debug_identity else None,
             "verification_ms": self.verification_ms,
+            "verification_method": self.verification_method,
+            "identity_policy_id": self.identity_policy_id,
+            "identity_policy_version": self.identity_policy_version,
+            "verification_result": self.verification_result,
+            "verification_reason": self.verification_reason,
         }
 
 
@@ -526,81 +536,40 @@ class DebugImageProvider:
             self.verification_ms = res.verification_ms
             return res
 
-        # 2. Build ID / Identity Policy verification (Strongest authority, fail-closed)
-        from .adapters.identity_policy import DEFAULT_IDENTITY_POLICY, TargetIdentityPolicy
+        # 2. Unified Identity Policy verification (shared fail-closed verifier)
+        from .adapters.identity_policy import DEFAULT_IDENTITY_POLICY, verify_debug_image_identity
         _pol = getattr(self, "identity_policy", None) or DEFAULT_IDENTITY_POLICY
-        _rb_real = bool(
-            runtime_id.build_id
-            and str(runtime_id.build_id).strip()
-            and str(runtime_id.build_id).strip().lower() != "default_build_id"
-            and not TargetIdentityPolicy.is_synthetic_build_id(runtime_id.build_id)
+        v_res = verify_debug_image_identity(
+            runtime_build_id=runtime_id.build_id,
+            debug_build_id=debug_id.build_id,
+            debuglink=runtime_id.debuglink,
+            debug_image_path=self.debug_image_path,
+            runtime_fingerprint=compute_elf_sha256(runtime_binary_path),
+            debug_fingerprint=compute_elf_sha256(self.debug_image_path),
+            identity_policy=_pol,
         )
-        _db_real = bool(
-            debug_id.build_id
-            and str(debug_id.build_id).strip()
-            and str(debug_id.build_id).strip().lower() != "default_build_id"
-            and not TargetIdentityPolicy.is_synthetic_build_id(debug_id.build_id)
-        )
-
-        if _rb_real:
-            if not _db_real or str(runtime_id.build_id).strip().lower() != str(debug_id.build_id).strip().lower():
-                res = CompatibilityResult(
-                    compatible=False,
-                    reason="BUILD_ID_MISMATCH",
-                    runtime_identity=runtime_id,
-                    debug_identity=debug_id,
-                    verification_ms=round((time.monotonic() - t0) * 1000, 3)
-                )
-                self.compatibility = res
-                self.verification_ms = res.verification_ms
-                return res
-            # Matching real GNU Build ID
-            reason = "COMPATIBLE"
-        elif runtime_id.debuglink and self.debug_image_path and not _db_real:
-            # Fallback to .gnu_debuglink if Build ID is absent
-            expected_name = runtime_id.debuglink.get("filename")
-            actual_name = os.path.basename(self.debug_image_path)
-            expected_crc = runtime_id.debuglink.get("crc")
-            crc_ok = True
-            if expected_crc is not None and os.path.isfile(self.debug_image_path):
-                from .debug_artifacts import compute_gnu_debuglink_crc
-                crc_ok = (compute_gnu_debuglink_crc(self.debug_image_path) == expected_crc)
-            if expected_name == actual_name and crc_ok:
-                reason = "COMPATIBLE_DEBUGLINK"
-            else:
-                res = CompatibilityResult(
-                    compatible=False,
-                    reason="DEBUGLINK_CRC_MISMATCH" if (expected_name == actual_name and not crc_ok) else "BUILD_ID_NOT_AVAILABLE",
-                    runtime_identity=runtime_id,
-                    debug_identity=debug_id,
-                    verification_ms=round((time.monotonic() - t0) * 1000, 3)
-                )
-                self.compatibility = res
-                self.verification_ms = res.verification_ms
-                return res
-        else:
-            # Delegate absent / synthetic / mismatched Build ID cases to identity policy.
-            # Compute independent cryptographic SHA-256 fingerprints only from actual readable files.
-            r_fp = compute_elf_sha256(runtime_binary_path)
-            d_fp = compute_elf_sha256(self.debug_image_path)
-            _compat_ok, _compat_reason = _pol.validate_debug_image_compatibility(
-                runtime_id.build_id,
-                debug_id.build_id,
-                runtime_fingerprint=r_fp,
-                debug_fingerprint=d_fp,
+        if not v_res.compatible:
+            legacy_reason = (
+                "BUILD_ID_MISMATCH"
+                if (v_res.verification_method == "gnu_build_id" and runtime_id.build_id)
+                else v_res.verification_reason
             )
-            if not _compat_ok:
-                res = CompatibilityResult(
-                    compatible=False,
-                    reason=_compat_reason,
-                    runtime_identity=runtime_id,
-                    debug_identity=debug_id,
-                    verification_ms=round((time.monotonic() - t0) * 1000, 3),
-                )
-                self.compatibility = res
-                self.verification_ms = res.verification_ms
-                return res
-            reason = _compat_reason
+            res = CompatibilityResult(
+                compatible=False,
+                reason=legacy_reason,
+                runtime_identity=runtime_id,
+                debug_identity=debug_id,
+                verification_ms=round((time.monotonic() - t0) * 1000, 3),
+                verification_method=v_res.verification_method,
+                identity_policy_id=v_res.identity_policy_id,
+                identity_policy_version=v_res.identity_policy_version,
+                verification_result=v_res.verification_result,
+                verification_reason=v_res.verification_reason,
+            )
+            self.compatibility = res
+            self.verification_ms = res.verification_ms
+            return res
+        reason = "COMPATIBLE" if v_res.verification_reason == "BUILD_ID_MATCH" else v_res.verification_reason
 
         # 3. Ensure debug image actually contains debug info or symbols
         if not debug_id.has_debug_info and debug_id.stripped:
@@ -609,7 +578,12 @@ class DebugImageProvider:
                 reason="DEBUG_INFO_MISSING",
                 runtime_identity=runtime_id,
                 debug_identity=debug_id,
-                verification_ms=round((time.monotonic() - t0) * 1000, 3)
+                verification_ms=round((time.monotonic() - t0) * 1000, 3),
+                verification_method=v_res.verification_method,
+                identity_policy_id=v_res.identity_policy_id,
+                identity_policy_version=v_res.identity_policy_version,
+                verification_result="MISMATCH",
+                verification_reason="DEBUG_INFO_MISSING",
             )
             self.compatibility = res
             self.verification_ms = res.verification_ms
@@ -620,7 +594,12 @@ class DebugImageProvider:
             reason=reason,
             runtime_identity=runtime_id,
             debug_identity=debug_id,
-            verification_ms=round((time.monotonic() - t0) * 1000, 3)
+            verification_ms=round((time.monotonic() - t0) * 1000, 3),
+            verification_method=v_res.verification_method,
+            identity_policy_id=v_res.identity_policy_id,
+            identity_policy_version=v_res.identity_policy_version,
+            verification_result=v_res.verification_result,
+            verification_reason=v_res.verification_reason,
         )
         self.compatibility = res
         self.verification_ms = res.verification_ms
@@ -657,8 +636,24 @@ class DebugImageProvider:
                 "verified": bool(self.compatibility and self.compatibility.compatible),
                 "compatible": bool(self.compatibility and self.compatibility.compatible),
                 "reason": self.compatibility.reason if self.compatibility else None,
-                "identity_policy_id": getattr(getattr(self, "identity_policy", None), "policy_id", "default-optional-build-id"),
-                "identity_policy_version": getattr(getattr(self, "identity_policy", None), "policy_version", "1.0"),
+                "verification_method": (self.compatibility.verification_method if self.compatibility else "none"),
+                "identity_policy_id": (
+                    (self.compatibility.identity_policy_id if self.compatibility and self.compatibility.identity_policy_id else None)
+                    or getattr(getattr(self, "identity_policy", None), "policy_id", "default-optional-build-id")
+                ),
+                "identity_policy_version": (
+                    (self.compatibility.identity_policy_version if self.compatibility and self.compatibility.identity_policy_version else None)
+                    or getattr(getattr(self, "identity_policy", None), "policy_version", "1.0")
+                ),
+                "verification_result": (
+                    self.compatibility.verification_result
+                    if self.compatibility and self.compatibility.verification_result
+                    else ("VERIFIED" if (self.compatibility and self.compatibility.compatible) else "UNVERIFIABLE")
+                ),
+                "verification_reason": (
+                    (self.compatibility.verification_reason if self.compatibility and self.compatibility.verification_reason else None)
+                    or (self.compatibility.reason if self.compatibility else None)
+                ),
             }
 
         return {

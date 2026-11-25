@@ -10,7 +10,9 @@ from __future__ import annotations
 import hashlib
 import re
 from abc import ABC, abstractmethod
-from typing import Any, Dict, Optional, Tuple
+from dataclasses import dataclass
+import os
+from typing import Any, Callable, Dict, Optional, Tuple
 
 
 _SHA256_FP_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
@@ -250,3 +252,185 @@ class StrictBuildIdIdentityPolicy(DefaultTargetIdentityPolicy):
 
 
 DEFAULT_IDENTITY_POLICY = DefaultTargetIdentityPolicy()
+
+
+@dataclass(frozen=True)
+class DebugImageVerificationResult:
+    """Unified, fail-closed identity verification outcome shared by all Debug Image providers."""
+
+    compatible: bool
+    verification_method: str       # "gnu_build_id" | "gnu_debuglink_crc32" | "sha256_fingerprint" | "none"
+    identity_policy_id: str
+    identity_policy_version: str
+    verification_result: str       # "VERIFIED" | "MISMATCH" | "UNVERIFIABLE"
+    verification_reason: str       # Canonical reason code
+
+    def provenance_fields(self) -> Dict[str, Any]:
+        return {
+            "verification_method": self.verification_method,
+            "identity_policy_id": self.identity_policy_id,
+            "identity_policy_version": self.identity_policy_version,
+            "verification_result": self.verification_result,
+            "verification_reason": self.verification_reason,
+        }
+
+
+def _is_real_build_id(build_id: Optional[str]) -> bool:
+    b = str(build_id or "").strip().lower()
+    return bool(b and b != "default_build_id" and not b.startswith("no-build-id:"))
+
+
+def verify_debug_image_identity(
+    *,
+    runtime_build_id: Optional[str],
+    debug_build_id: Optional[str],
+    debuglink: Optional[Dict[str, Any]] = None,
+    debug_image_path: Optional[str] = None,
+    runtime_fingerprint: Optional[str] = None,
+    debug_fingerprint: Optional[str] = None,
+    identity_policy: Optional[TargetIdentityPolicy] = None,
+    debuglink_crc_fn: Optional[Callable[[str], Optional[int]]] = None,
+) -> DebugImageVerificationResult:
+    """Single shared, fail-closed debug image identity verifier.
+
+    Used by both ``DebugImageProvider`` and ``DebugArtifactProvider`` so identical
+    input evidence always yields the exact same compatibility decision and provenance.
+
+    Rules (in strict precedence order):
+    1. If both sides carry real GNU Build IDs: require exact match.
+    2. If only one side carries a real GNU Build ID: fail closed (never approve).
+    3. If policy is strict (rejects absent Build IDs): fail closed with ``STRICT_BUILD_ID_REQUIRED``.
+    4. If ``.gnu_debuglink`` is present with matching basename AND an explicit CRC AND
+       ``debug_image_path`` is a readable file: verify CRC-32 against the actual bytes.
+       - Matching CRC -> ``VERIFIED`` via ``gnu_debuglink_crc32`` (``COMPATIBLE_DEBUGLINK``).
+       - Missing CRC or unreadable file -> filename equality NEVER establishes compatibility;
+         fall through to independent SHA-256 fingerprint verification.
+       - Mismatched CRC -> only independently verified matching SHA-256 fingerprints may
+         establish compatibility; otherwise fail closed with ``DEBUGLINK_CRC_MISMATCH``.
+    5. Independent cryptographic SHA-256 fingerprints (``sha256:<64-hex>``) via
+       ``identity_policy.validate_debug_image_compatibility()``:
+       - Matching -> ``VERIFIED`` via ``sha256_fingerprint`` (``FINGERPRINT_MATCH``).
+       - Mismatched -> ``MISMATCH`` via ``sha256_fingerprint`` (``FINGERPRINT_MISMATCH``).
+       - Unavailable -> ``UNVERIFIABLE`` via ``none`` (``UNKNOWN_IDENTITY_UNVERIFIABLE``).
+    """
+    pol = identity_policy or DEFAULT_IDENTITY_POLICY
+    pol_id = str(getattr(pol, "policy_id", "default-optional-build-id"))
+    pol_ver = str(getattr(pol, "policy_version", "1.0"))
+
+    rb_real = _is_real_build_id(runtime_build_id)
+    db_real = _is_real_build_id(debug_build_id)
+
+    # 1 & 2. Real GNU Build ID present on one or both sides
+    if rb_real or db_real:
+        ok, reason = pol.validate_debug_image_compatibility(
+            runtime_build_id,
+            debug_build_id,
+            runtime_fingerprint=runtime_fingerprint,
+            debug_fingerprint=debug_fingerprint,
+        )
+        if ok:
+            return DebugImageVerificationResult(
+                compatible=True,
+                verification_method="gnu_build_id",
+                identity_policy_id=pol_id,
+                identity_policy_version=pol_ver,
+                verification_result="VERIFIED",
+                verification_reason=reason,
+            )
+        v_res = "MISMATCH" if reason == "BUILD_ID_MISMATCH" else "UNVERIFIABLE"
+        v_method = "none" if reason == "STRICT_BUILD_ID_REQUIRED" else "gnu_build_id"
+        return DebugImageVerificationResult(
+            compatible=False,
+            verification_method=v_method,
+            identity_policy_id=pol_id,
+            identity_policy_version=pol_ver,
+            verification_result=v_res,
+            verification_reason=reason,
+        )
+
+    # 3. Both Build IDs absent/synthetic: check whether policy strictly requires GNU Build ID
+    if isinstance(pol, StrictBuildIdIdentityPolicy):
+        return DebugImageVerificationResult(
+            compatible=False,
+            verification_method="none",
+            identity_policy_id=pol_id,
+            identity_policy_version=pol_ver,
+            verification_result="UNVERIFIABLE",
+            verification_reason="STRICT_BUILD_ID_REQUIRED",
+        )
+
+    # 4. .gnu_debuglink CRC-32 verification (filename equality alone NEVER suffices)
+    crc_mismatch_seen = False
+    if isinstance(debuglink, dict) and debuglink.get("filename") and debug_image_path:
+        expected_name = str(debuglink.get("filename") or "")
+        actual_name = os.path.basename(str(debug_image_path))
+        expected_crc = debuglink.get("crc")
+        if (
+            expected_name
+            and expected_name == actual_name
+            and expected_crc is not None
+            and os.path.isfile(debug_image_path)
+        ):
+            if debuglink_crc_fn is None:
+                from ..debug_artifacts import compute_gnu_debuglink_crc as _default_crc_fn
+                crc_fn = _default_crc_fn
+            else:
+                crc_fn = debuglink_crc_fn
+            try:
+                actual_crc = crc_fn(debug_image_path)
+            except OSError:
+                actual_crc = None
+            if actual_crc is not None:
+                if int(actual_crc) == int(expected_crc):
+                    return DebugImageVerificationResult(
+                        compatible=True,
+                        verification_method="gnu_debuglink_crc32",
+                        identity_policy_id=pol_id,
+                        identity_policy_version=pol_ver,
+                        verification_result="VERIFIED",
+                        verification_reason="COMPATIBLE_DEBUGLINK",
+                    )
+                crc_mismatch_seen = True
+
+    # 5. Independent SHA-256 fingerprint verification via identity policy
+    ok, reason = pol.validate_debug_image_compatibility(
+        runtime_build_id,
+        debug_build_id,
+        runtime_fingerprint=runtime_fingerprint,
+        debug_fingerprint=debug_fingerprint,
+    )
+    if ok:
+        return DebugImageVerificationResult(
+            compatible=True,
+            verification_method="sha256_fingerprint",
+            identity_policy_id=pol_id,
+            identity_policy_version=pol_ver,
+            verification_result="VERIFIED",
+            verification_reason=reason,
+        )
+    if crc_mismatch_seen:
+        return DebugImageVerificationResult(
+            compatible=False,
+            verification_method="gnu_debuglink_crc32",
+            identity_policy_id=pol_id,
+            identity_policy_version=pol_ver,
+            verification_result="MISMATCH",
+            verification_reason="DEBUGLINK_CRC_MISMATCH",
+        )
+    if reason == "FINGERPRINT_MISMATCH":
+        return DebugImageVerificationResult(
+            compatible=False,
+            verification_method="sha256_fingerprint",
+            identity_policy_id=pol_id,
+            identity_policy_version=pol_ver,
+            verification_result="MISMATCH",
+            verification_reason="FINGERPRINT_MISMATCH",
+        )
+    return DebugImageVerificationResult(
+        compatible=False,
+        verification_method="none",
+        identity_policy_id=pol_id,
+        identity_policy_version=pol_ver,
+        verification_result="UNVERIFIABLE",
+        verification_reason=reason,
+    )
