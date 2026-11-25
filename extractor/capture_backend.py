@@ -630,17 +630,13 @@ class LiveCaptureReceipt:
             if ":" in exp_exe and ":" in act_exe and act_exe != exp_exe:
                 return False, f"mismatched_executable_inode:expected={exp_exe},got={act_exe}"
 
-        # 7. Validate Build ID (allow synthetic no-build-id: marker to match absent build_id)
+        # 7. Validate Build ID via TargetIdentityPolicy strategy
         if expected_build_id is not None and str(expected_build_id).strip():
-            exp_b = str(expected_build_id).strip().lower()
-            got_b = str(self.build_id or "").strip().lower()
-            exp_absent = exp_b.startswith("no-build-id:")
-            got_absent = (not got_b) or got_b.startswith("no-build-id:")
-            if exp_absent and got_absent:
-                if got_b and got_b != exp_b:
-                    return False, f"mismatched_build_id:expected={expected_build_id},got={self.build_id}"
-            elif not got_b or got_b != exp_b:
-                return False, f"mismatched_build_id:expected={expected_build_id},got={self.build_id}"
+            from .adapters.identity_policy import DEFAULT_IDENTITY_POLICY
+            _pol = getattr(self, "_identity_policy", None) or DEFAULT_IDENTITY_POLICY
+            _ok_bid, _bid_msg = _pol.validate_build_id_match(expected_build_id, self.build_id)
+            if not _ok_bid:
+                return False, _bid_msg
 
         # 8. Validate snapshot binding
         if not self.snapshot_binding or not str(self.snapshot_binding).strip():

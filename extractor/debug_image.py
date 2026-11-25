@@ -536,9 +536,21 @@ class DebugImageProvider:
                 self.verification_ms = res.verification_ms
                 return res
         elif not debug_id.build_id:
-            # Neither runtime ELF nor debug image carries a GNU Build ID (e.g. -Wl,--build-id=none);
-            # architecture, ELF class, and endianness already matched above.
-            reason = "COMPATIBLE_NO_BUILD_ID"
+            from .adapters.identity_policy import DEFAULT_IDENTITY_POLICY
+            _pol = getattr(self, "identity_policy", None) or DEFAULT_IDENTITY_POLICY
+            _compat_ok, _compat_reason = _pol.validate_debug_image_compatibility(runtime_id.build_id, debug_id.build_id)
+            if not _compat_ok:
+                res = CompatibilityResult(
+                    compatible=False,
+                    reason=_compat_reason,
+                    runtime_identity=runtime_id,
+                    debug_identity=debug_id,
+                    verification_ms=round((time.perf_counter() - t0) * 1000.0, 2),
+                )
+                self.compatibility = res
+                self.verification_ms = res.verification_ms
+                return res
+            reason = _compat_reason
         else:
             # Runtime lacks Build ID while debug image has one (no debuglink match): fail closed.
             res = CompatibilityResult(

@@ -3410,6 +3410,22 @@ class WebApiAdapter:
                 "collector_path": params.get("collector_path") or None,
                 "use_snapshot_bundle": params.get("use_snapshot_bundle") is not False,
             }
+        elif params.get("target_uri") or (params.get("transport") and str(params.get("transport")).strip().lower() != "local"):
+            from extractor.adapters import DEFAULT_ADAPTER_REGISTRY
+            raw_transport = str(params.get("transport") or "").strip().lower() or None
+            raw_uri = params.get("target_uri")
+            raw_tp = params.get("transport_params")
+            if raw_tp is not None and not isinstance(raw_tp, dict):
+                return {"success": False, "error": {"code": "INVALID_PARAM", "message": "transport_params must be an object"}}
+            if raw_transport and DEFAULT_ADAPTER_REGISTRY.get(raw_transport) is None:
+                return {"success": False, "error": {"code": "INVALID_PARAM", "message": f"unknown transport '{raw_transport}'"}}
+            remote_target = {
+                "transport": raw_transport,
+                "target_uri": str(raw_uri).strip() if isinstance(raw_uri, str) and raw_uri.strip() else None,
+                "transport_params": dict(raw_tp or {}),
+                "auto_deploy_collector": params.get("auto_deploy_collector") is not False,
+                "use_snapshot_bundle": params.get("use_snapshot_bundle") is not False,
+            }
         # Structured symptom input (optional): the same fields as the CLI and the MCP tool.
         from extractor.symptom_interpretation import SymptomFieldError, fields_from_mapping
         try:
@@ -3960,6 +3976,7 @@ WebRuntimeAdapter = WebApiAdapter
 #: _handle_diagnose_job_get answers only the job routes listed here.
 API_ROUTES: Tuple[Tuple[str, str], ...] = (
     ("GET", "/api/health"),
+    ("GET", "/api/target/remotes"),            # generic transport metadata & dynamic destinations from AdapterRegistry
     ("GET", "/api/target/processes"),          # the UI resolves a process name to a pid
     ("POST", "/api/diagnose"),                 # synchronous one-call diagnosis (IMP-006)
     ("POST", "/api/diagnose/start"),           # the same diagnosis in a worker thread; returns a job id
@@ -4244,8 +4261,25 @@ class DynamicStateRequestHandler(http.server.BaseHTTPRequestHandler):
             if path == "/api/health":
                 self._send_json(adapter.get_health())
                 return
+            # GET /api/target/remotes (generic transport metadata & dynamic destinations from AdapterRegistry)
+            if path == "/api/target/remotes":
+                from extractor.adapters import list_transport_metadata
+                transports = list_transport_metadata(include_destinations=True)
+                self._send_json({
+                    "success": True,
+                    "transports": transports,
+                    "remotes": [t for t in transports if t.get("is_remote")],
+                })
+                return
             # GET /api/target/processes (the UI resolves a process name to a pid with it)
             if path == "/api/target/processes":
+                raw_tp_q = q_param("transport_params")
+                parsed_tp = None
+                if raw_tp_q:
+                    try:
+                        parsed_tp = json.loads(raw_tp_q)
+                    except ValueError:
+                        parsed_tp = None
                 self._send_json(adapter.find_target_processes({
                     "process_name": q_param("process_name") or q_param("query"),
                     "companion_elf": q_param("companion_elf") or q_param("debug_image"),
@@ -4254,6 +4288,9 @@ class DynamicStateRequestHandler(http.server.BaseHTTPRequestHandler):
                     "ssh_port": q_param("ssh_port", "22"),
                     "ssh_key": q_param("ssh_key"),
                     "ssh_proxy_jump": q_param("ssh_proxy_jump"),
+                    "transport": q_param("transport"),
+                    "target_uri": q_param("target_uri"),
+                    "transport_params": parsed_tp,
                 }))
                 return
             self._not_found(path)

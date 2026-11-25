@@ -5304,23 +5304,71 @@ class TargetSpec:
     timeout_s: Optional[float] = None
     command_runner: Any = None
     stream_opener: Any = None
+    transport: Optional[str] = None
+    target_uri: Optional[str] = None
+    transport_params: Dict[str, Any] = field(default_factory=dict)
 
     @classmethod
     def from_value(cls, value: Any) -> "TargetSpec":
         if isinstance(value, cls):
             return value
+        if isinstance(value, str) and "://" in value.strip():
+            from .adapters import DEFAULT_ADAPTER_REGISTRY
+            tid, params = DEFAULT_ADAPTER_REGISTRY.normalize_request(value.strip())
+            if tid == "ssh":
+                return cls.from_value({**params, "transport": "ssh", "target_uri": value.strip()})
+            return cls(transport=tid, target_uri=value.strip(), transport_params=dict(params))
         if not isinstance(value, dict):
-            raise ValueError("target must be a TargetSpec or a dict of connection parameters")
+            raise ValueError("target must be a TargetSpec, target URI string, or a dict of connection parameters")
+        raw = dict(value)
+        if isinstance(raw.get("target_uri") or raw.get("uri"), str) and "://" in str(raw.get("target_uri") or raw.get("uri")):
+            from .adapters import DEFAULT_ADAPTER_REGISTRY
+            uri = str(raw.get("target_uri") or raw.get("uri")).strip()
+            tid, params = DEFAULT_ADAPTER_REGISTRY.normalize_request(raw)
+            if tid == "ssh":
+                raw = {**params, "transport": "ssh", "target_uri": uri}
+            else:
+                return cls(
+                    transport=tid,
+                    target_uri=uri,
+                    transport_params=dict(params),
+                    auto_deploy_collector=bool(raw.get("auto_deploy_collector", False)),
+                    use_snapshot_bundle=bool(raw.get("use_snapshot_bundle", True)),
+                    timeout_s=raw.get("timeout_s"),
+                    command_runner=raw.get("command_runner"),
+                    stream_opener=raw.get("stream_opener"),
+                )
+        explicit_transport = str(raw.get("transport") or "").strip().lower() or None
+        if explicit_transport and explicit_transport not in ("ssh", "local"):
+            from .adapters import DEFAULT_ADAPTER_REGISTRY
+            if DEFAULT_ADAPTER_REGISTRY.get(explicit_transport) is None:
+                raise ValueError(f"unknown target transport '{explicit_transport}'")
+            tp = dict(raw.get("transport_params") or {}) if isinstance(raw.get("transport_params"), dict) else {}
+            for k, v in raw.items():
+                if k not in cls.__dataclass_fields__ and v is not None:
+                    tp.setdefault(k, v)
+            return cls(
+                transport=explicit_transport,
+                target_uri=raw.get("target_uri"),
+                transport_params=tp,
+                remote_host=tp.get("remote_host") or tp.get("host") or tp.get("target_name"),
+                auto_deploy_collector=bool(raw.get("auto_deploy_collector", False)),
+                collector_path=raw.get("collector_path"),
+                use_snapshot_bundle=bool(raw.get("use_snapshot_bundle", True)),
+                timeout_s=raw.get("timeout_s"),
+                command_runner=raw.get("command_runner"),
+                stream_opener=raw.get("stream_opener"),
+            )
         aliases = {"host": "remote_host", "user": "ssh_user", "port": "ssh_port", "identity": "ssh_key",
                    "ssh_key_file": "ssh_key", "key_file": "ssh_key", "proxy_jump": "ssh_proxy_jump"}
         kw: Dict[str, Any] = {}
-        for k, v in value.items():
+        for k, v in raw.items():
             k = aliases.get(k, k)
             if k not in cls.__dataclass_fields__:
                 raise ValueError(f"unknown target parameter '{k}'")
             kw[k] = v
         spec = cls(**kw)
-        for f in ("remote_host", "ssh_user", "ssh_key", "ssh_proxy_jump", "collector_path"):
+        for f in ("remote_host", "ssh_user", "ssh_key", "ssh_proxy_jump", "collector_path", "transport", "target_uri"):
             v = getattr(spec, f)
             setattr(spec, f, v.strip() if isinstance(v, str) and v.strip() else None)
         try:
@@ -5334,22 +5382,18 @@ class TargetSpec:
         return spec
 
     def build_adapter(self) -> TargetExecutionAdapter:
+        from .adapters import DEFAULT_ADAPTER_REGISTRY
+        if self.transport and self.transport != "ssh":
+            return DEFAULT_ADAPTER_REGISTRY.dispatch(self)
         if not self.remote_host:
             raise ValueError("target.remote_host is required for a remote target")
-        kw: Dict[str, Any] = {}
-        if self.command_runner is not None:
-            kw["command_runner"] = self.command_runner
-        if self.stream_opener is not None:
-            kw["stream_opener"] = self.stream_opener
-        if self.timeout_s:
-            kw["timeout_sec"] = float(self.timeout_s)
-        return RemoteSshTargetAdapter(
-            host=self.remote_host, user=self.ssh_user, port=self.ssh_port, key_file=self.ssh_key,
-            proxy_jump=self.ssh_proxy_jump, collector_path=self.collector_path,
-            use_snapshot_bundle=self.use_snapshot_bundle, **kw)
+        return DEFAULT_ADAPTER_REGISTRY.dispatch(self)
 
     def describe(self) -> Dict[str, Any]:
         """Transport info for the result: host / user / port / jump host; never a key or a key path."""
+        if self.transport and self.transport != "ssh":
+            from .adapters import DEFAULT_ADAPTER_REGISTRY
+            return DEFAULT_ADAPTER_REGISTRY.describe(self)
         return {"transport": "ssh", "host": self.remote_host, "user": self.ssh_user, "port": self.ssh_port,
                 "proxy_jump": self.ssh_proxy_jump, "auto_deploy_collector": self.auto_deploy_collector,
                 "use_snapshot_bundle": self.use_snapshot_bundle}

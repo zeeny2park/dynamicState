@@ -482,6 +482,15 @@ class CaptureTransaction:
 
 
 class TargetExecutionAdapter(ABC):
+    def get_identity_policy(self):
+        """Return the TargetIdentityPolicy strategy governing build-id and binary identity checks.
+
+        Custom adapters may override this method to supply stricter or transport-specific
+        identity rules without modifying core transaction code.
+        """
+        from .adapters.identity_policy import DEFAULT_IDENTITY_POLICY
+        return DEFAULT_IDENTITY_POLICY
+
     """Abstract interface for interacting with a local or remote target process."""
 
     def _ensure_tracking_state(self) -> None:
@@ -910,20 +919,12 @@ class TargetExecutionAdapter(ABC):
                 self.rollback_capture_transaction(target_tx, "Kernel boot_id missing or unavailable")
                 raise ProcessIdentityUnavailableError(f"Kernel boot_id is missing or unavailable on target {target_tx.pid}")
 
-            cur_bid = cur_ident.get("build_id")
-            if not cur_bid or cur_bid == "default_build_id":
-                # Allow binaries compiled without GNU Build-ID (e.g. -Wl,--build-id=none) when a real
-                # executable path, executable_identity, or file fingerprint is observed; still fail closed on empty/corrupt identities.
-                _exe_path = str(cur_ident.get("executable") or "").strip()
-                _exe_fp = str(cur_ident.get("exe_fingerprint") or "").strip()
-                _exe_id = str(cur_ident.get("executable_identity") or "").strip()
-                if _exe_path or _exe_fp or _exe_id:
-                    _fb_raw = f"{_exe_path or _exe_id}|{_exe_fp}".encode("utf-8", "replace")
-                    cur_bid = f"no-build-id:{hashlib.sha256(_fb_raw).hexdigest()[:24]}"
-                    target_tx.metadata["build_id_absent"] = True
-                else:
-                    self.rollback_capture_transaction(target_tx, "Target build_id missing or unavailable")
-                    raise MissingIdentityFieldError(f"Mandatory build_id is missing or unavailable on target {target_tx.pid}")
+            cur_bid, _bid_err = self.get_identity_policy().resolve_build_id(cur_ident, target_tx.metadata)
+            if not cur_bid:
+                self.rollback_capture_transaction(target_tx, f"Target build_id rejected ({_bid_err or 'missing'})")
+                raise MissingIdentityFieldError(
+                    f"Mandatory build_id is missing or unavailable on target {target_tx.pid} ({_bid_err or 'missing'})"
+                )
 
             p_start_raw = cur_ident.get("start_time")
             try:
@@ -5005,3 +5006,21 @@ class MutexOwnerResolutionResult:
     metadata: Dict[str, Any] = field(default_factory=dict)
     owner_name: Optional[str] = None
     error: Optional[str] = None
+
+
+# Facade re-exports from extractor.adapters for backward-compatible extensibility imports
+from .adapters import (  # noqa: E402, F401
+    DEFAULT_ADAPTER_REGISTRY,
+    DEFAULT_IDENTITY_POLICY,
+    DefaultTargetIdentityPolicy,
+    StrictBuildIdIdentityPolicy,
+    TargetAdapterDescriptor,
+    TargetAdapterRegistry,
+    TargetIdentityPolicy,
+    TransportFieldSpec,
+    TransportMetadata,
+    dispatch_target_adapter,
+    list_transport_metadata,
+    parse_target_uri,
+    register_adapter,
+)

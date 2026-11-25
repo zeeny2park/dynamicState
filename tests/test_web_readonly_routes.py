@@ -59,6 +59,7 @@ POST_PREFIXES = ("/api/diagnose",)
 # "the route answered". The probe only proves dispatch reaches the route; behaviour is tested elsewhere.
 PROBES = {
     ("GET", "/api/health"): ("/api/health", None, {200}),
+    ("GET", "/api/target/remotes"): ("/api/target/remotes", None, (200,)),
     ("GET", "/api/target/processes"): ("/api/target/processes?process_name=no_such_process_e5", None, {200}),
     ("POST", "/api/diagnose"): ("/api/diagnose", {"pid": 1}, {200}),          # pid 1 is refused by validation: no run
     ("POST", "/api/diagnose/start"): ("/api/diagnose/start", {"pid": 4242, "language": "en"}, {200}),

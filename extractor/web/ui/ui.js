@@ -817,6 +817,59 @@
     return d <= 1 ? tr(lang, "ago_day") : tr(lang, "ago_days", { n: d });
   }
   /* idle: the title line, the form, the recent diagnoses (or the examples when there is no server) */
+  var DEFAULT_TRANSPORTS = [
+    { id: "local", label: { en: "Local", ko: "로컬" }, is_remote: false, fields: [] },
+    { id: "ssh", label: { en: "SSH", ko: "SSH" }, is_remote: true, fields: [
+      { name: "remote_host", label: { en: "Host", ko: "호스트" }, type: "text", required: true, placeholder: { en: "Host (IP or name)", ko: "호스트 (IP 또는 이름)" } },
+      { name: "ssh_user", label: { en: "SSH User", ko: "SSH 사용자" }, type: "text", required: false, placeholder: { en: "SSH user", ko: "SSH 사용자" } },
+      { name: "ssh_port", label: { en: "Port", ko: "포트" }, type: "text", required: false, placeholder: { en: "Port (22)", ko: "포트 (22)" }, flex: ".4" },
+      { name: "ssh_key", label: { en: "Key file", ko: "키 파일 경로" }, type: "text", required: false, placeholder: { en: "Key file path", ko: "키 파일 경로" } }
+    ] }
+  ];
+  function getTransports(u) { return (u && Array.isArray(u.transports) && u.transports.length) ? u.transports : DEFAULT_TRANSPORTS; }
+  function activeTransport(mode, u) {
+    var list = getTransports(u), m = mode || "local";
+    for (var i = 0; i < list.length; i++) if (list[i].id === m) return list[i];
+    return list[0];
+  }
+  function renderTransportTabs(lang, mode, u) {
+    return getTransports(u).map(function (t) {
+      var pressed = (mode || "local") === t.id;
+      return '<button type="button" data-act="mode" data-mode="' + esc(t.id) + '" aria-pressed="' + pressed + '">' + esc(L(t.label, lang) || t.id) + "</button>";
+    }).join("");
+  }
+  function renderTransportFields(lang, f, inp, u) {
+    var t = activeTransport(f.mode, u);
+    if (!t || !t.fields || !t.fields.length) return "";
+    var isSsh = t.id === "ssh";
+    var tpVals = (f.transport_params && f.transport_params[t.id]) || {};
+    var controls = t.fields.map(function (fd) {
+      var label = L(fd.label, lang) || fd.name;
+      var ph = L(fd.placeholder, lang) || label;
+      var val = isSsh ? (f[fd.name] != null ? f[fd.name] : "") : (tpVals[fd.name] != null ? tpVals[fd.name] : (fd["default"] != null ? fd["default"] : ""));
+      var style = fd.flex ? ' style="flex:' + esc(fd.flex) + '"' : "";
+      if (isSsh && fd.type !== "select" && fd.type !== "checkbox") {
+        var html = inp(fd.name, "mono", ph, ph, fd.type || "text");
+        return fd.flex ? html.replace('class="input mono"', 'class="input mono"' + style) : html;
+      }
+      var attr = isSsh ? ('name="' + esc(fd.name) + '"') : ('data-tp="' + esc(fd.name) + '"');
+      if (fd.type === "select") {
+        var opts = (Array.isArray(fd.options) && fd.options.length ? fd.options : (Array.isArray(t.destinations) ? t.destinations : []));
+        var optHtml = '<option value="">' + esc(ph) + "</option>" + opts.map(function (o) {
+          var ov = typeof o === "string" ? o : (o.value != null ? o.value : (o.id != null ? o.id : (o.name || "")));
+          var ol = typeof o === "string" ? o : (L(o.label, lang) || o.name || ov);
+          return '<option value="' + esc(ov) + '"' + (String(val) === String(ov) ? " selected" : "") + ">" + esc(ol) + "</option>";
+        }).join("");
+        return '<select class="input mono" ' + attr + ' aria-label="' + esc(label) + '"' + style + ">" + optHtml + "</select>";
+      }
+      if (fd.type === "checkbox") {
+        return '<label class="adv"><input type="checkbox" ' + attr + (val ? " checked" : "") + "> " + esc(label) + "</label>";
+      }
+      return '<input class="input mono" type="' + esc(fd.type || "text") + '" ' + attr + ' placeholder="' + esc(ph) + '" aria-label="' + esc(label) + '" value="' + esc(val) + '"' + style + ">";
+    }).join("");
+    return '<div class="row">' + controls + "</div>";
+  }
+
   function renderIdle(ui) {
     var lang = ui.lang, f = ui.form || {}, ssh = f.mode === "ssh";
     function inp(name, cls, ph, label, type) {
@@ -852,13 +905,10 @@
     return '<div class="hero"><h1>' + esc(tr(lang, "hero_h")) + "</h1><p>" + esc(tr(lang, "hero_p")) + "</p>" +
       '<form class="card form" id="form" novalidate autocomplete="off">' +
       '<div class="row"><div class="toggle-group toggle-group-lg" role="group" aria-label="' + esc(tr(lang, "mode_label")) + '">' +
-      '<button type="button" data-act="mode" data-mode="local" aria-pressed="' + !ssh + '">' + esc(tr(lang, "local")) + "</button>" +
-      '<button type="button" data-act="mode" data-mode="ssh" aria-pressed="' + ssh + '">' + esc(tr(lang, "ssh")) + "</button></div>" +
+      renderTransportTabs(lang, f.mode, ui) + "</div>" +
       inp("target", "input-lg mono", tr(lang, "target_ph"), tr(lang, "target_label")) +
       '<button type="submit" class="btn btn-lg" id="go"' + (ui.starting ? " disabled" : "") + ">" + esc(tr(lang, ui.starting ? "starting" : "go")) + "</button></div>" +
-      (ssh ? '<div class="row">' + inp("remote_host", "mono", tr(lang, "host_ph"), tr(lang, "host_ph")) + inp("ssh_user", "mono", tr(lang, "user_ph"), tr(lang, "user_ph")) +
-        inp("ssh_port", "mono", tr(lang, "port_ph"), tr(lang, "port_ph"), "text").replace('class="input mono"', 'class="input mono" style="flex:.4"') +
-        inp("ssh_key", "mono", tr(lang, "key_ph"), tr(lang, "key_ph")) + "</div>" : "") +
+      renderTransportFields(lang, f, inp, ui) +
       '<div class="row">' + inp("symptom", "", tr(lang, "symptom_ph"), tr(lang, "symptom_label")) +
       inp("debug_image", "mono elf", tr(lang, "elf_ph"), tr(lang, "elf_label")) + "</div>" +
       '<div class="opt"><span>' + esc(tr(lang, "opt_line")) + "</span>" +
@@ -908,6 +958,7 @@
     PHASES: PHASES, viewOf: viewOf, fillSlots: fillSlots, backLink: backLink, tr: tr, esc: esc, L: L };
   if (typeof module !== "undefined" && module.exports) module.exports = api;
   root.DSUI = api;
+  root.DS = api;
   if (typeof document === "undefined") return;
 
   /* ================================================================== browser shell (side effects only) */
@@ -916,7 +967,7 @@
     get: function (k) { try { return localStorage.getItem(k); } catch (e) { return null; } },
     set: function (k, v) { try { localStorage.setItem(k, v); } catch (e) { /* storage blocked */ } }
   };
-  var ui = { lang: (Q.get("lang") || LS.get("ds-lang") || "ko") === "en" ? "en" : "ko", expanded: {}, open: {}, form: { mode: "local" },
+  var ui = { lang: (Q.get("lang") || LS.get("ds-lang") || "ko") === "en" ? "en" : "ko", expanded: {}, open: {}, form: { mode: "local", transport_params: {} }, transports: DEFAULT_TRANSPORTS,
     elapsed: 0, conn: "ok", jobs: null, jobsState: "", examples: [], now: Date.now() };
   var events = [], request = null, job = null, replayTimers = [], es = null, pollTimer = null, watchdog = null,
     retries = 0, t0 = 0, tick = null, frozenElapsed = null, lastSpoken = "", gen = 0;
@@ -1119,6 +1170,11 @@
       body.ssh_port = req.ssh_port ? Number(req.ssh_port) : undefined; body.ssh_key = req.ssh_key || undefined;
       body.auto_deploy_collector = req.auto_deploy_collector !== false;
       body.use_snapshot_bundle = req.use_snapshot_bundle !== false;
+    } else if (req.mode && req.mode !== "local") {
+      body.transport = req.mode;
+      body.transport_params = Object.assign({}, (req.transport_params && req.transport_params[req.mode]) || {});
+      body.auto_deploy_collector = req.auto_deploy_collector !== false;
+      body.use_snapshot_bundle = req.use_snapshot_bundle !== false;
     }
     var fail = function (code, message) { ui.starting = false; ui.formError = errorText({ code: code, message: message }, ui.lang, req); draw(); };
     (req.continue_collected_only && /^\d+$/.test(String(req.target || "")) ? Promise.resolve(Number(req.target)) : resolvePid(req)).then(function (pid) {
@@ -1146,6 +1202,7 @@
     if (/^\d+$/.test(req.target)) return Promise.resolve(Number(req.target));
     var q = "process_name=" + encodeURIComponent(req.target);
     if (req.mode === "ssh") ["remote_host", "ssh_user", "ssh_port", "ssh_key"].forEach(function (k) { if (req[k]) q += "&" + k + "=" + encodeURIComponent(req[k]); });
+    else if (req.mode && req.mode !== "local") { q += "&transport=" + encodeURIComponent(req.mode) + "&transport_params=" + encodeURIComponent(JSON.stringify((req.transport_params && req.transport_params[req.mode]) || {})); }
     return getJSON("api/target/processes?" + q).then(function (b) {
       if (b.success === false) throw { code: (b.error || {}).code || "FIND_PROCESSES_ERROR", message: (b.error || {}).message || "" };
       var all = ((b.data || {}).processes || []);
@@ -1201,6 +1258,9 @@
       ui.jobs = b.jobs; ui.jobsState = b.jobs.length ? "ok" : "empty"; draw();
     }).catch(function () { ui.jobs = []; ui.jobsState = "unreachable"; draw(); });
     getJSON("replay/index.json").then(function (b) { if (Array.isArray(b)) { ui.examples = b; draw(); } }).catch(function () { /* none */ });
+    getJSON("api/target/remotes").then(function (b) {
+      if (b && Array.isArray(b.transports) && b.transports.length) { ui.transports = b.transports; draw(); }
+    }).catch(function () { /* fallback to built-in transports */ });
   }
 
   function route() {
@@ -1215,7 +1275,17 @@
   function readForm() {
     var fm = document.getElementById("form");
     if (!fm) return ui.form;
-    Array.prototype.forEach.call(fm.querySelectorAll("input[name]"), function (n) { ui.form[n.name] = (n.type === "checkbox") ? !!n.checked : n.value.trim(); });
+    Array.prototype.forEach.call(fm.querySelectorAll("input[name], select[name]"), function (n) { ui.form[n.name] = (n.type === "checkbox") ? !!n.checked : String(n.value || "").trim(); });
+    if (!ui.form.transport_params) ui.form.transport_params = {};
+    var mode = ui.form.mode || "local";
+    var tpNodes = fm.querySelectorAll("[data-tp]");
+    if (tpNodes.length) {
+      var bucket = ui.form.transport_params[mode] = Object.assign({}, ui.form.transport_params[mode] || {});
+      Array.prototype.forEach.call(tpNodes, function (n) {
+        var k = n.getAttribute("data-tp");
+        bucket[k] = (n.type === "checkbox") ? !!n.checked : String(n.value || "").trim();
+      });
+    }
     return ui.form;
   }
   function download(name, text, type) {
@@ -1310,9 +1380,27 @@
     var f = readForm();
     if (!f.target) { ui.formError = tr(ui.lang, "need_target"); drawNow(); document.querySelector('#form input[name="target"]').focus(); return; }
     if (f.mode === "ssh" && !f.remote_host) { ui.formError = tr(ui.lang, "need_host"); drawNow(); return; }
+    if (f.mode && f.mode !== "local" && f.mode !== "ssh") {
+      var actT = activeTransport(f.mode, ui), tpMap = (f.transport_params && f.transport_params[f.mode]) || {};
+      var missingF = (actT && actT.fields || []).filter(function (fd) { return fd.required && !tpMap[fd.name]; });
+      if (missingF.length) { ui.formError = (L(missingF[0].label, ui.lang) || missingF[0].name) + " is required"; drawNow(); return; }
+    }
     start(Object.assign({}, f));
   });
-  document.addEventListener("input", function (ev) { if (ev.target.name && ev.target.closest("#form")) ui.form[ev.target.name] = ev.target.value; });
+  function _syncField(ev) {
+    if (!ev.target || !ev.target.closest("#form")) return;
+    var tpKey = ev.target.getAttribute && ev.target.getAttribute("data-tp");
+    if (tpKey) {
+      if (!ui.form.transport_params) ui.form.transport_params = {};
+      var m = ui.form.mode || "local";
+      if (!ui.form.transport_params[m]) ui.form.transport_params[m] = {};
+      ui.form.transport_params[m][tpKey] = (ev.target.type === "checkbox") ? !!ev.target.checked : ev.target.value;
+    } else if (ev.target.name) {
+      ui.form[ev.target.name] = (ev.target.type === "checkbox") ? !!ev.target.checked : ev.target.value;
+    }
+  }
+  document.addEventListener("input", _syncField);
+  document.addEventListener("change", _syncField);
 
   window.addEventListener("popstate", route);
   api.shell = { ui: ui, draw: draw, drawNow: drawNow, state: state, getJSON: getJSON, job: function () { return job; } };
