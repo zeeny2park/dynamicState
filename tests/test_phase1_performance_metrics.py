@@ -31,7 +31,7 @@ class TestDiagnosticPerformanceMetrics(unittest.TestCase):
         self.assertIn("recipes_planned_count", d)
         self.assertIn("recipes_executed_count", d)
         self.assertIn("evidence_reuse_ratio", d)
-        self.assertEqual(len(d), 35)
+        self.assertEqual(len(d), 40)
 
     def test_tracker_measures_phase_monotonic(self):
         tracker = DiagnosticPerformanceTracker()
@@ -114,7 +114,7 @@ class TestDiagnosisPipelineMetricsIntegration(unittest.TestCase):
         # Verify performance_metrics property exists and contains metrics
         perf = res.performance_metrics
         self.assertIsInstance(perf, dict)
-        self.assertEqual(len(perf), 35)
+        self.assertEqual(len(perf), 40)
         self.assertIn("total_wall_clock_s", perf)
         self.assertGreaterEqual(perf["total_wall_clock_s"], 0.0)
         self.assertIn("plan_generation_s", perf)

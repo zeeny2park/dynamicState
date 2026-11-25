@@ -27,6 +27,8 @@ RESULT_KEYS = {
     "schema_version", "verdict", "confidence", "confidence_basis", "summary", "findings", "checks_run",
     "not_covered", "collection_impact", "report_path", "report", "investigation_id", "target", "state",
     "stop_reason", "duration_s", "healthy_scope", "symptom_interpretation", "process_profile",
+    "verdict_qualifier", "coverage_summary", "coverage_detail", "notable_observations", "liveness",
+    "baseline_diff", "suggested_actions", "agent_summary",
 }
 
 
