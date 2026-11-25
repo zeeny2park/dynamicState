@@ -1345,14 +1345,24 @@ class TargetExecutionAdapter(ABC):
         if not exe_id:
             raise ValueError(f"Cannot issue live receipt: missing verified executable identity for PID {pid}")
 
-        bid = ident.get("build_id") or ""
+        id_policy = self.get_identity_policy()
+        resolved_bid, bid_err = id_policy.resolve_build_id(ident, tx.metadata)
+        if not resolved_bid and getattr(tx, "target_build_id", None):
+            # Re-verify transaction build_id under the same policy
+            ok_tx_bid, _ = id_policy.validate_build_id_match(tx.target_build_id, tx.target_build_id)
+            if ok_tx_bid:
+                resolved_bid = tx.target_build_id
+        if not resolved_bid:
+            raise ValueError(
+                f"Cannot issue live receipt: target identity policy '{id_policy.policy_id}' rejected build_id ({bid_err or 'missing'})"
+            )
+        bid = str(resolved_bid)
         if companion_build_id:
-            if bid and str(bid).strip().lower() != str(companion_build_id).strip().lower():
+            ok_cmp, cmp_msg = id_policy.validate_build_id_match(companion_build_id, bid)
+            if not ok_cmp:
                 raise ValueError(
-                    f"Cannot issue live receipt: Build ID mismatch between process ({bid}) and companion ELF ({companion_build_id})"
+                    f"Cannot issue live receipt: Build ID mismatch between process ({bid}) and companion ELF ({companion_build_id}): {cmp_msg}"
                 )
-            if not bid:
-                bid = companion_build_id
 
         is_custom = bool(getattr(self, "_memory_reader", None) is not None)
         if is_custom:
@@ -1362,7 +1372,11 @@ class TargetExecutionAdapter(ABC):
         else:
             auth_lvl = "TEST" if getattr(self, "_force_test_authority", False) else "PRODUCTION"
 
-        target_constraints: Dict[str, Any] = {}
+        target_constraints: Dict[str, Any] = {
+            "identity_policy_id": id_policy.policy_id,
+            "identity_policy_version": id_policy.policy_version,
+            "identity_verification_mode": id_policy.verification_mode(bid),
+        }
         if self.is_remote():
             th = self.target_host()
             if not th:
@@ -1396,6 +1410,7 @@ class TargetExecutionAdapter(ABC):
                 eff_ts.bind_operation_receipt(tx.transaction_id, rcpt.receipt_id)
             except Exception as e:
                 raise RuntimeError(f"Failed to bind receipt to operation in durable trust store: {e}") from e
+        rcpt._identity_policy = id_policy
         tx.receipt_issued = True
         self._issued_live_receipts.append(rcpt)
         return rcpt

@@ -1,11 +1,32 @@
-"""Extensible Target Adapter Registry with schema/URI dispatch and UI transport metadata."""
+"""Extensible Target Adapter Registry with thread safety, scheme ownership, and secret redaction."""
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple, Type
+import threading
+from dataclasses import dataclass
+from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
 from .uri import ParsedTargetUri, parse_target_uri
+
+_SECRET_KEY_NAMES = frozenset({
+    "ssh_key", "key_file", "identity", "ssh_key_file", "ssh_private_key",
+    "ssh_key_data", "password", "ssh_password", "passphrase", "token",
+    "secret", "api_key", "private_key", "auth_token", "credential", "credentials",
+})
+
+
+def _redact_secrets(obj: Any, extra_secret_keys: Iterable[str] = ()) -> Any:
+    """Recursively strip secret keys from transport descriptions (defense-in-depth)."""
+    secrets = _SECRET_KEY_NAMES | {str(k).strip().lower() for k in extra_secret_keys if k}
+    if isinstance(obj, dict):
+        return {
+            k: _redact_secrets(v, secrets)
+            for k, v in obj.items()
+            if str(k).strip().lower() not in secrets
+        }
+    if isinstance(obj, list):
+        return [_redact_secrets(v, secrets) for v in obj]
+    return obj
 
 
 @dataclass(frozen=True)
@@ -69,9 +90,12 @@ class TransportMetadata:
         if include_destinations and callable(self.discover_destinations):
             try:
                 dests = self.discover_destinations() or []
-                out["destinations"] = [d for d in dests if isinstance(d, dict)]
+                out["destinations"] = [
+                    _redact_secrets(d) for d in dests if isinstance(d, dict)
+                ]
             except Exception:  # noqa: BLE001 - destination discovery must never break metadata API
                 out["destinations"] = []
+                out["discovery_error"] = True
         return out
 
 
@@ -102,9 +126,10 @@ def _default_uri_to_params(parsed: ParsedTargetUri) -> Dict[str, Any]:
 
 
 class TargetAdapterRegistry:
-    """Registry supporting custom target adapters, URI auto-dispatch, and metadata discovery."""
+    """Thread-safe registry supporting custom adapters, URI scheme ownership, and metadata discovery."""
 
     def __init__(self) -> None:
+        self._lock = threading.RLock()
         self._by_id: Dict[str, TargetAdapterDescriptor] = {}
         self._by_scheme: Dict[str, str] = {}
 
@@ -118,63 +143,112 @@ class TargetAdapterRegistry:
         uri_to_params: Optional[Callable[[ParsedTargetUri], Dict[str, Any]]] = None,
         describe_fn: Optional[Callable[[Dict[str, Any]], Dict[str, Any]]] = None,
         replace: bool = False,
+        allow_scheme_override: bool = False,
     ) -> TargetAdapterDescriptor:
         tid = str(transport_id or "").strip().lower()
         if not tid:
             raise ValueError("transport_id must be a non-empty string")
-        if tid in self._by_id and not replace:
-            raise ValueError(f"transport '{tid}' is already registered (pass replace=True to override)")
         schemes = tuple(dict.fromkeys(
-            str(s).strip().lower() for s in (uri_schemes or (metadata.uri_schemes if metadata else ()) or (tid,)) if s
+            str(s).strip().lower()
+            for s in (uri_schemes or (metadata.uri_schemes if metadata else ()) or (tid,))
+            if s and str(s).strip()
         ))
-        meta = metadata or TransportMetadata(
-            id=tid,
-            label_en=tid.upper(),
-            label_ko=tid.upper(),
-            uri_schemes=schemes,
-            is_remote=(tid != "local"),
-        )
-        desc = TargetAdapterDescriptor(
-            transport_id=tid,
-            factory=factory,
-            metadata=meta,
-            uri_schemes=schemes,
-            uri_to_params=uri_to_params or _default_uri_to_params,
-            describe_fn=describe_fn,
-        )
-        # Clean old scheme mappings on replace
-        if tid in self._by_id:
+        if not schemes:
+            raise ValueError(f"transport '{tid}' must declare at least one URI scheme")
+
+        with self._lock:
+            if tid in self._by_id and not replace:
+                raise ValueError(f"transport '{tid}' is already registered (pass replace=True to override)")
+
+            # Enforce unambiguous URI scheme ownership across distinct transports
+            for s in schemes:
+                owner = self._by_scheme.get(s)
+                if owner is not None and owner != tid and not allow_scheme_override:
+                    raise ValueError(
+                        f"URI scheme '{s}' is already owned by transport '{owner}' "
+                        "(pass allow_scheme_override=True to transfer ownership explicitly)"
+                    )
+
+            meta = metadata or TransportMetadata(
+                id=tid,
+                label_en=tid.upper(),
+                label_ko=tid.upper(),
+                uri_schemes=schemes,
+                is_remote=(tid != "local"),
+            )
+            desc = TargetAdapterDescriptor(
+                transport_id=tid,
+                factory=factory,
+                metadata=meta,
+                uri_schemes=schemes,
+                uri_to_params=uri_to_params or _default_uri_to_params,
+                describe_fn=describe_fn,
+            )
+
+            # Remove previous scheme mappings belonging to this transport_id
             for s in list(self._by_scheme):
                 if self._by_scheme[s] == tid:
                     del self._by_scheme[s]
-        self._by_id[tid] = desc
-        for s in schemes:
-            self._by_scheme[s] = tid
-        return desc
+
+            # If transferring scheme ownership explicitly, also remove from prior owner's descriptor record
+            if allow_scheme_override:
+                for s in schemes:
+                    prev_owner = self._by_scheme.get(s)
+                    if prev_owner and prev_owner != tid and prev_owner in self._by_id:
+                        old_d = self._by_id[prev_owner]
+                        old_d.uri_schemes = tuple(x for x in old_d.uri_schemes if x != s)
+
+            self._by_id[tid] = desc
+            for s in schemes:
+                self._by_scheme[s] = tid
+            return desc
 
     def unregister(self, transport_id: str) -> bool:
         tid = str(transport_id or "").strip().lower()
-        if tid not in self._by_id:
-            return False
-        del self._by_id[tid]
-        for s in list(self._by_scheme):
-            if self._by_scheme[s] == tid:
-                del self._by_scheme[s]
-        return True
+        with self._lock:
+            if tid not in self._by_id:
+                return False
+            del self._by_id[tid]
+            for s in list(self._by_scheme):
+                if self._by_scheme[s] == tid:
+                    del self._by_scheme[s]
+            return True
 
     def get(self, transport_id: str) -> Optional[TargetAdapterDescriptor]:
-        return self._by_id.get(str(transport_id or "").strip().lower())
+        with self._lock:
+            return self._by_id.get(str(transport_id or "").strip().lower())
 
     def resolve_scheme(self, scheme: str) -> Optional[TargetAdapterDescriptor]:
-        tid = self._by_scheme.get(str(scheme or "").strip().lower())
-        return self._by_id.get(tid) if tid else None
+        with self._lock:
+            tid = self._by_scheme.get(str(scheme or "").strip().lower())
+            return self._by_id.get(tid) if tid else None
+
+    def scheme_owner(self, scheme: str) -> Optional[str]:
+        with self._lock:
+            return self._by_scheme.get(str(scheme or "").strip().lower())
 
     def list_ids(self) -> List[str]:
-        return [d.transport_id for d in sorted(self._by_id.values(), key=lambda x: (x.metadata.order, x.transport_id))]
+        with self._lock:
+            return [d.transport_id for d in sorted(self._by_id.values(), key=lambda x: (x.metadata.order, x.transport_id))]
 
     def list_transport_metadata(self, *, include_destinations: bool = True) -> List[Dict[str, Any]]:
-        descs = sorted(self._by_id.values(), key=lambda x: (x.metadata.order, x.transport_id))
+        with self._lock:
+            descs = sorted(self._by_id.values(), key=lambda x: (x.metadata.order, x.transport_id))
         return [d.metadata.to_dict(include_destinations=include_destinations) for d in descs]
+
+    def validate_transport_params(self, transport_id: str, params: Dict[str, Any]) -> Tuple[bool, Optional[str]]:
+        """Validate required fields declared in a transport's metadata."""
+        desc = self.get(transport_id)
+        if desc is None:
+            return False, f"unknown transport '{transport_id}'"
+        if not isinstance(params, dict):
+            return False, "transport_params must be a dictionary"
+        for f in desc.metadata.fields:
+            if f.required:
+                val = params.get(f.name)
+                if val is None or (isinstance(val, str) and not val.strip()):
+                    return False, f"missing required parameter '{f.name}' for transport '{desc.transport_id}'"
+        return True, None
 
     def normalize_request(self, spec_or_uri: Any) -> Tuple[str, Dict[str, Any]]:
         """Resolve a URI string, generic payload dict, or legacy SSH dict into ``(transport_id, params)``."""
@@ -213,12 +287,10 @@ class TargetAdapterRegistry:
                         params.setdefault(k, v)
                 return tid, params
 
-            # Legacy SSH dict detection (remote_host / host without explicit transport)
             if raw.get("remote_host") or raw.get("host"):
                 return "ssh", raw
             return "local", raw
 
-        # Duck-typed TargetSpec object
         if hasattr(spec_or_uri, "transport") and getattr(spec_or_uri, "transport", None):
             tid = str(getattr(spec_or_uri, "transport")).strip().lower()
             tp = getattr(spec_or_uri, "transport_params", None)
@@ -254,14 +326,14 @@ class TargetAdapterRegistry:
         return desc.factory(merged)
 
     def describe(self, spec_or_uri: Any) -> Dict[str, Any]:
-        """Return a sanitized transport description (never containing secret fields)."""
+        """Return a sanitized transport description (strictly redacting secrets even from custom describe_fn)."""
         tid, params = self.normalize_request(spec_or_uri)
         desc = self.get(tid)
+        secret_fields = [f.name for f in (desc.metadata.fields if desc else ()) if f.secret]
         if desc and desc.describe_fn:
-            return desc.describe_fn(params)
-        secret_fields = {f.name for f in (desc.metadata.fields if desc else ()) if f.secret}
-        secret_fields |= {"ssh_key", "key_file", "identity", "password", "token", "secret"}
-        safe_params = {k: v for k, v in params.items() if k not in secret_fields and v is not None}
+            raw_desc = desc.describe_fn(params)
+            return _redact_secrets(raw_desc, secret_fields)
+        safe_params = _redact_secrets({k: v for k, v in params.items() if v is not None}, secret_fields)
         out: Dict[str, Any] = {"transport": tid}
         if safe_params:
             out["transport_params"] = safe_params
@@ -283,6 +355,7 @@ def register_adapter(
     describe_fn: Optional[Callable[[Dict[str, Any]], Dict[str, Any]]] = None,
     registry: Optional[TargetAdapterRegistry] = None,
     replace: bool = False,
+    allow_scheme_override: bool = False,
 ) -> Callable[[Callable[[Dict[str, Any]], Any]], Callable[[Dict[str, Any]], Any]]:
     """Decorator registering an adapter factory with the target adapter registry."""
     target_reg = registry or DEFAULT_ADAPTER_REGISTRY
@@ -296,6 +369,7 @@ def register_adapter(
             uri_to_params=uri_to_params,
             describe_fn=describe_fn,
             replace=replace,
+            allow_scheme_override=allow_scheme_override,
         )
         return fn
 

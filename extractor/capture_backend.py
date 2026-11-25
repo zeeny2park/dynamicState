@@ -583,6 +583,7 @@ class LiveCaptureReceipt:
         expected_observation_digest: Optional[str] = None,
         reject_probe_for_diagnostic: bool = False,
         require_physical_reads: bool = False,
+        identity_policy: Optional[Any] = None,
     ) -> Tuple[bool, str]:
         """Validate LiveCaptureReceipt against all Phase 2.0-A.3.6 through A.3.11 security and identity invariants."""
         # 1. Reject synthetic-to-live escalation
@@ -630,11 +631,29 @@ class LiveCaptureReceipt:
             if ":" in exp_exe and ":" in act_exe and act_exe != exp_exe:
                 return False, f"mismatched_executable_inode:expected={exp_exe},got={act_exe}"
 
-        # 7. Validate Build ID via TargetIdentityPolicy strategy
+        # 7. Validate Identity Policy provenance and Build ID via TargetIdentityPolicy strategy
+        from .adapters.identity_policy import DEFAULT_IDENTITY_POLICY
+        _recorded_pol_id = (self.target_constraints or {}).get("identity_policy_id")
+        if identity_policy is not None:
+            if _recorded_pol_id and str(_recorded_pol_id) != str(identity_policy.policy_id):
+                return False, f"identity_policy_mismatch:captured={_recorded_pol_id},validator={identity_policy.policy_id}"
+            _pol = identity_policy
+        elif getattr(self, "_identity_policy", None) is not None:
+            _pol = getattr(self, "_identity_policy")
+            if _recorded_pol_id and str(_recorded_pol_id) != str(_pol.policy_id):
+                return False, f"identity_policy_mismatch:captured={_recorded_pol_id},attached={_pol.policy_id}"
+        elif _recorded_pol_id and str(_recorded_pol_id) != str(DEFAULT_IDENTITY_POLICY.policy_id):
+            # Do not silently fall back to DEFAULT_IDENTITY_POLICY when a non-default policy was recorded
+            return False, f"missing_required_identity_policy:captured={_recorded_pol_id}"
+        else:
+            _pol = DEFAULT_IDENTITY_POLICY
+
         if expected_build_id is not None and str(expected_build_id).strip():
-            from .adapters.identity_policy import DEFAULT_IDENTITY_POLICY
-            _pol = getattr(self, "_identity_policy", None) or DEFAULT_IDENTITY_POLICY
             _ok_bid, _bid_msg = _pol.validate_build_id_match(expected_build_id, self.build_id)
+            if not _ok_bid:
+                return False, _bid_msg
+        elif _recorded_pol_id and _pol.policy_id == "strict-build-id":
+            _ok_bid, _bid_msg = _pol.validate_build_id_match(None, self.build_id)
             if not _ok_bid:
                 return False, _bid_msg
 

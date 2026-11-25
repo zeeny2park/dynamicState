@@ -239,8 +239,10 @@ class TestTargetIdentityPolicyHook(unittest.TestCase):
         self.assertEqual(err_s, "strict_build_id_required")
 
         # Default policy accepts matching synthetic no-build-id marker in LiveCaptureReceipt
-        ok, _ = default_ad.get_identity_policy().validate_build_id_match(bid, "")
+        ok, _ = default_ad.get_identity_policy().validate_build_id_match(bid, bid)
         self.assertTrue(ok)
+        ok_empty, _ = default_ad.get_identity_policy().validate_build_id_match(bid, "")
+        self.assertFalse(ok_empty)
         ok_compat, reason_compat = default_ad.get_identity_policy().validate_debug_image_compatibility(None, None)
         self.assertTrue(ok_compat)
         self.assertEqual(reason_compat, "COMPATIBLE_NO_BUILD_ID")

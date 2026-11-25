@@ -3365,8 +3365,8 @@ class WebApiAdapter:
                     raise ValueError
             except (TypeError, ValueError):
                 return {"success": False, "error": {"code": "INVALID_PARAM", "message": "time_limit_s must be a positive number"}}
-            time_limit_s = min(time_limit_s, self.DIAGNOSE_REMOTE_MAX_TIME_LIMIT_S if params.get("remote_host") not in (None, "")
-                               else self.DIAGNOSE_MAX_TIME_LIMIT_S)
+            # Defer capping until transport metadata (is_remote) is resolved below
+            _raw_time_limit_s = time_limit_s
         # Time budget of the default checks (extractor.check_budget): seconds, <= 0 = no limit; same as CLI / MCP.
         check_budget: Dict[str, Optional[float]] = {}
         for k in ("default_check_budget_s", "default_check_max_s"):
@@ -3417,15 +3417,39 @@ class WebApiAdapter:
             raw_tp = params.get("transport_params")
             if raw_tp is not None and not isinstance(raw_tp, dict):
                 return {"success": False, "error": {"code": "INVALID_PARAM", "message": "transport_params must be an object"}}
-            if raw_transport and DEFAULT_ADAPTER_REGISTRY.get(raw_transport) is None:
-                return {"success": False, "error": {"code": "INVALID_PARAM", "message": f"unknown transport '{raw_transport}'"}}
+            if raw_uri is not None and (not isinstance(raw_uri, str) or "://" not in raw_uri.strip()):
+                return {"success": False, "error": {"code": "INVALID_PARAM", "message": "target_uri must be a valid '<scheme>://...' URI"}}
+            try:
+                resolved_tid, merged_tp = DEFAULT_ADAPTER_REGISTRY.normalize_request({
+                    "transport": raw_transport,
+                    "target_uri": str(raw_uri).strip() if isinstance(raw_uri, str) and raw_uri.strip() else None,
+                    "transport_params": dict(raw_tp or {}),
+                })
+            except ValueError as exc:
+                return {"success": False, "error": {"code": "INVALID_PARAM", "message": str(exc)}}
+            desc = DEFAULT_ADAPTER_REGISTRY.get(resolved_tid)
+            if desc is None:
+                return {"success": False, "error": {"code": "INVALID_PARAM", "message": f"unknown transport '{resolved_tid}'"}}
+            ok_tp, tp_err = DEFAULT_ADAPTER_REGISTRY.validate_transport_params(resolved_tid, merged_tp)
+            if not ok_tp:
+                return {"success": False, "error": {"code": "INVALID_PARAM", "message": str(tp_err)}}
             remote_target = {
-                "transport": raw_transport,
+                "transport": resolved_tid,
                 "target_uri": str(raw_uri).strip() if isinstance(raw_uri, str) and raw_uri.strip() else None,
-                "transport_params": dict(raw_tp or {}),
+                "transport_params": dict(merged_tp),
                 "auto_deploy_collector": params.get("auto_deploy_collector") is not False,
                 "use_snapshot_bundle": params.get("use_snapshot_bundle") is not False,
             }
+        # Apply local vs remote time_limit_s cap from registered transport metadata (never relying solely on remote_host)
+        if time_limit_s is not None:
+            from extractor.adapters import DEFAULT_ADAPTER_REGISTRY
+            _eff_tid = "ssh" if remote_host not in (None, "") else (
+                (remote_target or {}).get("transport") or str(params.get("transport") or "local").strip().lower() or "local"
+            )
+            _eff_desc = DEFAULT_ADAPTER_REGISTRY.get(_eff_tid)
+            _is_remote_tp = bool(_eff_desc.metadata.is_remote) if _eff_desc is not None else bool(remote_target)
+            time_limit_s = min(time_limit_s, self.DIAGNOSE_REMOTE_MAX_TIME_LIMIT_S if _is_remote_tp
+                               else self.DIAGNOSE_MAX_TIME_LIMIT_S)
         # Structured symptom input (optional): the same fields as the CLI and the MCP tool.
         from extractor.symptom_interpretation import SymptomFieldError, fields_from_mapping
         try:
