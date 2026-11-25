@@ -5179,6 +5179,14 @@ class DiagnoseResult:
     healthy_scope: Dict[str, Any] = field(default_factory=dict)
     symptom_interpretation: Dict[str, Any] = field(default_factory=dict)
     process_profile: Dict[str, Any] = field(default_factory=dict)
+    verdict_qualifier: str = ""
+    coverage_summary: Dict[str, Any] = field(default_factory=dict)
+    coverage_detail: Dict[str, Any] = field(default_factory=dict)
+    notable_observations: List[Dict[str, Any]] = field(default_factory=list)
+    liveness: Dict[str, Any] = field(default_factory=dict)
+    baseline_diff: Optional[Dict[str, Any]] = None
+    suggested_actions: List[Dict[str, Any]] = field(default_factory=list)
+    agent_summary: Dict[str, Any] = field(default_factory=dict)
 
     @property
     def performance_metrics(self) -> Dict[str, Any]:
@@ -5357,6 +5365,96 @@ def _new_diagnose_result(pid: Any, debug_image: Optional[str]) -> DiagnoseResult
     return res
 
 
+def _populate_intelligence(
+    r: DiagnoseResult,
+    rep: Optional[Dict[str, Any]] = None,
+    cdir: Optional[str] = None,
+    save_baseline: bool = False,
+    compare_baseline: Optional[str] = None,
+) -> None:
+    try:
+        from .state_intelligence import (
+            build_agent_summary,
+            build_suggested_actions,
+            classify_coverage,
+            extract_notable_observations,
+        )
+        from .diagnosis_baseline import (
+            compare_diagnosis_baseline,
+            extract_baseline_snapshot,
+            load_diagnosis_baseline,
+            save_diagnosis_baseline,
+        )
+        rd = {
+            "verdict": r.verdict,
+            "confidence": r.confidence,
+            "findings": r.findings,
+            "checks_run": r.checks_run,
+            "not_covered": r.not_covered,
+            "healthy_scope": r.healthy_scope,
+            "target": r.target,
+            "investigation_id": r.investigation_id,
+            "process_profile": r.process_profile,
+        }
+        prof = r.process_profile if isinstance(r.process_profile, dict) else {}
+        r.liveness = dict(prof.get("liveness") or {})
+        r.notable_observations = extract_notable_observations(rd, rep, prof)
+        cov = classify_coverage(rd, rep)
+        r.verdict_qualifier = cov["verdict_qualifier"]
+        r.coverage_summary = {
+            "verdict_qualifier": cov["verdict_qualifier"],
+            "qualifier_label_en": cov["qualifier_label_en"],
+            "qualifier_label_ko": cov["qualifier_label_ko"],
+            "counts": cov["counts"],
+            "one_liner_en": cov["one_liner_en"],
+            "one_liner_ko": cov["one_liner_ko"],
+        }
+        r.coverage_detail = cov["detail"]
+
+        effective_cdir = cdir
+        if compare_baseline:
+            t_info = r.target if isinstance(r.target, dict) else {}
+            prior = load_diagnosis_baseline(
+                effective_cdir,
+                compare_baseline,
+                process_name=t_info.get("process_name"),
+                binary_path=t_info.get("binary_path") or t_info.get("executable"),
+                build_id=t_info.get("build_id"),
+                host=t_info.get("host") or t_info.get("remote_host"),
+                exclude_investigation_id=r.investigation_id,
+            )
+            if prior is not None:
+                curr_snap = extract_baseline_snapshot(rd, prof, r.notable_observations)
+                r.baseline_diff = compare_diagnosis_baseline(curr_snap, prior)
+            else:
+                r.baseline_diff = {
+                    "available": False,
+                    "selector": str(compare_baseline),
+                    "reason": "no_matching_baseline",
+                }
+        if save_baseline and prof.get("available"):
+            save_diagnosis_baseline(effective_cdir, rd, prof, r.notable_observations)
+
+        r.suggested_actions = build_suggested_actions(
+            rd, rep, prof, cov, r.notable_observations, r.baseline_diff
+        )
+        r.agent_summary = build_agent_summary(
+            rd, prof, cov, r.notable_observations, r.baseline_diff, r.suggested_actions, lang="en"
+        )
+        if isinstance(rep, dict):
+            rep["verdict_qualifier"] = r.verdict_qualifier
+            rep["coverage_summary"] = r.coverage_summary
+            rep["coverage_detail"] = r.coverage_detail
+            rep["notable_observations"] = r.notable_observations
+            rep["liveness"] = r.liveness
+            if r.baseline_diff is not None:
+                rep["baseline_diff"] = r.baseline_diff
+            rep["suggested_actions"] = r.suggested_actions
+            rep["agent_summary"] = r.agent_summary
+    except Exception:  # noqa: BLE001 - intelligence layer must never fail a diagnosis
+        pass
+
+
 def diagnose(
     pid: int,
     debug_image: Optional[str] = None,
@@ -5376,6 +5474,7 @@ def diagnose(
     resume_investigation_id: Optional[str] = None,
     continue_collected_only: bool = False,
     force_fresh: bool = False,
+    compare_baseline: Optional[str] = None,
 ) -> DiagnoseResult:
     """Diagnose live process ``pid`` end to end in one call and return a :class:`DiagnoseResult`.
 
@@ -5427,6 +5526,7 @@ def diagnose(
         _perf_m.target_impact = dict(r.collection_impact)
         r.performance_metrics = _perf_m.to_dict()
         r.collection_impact["performance_metrics"] = r.performance_metrics
+        _populate_intelligence(r, None, corpus_dir, save_baseline=False, compare_baseline=compare_baseline)
         return r
 
     try:
@@ -5577,6 +5677,7 @@ def _diagnose_run(
     resume_investigation_id: Optional[str] = None,
     continue_collected_only: bool = False,
     force_fresh: bool = False,
+    compare_baseline: Optional[str] = None,
 ) -> DiagnoseResult:
     res = _new_diagnose_result(pid, debug_image)
     res.target.update(extra_target)
@@ -5589,6 +5690,8 @@ def _diagnose_run(
         res.summary = summary
         if not res.healthy_scope:
             res.healthy_scope = not_healthy_scope(nc, summary)
+        if not res.verdict_qualifier:
+            _populate_intelligence(res, None, getattr(engine, "corpus_dir", corpus_dir), save_baseline=False, compare_baseline=compare_baseline)
         res.duration_s = round(time.monotonic() - t0, 3)
         trk = getattr(session, "perf_tracker", None) or fallback_tracker
         perf_m = trk.finish(total_wall_clock_s=res.duration_s)
@@ -6049,6 +6152,8 @@ def _diagnose_run(
             res.performance_metrics = perf_m.to_dict()
             res.collection_impact["performance_metrics"] = res.performance_metrics
             report["performance_metrics"] = res.performance_metrics
+
+        _populate_intelligence(res, report, engine.corpus_dir, save_baseline=True, compare_baseline=compare_baseline)
 
         # Serialized once (C encoder; json.dump() runs the pure-Python one): the same text is the report file and,
         # when asked for, the returned copy.

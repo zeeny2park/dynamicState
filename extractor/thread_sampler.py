@@ -944,6 +944,7 @@ def derive(series: ThreadSeries) -> Dict[str, Any]:
         }
         ticks = [r["utime_ticks"] + r["stime_ticks"] for r in recs]
         d["cpu_ticks_delta"] = ticks[-1] - ticks[0]
+        d["cpu_time_ms_delta"] = round((ticks[-1] - ticks[0]) / CLK_TCK * 1000.0, 2) if len(pts) >= 2 else None
         d["cpu_share"] = round((ticks[-1] - ticks[0]) / CLK_TCK / window, 3) if len(pts) >= 2 else None
         # runnable fraction from schedstat; never fabricated: None when absent / all-zero (kernel without SCHED_INFO)
         ss_pts = [(t, r["schedstat"]) for t, r in zip(times, recs) if isinstance(r.get("schedstat"), dict)]
@@ -960,6 +961,8 @@ def derive(series: ThreadSeries) -> Dict[str, Any]:
             if dr >= 0 and dw >= 0 and tb > ta:
                 d["runnable_fraction"] = round(min(1.0, (dr + dw) / span_ns), 3)
                 d["runnable_cpu_received"] = round(min(1.0, dr / span_ns), 3)
+                d["sched_run_ms_delta"] = round(dr / 1e6, 2)
+                d["sched_wait_ms_delta"] = round(dw / 1e6, 2)
                 # times the thread was put on a CPU in the window (schedstat third field, pcount)
                 if isinstance(a.get("timeslices"), int) and isinstance(b.get("timeslices"), int):
                     d["cpu_dispatches"] = max(0, b["timeslices"] - a["timeslices"])

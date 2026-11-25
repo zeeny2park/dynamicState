@@ -129,6 +129,20 @@ W: Dict[str, Tuple[str, str]] = {
     "n_thread_detail_partial": ("thread table: only {d} of {l} threads were sampled over the window; the others have one read",
                                 "스레드 표: {l}개 중 {d}개만 구간 동안 표본으로 관측했고 나머지는 한 번 읽은 값입니다"),
     "n_profile_no_report": ("the profile: the result carries no detailed report", "프로필: 결과에 상세 보고서가 없습니다"),
+    "s_liveness": ("Liveness & activity", "활동성 지표"),
+    "s_roles": ("Thread roles", "역할별 스레드 요약"),
+    "liv_active": ("active", "활성"),
+    "liv_idle_alive": ("idle alive", "유휴 생존"),
+    "liv_quiet": ("quiet (no delta observed)", "정적 (델타 미관측)"),
+    "liv_unknown": ("unknown", "알 수 없음"),
+    "liv_win": ("{w}s", "{w}초"),
+    "liv_cpu": ("CPU +{ms}ms", "CPU +{ms}ms"),
+    "liv_sw": ("ctx_sw +{tot} ({vol}/{invol})", "스위치 +{tot} (자발 {vol}/비자발 {invol})"),
+    "liv_sw_tot": ("ctx_sw +{tot}", "스위치 +{tot}"),
+    "liv_io": ("I/O +{io}", "I/O +{io}"),
+    "liv_disp": ("sched +{d}", "스케줄 +{d}"),
+    "liv_active_th": ("active {a}/{t}", "활성 {a}/{t}"),
+    "liv_fd": ("FD {s}->{e} ({d:+d})", "FD {s}->{e} ({d:+d})"),
 }
 
 
@@ -391,6 +405,70 @@ def not_observed_text(lx: Lx, it: Dict[str, Any]) -> str:
 MAX_MD_THREAD_LINES = 3
 
 
+def liveness_lines(lx: Lx, prof: Dict[str, Any]) -> List[str]:
+    """Render observation-window activity deltas and role/state thread groups."""
+    liv = prof.get("liveness")
+    if not isinstance(liv, dict):
+        return []
+    out: List[str] = []
+    st_key = "liv_" + str(liv.get("status") or "unknown").lower()
+    st_word = lx.t(st_key) if st_key in W else str(liv.get("status") or "")
+    parts: List[str] = []
+    if liv.get("window_s") is not None:
+        parts.append(lx.t("liv_win", w=liv["window_s"]))
+    if liv.get("cpu_time_ms_delta") is not None:
+        parts.append(lx.t("liv_cpu", ms=liv["cpu_time_ms_delta"]))
+    if liv.get("total_switches_delta") is not None:
+        if liv.get("voluntary_switches_delta") is not None and liv.get("involuntary_switches_delta") is not None:
+            parts.append(lx.t("liv_sw", tot=liv["total_switches_delta"],
+                              vol=liv["voluntary_switches_delta"], invol=liv["involuntary_switches_delta"]))
+        else:
+            parts.append(lx.t("liv_sw_tot", tot=liv["total_switches_delta"]))
+    if liv.get("io_syscalls_delta") is not None:
+        parts.append(lx.t("liv_io", io=liv["io_syscalls_delta"]))
+    if liv.get("cpu_dispatches_delta") is not None:
+        parts.append(lx.t("liv_disp", d=liv["cpu_dispatches_delta"]))
+    if liv.get("total_threads"):
+        parts.append(lx.t("liv_active_th", a=liv.get("active_threads", 0), t=liv["total_threads"]))
+    fd_act = liv.get("fd_activity")
+    if isinstance(fd_act, dict) and fd_act.get("start") is not None and fd_act.get("end") is not None and (int(fd_act.get("delta") or 0) != 0 or not prof.get("resources")):
+        fd_s = lx.t("liv_fd", s=fd_act["start"], e=fd_act["end"], d=int(fd_act.get("delta") or 0))
+        by_k = fd_act.get("by_kind") or {}
+        if by_k:
+            fd_s += " (" + ", ".join(f"{k}:{v}" for k, v in list(by_k.items())[:2]) + ")"
+        parts.append(fd_s)
+    has_signal = any(liv.get(k) is not None for k in (
+        "cpu_time_ms_delta", "total_switches_delta", "io_syscalls_delta",
+        "cpu_dispatches_delta", "fd_activity"
+    ))
+    if parts and has_signal:
+        out.append(f"- {lx.t('s_liveness')}: {st_word} — " + "; ".join(parts))
+
+    roles = liv.get("role_summary") or []
+    if any((g.get("count") or 0) > 1 for g in roles) or (len(roles) >= 3):
+        r_parts: List[str] = []
+        for g in roles[:5]:
+            role = _c(g.get("role"))
+            st = state_word(lx, str(g.get("state") or "unknown"))
+            cnt = g.get("count", 1)
+            extra = []
+            if g.get("cpu_time_ms_delta"):
+                extra.append(f"CPU +{g['cpu_time_ms_delta']} ms")
+            sw = (g.get("voluntary_switches_delta") or 0) + (g.get("involuntary_switches_delta") or 0)
+            if sw:
+                extra.append(f"스위치 +{sw}" if lx.lang == "ko" else f"switches +{sw}")
+            if g.get("representative_wait"):
+                extra.append(_c(g["representative_wait"]))
+            elif g.get("representative_function"):
+                extra.append(_c(g["representative_function"]))
+            r_parts.append(f"{role} ({st} ×{cnt}" + (f", {', '.join(extra)}" if extra else "") + ")")
+        if out:
+            out[-1] += f" | {lx.t('s_roles')}: " + "; ".join(r_parts[:2])
+        else:
+            out.append(f"- {lx.t('s_roles')}: " + "; ".join(r_parts[:2]))
+    return out
+
+
 def profile_lines(prof: Dict[str, Any], lang: str) -> List[str]:
     """The compact Markdown of the profile (bullets only; ``[]`` when the diagnosis left nothing to profile)."""
     if not prof or not prof.get("available"):
@@ -403,15 +481,17 @@ def profile_lines(prof: Dict[str, Any], lang: str) -> List[str]:
         out.append("- " + lx.t("glance", x=g) + (f" ({w}; {lx.t('caveat_short')})" if w else ""))
     if prof.get("runtime"):
         out.append(f"- {lx.t('s_runtime')}: " + runtime_text(lx, prof["runtime"]))
+    out += liveness_lines(lx, prof)
     th = prof.get("threads")
     if th:
         out.append(f"- {lx.t('s_threads')}: " + thread_count_text(lx, th))
         rows = th["rows"]
-        for r in rows[:MAX_MD_THREAD_LINES]:
+        max_th = 2 if liveness_lines(lx, prof) else MAX_MD_THREAD_LINES
+        for r in rows[:max_th]:
             out.append("  - " + thread_line(lx, r))
-        rest_g = len(rows) - MAX_MD_THREAD_LINES
+        rest_g = len(rows) - max_th
         if rest_g > 0 or th.get("omitted"):
-            n = sum(r.get("count", 1) for r in rows[MAX_MD_THREAD_LINES:]) + ((th.get("omitted") or {}).get("threads") or 0)
+            n = sum(r.get("count", 1) for r in rows[max_th:]) + ((th.get("omitted") or {}).get("threads") or 0)
             gcount = max(rest_g, 0) + ((th.get("omitted") or {}).get("groups") or 0)
             out.append("  - " + lx.t("t_more", g=gcount, n=n))
     mem = prof.get("memory")
@@ -507,6 +587,10 @@ def profile_html(prof: Dict[str, Any], lang: str, uid: str = "profile") -> str:
 
     if prof.get("runtime"):
         block("s_runtime", f"<p>{_md(runtime_text(lx, prof['runtime']))}</p>")
+    liv_md = liveness_lines(lx, prof)
+    if liv_md:
+        liv_items = "".join(f"<li>{_md(line.lstrip(' -'))}</li>" for line in liv_md)
+        parts.append(f'<div class="dsv-psec"><h3>{E(lx.t("s_liveness"))}</h3><ul class="dsv-plist">{liv_items}</ul></div>')
     th = prof.get("threads")
     if th:
         inner = f"<p>{_md(thread_count_text(lx, th))}</p>"

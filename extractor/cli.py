@@ -582,6 +582,8 @@ def main():
                       help="Resume an existing investigation ID (reuses already-collected data)")
     dx_p.add_argument("--continue-collected-only", dest="continue_collected_only", action="store_true", default=False,
                       help="Diagnose only from already-collected data (auto-matches saved bundle by host/pid/build_id or --resume)")
+    dx_p.add_argument("--compare-baseline", dest="compare_baseline", type=str, default=None,
+                      help="Compare against a saved diagnosis baseline ('latest', 'latest_healthy', investigation_id, or JSON path)")
     dx_p.add_argument("--refresh", dest="refresh", action="store_true", default=False,
                       help="Bypass saved remote collected bundles and force fresh target collection")
 
@@ -1860,6 +1862,7 @@ def main():
             enable_tracing=args.enable_tracing,
             resume_investigation_id=args.resume_investigation_id,
             continue_collected_only=args.continue_collected_only,
+            compare_baseline=args.compare_baseline,
         )
         if args.json:
             result["human_summary"] = summary

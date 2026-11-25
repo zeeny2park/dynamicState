@@ -209,6 +209,15 @@ def _threads_section(ev: _Evidence) -> Optional[Dict[str, Any]]:
                                "owner_name": owner_name or (names.get(owner_tid) if isinstance(owner_tid, int) else None)}
         elif syscall:
             row["waits_on"] = {"kind": "syscall", "name": str(syscall)}
+        for dk in ("cpu_ticks_delta", "cpu_time_ms_delta", "voluntary_switches_delta",
+                   "involuntary_switches_delta", "io_syscalls_delta", "cpu_dispatches",
+                   "sched_run_ms_delta", "sched_wait_ms_delta"):
+            dv = _num(s.get(dk))
+            if dv is not None:
+                row[dk] = round(dv, 2) if dk.endswith("_ms_delta") else int(round(dv))
+        if "cpu_time_ms_delta" not in row and "cpu_ticks_delta" in row:
+            clk = _num(sampling.get("clk_tck")) or 100.0
+            row["cpu_time_ms_delta"] = round(row["cpu_ticks_delta"] / clk * 1000.0, 2)
         rows.append(row)
     rows.sort(key=lambda r: (_RANK.get(r["state"], 99), r["tid"]))
 
@@ -261,7 +270,174 @@ def _threads_section(ev: _Evidence) -> Optional[Dict[str, Any]]:
         out["trend"] = str(ev.first("thread_count_trend") or "") or None
     if n_samples and window is not None:
         out["sampling"] = {"samples": n_samples, "window_s": round(window, 2)}
+    rgs = _thread_role_groups(rows)
+    if rgs:
+        out["role_groups"] = rgs
+    out["_all_rows_activity"] = [
+        {k: r[k] for k in ("tid", "name", "state", "function", "cpu_ticks_delta", "cpu_time_ms_delta",
+                           "voluntary_switches_delta", "involuntary_switches_delta", "io_syscalls_delta",
+                           "cpu_dispatches", "sched_run_ms_delta") if k in r}
+        for r in rows
+    ]
     return out
+
+
+_ROLE_SUFFIX_RE = re.compile(r"(?:[-_#:]?\d+)$")
+
+
+def _normalize_role(name: Optional[str]) -> str:
+    if not name or not str(name).strip():
+        return "unnamed"
+    raw = str(name).strip()
+    norm = _ROLE_SUFFIX_RE.sub("", raw).strip("-_#:")
+    return norm if len(norm) >= 2 else raw
+
+
+def _thread_role_groups(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Aggregate threads by normalized role name and classified state."""
+    buckets: Dict[Tuple[str, str], Dict[str, Any]] = {}
+    for r in rows:
+        role = _normalize_role(r.get("name"))
+        state = str(r.get("state") or "unknown")
+        key = (role, state)
+        b = buckets.get(key)
+        if b is None:
+            b = {
+                "role": role,
+                "state": state,
+                "count": 0,
+                "active_count": 0,
+                "cpu_time_ms_delta": 0.0,
+                "voluntary_switches_delta": 0,
+                "involuntary_switches_delta": 0,
+                "io_syscalls_delta": 0,
+                "representative_function": r.get("function"),
+                "representative_wait": (r.get("waits_on") or {}).get("name") if isinstance(r.get("waits_on"), dict) else None,
+            }
+            buckets[key] = b
+        b["count"] += 1
+        cpu_ms = _num(r.get("cpu_time_ms_delta")) or 0.0
+        vol = int(_num(r.get("voluntary_switches_delta")) or 0)
+        invol = int(_num(r.get("involuntary_switches_delta")) or 0)
+        io_d = int(_num(r.get("io_syscalls_delta")) or 0)
+        b["cpu_time_ms_delta"] = round(b["cpu_time_ms_delta"] + cpu_ms, 2)
+        b["voluntary_switches_delta"] += vol
+        b["involuntary_switches_delta"] += invol
+        b["io_syscalls_delta"] += io_d
+        if cpu_ms > 0 or vol > 0 or invol > 0 or io_d > 0 or state == "running":
+            b["active_count"] += 1
+        if not b["representative_function"] and r.get("function"):
+            b["representative_function"] = r.get("function")
+        if not b["representative_wait"] and isinstance(r.get("waits_on"), dict):
+            b["representative_wait"] = r["waits_on"].get("name")
+    groups = list(buckets.values())
+    groups.sort(key=lambda g: (_RANK.get(g["state"], 99), -g["count"], g["role"]))
+    return groups[:16]
+
+
+def _liveness_section(ev: _Evidence, secs: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Quantify process activity deltas over the observation window as liveness proof."""
+    th = secs.get("threads") or {}
+    act_rows = th.pop("_all_rows_activity", None) or []
+    sampling = th.get("sampling") or {}
+    window_s = _num(sampling.get("window_s")) or _num(ev.sec_b.get("observation_duration_sec"))
+    samples = int(sampling.get("samples") or ev.impact.get("samples_collected") or 0)
+
+    has_cpu = any("cpu_time_ms_delta" in r for r in act_rows)
+    has_vol = any("voluntary_switches_delta" in r for r in act_rows)
+    has_invol = any("involuntary_switches_delta" in r for r in act_rows)
+    has_io = any("io_syscalls_delta" in r for r in act_rows)
+    has_disp = any("cpu_dispatches" in r for r in act_rows)
+    has_run = any("sched_run_ms_delta" in r for r in act_rows)
+
+    cpu_ms = round(sum(_num(r.get("cpu_time_ms_delta")) or 0.0 for r in act_rows), 2) if has_cpu else None
+    cpu_ticks = int(sum(_num(r.get("cpu_ticks_delta")) or 0 for r in act_rows)) if has_cpu else None
+    vol_d = int(sum(_num(r.get("voluntary_switches_delta")) or 0 for r in act_rows)) if has_vol else None
+    invol_d = int(sum(_num(r.get("involuntary_switches_delta")) or 0 for r in act_rows)) if has_invol else None
+    total_sw = ((vol_d or 0) + (invol_d or 0)) if (has_vol or has_invol) else None
+    io_d = int(sum(_num(r.get("io_syscalls_delta")) or 0 for r in act_rows)) if has_io else None
+    disp_d = int(sum(_num(r.get("cpu_dispatches")) or 0 for r in act_rows)) if has_disp else None
+    sched_run_ms = round(sum(_num(r.get("sched_run_ms_delta")) or 0.0 for r in act_rows), 2) if has_run else None
+
+    active_list: List[Dict[str, Any]] = []
+    for r in act_rows:
+        score = (
+            (_num(r.get("cpu_time_ms_delta")) or 0.0) * 10.0
+            + (_num(r.get("voluntary_switches_delta")) or 0.0)
+            + (_num(r.get("involuntary_switches_delta")) or 0.0)
+            + (_num(r.get("io_syscalls_delta")) or 0.0)
+            + (_num(r.get("cpu_dispatches")) or 0.0)
+        )
+        if score > 0:
+            active_list.append((score, r))
+    active_list.sort(key=lambda pair: -pair[0])
+    top_active = [
+        {k: r[k] for k in ("tid", "name", "state", "function", "cpu_time_ms_delta",
+                           "voluntary_switches_delta", "involuntary_switches_delta", "io_syscalls_delta") if k in r}
+        for _, r in active_list[:5]
+    ]
+
+    # FD / socket activity summary
+    fd_activity: Optional[Dict[str, Any]] = None
+    fds = (secs.get("resources") or {}).get("fds")
+    if isinstance(fds, dict):
+        ser = fds.get("series") or []
+        fd_activity = {
+            "current": fds.get("v"),
+            "start": ser[0] if ser else fds.get("v"),
+            "end": ser[-1] if ser else fds.get("v"),
+            "delta": (ser[-1] - ser[0]) if len(ser) >= 2 else 0,
+            "new_targets": fds.get("new_targets", 0),
+        }
+        if fds.get("limit") is not None:
+            fd_activity["limit"] = fds.get("limit")
+        if fds.get("by_kind"):
+            fd_activity["by_kind"] = fds["by_kind"]
+
+    if not act_rows and fd_activity is None and window_s is None:
+        return None
+
+    # Classify liveness status from real observed deltas
+    if (cpu_ms and cpu_ms > 0) or (io_d and io_d > 0) or (total_sw and total_sw >= 5) or (sched_run_ms and sched_run_ms > 0):
+        status = "ACTIVE"
+    elif (total_sw and total_sw > 0) or (disp_d and disp_d > 0) or (fd_activity and fd_activity.get("delta", 0) != 0):
+        status = "IDLE_ALIVE"
+    elif act_rows:
+        status = "QUIET"
+    else:
+        status = "UNKNOWN"
+
+    liv_out: Dict[str, Any] = {
+        "status": status,
+        "active_threads": len(active_list),
+    }
+    if window_s is not None:
+        liv_out["window_s"] = round(window_s, 2)
+    if samples:
+        liv_out["samples"] = samples
+    tot_t = len(act_rows) if act_rows else ((th.get("count") or {}).get("v") if isinstance(th.get("count"), dict) else None)
+    if tot_t is not None:
+        liv_out["total_threads"] = tot_t
+    for k, v in (
+        ("cpu_time_ms_delta", cpu_ms),
+        ("cpu_ticks_delta", cpu_ticks),
+        ("voluntary_switches_delta", vol_d),
+        ("involuntary_switches_delta", invol_d),
+        ("total_switches_delta", total_sw),
+        ("io_syscalls_delta", io_d),
+        ("cpu_dispatches_delta", disp_d),
+        ("sched_run_ms_delta", sched_run_ms),
+    ):
+        if v is not None:
+            liv_out[k] = v
+    if top_active:
+        liv_out["top_active_threads"] = top_active
+    if fd_activity:
+        liv_out["fd_activity"] = fd_activity
+    role_sum = list(th.get("role_groups") or [])[:8]
+    if role_sum:
+        liv_out["role_summary"] = role_sum
+    return liv_out
 
 
 # ------------------------------------------------------------------------------------------------ memory
@@ -527,6 +703,12 @@ def build_process_profile(result: Dict[str, Any], report: Optional[Dict[str, Any
     samples = ev.impact.get("samples_collected")
     if window_s or samples:
         prof["window"] = {"seconds": window_s, "samples": int(samples) if _num(samples) else None}
+    try:
+        liv = _liveness_section(ev, secs)
+    except Exception:  # noqa: BLE001
+        liv = None
+    if liv:
+        prof["liveness"] = liv
     summary: Dict[str, Any] = {}
     th = secs.get("threads") or {}
     if th.get("count"):

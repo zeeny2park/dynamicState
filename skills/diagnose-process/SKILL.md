@@ -89,6 +89,8 @@ untagged applies to both. (`dynamic-state skill install` installs this file as i
   `bytes_read`, `budget_exhausted`.
 - `human_summary`: Markdown report with six numbered sections (conclusion, what is wrong, why, certainty and what was not examined, next steps, impact) and a glossary; identifiers are untouched.
 - `report_path`: JSON report on disk; cite it so the user can open it.
+- `agent_summary`, `coverage_summary`, `notable_observations[]`, `liveness`, `baseline_diff`, `suggested_actions[]`:
+  clean state-intelligence fields for follow-up decisions (use `suggested_actions[]` when blind spots or watchlist items need deeper inspection, or pass `compare_baseline` to detect drift against a prior snapshot).
 
 ## Follow-up by verdict
 - CONFIRMED_FAULT: report it. Optionally add detail with the thread call-stack tool (deadlock) or the heap tools.

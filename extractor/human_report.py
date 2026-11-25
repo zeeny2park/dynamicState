@@ -2008,6 +2008,76 @@ def profile_of(res: Dict[str, Any], report: Optional[Dict[str, Any]]) -> Dict[st
     return prof
 
 
+def _intelligence_data(
+    res: Dict[str, Any],
+    report: Optional[Dict[str, Any]],
+    profile: Dict[str, Any],
+    lang: str,
+) -> Dict[str, Any]:
+    from .state_intelligence import (
+        build_agent_summary,
+        build_suggested_actions,
+        classify_coverage,
+        extract_notable_observations,
+    )
+    notable = res.get("notable_observations")
+    if not isinstance(notable, list):
+        notable = extract_notable_observations(res, report, profile)
+    cov = classify_coverage(res, report)
+    bdiff = res.get("baseline_diff") if isinstance(res.get("baseline_diff"), dict) else None
+    actions = res.get("suggested_actions")
+    if not isinstance(actions, list):
+        actions = build_suggested_actions(res, report, profile, cov, notable, bdiff)
+    agent_sum = build_agent_summary(res, profile, cov, notable, bdiff, actions, lang=lang)
+    return {
+        "notable": notable,
+        "coverage": cov,
+        "baseline_diff": bdiff,
+        "suggested_actions": actions,
+        "agent_summary": agent_sum,
+    }
+
+
+def _watchlist_and_baseline_lines(lang: str, notable: List[Dict[str, Any]],
+                                  baseline_diff: Optional[Dict[str, Any]]) -> List[str]:
+    ko = lang == "ko"
+    out: List[str] = []
+    if notable:
+        head = "주의 관찰 항목" if ko else "Notable observations"
+        titles = [str(n.get("title_ko" if ko else "title_en") or n.get("id") or "") for n in notable[:3]]
+        more = f" (+{len(notable) - 3})" if len(notable) > 3 else ""
+        out.append(f"- **{head}**: " + "; ".join(titles) + more)
+    if isinstance(baseline_diff, dict) and baseline_diff.get("available"):
+        head = "기준선 비교:" if ko else "Baseline comparison:"
+        summary = str(baseline_diff.get("summary_ko" if ko else "summary_en") or "")
+        out.append(f"- **{head}** {summary}")
+        for m in (baseline_diff.get("metrics") or [])[:5]:
+            if m.get("delta") == 0:
+                continue
+            sign = "+" if (m.get("delta") or 0) > 0 else ""
+            out.append(f"  - `{m['metric']}`: {m['baseline']} -> {m['current']} {m['unit']} ({sign}{m['delta_pct']}%)")
+    return out
+
+
+def _suggested_action_lines(lang: str, actions: List[Dict[str, Any]]) -> List[str]:
+    if not actions:
+        return []
+    ko = lang == "ko"
+    lbl = "후속 실행" if ko else "Follow-up"
+    out: List[str] = []
+    for a in actions[:2]:
+        title = str(a.get("title_ko" if ko else "title_en") or a.get("id") or "")
+        cli = str(a.get("cli_command") or "")
+        tool = str(a.get("mcp_tool") or "")
+        line = f"- **{lbl}**: {title}"
+        if cli:
+            line += f" — `{cli}`"
+        elif tool:
+            line += f" — `{tool}`"
+        out.append(line)
+    return out
+
+
 def compose(result: Dict[str, Any], report: Optional[Dict[str, Any]] = None, lang: str = "en", *,
             pointers: bool = False, method_extra: Optional[Dict[str, Any]] = None,
             extra_sections: Optional[Dict[str, List[str]]] = None,
@@ -2051,14 +2121,21 @@ def compose(result: Dict[str, Any], report: Optional[Dict[str, Any]] = None, lan
     blocks = _finding_blocks(ctx, res, renders, report, rows)
     story = _story_parts(ctx, res, report, rows, renders, blocks, verdict)
     extra_sections = extra_sections or {}
+    intel = _intelligence_data(res, report, profile, lang)
+    cov_line = intel["coverage"]["one_liner_ko" if lang == "ko" else "one_liner_en"]
+    cov_label = intel["coverage"]["qualifier_label_ko" if lang == "ko" else "qualifier_label_en"]
+    cov_note = [f"- {'커버리지 요약' if lang == 'ko' else 'Coverage summary'}: {cov_label} ({cov_line})"] if rows else []
+    wb_lines = _watchlist_and_baseline_lines(lang, intel["notable"], intel["baseline_diff"])
+    prof_md = profile_lines(profile, lang)
+    next_md = _section5(ctx, res, renders) + _suggested_action_lines(lang, intel["suggested_actions"])
     body: Dict[str, List[str]] = {
-        "conclusion": concl + ([""] + glance if glance else []),
+        "conclusion": concl + ([""] + glance if glance else []) + cov_note + wb_lines,
         "target": _section_target(ctx, res, report, repro),
-        "profile": profile_lines(profile, lang),
+        "profile": prof_md,
         "findings": _section2(ctx, blocks) if blocks else [],
         "checks": _section4(ctx, res, rows) + story["timeline_lines"],
         "not_examined": _section_not_examined(ctx, res, rows),
-        "next": _section5(ctx, res, renders),
+        "next": next_md,
         "hypothesis": list(extra_sections.get("hypothesis") or []),
         "method": _section6(ctx, res, method_extra),
         "reproducibility": list(extra_sections.get("reproducibility") or []),
@@ -2079,7 +2156,7 @@ def compose(result: Dict[str, Any], report: Optional[Dict[str, Any]] = None, lan
             "counts": check_counts(rows), "verdict": verdict, "verdict_line": concl[0], "conclusion": concl[2],
             "symptom_note": sym, "glossary": g, "sections": sections, "glance": glance_parts(ctx, res, rows),
             "repro": repro, "profile": profile, "competing": story["competing"], "timeline": story["timeline"],
-            "scope_head": _scope_head(ctx, res, rows), "not_examined": _not_examined_lines(ctx, res)}
+            "scope_head": _scope_head(ctx, res, rows), "not_examined": _not_examined_lines(ctx, res), "coverage": intel["coverage"], "notable_observations": intel["notable"], "baseline_diff": intel["baseline_diff"], "suggested_actions": intel["suggested_actions"], "agent_summary": intel["agent_summary"]}
 
 
 def sections_markdown(comp: Dict[str, Any], level: int = 2) -> List[str]:
@@ -2114,7 +2191,8 @@ def diagnose_with_summary(pid: int, debug_image: Optional[str] = None, symptom: 
                           default_check_max_s: Optional[float] = None,
                           enable_tracing: Optional[bool] = None,
                           resume_investigation_id: Optional[str] = None,
-                          continue_collected_only: bool = False, force_fresh: bool = False) -> Tuple[Dict[str, Any], str]:
+                          continue_collected_only: bool = False, force_fresh: bool = False,
+                          compare_baseline: Optional[str] = None) -> Tuple[Dict[str, Any], str]:
     """Run ``diagnose`` once and return ``(result_dict_without_inline_report, human_summary_markdown)``.
 
     The inline full report is requested only to give the summary its names and numbers; it is dropped from the
@@ -2140,10 +2218,21 @@ def diagnose_with_summary(pid: int, debug_image: Optional[str] = None, symptom: 
         kw["continue_collected_only"] = True
     if force_fresh:
         kw["force_fresh"] = True
+    if compare_baseline:
+        kw["compare_baseline"] = compare_baseline
     res = diagnose(pid, debug_image=debug_image, symptom=symptom, time_limit_s=time_limit_s,
                    include_report=True, **kw)
     d = res.to_dict()
     summary = render_human_report(d, d.get("report"), lang=lang)
+    try:
+        from .state_intelligence import build_agent_summary, classify_coverage
+        _cov = classify_coverage(d, d.get("report"))
+        d["agent_summary"] = build_agent_summary(
+            d, d.get("process_profile"), _cov, d.get("notable_observations"),
+            d.get("baseline_diff"), d.get("suggested_actions"), lang=lang
+        )
+    except Exception:  # noqa: BLE001
+        pass
     if not keep_report:     # keep_report=True: the caller renders the report / the UI view from the same result
         d["report"] = None
     return d, summary

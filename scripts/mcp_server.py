@@ -808,6 +808,7 @@ def runtime_diagnose_process(
     resume_investigation_id: Optional[str] = None,
     continue_collected_only: bool = False,
     force_fresh: bool = False,
+    compare_baseline: Optional[str] = None,
 ) -> str:
     """Diagnose a live Linux process end to end in ONE call and return the final verdict.
 
@@ -818,7 +819,9 @@ def runtime_diagnose_process(
     Returns JSON with: verdict (CONFIRMED_FAULT, PROBABLE_FAULT, FAULT, DEGRADED, HEALTHY, INCONCLUSIVE,
     ABORTED), confidence, summary, findings (category, severity, subjects = concrete lock/thread/function/
     variable names), checks_run, not_covered (what could not be examined and why), collection_impact,
-    report_path, investigation_id and target, plus human_summary: a plain-language Markdown report (conclusion,
+    report_path, investigation_id and target, plus verdict_qualifier, coverage_summary, coverage_detail,
+    notable_observations, liveness, baseline_diff (when compare_baseline is set), suggested_actions,
+    agent_summary (disclaimer-free LLM summary), and human_summary: a plain-language Markdown report (conclusion,
     names and source locations, reasoning, certainty and what was not examined, next steps, measured impact) in
     the requested language. Relay human_summary to the user. An unreadable PID or missing debug image gives INCONCLUSIVE
     with the cause in not_covered; it is never reported as healthy. HEALTHY means every baseline check ran to
@@ -894,6 +897,7 @@ def runtime_diagnose_process(
             resume_investigation_id=resume_investigation_id,
             continue_collected_only=bool(continue_collected_only),
             force_fresh=bool(force_fresh),
+            compare_baseline=compare_baseline,
         )
         out["human_summary"] = summary
         return _format_watch_result(out)

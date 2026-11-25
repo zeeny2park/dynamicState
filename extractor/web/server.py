@@ -3433,6 +3433,7 @@ class WebApiAdapter:
             "resume_investigation_id": resume_investigation_id,
             "continue_collected_only": continue_collected_only,
             "force_fresh": force_fresh,
+            "compare_baseline": str(params.get("compare_baseline")).strip() if params.get("compare_baseline") else None,
             **check_budget}}
 
     def diagnose_api(self, params: Dict[str, Any]) -> Dict[str, Any]:
@@ -3459,6 +3460,7 @@ class WebApiAdapter:
                 resume_investigation_id=a.get("resume_investigation_id"),
                 continue_collected_only=bool(a.get("continue_collected_only")),
                 force_fresh=bool(a.get("force_fresh")),
+                compare_baseline=a.get("compare_baseline"),
             )
             return {"success": True, "result": _to_json_serializable({**result, "human_summary": summary})}
         except Exception as e:
