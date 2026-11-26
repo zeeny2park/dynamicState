@@ -4,6 +4,8 @@ and Self-Recovery Action Builder for continuous LLM coding-agent troubleshooting
 
 from __future__ import annotations
 
+import json
+import os
 import threading
 import time
 from collections import OrderedDict
@@ -668,16 +670,74 @@ class TargetTrackingLedger:
 class TrackingLedgerStore:
     """Thread-safe bounded LRU store of per-target TargetTrackingLedger instances."""
 
-    def __init__(self, max_targets: int = _MAX_TARGETS):
+    def __init__(self, max_targets: int = _MAX_TARGETS, persist_dir: Optional[str] = None):
         self._lock = threading.Lock()
         self._max_targets = max_targets
+        self._persist_dir = persist_dir or os.environ.get("DYNAMICSTATE_LEDGER_DIR") or None
         self._ledgers: "OrderedDict[str, TargetTrackingLedger]" = OrderedDict()
+
+    def _ledger_path(self, target_key: str) -> Optional[str]:
+        if not self._persist_dir:
+            return None
+        safe = "".join(c if c.isalnum() or c in ("-", "_", ".") else "_" for c in str(target_key))
+        return os.path.join(self._persist_dir, f"ledger_{safe}.json")
+
+    def save(self, target_key: str) -> bool:
+        path = self._ledger_path(target_key)
+        if not path:
+            return False
+        with self._lock:
+            ledger = self._ledgers.get(target_key)
+            if ledger is None:
+                return False
+            data = {
+                "target_key": ledger.target_key,
+                "active_playbook": ledger.active_playbook,
+                "max_iterations": ledger.max_iterations,
+                "iteration": ledger.iteration,
+                "consecutive_plateaus": ledger.consecutive_plateaus,
+                "predicate_status": ledger.predicate_status,
+                "decision_log": ledger.decision_log,
+                "code_anchors": ledger.code_anchors,
+                "dead_end_signatures": sorted(ledger.dead_end_signatures),
+                "calls": ledger.calls,
+            }
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            tmp = path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+            os.replace(tmp, path)
+            return True
+        except OSError:
+            return False
+
+    def _try_load(self, target_key: str) -> Optional[TargetTrackingLedger]:
+        path = self._ledger_path(target_key)
+        if not path or not os.path.isfile(path):
+            return None
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            ledger = TargetTrackingLedger(target_key)
+            ledger.active_playbook = data.get("active_playbook")
+            ledger.max_iterations = int(data.get("max_iterations") or 6)
+            ledger.iteration = int(data.get("iteration") or 0)
+            ledger.consecutive_plateaus = int(data.get("consecutive_plateaus") or 0)
+            ledger.predicate_status = str(data.get("predicate_status") or "OPEN")
+            ledger.decision_log = list(data.get("decision_log") or [])
+            ledger.code_anchors = list(data.get("code_anchors") or [])
+            ledger.dead_end_signatures = set(data.get("dead_end_signatures") or [])
+            ledger.calls = list(data.get("calls") or [])
+            return ledger
+        except Exception:
+            return None
 
     def get_or_create(self, target_key: str) -> TargetTrackingLedger:
         with self._lock:
             ledger = self._ledgers.get(target_key)
             if ledger is None:
-                ledger = TargetTrackingLedger(target_key)
+                ledger = self._try_load(target_key) or TargetTrackingLedger(target_key)
                 self._ledgers[target_key] = ledger
                 if len(self._ledgers) > self._max_targets:
                     self._ledgers.popitem(last=False)
@@ -749,4 +809,5 @@ def enrich_tool_response(
             payload["recovery_actions"] = filtered_rec
 
     payload["tracking_context"] = ledger.summary()
+    store.save(tkey)
     return payload

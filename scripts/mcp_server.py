@@ -3453,8 +3453,161 @@ def runtime_get_playbook(
     return _format_watch_result(out)
 
 
-def main() -> None:
-    server.run(transport="stdio")
+@server.tool()
+def runtime_run_playbook_loop(
+    pid: int,
+    symptom: str,
+    companion_elf: Optional[str] = None,
+    max_iterations: int = 4,
+    time_budget_s: float = 20.0,
+    language: str = "en",
+    compact: bool = True,
+    remote_host: Optional[str] = None,
+    ssh_user: Optional[str] = None,
+    ssh_port: int = 22,
+    ssh_key: Optional[str] = None,
+    ssh_proxy_jump: Optional[str] = None,
+) -> str:
+    """Single-call server-side autonomous playbook loop (pstack-inspired).
+    Routes `symptom` to the matching diagnostic playbook, executes read-only narrowing steps
+    internally within `max_iterations` / `time_budget_s`, pivots automatically on plateaus,
+    and returns a compact verdict + decision_log + code_anchors + handoff_markdown.
+    """
+    from extractor.playbook_loop_runner import compact_payload, run_playbook_loop
+
+    rm = (
+        {
+            "remote_host": remote_host,
+            "ssh_user": ssh_user,
+            "ssh_port": ssh_port,
+            "ssh_key": ssh_key,
+            "ssh_proxy_jump": ssh_proxy_jump,
+        }
+        if remote_host
+        else None
+    )
+    lang = "ko" if str(language or "").lower().startswith("ko") else "en"
+
+    _tool_dispatch = {
+        "runtime_diagnose_process": runtime_diagnose_process,
+        "runtime_heap_leak_candidates": runtime_heap_leak_candidates,
+        "runtime_inspect_thread_callstack_and_locks": runtime_inspect_thread_callstack_and_locks,
+        "runtime_trace_ipc_pipeline": runtime_trace_ipc_pipeline,
+        "runtime_scan_heap_objects": runtime_scan_heap_objects,
+        "runtime_build_dependency_graph": runtime_build_dependency_graph,
+        "runtime_correlate_source_and_state": runtime_correlate_source_and_state,
+        "runtime_explain_process_behavior": runtime_explain_process_behavior,
+        "runtime_symbol_search": runtime_symbol_search,
+        "runtime_capture_and_diff": runtime_capture_and_diff,
+        "runtime_audit_memory_integrity": runtime_audit_memory_integrity,
+    }
+
+    def _exec(tool_name: str, call_args: Dict[str, Any]) -> Dict[str, Any]:
+        fn = _tool_dispatch.get(tool_name)
+        if fn is None:
+            return {"success": False, "error": f"unsupported loop tool: {tool_name}"}
+        import inspect
+        sig = inspect.signature(fn)
+        valid_kwargs = {k: v for k, v in call_args.items() if k in sig.parameters}
+        raw = fn(**valid_kwargs)
+        try:
+            parsed = json.loads(raw) if isinstance(raw, str) else raw
+            return parsed if isinstance(parsed, dict) else {"success": True, "data": parsed}
+        except Exception:
+            return {"success": True, "raw": str(raw)[:400]}
+
+    res = run_playbook_loop(
+        pid=int(pid),
+        symptom=str(symptom),
+        executor=_exec,
+        companion_elf=companion_elf,
+        max_iterations=max_iterations,
+        time_budget_s=time_budget_s,
+        lang=lang,
+        remote_target=rm,
+    )
+    if compact:
+        res = compact_payload(res, max_items=10)
+    return _format_watch_result(res)
+
+
+# ---------------------------------------------------------------------------
+# MCP Prompts (native slash-command entrypoints) & Resources (live ledger)
+# ---------------------------------------------------------------------------
+def _build_playbook_prompt_text(playbook_id: str, pid: str, symptom: str) -> str:
+    from extractor.diagnostic_playbooks import get_playbook, select_playbook
+    pb_obj = get_playbook(playbook_id) if playbook_id else None
+    pb = pb_obj.to_dict("en") if pb_obj else select_playbook(symptom=symptom or "general", lang="en")
+    nl = "\n"
+    steps_txt = nl.join(f"{st['step']}. [{st['tier']}] `{st['tool']}` — {st['purpose']}" for st in pb["steps"])
+    return (
+        f"You are investigating PID {pid} for: {symptom or pb['title']}." + nl
+        + f"Selected Playbook: `{pb['playbook_id']}` — {pb['title']}" + nl
+        + f"Exit Predicate (NEVER relax): {pb['exit_predicate']}" + nl
+        + f"Max Iterations: {pb['default_max_iterations']}" + nl + nl
+        + "Steps:" + nl + steps_txt + nl + nl
+        + f"Start by calling `runtime_run_playbook_loop(pid={pid}, symptom={symptom!r})` or "
+        + f"`runtime_get_playbook(symptom={symptom!r}, pid={pid})` and follow the loop until MET, BLOCKED, or EXHAUSTED."
+    )
+
+
+def diagnose_loop(pid: str, symptom: str = "general process issue") -> str:
+    """Start a pstack-style autonomous diagnostic playbook loop for any symptom."""
+    return _build_playbook_prompt_text("", pid, symptom)
+
+
+def triage_leak(pid: str, symptom: str = "memory leak / RSS growth") -> str:
+    """Start the Memory Leak & Large-Heap Attribution playbook loop."""
+    return _build_playbook_prompt_text("memory-leak-and-growth", pid, symptom)
+
+
+def triage_hang(pid: str, symptom: str = "process hang / deadlock / lock contention") -> str:
+    """Start the Hang, Deadlock & Lock Contention playbook loop."""
+    return _build_playbook_prompt_text("hang-deadlock-and-contention", pid, symptom)
+
+
+def triage_corruption(pid: str, symptom: str = "heap corruption / UAF / double free") -> str:
+    """Start the Heap Corruption, Double-Free & UAF playbook loop."""
+    return _build_playbook_prompt_text("heap-corruption-and-uaf", pid, symptom)
+
+
+def resource_playbook(playbook_id: str) -> str:
+    """Read-only JSON representation of a problem-specific diagnostic playbook."""
+    from extractor.diagnostic_playbooks import get_playbook, list_playbooks
+    if playbook_id in ("all", "list"):
+        return json.dumps({"playbooks": list_playbooks("en")}, indent=2, ensure_ascii=False)
+    pb = get_playbook(playbook_id)
+    if pb is None:
+        return json.dumps({"error": f"unknown playbook_id: {playbook_id}"})
+    return json.dumps(pb.to_dict("en"), indent=2, ensure_ascii=False)
+
+
+def resource_ledger_decision_log(host: str, pid: str) -> str:
+    """Read-only live decision log and loop state for a target host:pid."""
+    from extractor.tracking_ledger import GLOBAL_TRACKING_LEDGER
+    ledger = GLOBAL_TRACKING_LEDGER.get(f"{host}:{pid}")
+    if ledger is None:
+        return json.dumps({"active": False, "target_key": f"{host}:{pid}", "decision_log": []})
+    return json.dumps({"active": True, **ledger.loop_state()}, indent=2, ensure_ascii=False)
+
+
+def resource_ledger_code_anchors(host: str, pid: str) -> str:
+    """Read-only accumulated source code anchors (file:line) for a target host:pid."""
+    from extractor.tracking_ledger import GLOBAL_TRACKING_LEDGER
+    ledger = GLOBAL_TRACKING_LEDGER.get(f"{host}:{pid}")
+    if ledger is None:
+        return json.dumps({"active": False, "target_key": f"{host}:{pid}", "code_anchors": []})
+    return json.dumps({"active": True, "target_key": f"{host}:{pid}", "code_anchors": ledger.code_anchors}, indent=2, ensure_ascii=False)
+
+
+if hasattr(server, "prompt"):
+    for _pfn in (diagnose_loop, triage_leak, triage_hang, triage_corruption):
+        server.prompt()(_pfn)
+
+if hasattr(server, "resource"):
+    server.resource("dynamicstate://playbooks/{playbook_id}")(resource_playbook)
+    server.resource("dynamicstate://ledger/{host}/{pid}/decision-log")(resource_ledger_decision_log)
+    server.resource("dynamicstate://ledger/{host}/{pid}/code-anchors")(resource_ledger_code_anchors)
 
 
 if __name__ == "__main__":

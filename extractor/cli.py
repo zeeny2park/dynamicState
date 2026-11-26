@@ -409,6 +409,24 @@ def main():
     pb_p.add_argument("--list", action="store_true", help="List all available problem-specific playbooks")
     pb_p.add_argument("--lang", choices=["en", "ko"], default="en", help="Output language (en or ko)")
     pb_p.add_argument("--json", action="store_true", help="Print structured JSON output")
+
+    loop_p = subparsers.add_parser("loop", help="Run an autonomous playbook investigation loop with plateau->pivot, handoff brief, and CI exit codes")
+    loop_p.add_argument("-p", "--pid", type=int, required=True, help="Target process PID")
+    loop_p.add_argument("--symptom", required=True, help="Symptom or goal (e.g. 'memory leak', 'deadlock', 'fd leak')")
+    loop_p.add_argument("-d", "--debug-image", "--companion-elf", dest="debug_image", default=None, help="Path to unstripped ELF / debug image")
+    loop_p.add_argument("--max-iter", type=int, default=4, help="Maximum loop iterations (default: 4)")
+    loop_p.add_argument("--time-budget", type=float, default=20.0, help="Total time budget in seconds (default: 20)")
+    loop_p.add_argument("--handoff-md", default=None, help="Write coding-agent handoff Markdown brief to this file")
+    loop_p.add_argument("--fail-on", default=None, help="Comma-separated verdicts to fail CI on (e.g. fault,degraded,inconclusive,blocked)")
+    loop_p.add_argument("--strict-exit-codes", action="store_true", help="Return standard exit codes (0=HEALTHY, 2=FAULT, 3=DEGRADED, 4=INCONCLUSIVE, 5=BLOCKED)")
+    loop_p.add_argument("--lang", choices=["en", "ko"], default="en", help="Output language")
+    loop_p.add_argument("--json", action="store_true", help="Print structured JSON output")
+
+    dr_p = subparsers.add_parser("diff-runs", help="Compare two saved diagnostic JSON snapshots for regressions and metric deltas")
+    dr_p.add_argument("before_json", help="Path to baseline/before diagnosis JSON file")
+    dr_p.add_argument("after_json", help="Path to current/after diagnosis JSON file")
+    dr_p.add_argument("--fail-on-regression", action="store_true", help="Exit with code 2 if regression is detected")
+    dr_p.add_argument("--json", action="store_true", help="Print structured JSON output")
     sh_p.add_argument("-p", "--pid", type=int, required=True)
     sh_p.add_argument("-d", "--debug-image", "--companion-elf", dest="debug_image", type=str, required=True)
     sh_p.add_argument("--samples", dest="samples_count", type=int, default=6)
@@ -1647,6 +1665,57 @@ def main():
                     print("Plateau -> Pivot Rules:")
                     for pr in sel["pivot_rules"]:
                         print(f"  - When {pr['when']} -> pivot to {pr['pivot_to_tool']}: {pr['reason']}")
+        return 0
+    elif args.command == "loop":
+        import scripts.mcp_server as _mcp
+        from extractor.playbook_loop_runner import run_playbook_loop, verdict_to_exit_code
+        fail_on_list = [x.strip() for x in (args.fail_on or "").split(",") if x.strip()] if args.fail_on else None
+        raw_res = _mcp.runtime_run_playbook_loop(
+            pid=args.pid,
+            symptom=args.symptom,
+            companion_elf=args.debug_image,
+            max_iterations=args.max_iter,
+            time_budget_s=args.time_budget,
+            language=args.lang,
+            compact=True,
+        )
+        data = json.loads(raw_res) if isinstance(raw_res, str) else raw_res
+        if args.handoff_md and data.get("handoff_markdown"):
+            with open(args.handoff_md, "w", encoding="utf-8") as hf:
+                hf.write(data["handoff_markdown"])
+        if args.json:
+            print(json.dumps(data, indent=2, ensure_ascii=False))
+        else:
+            print(data.get("handoff_markdown") or json.dumps(data, indent=2, ensure_ascii=False))
+        if args.strict_exit_codes or fail_on_list:
+            code = verdict_to_exit_code(
+                data.get("verdict"),
+                predicate_status=data.get("final_status"),
+                fail_on=fail_on_list,
+            )
+            if code != 0:
+                sys.exit(code)
+            return 0
+        return 0
+    elif args.command == "diff-runs":
+        from extractor.playbook_loop_runner import diff_diagnostic_runs
+        with open(args.before_json, "r", encoding="utf-8") as bf:
+            before_doc = json.load(bf)
+        with open(args.after_json, "r", encoding="utf-8") as af:
+            after_doc = json.load(af)
+        diff = diff_diagnostic_runs(before_doc, after_doc)
+        if args.json:
+            print(json.dumps(diff, indent=2, ensure_ascii=False))
+        else:
+            print(diff["summary"])
+            for k, md in (diff.get("metric_deltas") or {}).items():
+                print(f"  - {k}: {md['before']} -> {md['after']} ({md['delta']:+})")
+            for nf in (diff.get("new_findings") or []):
+                print(f"  + NEW: {nf['key']} — {nf['summary']}")
+            for rf in (diff.get("resolved_findings") or []):
+                print(f"  - RESOLVED: {rf['key']}")
+        if args.fail_on_regression and diff.get("regressed"):
+            sys.exit(2)
         return 0
     elif args.command == "hotspots":
         from .watch_session import WatchSessionManager
