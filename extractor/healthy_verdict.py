@@ -110,7 +110,7 @@ def _uaf_cap_scope_limit(c: Any) -> Optional[Dict[str, Any]]:
     integrity check, not missing evidence, so it is reported in ``not_checked`` instead of blocking HEALTHY."""
     obs = _obs(c)
     u = obs.get(OBS_FREED_MEMORY_USE)
-    if not isinstance(u, dict) or u.get("status") != "NOT_CHECKED" or u.get("findings"):
+    if not isinstance(u, dict) or u.get("status") not in ("NOT_CHECKED", "PARTIAL_SAMPLED") or u.get("findings"):
         return None
     heap = ((obs.get("memory_integrity") or {}).get("heap") or {})
     # structured reason only (stage 1): the check's own record carries the heap walk's not_checked_reason
@@ -130,7 +130,7 @@ def _double_free_cap_scope_limit(c: Any) -> Optional[Dict[str, Any]]:
     declared cost limit, the observation is NOT_CHECKED with ``heap_not_checked_reason == "above_baseline_cap"``:
     the same scope limit as the integrity check, listed in ``not_checked`` instead of blocking HEALTHY."""
     u = _obs(c).get("free_list_repeats")
-    if not isinstance(u, dict) or u.get("status") != "NOT_CHECKED" or u.get("findings"):
+    if not isinstance(u, dict) or u.get("status") not in ("NOT_CHECKED", "PARTIAL_SAMPLED") or u.get("findings"):
         return None
     if u.get("heap_not_checked_reason") != "above_baseline_cap":
         return None

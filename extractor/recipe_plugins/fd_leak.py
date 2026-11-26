@@ -198,10 +198,19 @@ def fd_leak_rule(recipe: DiagnosticRecipe, data: Dict[str, Any]) -> Optional[Rec
             recipe_id=rid, status=RECIPE_STATUS_CONTRADICTED, confidence=0.8,
             confidence_basis="fd count did not grow: " + trend, contradicting_facts=[trend],
             recommended_action="No fd leak in the observed window.", details=details)
+    top_fds = [t.get("fd_target") for t in (fu.get("new_fd_targets") or [])[:3] if isinstance(t, dict) and t.get("fd_target")]
+    details["partial_signals"] = {"top_new_fd_targets": top_fds, "fd_growth": growth}
+    details["next_fallback_tool"] = "runtime_trace_ipc_pipeline"
     return RecipeEvaluationResult(
         recipe_id=rid, status=RECIPE_STATUS_INSUFFICIENT_EVIDENCE, confidence=0.2,
         confidence_basis="fd count changed but not monotonically enough to call a leak: " + trend,
-        missing_evidence=["longer fd_count_trend"], limitations=list(recipe.limitations), details=details)
+        missing_evidence=["longer fd_count_trend"], limitations=list(recipe.limitations),
+        recommended_action=(
+            "Narrow scope with runtime_trace_ipc_pipeline(pid=...) to inspect active sockets/pipes/FDs"
+            + (f" (top new targets: {', '.join(top_fds)})" if top_fds else "")
+            + ", or re-sample over a longer window."
+        ),
+        details=details)
 
 
 register_observation_collector(OBS_FD_USAGE, collect_fd_usage)

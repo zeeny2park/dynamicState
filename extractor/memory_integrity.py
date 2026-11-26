@@ -205,6 +205,8 @@ def run_integrity(adapter: Any, pid: int, companion_elf: Optional[str], cfg: Int
                     "chunks": sm.get("chunks_sampled", 0),
                 }
                 heap["status"] = "SAMPLED_DEFECTS_FOUND" if defects else "PARTIAL_SAMPLED"
+                if keep is not None:
+                    keep.update(walk=swalk, walker=walker, analyzer=None, t_walk=time.monotonic(), sampled=True)
                 if is_cap:
                     rec["limitations"].append(
                         "full heap walk skipped (%.1f MiB > %.1f MiB baseline cap); Tier-2 bounded sampling checked "

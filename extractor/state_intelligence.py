@@ -883,12 +883,17 @@ def build_suggested_actions(
         for c in (res.get("checks_run") or [])
         if isinstance(c, dict) and str(c.get("status") or "").upper() in ("INCONCLUSIVE", "ERROR", "TIMEOUT")
     ]
+    _has_ipc_fd_gap = any(
+        any(k in r.upper() for k in ("FD_LEAK", "IPC", "PIPE", "SOCKET"))
+        for r in _inconclusive_rids
+    )
     _has_mem_gap = any(
-        any(k in r.upper() for k in ("HEAP", "MEMORY", "ALLOCATION", "UAF", "FREE", "LEAK"))
+        any(k in r.upper() for k in ("HEAP", "MEMORY", "ALLOCATION", "UAF", "FREE", "RETENTION", "MAPPING_GROWTH"))
+        and "FD_LEAK" not in r.upper() and "THREAD_LEAK" not in r.upper()
         for r in _inconclusive_rids
     )
     _has_thread_gap = any(
-        any(k in r.upper() for k in ("THREAD", "LOCK", "DEADLOCK", "BLOCKED", "SHARED_STATE"))
+        any(k in r.upper() for k in ("THREAD", "LOCK", "DEADLOCK", "CONTENTION", "ORPHAN_LOCK", "BLOCKED", "SHARED_STATE"))
         for r in _inconclusive_rids
     )
     _has_var_gap = any(
@@ -901,6 +906,25 @@ def build_suggested_actions(
     )
 
     if not _is_unreadable and (_verdict == "INCONCLUSIVE" or _blocking_gaps):
+        if _has_ipc_fd_gap:
+            _add({
+                "id": "drilldown_ipc_pipeline",
+                "priority": "high",
+                "category": "inconclusive_drilldown",
+                "title_en": "Drill down into inconclusive FD/IPC checks via IPC pipeline & peer trace",
+                "title_ko": "판정 불가 FD·IPC 검사를 파이프라인·피어 추적으로 심층 분석",
+                "reason_en": "FD/IPC checks were inconclusive in broad triage; inspect active sockets, pipes, shared memory, and peer PIDs directly.",
+                "reason_ko": "1차 진단에서 FD·IPC 검사가 판정 불가였으므로 소켓·파이프·공유메모리 및 피어 프로세스 연결을 직접 추적하세요.",
+                "mcp_tool": "runtime_trace_ipc_pipeline",
+                "mcp_args": dict(base_narrow_args),
+                "next_hop_tool": "runtime_inspect_thread_callstack_and_locks",
+                "estimated_cost": "low",
+                "expected_evidence": "Open FD targets, socket/pipe peers, and shared memory backlog state",
+                "risk_level": "read_only_zero_stop",
+                "requires_user_approval": False,
+                "expected_value_en": "Identifies leaking or blocked descriptors and connected peer endpoints.",
+                "expected_value_ko": "누수·차단된 디스크립터와 연결된 피어 프로세스를 특정합니다.",
+            })
         if _has_mem_gap:
             _add({
                 "id": "drilldown_heap_leak_candidates",
@@ -1088,10 +1112,32 @@ def build_inconclusive_drilldown(
         if isinstance(c, dict) and str(c.get("status") or "").upper() in ("INCONCLUSIVE", "ERROR", "TIMEOUT")
     ]
     if inc_checks and not unreadable:
-        mem_inc = [str(c.get("recipe_id")) for c in inc_checks if any(k in str(c.get("recipe_id") or "").upper() for k in ("HEAP", "MEMORY", "ALLOC", "UAF", "FREE"))]
-        thr_inc = [str(c.get("recipe_id")) for c in inc_checks if any(k in str(c.get("recipe_id") or "").upper() for k in ("THREAD", "LOCK", "DEADLOCK", "BLOCKED", "SHARED"))]
-        other_inc = [str(c.get("recipe_id")) for c in inc_checks if str(c.get("recipe_id")) not in mem_inc and str(c.get("recipe_id")) not in thr_inc]
+        fd_ipc_inc = [str(c.get("recipe_id")) for c in inc_checks if any(k in str(c.get("recipe_id") or "").upper() for k in ("FD_LEAK", "IPC", "PIPE", "SOCKET"))]
+        mem_inc = [
+            str(c.get("recipe_id")) for c in inc_checks
+            if any(k in str(c.get("recipe_id") or "").upper() for k in ("HEAP", "MEMORY", "ALLOC", "UAF", "FREE", "RETENTION", "MAPPING_GROWTH"))
+            and str(c.get("recipe_id")) not in fd_ipc_inc
+        ]
+        thr_inc = [
+            str(c.get("recipe_id")) for c in inc_checks
+            if any(k in str(c.get("recipe_id") or "").upper() for k in ("THREAD", "LOCK", "DEADLOCK", "CONTENTION", "ORPHAN_LOCK", "BLOCKED", "SHARED"))
+        ]
+        other_inc = [
+            str(c.get("recipe_id")) for c in inc_checks
+            if str(c.get("recipe_id")) not in fd_ipc_inc and str(c.get("recipe_id")) not in mem_inc and str(c.get("recipe_id")) not in thr_inc
+        ]
 
+        if fd_ipc_inc:
+            act = _find_action("runtime_trace_ipc_pipeline")
+            _add_cause(
+                "inconclusive_fd_ipc_checks",
+                fd_ipc_inc,
+                "FD or IPC checks were inconclusive in the initial window; trace active sockets, pipes, and peer PIDs.",
+                "초기 관측에서 FD·IPC 검사가 판정 불가였습니다. 소켓·파이프·피어 프로세스를 직접 추적해 원인을 좁히세요.",
+                "runtime_trace_ipc_pipeline",
+                act.get("mcp_args") if act else {},
+                "runtime_inspect_thread_callstack_and_locks",
+            )
         if mem_inc:
             act = _find_action("runtime_heap_leak_candidates")
             _add_cause(
@@ -1400,4 +1446,86 @@ def build_narrow_tool_next_steps(
                 "risk_level": "read_only_zero_stop",
                 "requires_user_approval": False,
             }, target_dict))
+    elif tool_name == "runtime_trace_ipc_pipeline":
+        peers = payload.get("peer_processes") or payload.get("peers") or []
+        peer_pids = [
+            int(p.get("pid")) for p in peers
+            if isinstance(p, dict) and p.get("pid") and int(p.get("pid")) != int(pid)
+        ][:2]
+        out.append(validate_suggested_action({
+            "id": "chain_ipc_thread_stacks",
+            "priority": "high" if peer_pids else "medium",
+            "category": "scope_narrowing",
+            "title_en": (
+                f"Inspect call stacks for blocked IPC threads (and peer PID(s) {peer_pids})"
+                if peer_pids else "Correlate open IPC descriptors with thread call stacks"
+            ),
+            "title_ko": (
+                f"IPC 대기 스레드 및 피어 PID {peer_pids} 콜스택 연계 조회"
+                if peer_pids else "활성 IPC 디스크립터와 스레드 콜스택 연계 조회"
+            ),
+            "reason_en": "Correlating IPC endpoints with thread call stacks identifies which function is stalled on read/write or leaking FDs.",
+            "reason_ko": "IPC 엔드포인트와 스레드 콜스택을 대조해 어떤 함수가 I/O 대기 중이거나 FD를 누수하는지 특정하세요.",
+            "mcp_tool": "runtime_inspect_thread_callstack_and_locks",
+            "mcp_args": dict(base_args),
+            "estimated_cost": "low",
+            "expected_evidence": "Thread stacks blocked on socket/pipe syscalls",
+            "risk_level": "read_only_zero_stop",
+            "requires_user_approval": False,
+        }, target_dict))
+
+    elif tool_name == "runtime_symbol_search":
+        syms = payload.get("symbols") if isinstance(payload.get("symbols"), list) else []
+        exprs = [str(sym.get("name")).strip() for sym in syms[:3] if isinstance(sym, dict) and sym.get("name")]
+        if exprs and companion_elf:
+            out.append(validate_suggested_action({
+                "id": "chain_eval_found_symbols",
+                "priority": "high",
+                "category": "scope_narrowing",
+                "title_en": f"Evaluate top {len(exprs)} matched symbol(s) in live process memory",
+                "title_ko": f"검색된 상위 심볼 {len(exprs)}개의 실시간 메모리 값 직접 조회",
+                "reason_en": "Exact DWARF symbol names are now known; read their live values directly without stopping the process.",
+                "reason_ko": "정확한 DWARF 심볼명을 확보했으므로 프로세스를 멈추지 않고 실시간 값을 바로 확인하세요.",
+                "mcp_tool": "runtime_eval_memory_path",
+                "mcp_args": {**base_args, "expressions": exprs},
+                "estimated_cost": "low",
+                "expected_evidence": "Live decoded struct/counter/pointer values for matched symbols",
+                "risk_level": "read_only_zero_stop",
+                "requires_user_approval": False,
+            }, target_dict))
+
+    elif tool_name == "runtime_heap_owner_lookup":
+        results = payload.get("results") if isinstance(payload.get("results"), list) else []
+        var_paths: List[str] = []
+        seen_vp = set()
+        for r in results:
+            if not isinstance(r, dict):
+                continue
+            for ref in (r.get("referrers") or r.get("owners") or []):
+                if isinstance(ref, dict):
+                    vp = str(ref.get("variable_path") or ref.get("variable") or "").strip()
+                    if vp and vp not in seen_vp:
+                        seen_vp.add(vp)
+                        var_paths.append(vp)
+                if len(var_paths) >= 3:
+                    break
+            if len(var_paths) >= 3:
+                break
+        if var_paths and companion_elf:
+            out.append(validate_suggested_action({
+                "id": "chain_eval_heap_owners",
+                "priority": "high",
+                "category": "scope_narrowing",
+                "title_en": f"Inspect owning container/variable path(s): {', '.join(var_paths)}",
+                "title_ko": f"소유 변수·컨테이너 경로 직접 조회: {', '.join(var_paths)}",
+                "reason_en": "Heap ownership lookup identified concrete owning variables; evaluate their size/count/state fields directly.",
+                "reason_ko": "힙 소유권 역추적에서 구체적인 소유 변수가 확인되었으므로 크기·개수·상태 필드를 직접 조회하세요.",
+                "mcp_tool": "runtime_eval_memory_path",
+                "mcp_args": {**base_args, "expressions": var_paths},
+                "estimated_cost": "low",
+                "expected_evidence": "Live container size, capacity, and retention state of owning variables",
+                "risk_level": "read_only_zero_stop",
+                "requires_user_approval": False,
+            }, target_dict))
+
     return out

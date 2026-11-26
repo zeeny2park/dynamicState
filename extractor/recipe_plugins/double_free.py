@@ -561,6 +561,52 @@ def run_double_free(adapter: Any, pid: int, companion_elf: Optional[str], objs: 
     cfg = cfg or DoubleFreeConfig()
     heap = (integrity or {}).get("heap") or {}
     walk = objs.get("walk") if objs else None
+    if heap.get("status") in ("PARTIAL_SAMPLED", "SAMPLED_DEFECTS_FOUND"):
+        sm = heap.get("sampling_summary") or (getattr(walk, "sampling_metadata", None) if walk is not None else None) or {}
+        anomalies = list(sm.get("anomalies_detected") or [])
+        df_anoms = [
+            a for a in anomalies
+            if isinstance(a, dict) and any(k in str(a.get("kind") or "").lower() for k in ("double_free", "cycle"))
+        ]
+        findings = []
+        for a in df_anoms:
+            kind = str(a.get("kind") or "")
+            flist = "tcache" if "tcache" in kind.lower() else "fastbins"
+            findings.append({
+                "level": "probable",
+                "level_reason": "detected during Tier-2 bounded tcache/fastbin sampling (full heap walk skipped)",
+                "sampling_tier": "TIER2_BOUNDED_SAMPLING",
+                "chunk_address": str(a.get("address") or "0x0"),
+                "free_list": flist,
+                "arena_index": a.get("arena_index", 0),
+                "bin": a.get("bin"),
+                "description": str(a.get("description") or f"{flist} cycle/double-free at {a.get('address')}"),
+            })
+        out = {
+            "status": "SAMPLED_DEFECTS_FOUND" if findings else "PARTIAL_SAMPLED",
+            "sampling_tier": "TIER2_BOUNDED_SAMPLING",
+            "sampling_summary": sm,
+            "findings": findings,
+            "not_evidence": [],
+            "checked": {
+                "arenas": int(sm.get("sampled_arenas") or 0),
+                "tcache_entries": int(sm.get("tcache_entries_checked") or 0),
+                "fastbin_entries": int(sm.get("fastbin_entries_checked") or 0),
+            },
+            "limitations": [
+                "double free: full heap walk skipped (%s); Tier-2 bounded sampling checked %d tcache and %d fastbin entries"
+                % (
+                    str(heap.get("not_checked_reason") or "heap_cap_or_budget"),
+                    int(sm.get("tcache_entries_checked") or 0),
+                    int(sm.get("fastbin_entries_checked") or 0),
+                )
+            ],
+            "cost": {"bytes_read": 0},
+            "walk_source": "tier2_sampled_integrity_walk",
+        }
+        if heap.get("not_checked_reason"):
+            out["heap_not_checked_reason"] = heap["not_checked_reason"]
+        return out
     if walk is None or not getattr(walk, "ok", False) or heap.get("status") not in ("COMPLETED", "PARTIAL"):
         why = "; ".join(l for l in (integrity or {}).get("limitations") or [] if "heap" in l) or \
             "heap %s" % (heap.get("status") or "not walked")
@@ -765,11 +811,37 @@ def double_free_rule(recipe: DiagnosticRecipe, data: Dict[str, Any]) -> Optional
         reasons.append("%s not walked completely: %s" % (u.get("list"), u.get("why")))
     if rec.get("status") == "FAILED" or not rec:
         reasons = reasons or ["double free not checked: no free-list observation"]
+    if rec.get("status") == "PARTIAL_SAMPLED":
+        sm = rec.get("sampling_summary") or {}
+        txt = (
+            "Tier-2 bounded free-list sampling checked %d arena(s), %d tcache entries, and %d fastbin entries "
+            "with no duplicate/cycle detected; full free-list walk was skipped (%s)"
+            % (
+                int(sm.get("sampled_arenas") or 0),
+                int(sm.get("tcache_entries_checked") or 0),
+                int(sm.get("fastbin_entries_checked") or 0),
+                str(rec.get("heap_not_checked_reason") or "heap_cap_or_budget"),
+            )
+        )
+        return RecipeEvaluationResult(
+            recipe_id=rid, status=RECIPE_STATUS_INSUFFICIENT_EVIDENCE, confidence=0.35,
+            confidence_basis=txt, missing_evidence=["complete_free_list_walk"], limitations=reasons,
+            recommended_action=(
+                "Tier-2 tcache/fastbin sampling found no double-free cycle, but full heap walk exceeded budget. "
+                "Narrow scope with runtime_heap_leak_candidates(pid=...) -> runtime_heap_owner_lookup(addresses=[...])."
+            ),
+            details={"free_lists_checked": False, "double_free_confirmed": False, "limitations": reasons,
+                     "tiered_fallback_applied": True, "sampling_tier": "TIER2_BOUNDED_SAMPLING",
+                     "sampling_summary": sm, "next_fallback_tool": "runtime_heap_leak_candidates",
+                     **({"heap_not_checked_reason": rec["heap_not_checked_reason"]}
+                        if rec.get("heap_not_checked_reason") else {})})
     return RecipeEvaluationResult(
         recipe_id=rid, status=RECIPE_STATUS_INSUFFICIENT_EVIDENCE, confidence=0.1,
         confidence_basis="; ".join(reasons) or "double free not checked",
         missing_evidence=["complete_free_list_walk"], limitations=reasons,
+        recommended_action="Narrow scope with runtime_heap_leak_candidates(pid=...) or inspect suspect allocator structs via runtime_eval_memory_path.",
         details={"free_lists_checked": False, "double_free_confirmed": False, "limitations": reasons,
+                 "next_fallback_tool": "runtime_heap_leak_candidates",
                  **({"heap_not_checked_reason": rec["heap_not_checked_reason"]}
                     if rec.get("heap_not_checked_reason") else {})})
 

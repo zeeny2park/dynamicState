@@ -144,11 +144,35 @@ def freed_memory_use_rule(recipe: DiagnosticRecipe, data: Dict[str, Any]) -> Opt
             contradicting_facts=[txt], limitations=lims,
             recommended_action="No use after free visible in the walked heap during the window.",
             details={"freed_memory_checked": True, "limitations": lims})
+    if rec.get("status") == "PARTIAL_SAMPLED":
+        sm = rec.get("sampling_summary") or {}
+        txt = (
+            "Tier-2 bounded UAF sampling inspected %d arena(s), %d tcache and %d fastbin entries with no "
+            "dangling pointer or freed-chunk write observed; full heap walk was skipped (%s)"
+            % (
+                int(sm.get("sampled_arenas") or 0),
+                int(sm.get("tcache_entries_checked") or 0),
+                int(sm.get("fastbin_entries_checked") or 0),
+                str(rec.get("heap_not_checked_reason") or "heap_cap_or_budget"),
+            )
+        )
+        return RecipeEvaluationResult(
+            recipe_id=rid, status=RECIPE_STATUS_INSUFFICIENT_EVIDENCE, confidence=0.35,
+            confidence_basis=txt, missing_evidence=["full_heap_walk_with_free_chunk_rereads"], limitations=lims,
+            recommended_action=(
+                "Tier-2 tcache/fastbin UAF sampling found no dangling pointers, but full heap walk exceeded budget. "
+                "Narrow scope with runtime_symbol_search -> runtime_eval_memory_path on suspect owning pointers "
+                "or runtime_heap_leak_candidates(pid=...)."
+            ),
+            details={"freed_memory_checked": False, "limitations": lims, "tiered_fallback_applied": True,
+                     "sampling_tier": "TIER2_BOUNDED_SAMPLING", "sampling_summary": sm,
+                     "next_fallback_tool": "runtime_heap_leak_candidates"})
     return RecipeEvaluationResult(
         recipe_id=rid, status=RECIPE_STATUS_INSUFFICIENT_EVIDENCE, confidence=0.1,
         confidence_basis="; ".join(lims) or "use-after-free not checked",
         missing_evidence=["heap_walk_with_free_chunk_rereads"], limitations=lims,
-        details={"freed_memory_checked": False, "limitations": lims})
+        recommended_action="Narrow scope with runtime_symbol_search -> runtime_eval_memory_path on suspect pointers.",
+        details={"freed_memory_checked": False, "limitations": lims, "next_fallback_tool": "runtime_heap_leak_candidates"})
 
 
 register_observation_collector(OBS_FREED_MEMORY_USE, collect_freed_memory_use)

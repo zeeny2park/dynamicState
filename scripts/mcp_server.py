@@ -1563,14 +1563,21 @@ def runtime_symbol_search(
             load_bias=load_bias_int,
             is_dyn=(idx.elf_type == "ET_DYN"),
         )
-        return _format_watch_result({
+        out = {
             "success": True,
             "companion_elf": os.path.abspath(companion_elf),
             "query": query,
             "category": category,
             "returned_count": len(results),
             "symbols": results,
-        })
+        }
+        if pid is not None and results:
+            from extractor.state_intelligence import build_narrow_tool_next_steps
+            _rm = {"remote_host": remote_host, "ssh_user": ssh_user, "ssh_port": ssh_port, "ssh_key": ssh_key, "ssh_proxy_jump": ssh_proxy_jump} if remote_host else None
+            _next = build_narrow_tool_next_steps("runtime_symbol_search", out, pid=pid, companion_elf=os.path.abspath(companion_elf), remote_target=_rm)
+            if _next:
+                out["next_drilldown"] = _next
+        return _format_watch_result(out)
     except Exception as e:
         return _format_watch_result({"success": False, "error": str(e), "error_code": type(e).__name__})
 
@@ -2338,7 +2345,13 @@ def runtime_trace_ipc_pipeline(
             ssh_key=ssh_key,
             ssh_proxy_jump=ssh_proxy_jump,
         )
-        return _format_watch_result({"success": True, **res})
+        out = {"success": True, **res}
+        from extractor.state_intelligence import build_narrow_tool_next_steps
+        _rm = {"remote_host": remote_host, "ssh_user": ssh_user, "ssh_port": ssh_port, "ssh_key": ssh_key, "ssh_proxy_jump": ssh_proxy_jump} if remote_host else None
+        _next = build_narrow_tool_next_steps("runtime_trace_ipc_pipeline", out, pid=pid, companion_elf=companion_elf, remote_target=_rm)
+        if _next:
+            out["next_drilldown"] = _next
+        return _format_watch_result(out)
     except Exception as e:
         return _format_watch_result({"success": False, "error": str(e), "error_code": type(e).__name__})
 
@@ -2454,7 +2467,7 @@ def runtime_heap_owner_lookup(
         an = _heap_ownership_analysis(pid, companion_elf, analysis_id, include_typed_locals, max_bytes_read,
                                       max_wall_clock_ms, remote_host, ssh_user, ssh_port, ssh_key, ssh_proxy_jump)
         summary = an.summary()
-        return _format_watch_result({
+        out = {
             "success": an.ok,
             "analysis_id": an.analysis_id,
             "status": an.status,
@@ -2465,7 +2478,13 @@ def runtime_heap_owner_lookup(
             "root_sources": summary.get("root_sources"),
             "cost": summary.get("cost"),
             "results": [an.lookup(a) for a in addrs],
-        })
+        }
+        from extractor.state_intelligence import build_narrow_tool_next_steps
+        _rm = {"remote_host": remote_host, "ssh_user": ssh_user, "ssh_port": ssh_port, "ssh_key": ssh_key, "ssh_proxy_jump": ssh_proxy_jump} if remote_host else None
+        _next = build_narrow_tool_next_steps("runtime_heap_owner_lookup", out, pid=pid, companion_elf=companion_elf, remote_target=_rm)
+        if _next:
+            out["next_drilldown"] = _next
+        return _format_watch_result(out)
     except Exception as e:
         return _format_watch_result({"success": False, "error": str(e), "error_code": type(e).__name__})
 

@@ -158,10 +158,24 @@ def lock_contention_rule(recipe: DiagnosticRecipe, data: Dict[str, Any]) -> Opti
     details: Dict[str, Any] = {"lock_contention": lc}
 
     def insufficient(why: str, conf: float = 0.2) -> RecipeEvaluationResult:
+        busiest = locks[0] if locks else None
+        partial = (
+            {"busiest_lock": busiest.get("lock_name"), "max_waiters": busiest.get("max_waiters"),
+             "owner_tids": list(busiest.get("owner_tids") or [])[:4]}
+            if busiest else {}
+        )
         return RecipeEvaluationResult(
             recipe_id=rid, status=RECIPE_STATUS_INSUFFICIENT_EVIDENCE, confidence=conf,
             confidence_basis="lock contention not decided: " + why, missing_evidence=["lock_wait_samples"],
-            limitations=list(recipe.limitations), details=dict(details, reason=why))
+            limitations=list(recipe.limitations),
+            recommended_action=(
+                "Narrow scope with runtime_inspect_thread_callstack_and_locks(pid=...) to capture exact "
+                "mutex owners and waiter call stacks"
+                + (f" (focus on lock '{busiest.get('lock_name')}')" if busiest and busiest.get("lock_name") else "")
+                + ", then query lock globals via runtime_symbol_search -> runtime_eval_memory_path."
+            ),
+            details=dict(details, reason=why, partial_signals=partial,
+                         next_fallback_tool="runtime_inspect_thread_callstack_and_locks"))
 
     if n < MIN_SAMPLES:
         return insufficient("%d sample(s) with a lock inspection, need %d" % (n, MIN_SAMPLES), 0.0)

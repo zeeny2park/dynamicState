@@ -714,6 +714,49 @@ def run_uaf(adapter: Any, pid: int, companion_elf: Optional[str], objs: Dict[str
     cfg = cfg or UafConfig()
     heap = (integrity or {}).get("heap") or {}
     walk = objs.get("walk") if objs else None
+    if heap.get("status") in ("PARTIAL_SAMPLED", "SAMPLED_DEFECTS_FOUND"):
+        sm = heap.get("sampling_summary") or (getattr(walk, "sampling_metadata", None) if walk is not None else None) or {}
+        lims_t2: List[str] = [
+            "use-after-free: full heap walk skipped (%s); Tier-2 bounded sampling inspected %d tcache and %d fastbin chunks"
+            % (
+                str(heap.get("not_checked_reason") or "heap_cap_or_budget"),
+                int(sm.get("tcache_entries_checked") or 0),
+                int(sm.get("fastbin_entries_checked") or 0),
+            )
+        ]
+        if walk is not None and len(getattr(walk, "chunks", ())) > 0 and companion_elf:
+            t2_cfg = UafConfig(**dict(cfg.__dict__, window_s=min(cfg.window_s, 0.2), observations=2,
+                                      reuse_probe_reads=2, max_hashed_chunks=min(cfg.max_hashed_chunks, 64)))
+            det = UafDetector(walk, objs.get("walker"), adapter, pid, analyzer=None, cfg=t2_cfg, walk_time=objs.get("t_walk"))
+            if objs.get("walker") is not None:
+                objs["walker"].reader = det.reader
+            try:
+                det.analyzer = _globals_analyzer(walk, objs.get("walker"), adapter, pid, companion_elf, det.reader, lims_t2)
+            except Exception as exc:  # noqa: BLE001
+                lims_t2.append("use-after-free (Tier-2): reference map unavailable (%s: %s)" % (type(exc).__name__, exc))
+            det.limitations.extend(lims_t2)
+            rec = det.run(heap.get("defects") or [])
+            rec["sampling_tier"] = "TIER2_BOUNDED_SAMPLING"
+            rec["sampling_summary"] = sm
+            rec["status"] = "SAMPLED_DEFECTS_FOUND" if rec.get("findings") else "PARTIAL_SAMPLED"
+            rec["reference_map"] = "typed globals / statics only (Tier-2 sampled)"
+            rec["walk_source"] = "tier2_sampled_integrity_walk"
+            if heap.get("not_checked_reason"):
+                rec["heap_not_checked_reason"] = heap["not_checked_reason"]
+            return rec
+        out = {
+            "status": "PARTIAL_SAMPLED",
+            "sampling_tier": "TIER2_BOUNDED_SAMPLING",
+            "sampling_summary": sm,
+            "findings": [],
+            "not_evidence": [],
+            "limitations": lims_t2,
+            "cost": {"bytes_read": 0},
+            "walk_source": "tier2_sampled_integrity_walk",
+        }
+        if heap.get("not_checked_reason"):
+            out["heap_not_checked_reason"] = heap["not_checked_reason"]
+        return out
     if walk is None or not getattr(walk, "ok", False) or heap.get("status") not in ("COMPLETED", "PARTIAL"):
         why = "; ".join(l for l in (integrity or {}).get("limitations") or [] if "heap" in l) or \
             "heap %s" % (heap.get("status") or "not walked")

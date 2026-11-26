@@ -663,10 +663,19 @@ def mapping_growth_rule(recipe: DiagnosticRecipe, data: Dict[str, Any]) -> Optio
             recipe_id=rid, status=RECIPE_STATUS_CONTRADICTED, confidence=0.8,
             confidence_basis="nothing grows outside malloc: " + trend, contradicting_facts=["no growth outside malloc: " + trend],
             recommended_action="No memory growth outside malloc in the observed window.", details=details)
+    grown_top = [f"{r.get('start')}-{r.get('end')} (+{r.get('added_kb')} KB)" for r in (mg.get("grown_mappings") or [])[:3] if isinstance(r, dict)]
+    details["partial_signals"] = {"top_grown_mappings": grown_top, "outside_growth_kb": out_kb, "rss_growth_kb": rss_kb}
+    details["next_fallback_tool"] = "runtime_heap_leak_candidates"
     return RecipeEvaluationResult(
         recipe_id=rid, status=RECIPE_STATUS_INSUFFICIENT_EVIDENCE, confidence=0.2,
         confidence_basis="memory outside malloc changed, but not as sustained resident growth: " + trend,
-        missing_evidence=["longer proc_maps_series"], limitations=list(recipe.limitations), details=details)
+        missing_evidence=["longer proc_maps_series"], limitations=list(recipe.limitations),
+        recommended_action=(
+            "Narrow scope with runtime_heap_leak_candidates(pid=...) and runtime_explain_process_behavior(pid=...) "
+            "to separate mmap/custom-pool growth from glibc heap churn"
+            + (f" (top grown ranges: {', '.join(grown_top)})" if grown_top else "") + "."
+        ),
+        details=details)
 
 
 register_observation_collector(OBS_MAPPING_GROWTH, collect_mapping_growth)

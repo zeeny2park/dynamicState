@@ -1190,7 +1190,58 @@ def _tiered_fallback_ladder_for_recipe(recipe: DiagnosticRecipe) -> List[Dict[st
     """Return a concrete multi-tier MCP scope-narrowing fallback ladder for an inconclusive recipe."""
     rid = str(recipe.recipe_id or "").upper()
     cat = str(getattr(recipe, "category", None) or getattr(recipe, "name", "") or "").upper()
-    if any(k in rid for k in ("HEAP", "LEAK", "MEMORY", "UAF", "USE_AFTER_FREE", "ALLOC", "FRAGMENT")) or "MEMORY" in cat:
+    if any(k in rid for k in ("FD_LEAK", "IPC", "PIPE", "SOCKET", "FILE_DESCRIPTOR")) or "IPC" in cat or "DESCRIPTOR" in cat:
+        return [
+            {
+                "tier": "TIER2_IPC_PIPELINE_TRACE",
+                "tool": "runtime_trace_ipc_pipeline",
+                "purpose": "Inspect open FDs, pipe/socket peer chains, and blocked producer/consumer endpoints",
+            },
+            {
+                "tier": "TIER3_THREAD_CALLSTACK",
+                "tool": "runtime_inspect_thread_callstack_and_locks",
+                "purpose": "Correlate growing/blocked descriptors with thread call stacks",
+            },
+        ]
+    if any(k in rid for k in ("THREAD_LEAK", "LOCK", "DEADLOCK", "MUTEX", "THREAD", "HANG", "STARV", "SPIN", "CPU", "FUTEX")) or any(
+        k in cat for k in ("LOCK", "THREAD", "CONCURRENCY", "CPU", "DEADLOCK")
+    ):
+        return [
+            {
+                "tier": "TIER2_THREAD_LOCK_INSPECTION",
+                "tool": "runtime_inspect_thread_callstack_and_locks",
+                "purpose": "Capture exact waiting/growing TID callstacks, futex wait addresses, and lock owners",
+            },
+            {
+                "tier": "TIER3_SYMBOL_DISCOVERY",
+                "tool": "runtime_symbol_search",
+                "purpose": "Locate mutex, queue, or thread-pool globals matching the blocked callstack frames",
+            },
+            {
+                "tier": "TIER4_STATE_INSPECTION",
+                "tool": "runtime_eval_memory_path",
+                "purpose": "Read lock owner fields, refcounts, or condition state directly",
+            },
+        ]
+    if any(k in rid for k in ("VARIABLE", "STATE_TRANSITION", "INCONSISTENT_RELATED", "NULL_OR_INVALID", "BOUNDARY", "SHARED_STATE")):
+        return [
+            {
+                "tier": "TIER2_SYMBOL_DISCOVERY",
+                "tool": "runtime_symbol_search",
+                "purpose": "Locate exact DWARF symbols for suspect state machines, pointers, or guard variables",
+            },
+            {
+                "tier": "TIER3_DIRECT_MEMORY_EVAL",
+                "tool": "runtime_eval_memory_path",
+                "purpose": "Read and validate live variable/struct fields directly without stopping the process",
+            },
+            {
+                "tier": "TIER4_THREAD_CORRELATION",
+                "tool": "runtime_inspect_thread_callstack_and_locks",
+                "purpose": "Correlate state anomalies with active thread call stacks and lock holders",
+            },
+        ]
+    if any(k in rid for k in ("HEAP", "LEAK", "MEMORY", "UAF", "USE_AFTER_FREE", "DOUBLE_FREE", "INVALID_FREE", "FREED_MEMORY", "ALLOC", "FRAGMENT", "MAPPING_GROWTH", "RETENTION")) or "MEMORY" in cat:
         return [
             {
                 "tier": "TIER2_BOUNDED_SAMPLING",

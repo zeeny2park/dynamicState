@@ -161,10 +161,19 @@ def thread_leak_rule(recipe: DiagnosticRecipe, data: Dict[str, Any]) -> Optional
             confidence_basis="thread count did not grow during the observed window: " + trend,
             contradicting_facts=[trend], recommended_action="No thread leak in the observed window.",
             limitations=list(recipe.limitations), details=details)
+    top_threads = [g.get("thread_name") or g.get("function_name") for g in (tg.get("new_threads") or [])[:3] if isinstance(g, dict)]
+    details["partial_signals"] = {"top_new_threads": [x for x in top_threads if x], "thread_growth": growth}
+    details["next_fallback_tool"] = "runtime_inspect_thread_callstack_and_locks"
     return RecipeEvaluationResult(
         recipe_id=rid, status=RECIPE_STATUS_INSUFFICIENT_EVIDENCE, confidence=0.2,
         confidence_basis="thread count changed but not monotonically (or not by enough) to call a leak: " + trend,
-        missing_evidence=["longer thread_count_series"], limitations=list(recipe.limitations), details=details)
+        missing_evidence=["longer thread_count_series"], limitations=list(recipe.limitations),
+        recommended_action=(
+            "Narrow scope with runtime_inspect_thread_callstack_and_locks(pid=...) to see where newly spawned "
+            "threads are parked or failing to join"
+            + (f" (new threads: {', '.join(x for x in top_threads if x)})" if any(top_threads) else "") + "."
+        ),
+        details=details)
 
 
 register_observation_collector(OBS_THREAD_GROWTH, collect_thread_growth)

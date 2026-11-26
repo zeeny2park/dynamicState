@@ -91,12 +91,25 @@ def _own_walk(provider: Any, pid: int, est: int) -> Dict[str, Any]:
     from ..observation_budget import ObservationBudgetLimits, ObservationBudgetTracker
     wall, byt = _remaining(getattr(provider, "budget_tracker", None))
     allow = int(byt * BYTES_FRACTION)
-    if est > MAX_OWN_WALK_BYTES:
-        return {"status": "NOT_CHECKED", "reason": "heap (%.1f MiB) above the walk cap of this check (%.0f MiB)"
-                % (est / 1048576.0, MAX_OWN_WALK_BYTES / 1048576.0)}
-    if allow < est + 65536:
-        return {"status": "NOT_CHECKED", "reason": "the observation byte budget left (%d bytes) is below the heap size "
-                "(%d bytes)" % (allow, est)}
+    if est > MAX_OWN_WALK_BYTES or allow < est + 65536:
+        why = (
+            "heap (%.1f MiB) above the walk cap of this check (%.0f MiB)"
+            % (est / 1048576.0, MAX_OWN_WALK_BYTES / 1048576.0)
+            if est > MAX_OWN_WALK_BYTES else
+            "the observation byte budget left (%d bytes) is below the heap size (%d bytes)" % (allow, est)
+        )
+        if allow >= 262144:
+            sb = ObservationBudgetTracker(ObservationBudgetLimits(
+                max_wall_clock_ms=max(100.0, min(wall * WALL_FRACTION, 5.0) * 1000.0),
+                max_bytes_read=min(allow, 4 * 1024 * 1024),
+                max_samples=1 << 30, max_bytes_per_observation=1 << 40,
+                max_consecutive_read_failures=1 << 20, max_total_read_failures=1 << 20))
+            sreader = BudgetedReader(adapter=provider.adapter, pid=pid, budget=sb, profile_id="heap_retention_tier2")
+            swalk = HeapWalker(provider.adapter, pid, budget=sb, reader=sreader, use_libc_debug_info=False).walk_sampled(
+                max_arenas=4, max_tcache_entries=64, max_fastbin_entries=64,
+                max_chunks_per_arena=128, max_segment_bytes=131072)
+            return {"walk": swalk, "bytes_read": int(sreader.bytes_read), "sampled": True, "reason": why}
+        return {"status": "NOT_CHECKED", "reason": why}
     hb = ObservationBudgetTracker(ObservationBudgetLimits(
         max_wall_clock_ms=max(100.0, wall * WALL_FRACTION * 1000.0), max_bytes_read=max(65536, allow),
         max_samples=1 << 30, max_bytes_per_observation=1 << 40, max_consecutive_read_failures=1 << 20,
@@ -181,22 +194,29 @@ def collect_heap_retention(provider: Any, ctx: Dict[str, Any]) -> None:
                             "heap grows or shrinks"
         else:
             walk, source = _shared_walk(provider, key)
+            is_sampled = False
+            if walk is not None and getattr(walk, "sampling_metadata", None) is not None:
+                is_sampled = True
             if walk is None:
                 own = _own_walk(provider, pid, s1["heap_bytes"])
                 walk, nbytes = own.get("walk"), int(own.get("bytes_read") or 0)
-                source = "own_walk" if walk is not None else None
-                if walk is None:
+                is_sampled = bool(own.get("sampled")) or (walk is not None and getattr(walk, "sampling_metadata", None) is not None)
+                source = ("own_tier2_sampled_walk" if is_sampled else "own_walk") if walk is not None else None
+                if own.get("reason"):
                     obs["reason"] = own.get("reason")
             if walk is not None and walk.status in _UNSUPPORTED:
                 obs["status"] = "UNSUPPORTED"
                 obs["reason"] = "%s: %s" % (walk.status, walk.message)
                 walk = None
-            elif walk is not None and not walk.ok:
+            elif walk is not None and not is_sampled and not walk.ok:
                 obs["reason"] = "heap walk incomplete: %s (%s)" % (walk.status, walk.message)
                 walk = None
             if walk is not None:
                 obs.update(arena_usage(walk))
-                obs["status"] = "COMPLETED"
+                obs["status"] = "PARTIAL_SAMPLED" if is_sampled else "COMPLETED"
+                if is_sampled:
+                    obs["sampling_tier"] = "TIER2_BOUNDED_SAMPLING"
+                    obs["sampling_summary"] = getattr(walk, "sampling_metadata", None) or {}
                 obs["walk_source"] = source
                 obs["walk_status"] = walk.status
                 obs["counts_by_state"] = (walk.counts() or {}).get("by_state")
@@ -244,11 +264,38 @@ def heap_retention_rule(recipe: DiagnosticRecipe, data: Dict[str, Any]) -> Optio
                                       confidence_basis=txt, contradicting_facts=[txt],
                                       recommended_action="No heap retention to explain.", details=details)
     tot = hr.get("totals") or {}
+    if st == "PARTIAL_SAMPLED":
+        sm = hr.get("sampling_summary") or {}
+        sysm_s = int(tot.get("system_mem") or 0)
+        txt = (
+            "Tier-2 bounded arena sampling inspected %d active arena(s) (system_mem %s, %d tcache + %d fastbin entries); "
+            "full heap walk was skipped (%s)"
+            % (
+                int(sm.get("sampled_arenas") or len(hr.get("arenas") or [])),
+                _mib(sysm_s),
+                int(sm.get("tcache_entries_checked") or 0),
+                int(sm.get("fastbin_entries_checked") or 0),
+                str(hr.get("reason") or "heap_cap_or_budget"),
+            )
+        )
+        details.update(tiered_fallback_applied=True, sampling_tier="TIER2_BOUNDED_SAMPLING",
+                       sampling_summary=sm, next_fallback_tool="runtime_heap_leak_candidates")
+        return RecipeEvaluationResult(
+            recipe_id=rid, status=RECIPE_STATUS_INSUFFICIENT_EVIDENCE, confidence=0.35,
+            confidence_basis=txt, missing_evidence=["full_heap_walk"], limitations=lims,
+            recommended_action=(
+                "Full heap retention walk exceeded cap; Tier-2 arena headers were sampled. "
+                "Narrow scope with runtime_heap_leak_candidates(pid=...) or runtime_explain_process_behavior(pid=...)."
+            ),
+            details=details)
     if st != "COMPLETED" or not tot:
+        details.setdefault("next_fallback_tool", "runtime_heap_leak_candidates")
         return RecipeEvaluationResult(
             recipe_id=rid, status=RECIPE_STATUS_INSUFFICIENT_EVIDENCE, confidence=0.1,
             confidence_basis="; ".join(lims) or "heap retention not assessed", missing_evidence=["heap_walk"],
-            limitations=lims, details=details)
+            limitations=lims,
+            recommended_action="Narrow scope with runtime_heap_leak_candidates(pid=...) or runtime_explain_process_behavior(pid=...).",
+            details=details)
     sysm, inuse, free, top = (int(tot.get(k) or 0) for k in ("system_mem", "in_use_bytes", "free_bytes", "top_bytes"))
     ratio = free / sysm if sysm else 0.0
     shape = ("arenas hold %s from the system: %s in use, %s free in %d free chunks (%.0f %%), top %s"
