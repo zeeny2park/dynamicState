@@ -404,6 +404,11 @@ def main():
     is_p.add_argument("--corpus", type=str, default="corpus")
 
     sh_p = subparsers.add_parser("hotspots", help="Zero-stop statistical CPU & callstack hotspot profiler (zero-stop)")
+    pb_p = subparsers.add_parser("playbook", help="Select a problem-specific diagnostic playbook and investigation loop checklist")
+    pb_p.add_argument("--symptom", default="", help="Free-text symptom or goal (e.g. 'memory leak', 'deadlock', 'fd leak')")
+    pb_p.add_argument("--list", action="store_true", help="List all available problem-specific playbooks")
+    pb_p.add_argument("--lang", choices=["en", "ko"], default="en", help="Output language (en or ko)")
+    pb_p.add_argument("--json", action="store_true", help="Print structured JSON output")
     sh_p.add_argument("-p", "--pid", type=int, required=True)
     sh_p.add_argument("-d", "--debug-image", "--companion-elf", dest="debug_image", type=str, required=True)
     sh_p.add_argument("--samples", dest="samples_count", type=int, default=6)
@@ -1616,6 +1621,33 @@ def main():
         print(json.dumps({"success": True, **res}, indent=2, ensure_ascii=False))
         sys.exit(0)
 
+    elif args.command == "playbook":
+        from extractor.diagnostic_playbooks import list_playbooks, select_playbook
+        if getattr(args, "list", False) or not (getattr(args, "symptom", "") or "").strip():
+            pbs = list_playbooks(lang=args.lang)
+            if getattr(args, "json", False):
+                print(json.dumps({"success": True, "playbooks": pbs}, indent=2, ensure_ascii=False))
+            else:
+                for pb in pbs:
+                    print(f"- {pb['playbook_id']}: {pb['title']} ({len(pb['steps'])} steps)")
+                    print(f"  Exit Predicate: {pb['exit_predicate']}")
+        else:
+            sel = select_playbook(symptom=args.symptom, lang=args.lang)
+            if getattr(args, "json", False):
+                print(json.dumps({"success": True, "selected_playbook": sel}, indent=2, ensure_ascii=False))
+            else:
+                print(f"Playbook: {sel['playbook_id']} — {sel['title']}")
+                print(f"Exit Predicate (never relax): {sel['exit_predicate']}")
+                print(f"Max Iterations: {sel['default_max_iterations']} | Routing: {', '.join(sel.get('routing_reasons') or [])}")
+                print("Steps:")
+                for st in sel["steps"]:
+                    print(f"  {st['step']}. [{st['tier']}] {st['tool']} — {st['purpose']}")
+                    print(f"     CLI: {st['cli_hint']}")
+                if sel.get("pivot_rules"):
+                    print("Plateau -> Pivot Rules:")
+                    for pr in sel["pivot_rules"]:
+                        print(f"  - When {pr['when']} -> pivot to {pr['pivot_to_tool']}: {pr['reason']}")
+        return 0
     elif args.command == "hotspots":
         from .watch_session import WatchSessionManager
         wm = WatchSessionManager(corpus_dir=args.corpus)

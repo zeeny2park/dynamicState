@@ -498,6 +498,52 @@ class TargetTrackingLedger:
         self.tried_signatures: Dict[str, int] = {}
         self.code_anchors: List[Dict[str, Any]] = []
         self._anchor_keys: set = set()
+        # Playbook Loop State Machine (pstack-inspired)
+        self.active_playbook: Optional[Dict[str, Any]] = None
+        self.max_iterations: int = 6
+        self.iteration: int = 0
+        self.consecutive_plateaus: int = 0
+        self.predicate_status: str = "OPEN"  # OPEN | MET | PIVOT_REQUIRED | BLOCKED | EXHAUSTED
+        self.decision_log: List[Dict[str, Any]] = []
+
+    def activate_playbook(
+        self,
+        playbook: Dict[str, Any],
+        *,
+        max_iterations: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        self.active_playbook = dict(playbook)
+        self.max_iterations = max(1, int(max_iterations or playbook.get("default_max_iterations") or 6))
+        self.iteration = 0
+        self.consecutive_plateaus = 0
+        self.predicate_status = "OPEN"
+        return self.loop_state()
+
+    def loop_state(self) -> Dict[str, Any]:
+        pb = self.active_playbook
+        next_step = None
+        pivot_hint = None
+        if isinstance(pb, dict):
+            steps = pb.get("steps") or []
+            used_tools = {c["tool"] for c in self.calls}
+            for st in steps:
+                if st.get("tool") not in used_tools:
+                    next_step = st
+                    break
+            pivots = pb.get("pivot_rules") or []
+            if self.predicate_status == "PIVOT_REQUIRED" and pivots:
+                pivot_hint = pivots[min(max(0, self.consecutive_plateaus - 2), len(pivots) - 1)]
+        return {
+            "playbook_id": pb.get("playbook_id") if isinstance(pb, dict) else None,
+            "exit_predicate": pb.get("exit_predicate") if isinstance(pb, dict) else None,
+            "iteration": self.iteration,
+            "max_iterations": self.max_iterations,
+            "predicate_status": self.predicate_status,
+            "consecutive_plateaus": self.consecutive_plateaus,
+            "next_planned_step": next_step,
+            "pivot_recommendation": pivot_hint,
+            "decision_log": self.decision_log[-8:],
+        }
 
     def record(
         self,
@@ -538,6 +584,57 @@ class TargetTrackingLedger:
         if len(self.calls) > _MAX_CALLS_PER_TARGET:
             self.calls = self.calls[-_MAX_CALLS_PER_TARGET:]
 
+        # Update Playbook Loop State Machine on every recorded call
+        self.iteration += 1
+        err_low = str(payload.get("error") or payload.get("error_message") or "").lower()
+        is_hard_blocked = payload.get("success") is False and any(
+            k in err_low for k in ("permission denied", "eperm", "ptrace", "no such process", "esrch", "process_exited")
+        )
+        verdict = str(payload.get("verdict") or "").upper()
+        evidence_moved = bool(
+            (not empty)
+            and (
+                len(new_anchors) > 0
+                or (delta is not None and (
+                    delta.get("stuck_count", 0) > 0
+                    or len(delta.get("growing_size_classes") or []) > 0
+                    or len(delta.get("changed_expressions") or []) > 0
+                ))
+                or verdict in ("FAULT", "DEFECT_CONFIRMED", "DEGRADED", "HEALTHY")
+                or (tool_name == "runtime_correlate_source_and_state" and not empty)
+            )
+        )
+        if is_hard_blocked:
+            self.predicate_status = "BLOCKED"
+        elif verdict in ("FAULT", "DEFECT_CONFIRMED") and len(self.code_anchors) > 0:
+            self.predicate_status = "MET"
+            self.consecutive_plateaus = 0
+        elif tool_name == "runtime_correlate_source_and_state" and len(self.code_anchors) > 0:
+            self.predicate_status = "MET"
+            self.consecutive_plateaus = 0
+        elif self.iteration >= self.max_iterations:
+            self.predicate_status = "EXHAUSTED"
+        elif evidence_moved:
+            self.consecutive_plateaus = 0
+            self.predicate_status = "OPEN"
+        else:
+            self.consecutive_plateaus += 1
+            if self.consecutive_plateaus >= 2:
+                self.predicate_status = "PIVOT_REQUIRED"
+            else:
+                self.predicate_status = "OPEN"
+
+        self.decision_log.append({
+            "iter": self.iteration,
+            "tool": tool_name,
+            "evidence_moved": evidence_moved,
+            "new_anchors": len(new_anchors),
+            "predicate_status": self.predicate_status,
+            "note": (delta.get("summary") if isinstance(delta, dict) else ("empty/failed" if empty else "observed")),
+        })
+        if len(self.decision_log) > _MAX_CALLS_PER_TARGET:
+            self.decision_log = self.decision_log[-_MAX_CALLS_PER_TARGET:]
+
         return delta, new_anchors
 
     def filter_actions(self, actions: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], List[str]]:
@@ -564,6 +661,7 @@ class TargetTrackingLedger:
             "dead_end_calls_suppressed_ready": len(self.dead_end_signatures),
             "code_anchors_collected": len(self.code_anchors),
             "top_code_anchors": self.code_anchors[:5],
+            "loop_state": self.loop_state(),
         }
 
 

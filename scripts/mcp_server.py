@@ -3415,17 +3415,42 @@ def runtime_explain_process_behavior(
 
 
 @server.tool()
-def runtime_get_playbook() -> str:
-    """Returns the diagnosis playbook (the same text as the server instructions and the diagnose-process
-    agent skill): when to diagnose, required inputs, how to read the result, follow-up per verdict, hard rules.
+def runtime_get_playbook(
+    symptom: Optional[str] = None,
+    pid: Optional[int] = None,
+    max_iterations: int = 6,
+    language: str = "en",
+    remote_host: Optional[str] = None,
+) -> str:
+    """Front-door playbook router & investigation loop starter (pstack-inspired).
+    - With no arguments: returns the general diagnosis playbook, tool tiers, and all 6 problem-specific playbooks.
+    - With `symptom`: routes to the best-matching problem playbook with a strict Exit Predicate, ordered steps,
+      and Plateau -> Pivot rules.
+    - With `symptom` + `pid`: also activates the playbook loop state machine in the target's TrackingLedger so
+      subsequent tool calls track iteration count, decision_log, and automatic pivot triggers.
     """
-    return _format_watch_result({
+    from extractor.diagnostic_playbooks import list_playbooks, select_playbook
+    lang = "ko" if str(language or "").lower().startswith("ko") else "en"
+    out: Dict[str, Any] = {
         "success": True,
         "skill": "diagnose-process",
         "recommended_workflow": workflow_steps(),
         "tool_tiers": get_mcp_tool_tiers(),
+        "available_playbooks": [
+            {"playbook_id": pb["playbook_id"], "title": pb["title"], "exit_predicate": pb["exit_predicate"]}
+            for pb in list_playbooks(lang=lang)
+        ],
         "playbook": skill_body(),
-    })
+    }
+    if symptom:
+        selected = select_playbook(symptom=symptom, lang=lang)
+        out["selected_playbook"] = selected
+        if pid is not None:
+            from extractor.tracking_ledger import GLOBAL_TRACKING_LEDGER, make_target_key
+            rm = {"remote_host": remote_host} if remote_host else None
+            ledger = GLOBAL_TRACKING_LEDGER.get_or_create(make_target_key(int(pid), rm))
+            out["loop_state"] = ledger.activate_playbook(selected, max_iterations=max_iterations)
+    return _format_watch_result(out)
 
 
 def main() -> None:

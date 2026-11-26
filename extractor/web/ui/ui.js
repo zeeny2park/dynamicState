@@ -786,11 +786,49 @@
     return out;
   }
 
+  function renderPlaybookLoop(s, ui) {
+    var dd = (s && s.agent_summary && s.agent_summary.inconclusive_drilldown) || null;
+    var pb = (dd && dd.recommended_playbook) || (s && s.recommended_playbook) || null;
+    if (!pb || !pb.playbook_id) return "";
+    var lang = ui && ui.lang === "ko" ? "ko" : "en";
+    var title = (lang === "ko" ? pb.title_ko : pb.title_en) || pb.title || pb.playbook_id;
+    var pred = (lang === "ko" ? pb.exit_predicate_ko : pb.exit_predicate_en) || pb.exit_predicate || "";
+    var steps = Array.isArray(pb.steps) ? pb.steps : [];
+    var pivots = Array.isArray(pb.pivot_rules) ? pb.pivot_rules : [];
+    var heading = lang === "ko" ? "추천 조사 플레이북 및 반복 루프" : "Recommended Investigation Playbook & Loop";
+    var predLabel = lang === "ko" ? "종료 조건 (완화 금지)" : "Exit Predicate (never relax)";
+    var pivotLabel = lang === "ko" ? "정체 시 피벗 규칙" : "Plateau -> Pivot Rules";
+    var html = '<section class="card playbook-loop-card" aria-label="' + esc(heading) + '"><div class="card-body">';
+    html += '<h3>' + esc(heading) + ': <code>' + esc(pb.playbook_id) + '</code> — ' + esc(title) + '</h3>';
+    if (pred) {
+      html += '<p class="text-muted"><b>' + esc(predLabel) + ':</b> ' + esc(pred) + '</p>';
+    }
+    if (steps.length) {
+      html += '<ol class="playbook-steps">';
+      for (var i = 0; i < steps.length; i++) {
+        var st = steps[i];
+        html += '<li><b>[' + esc(st.tier || "") + '] <code>' + esc(st.tool || "") + '</code></b> — ' + esc(st.purpose || "") +
+          (st.cli_hint ? ' <code class="text-muted">' + esc(st.cli_hint) + '</code>' : "") + '</li>';
+      }
+      html += '</ol>';
+    }
+    if (pivots.length) {
+      html += '<p><b>' + esc(pivotLabel) + '</b></p><ul>';
+      for (var j = 0; j < pivots.length; j++) {
+        var pr = pivots[j];
+        html += '<li>' + esc(pr.when || "") + ' &rarr; <code>' + esc(pr.pivot_to_tool || "") + '</code>: ' + esc(pr.reason || "") + '</li>';
+      }
+      html += '</ul>';
+    }
+    html += '</div></section>';
+    return html;
+  }
+
   /* the running/finished diagnosis: the cards in the report's order, each present once its data exists */
   function render(s, ui) {
     var started = s.count > 0 || ui.started;
     if (!started) return "";
-    return renderBanner(s, ui) + renderTiles(s, ui) + renderTarget(s, ui) + renderProfile(s, ui) + renderFindings(s, ui) + renderChecks(s, ui) + renderTail(s, ui) +
+    return renderBanner(s, ui) + renderTiles(s, ui) + renderTarget(s, ui) + renderProfile(s, ui) + renderFindings(s, ui) + renderChecks(s, ui) + renderPlaybookLoop(s, ui) + renderTail(s, ui) +
       (ui.replay ? '<div class="replaybar no-print" role="region" aria-label="' + esc(tr(ui.lang, "replay_label")) + '"><span>' +
         esc(tr(ui.lang, "replay_label")) + ": <b>" + esc(ui.replay) + '</b> · <span class="text-muted">' + esc(tr(ui.lang, "replay_note")) +
         '</span></span><button type="button" class="btn btn-outline btn-sm" data-act="replay-again">' + esc(tr(ui.lang, "replay_again")) + "</button></div>" : "");

@@ -1298,11 +1298,19 @@ def build_inconclusive_drilldown(
             if ko else "No mandatory drill-down required; optional follow-up actions are available in suggested_actions."
         )
 
+    from .diagnostic_playbooks import select_playbook
+    rec_pb = select_playbook(
+        symptom=str(res.get("symptom") or (res.get("target") or {}).get("symptom") or ""),
+        diagnose_result=res,
+        coverage=cov,
+        lang=lang,
+    )
     return {
         "should_continue": should_continue,
         "agent_directive": directive,
         "causes": causes,
         "scope_narrowing_ladder": ladder,
+        "recommended_playbook": rec_pb,
     }
 
 

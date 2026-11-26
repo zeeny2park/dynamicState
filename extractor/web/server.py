@@ -4000,6 +4000,8 @@ WebRuntimeAdapter = WebApiAdapter
 #: _handle_diagnose_job_get answers only the job routes listed here.
 API_ROUTES: Tuple[Tuple[str, str], ...] = (
     ("GET", "/api/health"),
+    ("GET", "/api/playbooks"),
+    ("GET", "/api/tracking/loop"),
     ("GET", "/api/target/remotes"),            # generic transport metadata & dynamic destinations from AdapterRegistry
     ("GET", "/api/target/processes"),          # the UI resolves a process name to a pid
     ("POST", "/api/diagnose"),                 # synchronous one-call diagnosis (IMP-006)
@@ -4284,6 +4286,43 @@ class DynamicStateRequestHandler(http.server.BaseHTTPRequestHandler):
             # GET /api/health
             if path == "/api/health":
                 self._send_json(adapter.get_health())
+                return
+            # GET /api/playbooks (list all 6 playbooks, route by ?symptom=..., optionally activate on ?pid=...&activate=1)
+            if path == "/api/playbooks":
+                from extractor.diagnostic_playbooks import list_playbooks, select_playbook
+                lang = "ko" if str(q_param("lang", "en") or "").lower().startswith("ko") else "en"
+                sym = q_param("symptom")
+                payload_pb: Dict[str, Any] = {
+                    "success": True,
+                    "playbooks": list_playbooks(lang=lang),
+                }
+                if sym:
+                    sel = select_playbook(symptom=sym, lang=lang)
+                    payload_pb["selected_playbook"] = sel
+                    pid_q = q_param("pid")
+                    if pid_q and str(q_param("activate", "")).lower() in ("1", "true", "yes"):
+                        try:
+                            from extractor.tracking_ledger import GLOBAL_TRACKING_LEDGER, make_target_key
+                            rm = {"remote_host": q_param("remote_host")} if q_param("remote_host") else None
+                            ledger = GLOBAL_TRACKING_LEDGER.get_or_create(make_target_key(int(pid_q), rm))
+                            max_it = int(q_param("max_iterations") or sel.get("default_max_iterations") or 6)
+                            payload_pb["loop_state"] = ledger.activate_playbook(sel, max_iterations=max_it)
+                        except (TypeError, ValueError):
+                            pass
+                self._send_json(payload_pb)
+                return
+            # GET /api/tracking/loop (inspect active investigation loop state, decision log & code anchors for pid)
+            if path == "/api/tracking/loop":
+                from extractor.tracking_ledger import GLOBAL_TRACKING_LEDGER, make_target_key
+                pid_q = q_param("pid")
+                rm = {"remote_host": q_param("remote_host")} if q_param("remote_host") else None
+                tkey = make_target_key(int(pid_q), rm) if pid_q and str(pid_q).isdigit() else make_target_key(None, rm)
+                ledger = GLOBAL_TRACKING_LEDGER.get(tkey)
+                self._send_json({
+                    "success": True,
+                    "active": ledger is not None,
+                    "tracking_context": ledger.summary() if ledger is not None else None,
+                })
                 return
             # GET /api/target/remotes (generic transport metadata & dynamic destinations from AdapterRegistry)
             if path == "/api/target/remotes":
