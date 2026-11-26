@@ -93,6 +93,20 @@ class TargetIdentityPolicy(ABC):
         evidence is unavailable.
         """
 
+    def authorize_debuglink_fallback(
+        self,
+        runtime_build_id: Optional[str],
+        debug_build_id: Optional[str],
+    ) -> Tuple[bool, str]:
+        """Explicitly authorize whether ``.gnu_debuglink`` CRC-32 fallback may be attempted
+        when real GNU Build IDs are absent.
+
+        Fail-closed by default: custom ``TargetIdentityPolicy`` subclasses MUST explicitly
+        override this method and return ``(True, reason)`` to allow ``.gnu_debuglink``
+        fallback. Otherwise debuglink fallback is denied and cannot bypass policy restrictions.
+        """
+        return False, "DEBUGLINK_FALLBACK_NOT_AUTHORIZED"
+
 
 class DefaultTargetIdentityPolicy(TargetIdentityPolicy):
     """Default identity policy supporting optional GNU Build-ID (e.g. ``-Wl,--build-id=none``).
@@ -192,6 +206,19 @@ class DefaultTargetIdentityPolicy(TargetIdentityPolicy):
 
         return False, "UNKNOWN_IDENTITY_UNVERIFIABLE"
 
+    def authorize_debuglink_fallback(
+        self,
+        runtime_build_id: Optional[str],
+        debug_build_id: Optional[str],
+    ) -> Tuple[bool, str]:
+        rb = str(runtime_build_id or "").strip().lower()
+        db = str(debug_build_id or "").strip().lower()
+        rb_absent = (not rb) or rb == "default_build_id" or rb.startswith("no-build-id:")
+        db_absent = (not db) or db == "default_build_id" or db.startswith("no-build-id:")
+        if rb_absent and db_absent:
+            return True, "DEBUGLINK_FALLBACK_ALLOWED"
+        return False, "BUILD_ID_NOT_AVAILABLE"
+
 
 class StrictBuildIdIdentityPolicy(DefaultTargetIdentityPolicy):
     """Strict identity policy requiring an explicit GNU Build-ID on all targets."""
@@ -250,6 +277,13 @@ class StrictBuildIdIdentityPolicy(DefaultTargetIdentityPolicy):
             return False, "STRICT_BUILD_ID_REQUIRED"
         return (rb == db), ("BUILD_ID_MATCH" if rb == db else "BUILD_ID_MISMATCH")
 
+    def authorize_debuglink_fallback(
+        self,
+        runtime_build_id: Optional[str],
+        debug_build_id: Optional[str],
+    ) -> Tuple[bool, str]:
+        return False, "STRICT_BUILD_ID_REQUIRED"
+
 
 DEFAULT_IDENTITY_POLICY = DefaultTargetIdentityPolicy()
 
@@ -299,7 +333,9 @@ def verify_debug_image_identity(
     Rules (in strict precedence order):
     1. If both sides carry real GNU Build IDs: require exact match.
     2. If only one side carries a real GNU Build ID: fail closed (never approve).
-    3. If policy is strict (rejects absent Build IDs): fail closed with ``STRICT_BUILD_ID_REQUIRED``.
+    3. When both Build IDs are absent/synthetic, consult
+       ``identity_policy.authorize_debuglink_fallback()`` (fail-closed by default on
+       ``TargetIdentityPolicy``). No fallback may bypass a policy that does not authorize it.
     4. If ``.gnu_debuglink`` is present with matching basename AND an explicit CRC AND
        ``debug_image_path`` is a readable file: verify CRC-32 against the actual bytes.
        - Matching CRC -> ``VERIFIED`` via ``gnu_debuglink_crc32`` (``COMPATIBLE_DEBUGLINK``).
@@ -348,20 +384,16 @@ def verify_debug_image_identity(
             verification_reason=reason,
         )
 
-    # 3. Both Build IDs absent/synthetic: check whether policy strictly requires GNU Build ID
-    if isinstance(pol, StrictBuildIdIdentityPolicy):
-        return DebugImageVerificationResult(
-            compatible=False,
-            verification_method="none",
-            identity_policy_id=pol_id,
-            identity_policy_version=pol_ver,
-            verification_result="UNVERIFIABLE",
-            verification_reason="STRICT_BUILD_ID_REQUIRED",
-        )
-
-    # 4. .gnu_debuglink CRC-32 verification (filename equality alone NEVER suffices)
+    # 3 & 4. Both Build IDs absent/synthetic: ask the policy explicitly whether
+    #        .gnu_debuglink CRC-32 fallback is authorized (no concrete-class checks).
+    #        Filename equality alone NEVER establishes compatibility; actual CRC-32
+    #        verification against readable debug artifact bytes is always required.
+    dl_allowed, _dl_auth_reason = pol.authorize_debuglink_fallback(
+        runtime_build_id,
+        debug_build_id,
+    )
     crc_mismatch_seen = False
-    if isinstance(debuglink, dict) and debuglink.get("filename") and debug_image_path:
+    if dl_allowed and isinstance(debuglink, dict) and debuglink.get("filename") and debug_image_path:
         expected_name = str(debuglink.get("filename") or "")
         actual_name = os.path.basename(str(debug_image_path))
         expected_crc = debuglink.get("crc")

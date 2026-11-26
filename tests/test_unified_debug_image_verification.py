@@ -12,12 +12,79 @@ import tempfile
 import unittest
 from unittest import mock
 
-from extractor.adapters.identity_policy import StrictBuildIdIdentityPolicy
+from extractor.adapters.identity_policy import (
+    DefaultTargetIdentityPolicy,
+    StrictBuildIdIdentityPolicy,
+    TargetIdentityPolicy,
+)
 from extractor.debug_artifacts import DebugArtifactProvider, compute_gnu_debuglink_crc
 from extractor.debug_image import BinaryIdentity, DebugImageProvider, inspect_elf
 from extractor.memory_snapshot import RawMemorySnapshot
 from extractor.modules import RuntimeModule
 from extractor.offline_analyzer import OfflineMemoryAnalyzer
+
+
+class _CustomStrictPolicy(TargetIdentityPolicy):
+    """Direct TargetIdentityPolicy subclass (NOT subclassing StrictBuildIdIdentityPolicy)
+    that requires real GNU Build IDs and does NOT authorize debuglink or SHA-256 fallback.
+    """
+
+    policy_id = "custom-corp-strict"
+    policy_version = "2.0"
+
+    def resolve_build_id(self, identity, tx_metadata=None):
+        bid = (identity or {}).get("build_id")
+        if bid and not self.is_synthetic_build_id(bid):
+            return str(bid), None
+        return None, "CUSTOM_BUILD_ID_REQUIRED"
+
+    def validate_build_id_match(self, expected_build_id, actual_build_id):
+        if not expected_build_id or not actual_build_id:
+            return False, "CUSTOM_BUILD_ID_REQUIRED"
+        return (str(expected_build_id).lower() == str(actual_build_id).lower()), (
+            "ok" if str(expected_build_id).lower() == str(actual_build_id).lower() else "BUILD_ID_MISMATCH"
+        )
+
+    def validate_debug_image_compatibility(
+        self,
+        runtime_build_id,
+        debug_build_id,
+        *,
+        runtime_fingerprint=None,
+        debug_fingerprint=None,
+    ):
+        rb = str(runtime_build_id or "").strip().lower()
+        db = str(debug_build_id or "").strip().lower()
+        if not rb or not db or rb.startswith("no-build-id:") or db.startswith("no-build-id:"):
+            return False, "CUSTOM_BUILD_ID_REQUIRED"
+        return (rb == db), ("BUILD_ID_MATCH" if rb == db else "BUILD_ID_MISMATCH")
+
+
+class _CustomDebuglinkOnlyPolicy(_CustomStrictPolicy):
+    """Custom policy that explicitly authorizes .gnu_debuglink CRC-32 fallback,
+    while STILL rejecting SHA-256 fallback when Build IDs are absent.
+    """
+
+    policy_id = "custom-debuglink-authorized"
+    policy_version = "2.1"
+
+    def authorize_debuglink_fallback(self, runtime_build_id, debug_build_id):
+        return True, "CUSTOM_DEBUGLINK_ALLOWED"
+
+    def validate_debug_image_compatibility(
+        self,
+        runtime_build_id,
+        debug_build_id,
+        *,
+        runtime_fingerprint=None,
+        debug_fingerprint=None,
+    ):
+        rb = str(runtime_build_id or "").strip().lower()
+        db = str(debug_build_id or "").strip().lower()
+        if not rb or not db or rb.startswith("no-build-id:") or db.startswith("no-build-id:"):
+            return False, "CUSTOM_SHA256_DISALLOWED"
+        return (rb == db), ("BUILD_ID_MATCH" if rb == db else "BUILD_ID_MISMATCH")
+
 
 
 class TestUnifiedDebugImageVerificationParity(unittest.TestCase):
@@ -363,6 +430,160 @@ class TestUnifiedDebugImageVerificationParity(unittest.TestCase):
             self.assertIn("UNKNOWN_IDENTITY_UNVERIFIABLE", str(ctx.exception))
             fake_gdb.execute.assert_not_called()
 
+
+    def test_13_custom_strict_policy_cannot_be_bypassed_by_valid_debuglink_crc(self):
+        dbg = os.path.join(self.tmp_dir, "corp.debug")
+        with open(dbg, "wb") as fh:
+            fh.write(b"valid-debuglink-bytes-for-custom-strict")
+        good_crc = compute_gnu_debuglink_crc(dbg)
+        r_id = BinaryIdentity(
+            path="/nonexistent/corp_stripped",
+            elf_class="ELF64",
+            architecture="x86_64",
+            endianness="little",
+            build_id=None,
+            debuglink={"filename": "corp.debug", "crc": good_crc},
+            stripped=True,
+        )
+        d_id = BinaryIdentity(path=dbg, elf_class="ELF64", architecture="x86_64", endianness="little", build_id=None, has_debug_info=True)
+
+        pol = _CustomStrictPolicy()
+        # Critical security invariant: NOT an instance of StrictBuildIdIdentityPolicy
+        self.assertNotIsInstance(pol, StrictBuildIdIdentityPolicy)
+
+        res_dip, res_dap, dip = self._run_both_providers(
+            runtime_path="/nonexistent/corp_stripped",
+            runtime_ident=r_id,
+            debug_path=dbg,
+            debug_ident=d_id,
+            identity_policy=pol,
+        )
+        self.assertFalse(res_dip.compatible)
+        self.assertEqual(res_dip.verification_method, "none")
+        self.assertEqual(res_dip.verification_result, "UNVERIFIABLE")
+        self.assertEqual(res_dip.verification_reason, "CUSTOM_BUILD_ID_REQUIRED")
+        self.assertEqual(res_dip.identity_policy_id, "custom-corp-strict")
+        self.assertEqual(res_dip.identity_policy_version, "2.0")
+
+        prov = dip.get_provenance()["debug_image"]
+        self.assertFalse(prov["verified"])
+        self.assertEqual(prov["identity_policy_id"], "custom-corp-strict")
+        self.assertEqual(prov["verification_reason"], "CUSTOM_BUILD_ID_REQUIRED")
+
+    def test_14_custom_policy_explicitly_allowing_debuglink_fallback_and_rejecting_sha256(self):
+        # 1) Valid debuglink CRC -> approved as gnu_debuglink_crc32
+        dbg = os.path.join(self.tmp_dir, "allowed.debug")
+        with open(dbg, "wb") as fh:
+            fh.write(b"valid-debuglink-bytes-authorized")
+        good_crc = compute_gnu_debuglink_crc(dbg)
+        wrong_crc = (good_crc ^ 0xA5A5A5A5) & 0xFFFFFFFF
+
+        pol = _CustomDebuglinkOnlyPolicy()
+        r_good = BinaryIdentity(
+            path="/nonexistent/allowed_app",
+            elf_class="ELF64",
+            architecture="x86_64",
+            endianness="little",
+            build_id=None,
+            debuglink={"filename": "allowed.debug", "crc": good_crc},
+            stripped=True,
+        )
+        d_id = BinaryIdentity(path=dbg, elf_class="ELF64", architecture="x86_64", endianness="little", build_id=None, has_debug_info=True)
+
+        res_ok, _, dip_ok = self._run_both_providers(
+            runtime_path="/nonexistent/allowed_app",
+            runtime_ident=r_good,
+            debug_path=dbg,
+            debug_ident=d_id,
+            identity_policy=pol,
+        )
+        self.assertTrue(res_ok.compatible)
+        self.assertEqual(res_ok.verification_method, "gnu_debuglink_crc32")
+        self.assertEqual(res_ok.verification_result, "VERIFIED")
+        self.assertEqual(res_ok.verification_reason, "COMPATIBLE_DEBUGLINK")
+        self.assertEqual(res_ok.identity_policy_id, "custom-debuglink-authorized")
+        self.assertEqual(dip_ok.get_provenance()["debug_image"]["verification_method"], "gnu_debuglink_crc32")
+
+        # 2) Missing CRC -> still rejected even when policy authorizes debuglink fallback
+        r_nocrc = BinaryIdentity(
+            path="/nonexistent/allowed_app",
+            elf_class="ELF64",
+            architecture="x86_64",
+            endianness="little",
+            build_id=None,
+            debuglink={"filename": "allowed.debug", "crc": None},
+            stripped=True,
+        )
+        res_nocrc, _, _ = self._run_both_providers(
+            runtime_path="/nonexistent/allowed_app",
+            runtime_ident=r_nocrc,
+            debug_path=dbg,
+            debug_ident=d_id,
+            identity_policy=pol,
+        )
+        self.assertFalse(res_nocrc.compatible)
+        self.assertEqual(res_nocrc.verification_method, "none")
+        self.assertEqual(res_nocrc.verification_result, "UNVERIFIABLE")
+        self.assertEqual(res_nocrc.verification_reason, "CUSTOM_SHA256_DISALLOWED")
+
+        # 3) Incorrect CRC -> rejected with DEBUGLINK_CRC_MISMATCH
+        r_badcrc = BinaryIdentity(
+            path="/nonexistent/allowed_app",
+            elf_class="ELF64",
+            architecture="x86_64",
+            endianness="little",
+            build_id=None,
+            debuglink={"filename": "allowed.debug", "crc": wrong_crc},
+            stripped=True,
+        )
+        res_badcrc, _, _ = self._run_both_providers(
+            runtime_path="/nonexistent/allowed_app",
+            runtime_ident=r_badcrc,
+            debug_path=dbg,
+            debug_ident=d_id,
+            identity_policy=pol,
+        )
+        self.assertFalse(res_badcrc.compatible)
+        self.assertEqual(res_badcrc.verification_method, "gnu_debuglink_crc32")
+        self.assertEqual(res_badcrc.verification_result, "MISMATCH")
+        self.assertEqual(res_badcrc.verification_reason, "DEBUGLINK_CRC_MISMATCH")
+
+        # 4) Matching SHA-256 fingerprints with absent Build ID -> rejected because policy disallows SHA-256 fallback
+        bin_a = self._compile_elf("sha_disallowed", "int q = 11; int main(void) { return q; }\n")
+        dbg_copy = os.path.join(self.tmp_dir, "sha_disallowed_copy.debug")
+        shutil.copyfile(bin_a, dbg_copy)
+        res_sha, _, _ = self._run_both_providers(
+            runtime_path=bin_a,
+            runtime_ident=inspect_elf(bin_a),
+            debug_path=dbg_copy,
+            debug_ident=inspect_elf(dbg_copy),
+            identity_policy=pol,
+        )
+        self.assertFalse(res_sha.compatible)
+        self.assertEqual(res_sha.verification_method, "none")
+        self.assertEqual(res_sha.verification_result, "UNVERIFIABLE")
+        self.assertEqual(res_sha.verification_reason, "CUSTOM_SHA256_DISALLOWED")
+
+    def test_15_custom_policy_matching_and_mismatching_build_ids(self):
+        dbg = os.path.join(self.tmp_dir, "custom_bid.debug")
+        with open(dbg, "wb") as fh:
+            fh.write(b"custom-bid-debug")
+        pol = _CustomStrictPolicy()
+        r_id = BinaryIdentity(path="/bin/app", elf_class="ELF64", architecture="x86_64", endianness="little", build_id="cafe1234", stripped=True)
+        d_match = BinaryIdentity(path=dbg, elf_class="ELF64", architecture="x86_64", endianness="little", build_id="CAFE1234", has_debug_info=True)
+        d_diff = BinaryIdentity(path=dbg, elf_class="ELF64", architecture="x86_64", endianness="little", build_id="beef9999", has_debug_info=True)
+
+        res_m, _, _ = self._run_both_providers(runtime_path="/bin/app", runtime_ident=r_id, debug_path=dbg, debug_ident=d_match, identity_policy=pol)
+        self.assertTrue(res_m.compatible)
+        self.assertEqual(res_m.verification_method, "gnu_build_id")
+        self.assertEqual(res_m.verification_result, "VERIFIED")
+        self.assertEqual(res_m.verification_reason, "BUILD_ID_MATCH")
+
+        res_d, _, _ = self._run_both_providers(runtime_path="/bin/app", runtime_ident=r_id, debug_path=dbg, debug_ident=d_diff, identity_policy=pol)
+        self.assertFalse(res_d.compatible)
+        self.assertEqual(res_d.verification_method, "gnu_build_id")
+        self.assertEqual(res_d.verification_result, "MISMATCH")
+        self.assertEqual(res_d.verification_reason, "BUILD_ID_MISMATCH")
 
 if __name__ == "__main__":
     unittest.main()
