@@ -45,7 +45,7 @@ class TestDiskLedgerAndCompactPayload(unittest.TestCase):
             )
             enrich_tool_response(
                 "runtime_correlate_source_and_state",
-                {"success": True, "correlations": [{"file": "src/main.cpp", "line": 77, "function": "run"}]},
+                {"success": True, "verdict": "FAULT", "findings": [{"recipe_id": "RECIPE_HEAP_GROWTH", "status": "SUPPORTED", "severity": "HIGH"}], "correlations": [{"file": "src/main.cpp", "line": 77, "function": "run"}]},
                 pid=3100,
                 companion_elf="/usr/bin/svc",
                 ledger_store=store1,

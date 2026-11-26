@@ -4,6 +4,7 @@ and Self-Recovery Action Builder for continuous LLM coding-agent troubleshooting
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import threading
@@ -27,9 +28,13 @@ _TEMPORAL_REPEAT_TOOLS = frozenset({
 
 def make_target_key(pid: Optional[int], remote_target: Optional[Dict[str, Any]] = None) -> str:
     host = "local"
+    port_suffix = ""
     if isinstance(remote_target, dict) and remote_target.get("remote_host"):
         host = str(remote_target["remote_host"]).strip()
-    return f"{host}:{int(pid) if pid is not None else 'none'}"
+        port = remote_target.get("ssh_port")
+        if port is not None and str(port) not in ("", "22"):
+            port_suffix = f"@{port}"
+    return f"{host}{port_suffix}:{int(pid) if pid is not None else 'none'}"
 
 
 def _canonical_arg_signature(tool_name: str, args: Optional[Dict[str, Any]]) -> str:
@@ -489,7 +494,13 @@ def build_recovery_actions(
 
 
 class TargetTrackingLedger:
-    """Per-target in-memory investigation ledger across consecutive MCP tool calls."""
+    """Per-target investigation ledger across consecutive MCP/CLI tool calls.
+
+    Separates:
+    - Evidence discovery (code anchors, deltas, raw observations)
+    - Hypothesis validation (SUPPORTED / CONTRADICTED / INCONCLUSIVE / BLOCKED / UNVALIDATED)
+    - Playbook Exit Predicate satisfaction (MET only when actual completion criteria are met)
+    """
 
     def __init__(self, target_key: str):
         self.target_key = target_key
@@ -500,13 +511,26 @@ class TargetTrackingLedger:
         self.tried_signatures: Dict[str, int] = {}
         self.code_anchors: List[Dict[str, Any]] = []
         self._anchor_keys: set = set()
-        # Playbook Loop State Machine (pstack-inspired)
+        # Playbook Loop State Machine
         self.active_playbook: Optional[Dict[str, Any]] = None
-        self.max_iterations: int = 6
+        self.max_iterations: Optional[int] = None  # None = no arbitrary cap unless explicitly configured
         self.iteration: int = 0
         self.consecutive_plateaus: int = 0
         self.predicate_status: str = "OPEN"  # OPEN | MET | PIVOT_REQUIRED | BLOCKED | EXHAUSTED
+        self.hypothesis_status: str = "UNVALIDATED"  # UNVALIDATED | SUPPORTED | CONTRADICTED | INCONCLUSIVE | BLOCKED
+        self.evidence_provenance: List[Dict[str, Any]] = []
+        self.exit_predicate_evaluation: Dict[str, Any] = {
+            "satisfied": False,
+            "status": "OPEN",
+            "hypothesis_status": "UNVALIDATED",
+            "reason": "Investigation started; no hypothesis validated yet.",
+            "provenance": [],
+        }
         self.decision_log: List[Dict[str, Any]] = []
+        # Persistence revision tracking (prevents stale in-memory overwrites)
+        self.revision: int = 0
+        self.updated_at_epoch: float = time.time()
+        self._disk_mtime_ns: int = 0
 
     def activate_playbook(
         self,
@@ -515,11 +539,200 @@ class TargetTrackingLedger:
         max_iterations: Optional[int] = None,
     ) -> Dict[str, Any]:
         self.active_playbook = dict(playbook)
-        self.max_iterations = max(1, int(max_iterations or playbook.get("default_max_iterations") or 6))
+        # Only enforce an iteration limit when explicitly configured by the caller
+        self.max_iterations = max(1, int(max_iterations)) if max_iterations is not None else None
         self.iteration = 0
         self.consecutive_plateaus = 0
         self.predicate_status = "OPEN"
+        self.hypothesis_status = "UNVALIDATED"
+        self.evidence_provenance = []
+        self.exit_predicate_evaluation = {
+            "satisfied": False,
+            "status": "OPEN",
+            "hypothesis_status": "UNVALIDATED",
+            "reason": "Playbook activated; awaiting hypothesis validation against exit predicate.",
+            "provenance": [],
+        }
+        self.revision += 1
+        self.updated_at_epoch = time.time()
         return self.loop_state()
+
+    def _has_corroborated_root_anchor(self) -> bool:
+        """True when at least one code anchor carries file:line, variable_path, or symbol."""
+        return any(
+            bool(a.get("file") or a.get("variable_path") or a.get("symbol") or a.get("function"))
+            for a in self.code_anchors
+        )
+
+    def _evaluate_exit_predicate(
+        self,
+        *,
+        tool_name: str,
+        payload: Dict[str, Any],
+        delta: Optional[Dict[str, Any]],
+        empty: bool,
+        is_hard_blocked: bool,
+    ) -> Tuple[str, str, str]:
+        """Evaluate the active playbook's actual exit predicate.
+
+        Returns (predicate_status_candidate, hypothesis_status, reason).
+        Code anchors alone NEVER satisfy MET; hypothesis validation is strictly required.
+        """
+        if is_hard_blocked:
+            err = str(payload.get("error") or payload.get("error_message") or "target access blocked")
+            return "BLOCKED", "BLOCKED", f"Hard external blocker encountered: {err}"
+
+        pb_id = str((self.active_playbook or {}).get("playbook_id") or "")
+        verdict = str(payload.get("verdict") or "").upper()
+        cov_qual = str(
+            (payload.get("agent_summary") or {}).get("verdict_qualifier")
+            or (payload.get("coverage") or {}).get("verdict_qualifier")
+            or ""
+        ).upper()
+        findings = [f for f in (payload.get("findings") or []) if isinstance(f, dict)]
+        has_confirmed_fault = (
+            verdict in ("FAULT", "DEFECT_CONFIRMED", "CONFIRMED", "CRITICAL")
+            or any(
+                str(f.get("status") or "").upper() in ("SUPPORTED", "CONFIRMED")
+                or str(f.get("severity") or "").upper() in ("HIGH", "CRITICAL")
+                for f in findings
+            )
+        )
+        has_clean_refutation = (
+            verdict == "HEALTHY"
+            and cov_qual not in ("NO_FAULT_LIMITED_OBSERVATION", "BLOCKED_EXECUTION", "PARTIAL_OBSERVATION")
+            and not bool((payload.get("memory_integrity") or {}).get("heap", {}).get("full_walk_skipped"))
+        )
+        has_owner_path = any(
+            bool(a.get("variable_path")) for a in self.code_anchors
+        ) or any(
+            isinstance(r, dict) and bool(r.get("referrers") or r.get("owners"))
+            for r in (payload.get("results") if isinstance(payload.get("results"), list) else [])
+        )
+        has_direct_eval = any(c["tool"] in ("runtime_eval_memory_path", "runtime_capture_and_diff") and not c.get("empty_or_failed") for c in self.calls)
+        has_temporal_evidence = any(
+            p.get("kind") == "temporal_delta" for p in self.evidence_provenance
+        ) or (
+            delta is not None and (
+                delta.get("stuck_count", 0) > 0
+                or len(delta.get("growing_size_classes") or []) > 0
+                or len(delta.get("changed_expressions") or []) > 0
+            )
+        )
+        has_prior_supported = any(p.get("hypothesis_status") == "SUPPORTED" for p in self.evidence_provenance)
+        has_prior_contradicted = any(p.get("hypothesis_status") == "CONTRADICTED" for p in self.evidence_provenance)
+
+        # Record provenance of hypothesis validation (distinct from raw anchor discovery)
+        cur_hyp = "INCONCLUSIVE"
+        if has_confirmed_fault:
+            cur_hyp = "SUPPORTED"
+            self.evidence_provenance.append({
+                "iter": self.iteration,
+                "tool": tool_name,
+                "kind": "fault_supported",
+                "hypothesis_status": "SUPPORTED",
+                "detail": verdict or (findings[0].get("recipe_id") if findings else "confirmed_finding"),
+            })
+        elif has_clean_refutation:
+            cur_hyp = "CONTRADICTED"
+            self.evidence_provenance.append({
+                "iter": self.iteration,
+                "tool": tool_name,
+                "kind": "hypothesis_refuted",
+                "hypothesis_status": "CONTRADICTED",
+                "detail": "Validated HEALTHY with complete coverage",
+            })
+        elif has_temporal_evidence:
+            cur_hyp = "SUPPORTED" if (delta and (delta.get("stuck_count", 0) > 0 or len(delta.get("growing_size_classes") or []) > 0)) else "INCONCLUSIVE"
+            self.evidence_provenance.append({
+                "iter": self.iteration,
+                "tool": tool_name,
+                "kind": "temporal_delta",
+                "hypothesis_status": cur_hyp,
+                "detail": delta.get("summary") if isinstance(delta, dict) else "temporal_observation",
+            })
+        elif tool_name == "runtime_eval_memory_path" and not empty and payload.get("success") is not False:
+            cur_hyp = "INCONCLUSIVE"
+            self.evidence_provenance.append({
+                "iter": self.iteration,
+                "tool": tool_name,
+                "kind": "direct_memory_eval",
+                "hypothesis_status": "INCONCLUSIVE",
+                "detail": "Direct symbol evaluation recorded",
+            })
+
+        supported_now = has_confirmed_fault or has_prior_supported
+        contradicted_now = has_clean_refutation or has_prior_contradicted
+        has_anchor = self._has_corroborated_root_anchor()
+
+        # Playbook-specific Exit Predicate verification:
+        # Note: runtime_correlate_source_and_state returning arbitrary anchors WITHOUT validated
+        # hypothesis evidence (supported_now / contradicted_now / direct eval) MUST NOT return MET.
+        if pb_id == "memory-leak-and-growth":
+            if supported_now and (has_owner_path or has_anchor):
+                return "MET", "SUPPORTED", "Memory leak/growth hypothesis SUPPORTED with owning variable/code anchor."
+            if contradicted_now and (has_temporal_evidence or has_clean_refutation):
+                return "MET", "CONTRADICTED", "Sustained memory growth CONTRADICTED with validated observation coverage."
+            return "OPEN", ("SUPPORTED" if supported_now else ("CONTRADICTED" if contradicted_now else "INCONCLUSIVE")), (
+                "Awaiting confirmed leak ownership/code anchor or validated growth refutation."
+            )
+
+        if pb_id == "heap-corruption-and-uaf":
+            if supported_now and has_anchor:
+                return "MET", "SUPPORTED", "Heap corruption/UAF defect SUPPORTED with corroborating symbol/code anchor."
+            if contradicted_now:
+                return "MET", "CONTRADICTED", "Full heap integrity check CONTRADICTED active corruption."
+            return "OPEN", ("SUPPORTED" if supported_now else "INCONCLUSIVE"), (
+                "Awaiting confirmed corruption/UAF defect with anchor or full integrity refutation."
+            )
+
+        if pb_id == "hang-deadlock-and-contention":
+            stuck_confirmed = any(
+                p.get("kind") == "temporal_delta" and p.get("hypothesis_status") == "SUPPORTED"
+                for p in self.evidence_provenance
+            )
+            if (supported_now or stuck_confirmed) and has_anchor:
+                return "MET", "SUPPORTED", "Hang/deadlock/stall SUPPORTED with lock/frame code anchor."
+            if contradicted_now:
+                return "MET", "CONTRADICTED", "All threads confirmed progressing normally."
+            return "OPEN", ("SUPPORTED" if (supported_now or stuck_confirmed) else "INCONCLUSIVE"), (
+                "Awaiting confirmed deadlock/sustained stuck thread with source anchor or validated liveness."
+            )
+
+        if pb_id == "fd-and-ipc-stall":
+            if supported_now and has_anchor:
+                return "MET", "SUPPORTED", "FD leak or IPC stall SUPPORTED with call-stack/code anchor."
+            if contradicted_now:
+                return "MET", "CONTRADICTED", "FD count and IPC endpoints confirmed stable."
+            return "OPEN", ("SUPPORTED" if supported_now else "INCONCLUSIVE"), (
+                "Awaiting confirmed FD/IPC fault with code anchor or validated stability."
+            )
+
+        if pb_id == "state-and-variable-bug":
+            if has_direct_eval and has_anchor and (supported_now or contradicted_now):
+                st_h = "SUPPORTED" if supported_now else "CONTRADICTED"
+                return "MET", st_h, f"Target symbol values directly evaluated and correlated to source ({st_h})."
+            return "OPEN", ("SUPPORTED" if supported_now else ("CONTRADICTED" if contradicted_now else "INCONCLUSIVE")), (
+                "Awaiting direct live symbol evaluation + source correlation validating or refuting the invariant."
+            )
+
+        if pb_id == "intermittent-temporal-bug":
+            if (has_temporal_evidence or supported_now) and has_anchor:
+                return "MET", "SUPPORTED", "Intermittent anomaly window captured with temporal delta and code anchor."
+            if contradicted_now and has_temporal_evidence:
+                return "MET", "CONTRADICTED", "Temporal observation window completed with validated baseline telemetry."
+            return "OPEN", ("SUPPORTED" if supported_now else "INCONCLUSIVE"), (
+                "Awaiting temporal delta capture with code anchor or validated baseline observation window."
+            )
+
+        # Generic (no specific playbook activated)
+        if supported_now and has_anchor:
+            return "MET", "SUPPORTED", "Fault hypothesis SUPPORTED with corroborating code anchor."
+        if contradicted_now:
+            return "MET", "CONTRADICTED", "Fault hypothesis CONTRADICTED with validated complete coverage."
+        return "OPEN", ("SUPPORTED" if supported_now else "INCONCLUSIVE"), (
+            "Evidence collected, but exit predicate is not yet satisfied."
+        )
 
     def loop_state(self) -> Dict[str, Any]:
         pb = self.active_playbook
@@ -541,10 +754,12 @@ class TargetTrackingLedger:
             "iteration": self.iteration,
             "max_iterations": self.max_iterations,
             "predicate_status": self.predicate_status,
+            "hypothesis_status": self.hypothesis_status,
+            "exit_predicate_evaluation": dict(self.exit_predicate_evaluation),
             "consecutive_plateaus": self.consecutive_plateaus,
             "next_planned_step": next_step,
             "pivot_recommendation": pivot_hint,
-            "decision_log": self.decision_log[-8:],
+            "decision_log": self.decision_log[-12:],
         }
 
     def record(
@@ -586,7 +801,7 @@ class TargetTrackingLedger:
         if len(self.calls) > _MAX_CALLS_PER_TARGET:
             self.calls = self.calls[-_MAX_CALLS_PER_TARGET:]
 
-        # Update Playbook Loop State Machine on every recorded call
+        # Update Playbook Loop State Machine
         self.iteration += 1
         err_low = str(payload.get("error") or payload.get("error_message") or "").lower()
         is_hard_blocked = payload.get("success") is False and any(
@@ -603,19 +818,27 @@ class TargetTrackingLedger:
                     or len(delta.get("changed_expressions") or []) > 0
                 ))
                 or verdict in ("FAULT", "DEFECT_CONFIRMED", "DEGRADED", "HEALTHY")
-                or (tool_name == "runtime_correlate_source_and_state" and not empty)
+                or (tool_name == "runtime_eval_memory_path" and payload.get("success") is not False)
             )
         )
-        if is_hard_blocked:
+
+        pred_cand, hyp_status, pred_reason = self._evaluate_exit_predicate(
+            tool_name=tool_name,
+            payload=payload,
+            delta=delta,
+            empty=empty,
+            is_hard_blocked=is_hard_blocked,
+        )
+        self.hypothesis_status = hyp_status
+
+        if pred_cand == "BLOCKED":
             self.predicate_status = "BLOCKED"
-        elif verdict in ("FAULT", "DEFECT_CONFIRMED") and len(self.code_anchors) > 0:
+        elif pred_cand == "MET":
             self.predicate_status = "MET"
             self.consecutive_plateaus = 0
-        elif tool_name == "runtime_correlate_source_and_state" and len(self.code_anchors) > 0:
-            self.predicate_status = "MET"
-            self.consecutive_plateaus = 0
-        elif self.iteration >= self.max_iterations:
+        elif self.max_iterations is not None and self.iteration >= self.max_iterations:
             self.predicate_status = "EXHAUSTED"
+            pred_reason = f"Explicit iteration limit ({self.max_iterations}) reached before exit predicate was satisfied."
         elif evidence_moved:
             self.consecutive_plateaus = 0
             self.predicate_status = "OPEN"
@@ -626,17 +849,28 @@ class TargetTrackingLedger:
             else:
                 self.predicate_status = "OPEN"
 
+        self.exit_predicate_evaluation = {
+            "satisfied": self.predicate_status == "MET",
+            "status": self.predicate_status,
+            "hypothesis_status": self.hypothesis_status,
+            "reason": pred_reason,
+            "provenance": list(self.evidence_provenance[-8:]),
+        }
+
         self.decision_log.append({
             "iter": self.iteration,
             "tool": tool_name,
             "evidence_moved": evidence_moved,
             "new_anchors": len(new_anchors),
+            "hypothesis_status": self.hypothesis_status,
             "predicate_status": self.predicate_status,
             "note": (delta.get("summary") if isinstance(delta, dict) else ("empty/failed" if empty else "observed")),
         })
         if len(self.decision_log) > _MAX_CALLS_PER_TARGET:
             self.decision_log = self.decision_log[-_MAX_CALLS_PER_TARGET:]
 
+        self.revision += 1
+        self.updated_at_epoch = time.time()
         return delta, new_anchors
 
     def filter_actions(self, actions: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], List[str]]:
@@ -668,19 +902,81 @@ class TargetTrackingLedger:
 
 
 class TrackingLedgerStore:
-    """Thread-safe bounded LRU store of per-target TargetTrackingLedger instances."""
+    """Thread-safe bounded LRU store of per-target TargetTrackingLedger instances
+    with collision-safe atomic disk persistence, restart recovery, and stale-overwrite protection.
+    """
 
     def __init__(self, max_targets: int = _MAX_TARGETS, persist_dir: Optional[str] = None):
         self._lock = threading.Lock()
         self._max_targets = max_targets
-        self._persist_dir = persist_dir or os.environ.get("DYNAMICSTATE_LEDGER_DIR") or None
+        self._persist_dir = persist_dir
         self._ledgers: "OrderedDict[str, TargetTrackingLedger]" = OrderedDict()
 
+    def _effective_persist_dir(self) -> Optional[str]:
+        return self._persist_dir or os.environ.get("DYNAMICSTATE_LEDGER_DIR") or None
+
     def _ledger_path(self, target_key: str) -> Optional[str]:
-        if not self._persist_dir:
+        pdir = self._effective_persist_dir()
+        if not pdir:
             return None
-        safe = "".join(c if c.isalnum() or c in ("-", "_", ".") else "_" for c in str(target_key))
-        return os.path.join(self._persist_dir, f"ledger_{safe}.json")
+        # Collision-safe: human-readable prefix + 16-char SHA-256 of exact target_key
+        safe = "".join(c if c.isalnum() or c in ("-", ".") else "_" for c in str(target_key))[:40]
+        digest = hashlib.sha256(str(target_key).encode("utf-8")).hexdigest()[:16]
+        return os.path.join(pdir, f"ledger_{safe}_{digest}.json")
+
+    def _deserialize(self, target_key: str, data: Dict[str, Any], mtime_ns: int = 0) -> TargetTrackingLedger:
+        ledger = TargetTrackingLedger(target_key)
+        ledger.active_playbook = data.get("active_playbook")
+        raw_max = data.get("max_iterations")
+        ledger.max_iterations = int(raw_max) if raw_max is not None else None
+        ledger.iteration = int(data.get("iteration") or 0)
+        ledger.consecutive_plateaus = int(data.get("consecutive_plateaus") or 0)
+        ledger.predicate_status = str(data.get("predicate_status") or "OPEN")
+        ledger.hypothesis_status = str(data.get("hypothesis_status") or "UNVALIDATED")
+        ledger.evidence_provenance = list(data.get("evidence_provenance") or [])[-_MAX_CALLS_PER_TARGET:]
+        if isinstance(data.get("exit_predicate_evaluation"), dict):
+            ledger.exit_predicate_evaluation = dict(data["exit_predicate_evaluation"])
+        ledger.decision_log = list(data.get("decision_log") or [])[-_MAX_CALLS_PER_TARGET:]
+        ledger.code_anchors = list(data.get("code_anchors") or [])[:_MAX_ANCHORS_PER_TARGET]
+        ledger._anchor_keys = {
+            (a.get("file", ""), a.get("line", 0), a.get("function", ""), a.get("symbol", ""), a.get("variable_path", ""))
+            for a in ledger.code_anchors if isinstance(a, dict)
+        }
+        ledger.dead_end_signatures = set(data.get("dead_end_signatures") or [])
+        ledger.calls = list(data.get("calls") or [])[-_MAX_CALLS_PER_TARGET:]
+        ledger.revision = int(data.get("revision") or 0)
+        ledger.updated_at_epoch = float(data.get("updated_at_epoch") or 0.0)
+        ledger._disk_mtime_ns = mtime_ns
+        return ledger
+
+    def _merge_newer_disk(self, mem: TargetTrackingLedger, disk: TargetTrackingLedger) -> None:
+        """Merge newer disk state into in-memory ledger without losing either side's anchors or logs."""
+        for a in disk.code_anchors:
+            if not isinstance(a, dict):
+                continue
+            ak = (a.get("file", ""), a.get("line", 0), a.get("function", ""), a.get("symbol", ""), a.get("variable_path", ""))
+            if ak not in mem._anchor_keys and len(mem.code_anchors) < _MAX_ANCHORS_PER_TARGET:
+                mem._anchor_keys.add(ak)
+                mem.code_anchors.append(a)
+        mem.dead_end_signatures.update(disk.dead_end_signatures)
+        if disk.revision > mem.revision:
+            mem.revision = disk.revision + 1
+            if len(disk.decision_log) > len(mem.decision_log):
+                mem.decision_log = (disk.decision_log + mem.decision_log[-1:])[-_MAX_CALLS_PER_TARGET:]
+
+    def _try_load(self, target_key: str) -> Optional[TargetTrackingLedger]:
+        path = self._ledger_path(target_key)
+        if not path or not os.path.isfile(path):
+            return None
+        try:
+            st = os.stat(path)
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if not isinstance(data, dict) or data.get("target_key") != target_key:
+                return None
+            return self._deserialize(target_key, data, mtime_ns=st.st_mtime_ns)
+        except Exception:
+            return None
 
     def save(self, target_key: str) -> bool:
         path = self._ledger_path(target_key)
@@ -690,64 +986,83 @@ class TrackingLedgerStore:
             ledger = self._ledgers.get(target_key)
             if ledger is None:
                 return False
+            # Guard against stale in-memory state overwriting newer disk state
+            disk_existing = self._try_load(target_key)
+            if disk_existing is not None and (
+                disk_existing.revision > ledger.revision
+                or (disk_existing._disk_mtime_ns > ledger._disk_mtime_ns and disk_existing.updated_at_epoch > ledger.updated_at_epoch)
+            ):
+                self._merge_newer_disk(ledger, disk_existing)
             data = {
                 "target_key": ledger.target_key,
+                "revision": ledger.revision,
+                "updated_at_epoch": ledger.updated_at_epoch,
                 "active_playbook": ledger.active_playbook,
                 "max_iterations": ledger.max_iterations,
                 "iteration": ledger.iteration,
                 "consecutive_plateaus": ledger.consecutive_plateaus,
                 "predicate_status": ledger.predicate_status,
-                "decision_log": ledger.decision_log,
-                "code_anchors": ledger.code_anchors,
+                "hypothesis_status": ledger.hypothesis_status,
+                "evidence_provenance": ledger.evidence_provenance[-_MAX_CALLS_PER_TARGET:],
+                "exit_predicate_evaluation": ledger.exit_predicate_evaluation,
+                "decision_log": ledger.decision_log[-_MAX_CALLS_PER_TARGET:],
+                "code_anchors": ledger.code_anchors[:_MAX_ANCHORS_PER_TARGET],
                 "dead_end_signatures": sorted(ledger.dead_end_signatures),
-                "calls": ledger.calls,
+                "calls": ledger.calls[-_MAX_CALLS_PER_TARGET:],
             }
-        try:
-            os.makedirs(os.path.dirname(path), exist_ok=True)
-            tmp = path + ".tmp"
-            with open(tmp, "w", encoding="utf-8") as f:
-                json.dump(data, f, ensure_ascii=False, indent=2)
-            os.replace(tmp, path)
-            return True
-        except OSError:
-            return False
+            try:
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                tmp = f"{path}.{os.getpid()}.{threading.get_ident()}.tmp"
+                with open(tmp, "w", encoding="utf-8") as f:
+                    json.dump(data, f, ensure_ascii=False, indent=2)
+                    f.flush()
+                    os.fsync(f.fileno())
+                os.replace(tmp, path)
+                try:
+                    ledger._disk_mtime_ns = os.stat(path).st_mtime_ns
+                except OSError:
+                    pass
+                return True
+            except OSError:
+                return False
 
-    def _try_load(self, target_key: str) -> Optional[TargetTrackingLedger]:
-        path = self._ledger_path(target_key)
-        if not path or not os.path.isfile(path):
-            return None
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            ledger = TargetTrackingLedger(target_key)
-            ledger.active_playbook = data.get("active_playbook")
-            ledger.max_iterations = int(data.get("max_iterations") or 6)
-            ledger.iteration = int(data.get("iteration") or 0)
-            ledger.consecutive_plateaus = int(data.get("consecutive_plateaus") or 0)
-            ledger.predicate_status = str(data.get("predicate_status") or "OPEN")
-            ledger.decision_log = list(data.get("decision_log") or [])
-            ledger.code_anchors = list(data.get("code_anchors") or [])
-            ledger.dead_end_signatures = set(data.get("dead_end_signatures") or [])
-            ledger.calls = list(data.get("calls") or [])
-            return ledger
-        except Exception:
-            return None
+    def _put_bounded_locked(self, target_key: str, ledger: TargetTrackingLedger) -> None:
+        self._ledgers[target_key] = ledger
+        self._ledgers.move_to_end(target_key)
+        while len(self._ledgers) > self._max_targets:
+            self._ledgers.popitem(last=False)
 
     def get_or_create(self, target_key: str) -> TargetTrackingLedger:
         with self._lock:
             ledger = self._ledgers.get(target_key)
             if ledger is None:
                 ledger = self._try_load(target_key) or TargetTrackingLedger(target_key)
-                self._ledgers[target_key] = ledger
-                if len(self._ledgers) > self._max_targets:
-                    self._ledgers.popitem(last=False)
+                self._put_bounded_locked(target_key, ledger)
             else:
-                self._ledgers.move_to_end(target_key)
+                # Check if disk has a newer revision (e.g. written by another worker/process)
+                disk = self._try_load(target_key)
+                if disk is not None and disk.revision > ledger.revision:
+                    ledger = disk
+                    self._put_bounded_locked(target_key, ledger)
+                else:
+                    self._ledgers.move_to_end(target_key)
             return ledger
 
     def get(self, target_key: str) -> Optional[TargetTrackingLedger]:
+        """Retrieve a ledger from memory OR recover it from disk persistence after restart."""
         with self._lock:
-            return self._ledgers.get(target_key)
+            ledger = self._ledgers.get(target_key)
+            disk = self._try_load(target_key)
+            if ledger is None:
+                if disk is not None:
+                    self._put_bounded_locked(target_key, disk)
+                    return disk
+                return None
+            if disk is not None and disk.revision > ledger.revision:
+                self._put_bounded_locked(target_key, disk)
+                return disk
+            self._ledgers.move_to_end(target_key)
+            return ledger
 
     def clear(self) -> None:
         with self._lock:

@@ -98,7 +98,7 @@ class TestPlaybookLoopStateMachine(unittest.TestCase):
         # Iter 3: correlate_source_and_state yields code_anchors -> MET!
         r3 = enrich_tool_response(
             "runtime_correlate_source_and_state",
-            {"success": True, "correlations": [{"file": "src/cache.cpp", "line": 120, "variable_path": "g_cache"}]},
+            {"success": True, "verdict": "FAULT", "findings": [{"recipe_id": "RECIPE_HEAP_GROWTH", "status": "SUPPORTED", "severity": "HIGH"}], "correlations": [{"file": "src/cache.cpp", "line": 120, "variable_path": "g_cache"}]},
             pid=7777,
             companion_elf="/usr/bin/app",
             ledger_store=store,

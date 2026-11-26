@@ -414,8 +414,8 @@ def main():
     loop_p.add_argument("-p", "--pid", type=int, required=True, help="Target process PID")
     loop_p.add_argument("--symptom", required=True, help="Symptom or goal (e.g. 'memory leak', 'deadlock', 'fd leak')")
     loop_p.add_argument("-d", "--debug-image", "--companion-elf", dest="debug_image", default=None, help="Path to unstripped ELF / debug image")
-    loop_p.add_argument("--max-iter", type=int, default=4, help="Maximum loop iterations (default: 4)")
-    loop_p.add_argument("--time-budget", type=float, default=20.0, help="Total time budget in seconds (default: 20)")
+    loop_p.add_argument("--max-iter", type=int, default=None, help="Optional explicit maximum loop iterations (default: unbounded)")
+    loop_p.add_argument("--time-budget", type=float, default=None, help="Optional explicit total time budget in seconds (default: unbounded)")
     loop_p.add_argument("--handoff-md", default=None, help="Write coding-agent handoff Markdown brief to this file")
     loop_p.add_argument("--fail-on", default=None, help="Comma-separated verdicts to fail CI on (e.g. fault,degraded,inconclusive,blocked)")
     loop_p.add_argument("--strict-exit-codes", action="store_true", help="Return standard exit codes (0=HEALTHY, 2=FAULT, 3=DEGRADED, 4=INCONCLUSIVE, 5=BLOCKED)")
@@ -1709,7 +1709,10 @@ def main():
         else:
             print(diff["summary"])
             for k, md in (diff.get("metric_deltas") or {}).items():
-                print(f"  - {k}: {md['before']} -> {md['after']} ({md['delta']:+})")
+                if md.get("status") == "measured" and md.get("delta") is not None:
+                    print(f"  - {k}: {md['before']} -> {md['after']} ({md['delta']:+})")
+                else:
+                    print(f"  - {k}: unknown (before={md.get('before')}, after={md.get('after')})")
             for nf in (diff.get("new_findings") or []):
                 print(f"  + NEW: {nf['key']} — {nf['summary']}")
             for rf in (diff.get("resolved_findings") or []):

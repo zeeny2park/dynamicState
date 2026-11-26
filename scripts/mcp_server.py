@@ -3418,7 +3418,7 @@ def runtime_explain_process_behavior(
 def runtime_get_playbook(
     symptom: Optional[str] = None,
     pid: Optional[int] = None,
-    max_iterations: int = 6,
+    max_iterations: Optional[int] = None,
     language: str = "en",
     remote_host: Optional[str] = None,
 ) -> str:
@@ -3458,8 +3458,8 @@ def runtime_run_playbook_loop(
     pid: int,
     symptom: str,
     companion_elf: Optional[str] = None,
-    max_iterations: int = 4,
-    time_budget_s: float = 20.0,
+    max_iterations: Optional[int] = None,
+    time_budget_s: Optional[float] = None,
     language: str = "en",
     compact: bool = True,
     remote_host: Optional[str] = None,
@@ -3608,6 +3608,10 @@ if hasattr(server, "resource"):
     server.resource("dynamicstate://playbooks/{playbook_id}")(resource_playbook)
     server.resource("dynamicstate://ledger/{host}/{pid}/decision-log")(resource_ledger_decision_log)
     server.resource("dynamicstate://ledger/{host}/{pid}/code-anchors")(resource_ledger_code_anchors)
+
+
+def main() -> None:
+    server.run(transport="stdio")
 
 
 if __name__ == "__main__":
