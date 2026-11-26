@@ -1486,6 +1486,99 @@ def runtime_target_connect(
         })
 
 
+
+# ---------------------------------------------------------------------------
+# P0/P1/P2: Cross-Call Tracking Ledger, Tool-Surface Tiering & Enrichment
+# ---------------------------------------------------------------------------
+MCP_TOOL_TIERS: Dict[str, List[str]] = {
+    "TIER0_ENTRY": [
+        "runtime_diagnose_process",
+        "runtime_explain_process_behavior",
+        "runtime_get_playbook",
+    ],
+    "TIER1_NARROWING": [
+        "runtime_inspect_thread_callstack_and_locks",
+        "runtime_heap_leak_candidates",
+        "runtime_trace_ipc_pipeline",
+        "runtime_build_dependency_graph",
+        "runtime_scan_heap_objects",
+    ],
+    "TIER2_DEEP_INSPECT": [
+        "runtime_heap_owner_lookup",
+        "runtime_symbol_search",
+        "runtime_eval_memory_path",
+        "runtime_correlate_source_and_state",
+        "runtime_coerce_expression",
+    ],
+    "TIER3_TEMPORAL_WATCH": [
+        "runtime_capture_and_diff",
+        "runtime_watch_until_condition",
+        "runtime_flight_recorder_time_machine",
+        "runtime_detect_behavioral_drift",
+    ],
+}
+
+CORE_MCP_TOOLS: List[str] = [
+    tool for tier_tools in MCP_TOOL_TIERS.values() for tool in tier_tools
+]
+
+
+def get_mcp_tool_tiers(profile: Optional[str] = None) -> Dict[str, Any]:
+    """Return the tiered MCP tool map for coding agents (supports 'core' and 'full' profiles)."""
+    active = (profile or os.environ.get("DYNAMICSTATE_MCP_TOOL_PROFILE") or "full").strip().lower()
+    if active not in ("core", "full"):
+        active = "full"
+    return {
+        "active_profile": active,
+        "core_tool_count": len(CORE_MCP_TOOLS),
+        "tiers": MCP_TOOL_TIERS,
+        "recommended_progression": [
+            "TIER0_ENTRY -> TIER1_NARROWING -> TIER2_DEEP_INSPECT -> TIER3_TEMPORAL_WATCH"
+        ],
+    }
+
+
+def _enrich_tracking(
+    tool_name: str,
+    payload: Dict[str, Any],
+    *,
+    pid: Optional[int] = None,
+    companion_elf: Optional[str] = None,
+    args: Optional[Dict[str, Any]] = None,
+    remote_host: Optional[str] = None,
+    ssh_user: Optional[str] = None,
+    ssh_port: int = 22,
+    ssh_key: Optional[str] = None,
+    ssh_proxy_jump: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Safely enrich a tool payload with cross-call ledger, repeat-call delta,
+    code_anchors, anti-looping next_drilldown, and self-recovery actions.
+    """
+    try:
+        from extractor.tracking_ledger import enrich_tool_response
+        rm = (
+            {
+                "remote_host": remote_host,
+                "ssh_user": ssh_user,
+                "ssh_port": ssh_port,
+                "ssh_key": ssh_key,
+                "ssh_proxy_jump": ssh_proxy_jump,
+            }
+            if remote_host
+            else None
+        )
+        return enrich_tool_response(
+            tool_name,
+            payload,
+            pid=pid,
+            companion_elf=companion_elf,
+            args=args,
+            remote_target=rm,
+        )
+    except Exception:
+        return payload
+
+
 @server.tool()
 def runtime_symbol_search(
     companion_elf: Optional[str] = None,
@@ -1544,14 +1637,19 @@ def runtime_symbol_search(
             if q_low:
                 fast_syms = [s for s in fast_syms if q_low in s["name"].lower()]
             fast_syms = fast_syms[:max(1, min(int(limit), 200))]
-            return _format_watch_result({
+            out_fast = {
                 "success": True,
                 "companion_elf": os.path.abspath(companion_elf),
                 "query": query,
                 "mode": "fast_symtab",
                 "returned_count": len(fast_syms),
                 "symbols": fast_syms,
-            })
+            }
+            return _format_watch_result(_enrich_tracking(
+                "runtime_symbol_search", out_fast, pid=pid, companion_elf=os.path.abspath(companion_elf),
+                args={"query": query, "fast_only": True}, remote_host=remote_host, ssh_user=ssh_user,
+                ssh_port=ssh_port, ssh_key=ssh_key, ssh_proxy_jump=ssh_proxy_jump,
+            ))
 
         idx = DwarfIndexer.get_index(companion_elf)
 
@@ -1577,7 +1675,11 @@ def runtime_symbol_search(
             _next = build_narrow_tool_next_steps("runtime_symbol_search", out, pid=pid, companion_elf=os.path.abspath(companion_elf), remote_target=_rm)
             if _next:
                 out["next_drilldown"] = _next
-        return _format_watch_result(out)
+        return _format_watch_result(_enrich_tracking(
+            "runtime_symbol_search", out, pid=pid, companion_elf=os.path.abspath(companion_elf),
+            args={"query": query, "category": category, "fast_only": fast_only},
+            remote_host=remote_host, ssh_user=ssh_user, ssh_port=ssh_port, ssh_key=ssh_key, ssh_proxy_jump=ssh_proxy_jump,
+        ))
     except Exception as e:
         return _format_watch_result({"success": False, "error": str(e), "error_code": type(e).__name__})
 
@@ -1623,9 +1725,17 @@ def runtime_eval_memory_path(
             ssh_key=ssh_key,
             ssh_proxy_jump=ssh_proxy_jump,
         )
-        return _format_watch_result({"success": True, **data})
+        return _format_watch_result(_enrich_tracking(
+            "runtime_eval_memory_path", {"success": True, **data}, pid=pid, companion_elf=companion_elf,
+            args={"expressions": expressions}, remote_host=remote_host, ssh_user=ssh_user,
+            ssh_port=ssh_port, ssh_key=ssh_key, ssh_proxy_jump=ssh_proxy_jump,
+        ))
     except Exception as e:
-        return _format_watch_result({"success": False, "error": str(e), "error_code": type(e).__name__})
+        return _format_watch_result(_enrich_tracking(
+            "runtime_eval_memory_path", {"success": False, "error": str(e), "error_code": type(e).__name__},
+            pid=pid, companion_elf=companion_elf, args={"expressions": expressions},
+            remote_host=remote_host, ssh_user=ssh_user, ssh_port=ssh_port, ssh_key=ssh_key, ssh_proxy_jump=ssh_proxy_jump,
+        ))
 
 
 @server.tool()
@@ -1666,7 +1776,11 @@ def runtime_capture_and_diff(
             ssh_key=ssh_key,
             ssh_proxy_jump=ssh_proxy_jump,
         )
-        return _format_watch_result({"success": True, **data})
+        return _format_watch_result(_enrich_tracking(
+            "runtime_capture_and_diff", {"success": True, **data}, pid=pid, companion_elf=companion_elf,
+            args={"expressions": expressions, "wait_ms": wait_ms}, remote_host=remote_host, ssh_user=ssh_user,
+            ssh_port=ssh_port, ssh_key=ssh_key, ssh_proxy_jump=ssh_proxy_jump,
+        ))
     except Exception as e:
         return _format_watch_result({"success": False, "error": str(e), "error_code": type(e).__name__})
 
@@ -2037,7 +2151,11 @@ def runtime_watch_until_condition(
             ssh_key=ssh_key,
             ssh_proxy_jump=ssh_proxy_jump,
         )
-        return _format_watch_result({"success": True, **res})
+        return _format_watch_result(_enrich_tracking(
+            "runtime_watch_until_condition", {"success": True, **res}, pid=pid, companion_elf=companion_elf,
+            args={"timeout_ms": timeout_ms}, remote_host=remote_host, ssh_user=ssh_user,
+            ssh_port=ssh_port, ssh_key=ssh_key, ssh_proxy_jump=ssh_proxy_jump,
+        ))
     except Exception as e:
         return _format_watch_result({"success": False, "error": str(e), "error_code": type(e).__name__})
 
@@ -2126,7 +2244,10 @@ def runtime_inspect_thread_callstack_and_locks(
         out = {"success": True, **res}
         if _next:
             out["next_drilldown"] = _next
-        return _format_watch_result(out)
+        return _format_watch_result(_enrich_tracking(
+            "runtime_inspect_thread_callstack_and_locks", out, pid=pid, companion_elf=companion_elf,
+            remote_host=remote_host, ssh_user=ssh_user, ssh_port=ssh_port, ssh_key=ssh_key, ssh_proxy_jump=ssh_proxy_jump,
+        ))
     except Exception as e:
         return _format_watch_result({"success": False, "error": str(e), "error_code": type(e).__name__})
 
@@ -2351,7 +2472,10 @@ def runtime_trace_ipc_pipeline(
         _next = build_narrow_tool_next_steps("runtime_trace_ipc_pipeline", out, pid=pid, companion_elf=companion_elf, remote_target=_rm)
         if _next:
             out["next_drilldown"] = _next
-        return _format_watch_result(out)
+        return _format_watch_result(_enrich_tracking(
+            "runtime_trace_ipc_pipeline", out, pid=pid, companion_elf=companion_elf,
+            remote_host=remote_host, ssh_user=ssh_user, ssh_port=ssh_port, ssh_key=ssh_key, ssh_proxy_jump=ssh_proxy_jump,
+        ))
     except Exception as e:
         return _format_watch_result({"success": False, "error": str(e), "error_code": type(e).__name__})
 
@@ -2390,7 +2514,11 @@ def runtime_scan_heap_objects(
             ssh_key=ssh_key,
             ssh_proxy_jump=ssh_proxy_jump,
         )
-        return _format_watch_result({"success": True, **res})
+        return _format_watch_result(_enrich_tracking(
+            "runtime_scan_heap_objects", {"success": True, **res}, pid=pid, companion_elf=companion_elf,
+            args={"class_filter": class_filter}, remote_host=remote_host, ssh_user=ssh_user,
+            ssh_port=ssh_port, ssh_key=ssh_key, ssh_proxy_jump=ssh_proxy_jump,
+        ))
     except Exception as e:
         return _format_watch_result({"success": False, "error": str(e), "error_code": type(e).__name__})
 
@@ -2484,7 +2612,11 @@ def runtime_heap_owner_lookup(
         _next = build_narrow_tool_next_steps("runtime_heap_owner_lookup", out, pid=pid, companion_elf=companion_elf, remote_target=_rm)
         if _next:
             out["next_drilldown"] = _next
-        return _format_watch_result(out)
+        return _format_watch_result(_enrich_tracking(
+            "runtime_heap_owner_lookup", out, pid=pid, companion_elf=companion_elf,
+            args={"addresses": raw[:8]}, remote_host=remote_host, ssh_user=ssh_user,
+            ssh_port=ssh_port, ssh_key=ssh_key, ssh_proxy_jump=ssh_proxy_jump,
+        ))
     except Exception as e:
         return _format_watch_result({"success": False, "error": str(e), "error_code": type(e).__name__})
 
@@ -2529,7 +2661,10 @@ def runtime_heap_leak_candidates(
         }
         if _next:
             out["next_drilldown"] = _next
-        return _format_watch_result(out)
+        return _format_watch_result(_enrich_tracking(
+            "runtime_heap_leak_candidates", out, pid=pid, companion_elf=companion_elf,
+            remote_host=remote_host, ssh_user=ssh_user, ssh_port=ssh_port, ssh_key=ssh_key, ssh_proxy_jump=ssh_proxy_jump,
+        ))
     except Exception as e:
         return _format_watch_result({"success": False, "error": str(e), "error_code": type(e).__name__})
 
@@ -2562,7 +2697,10 @@ def runtime_build_dependency_graph(
             ssh_key=ssh_key,
             ssh_proxy_jump=ssh_proxy_jump,
         )
-        return _format_watch_result({"success": True, **res})
+        return _format_watch_result(_enrich_tracking(
+            "runtime_build_dependency_graph", {"success": True, **res}, pid=pid, companion_elf=companion_elf,
+            remote_host=remote_host, ssh_user=ssh_user, ssh_port=ssh_port, ssh_key=ssh_key, ssh_proxy_jump=ssh_proxy_jump,
+        ))
     except Exception as e:
         return _format_watch_result({"success": False, "error": str(e), "error_code": type(e).__name__})
 
@@ -2603,7 +2741,10 @@ def runtime_correlate_source_and_state(
             ssh_key=ssh_key,
             ssh_proxy_jump=ssh_proxy_jump,
         )
-        return _format_watch_result({"success": True, **res})
+        return _format_watch_result(_enrich_tracking(
+            "runtime_correlate_source_and_state", {"success": True, **res}, pid=pid, companion_elf=companion_elf,
+            remote_host=remote_host, ssh_user=ssh_user, ssh_port=ssh_port, ssh_key=ssh_key, ssh_proxy_jump=ssh_proxy_jump,
+        ))
     except Exception as e:
         return _format_watch_result({"success": False, "error": str(e), "error_code": type(e).__name__})
 
@@ -3265,7 +3406,10 @@ def runtime_explain_process_behavior(
             target=remote_target,
             engine=runtime.expert_diagnostic_engine,
         )
-        return _format_watch_result(res)
+        return _format_watch_result(_enrich_tracking(
+            "runtime_explain_process_behavior", res, pid=pid, companion_elf=debug_image,
+            remote_host=(remote_target or {}).get("remote_host") if isinstance(remote_target, dict) else None,
+        ))
     except Exception as e:
         return _format_watch_result({"success": False, "error": str(e), "error_code": type(e).__name__})
 
@@ -3279,6 +3423,7 @@ def runtime_get_playbook() -> str:
         "success": True,
         "skill": "diagnose-process",
         "recommended_workflow": workflow_steps(),
+        "tool_tiers": get_mcp_tool_tiers(),
         "playbook": skill_body(),
     })
 

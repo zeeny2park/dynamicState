@@ -139,3 +139,7 @@ untagged applies to both. (`dynamic-state skill install` installs this file as i
 - Linux, same-user (or ptrace-permitted) processes; x86_64 and aarch64 hosts.
 - Heap tools support glibc ptmalloc only.
 - The diagnosis also runs against a remote target over SSH (ARM64 / x86-64 glibc board, host-side analysis); every heap byte then crosses the link, so heap checks are capped and slower, and the remote gaps listed in `not_covered` apply. Key authentication only (no passwords).
+
+### Continuous Tracking & Tool Tiers (Multi-Hop Coding-Agent Protocol)
+- **Tool Progression**: Follow `TIER0_ENTRY` (`runtime_diagnose_process` / `runtime_explain_process_behavior`) -> `TIER1_NARROWING` (`runtime_inspect_thread_callstack_and_locks` / `runtime_heap_leak_candidates` / `runtime_trace_ipc_pipeline` / `runtime_build_dependency_graph`) -> `TIER2_DEEP_INSPECT` (`runtime_heap_owner_lookup` / `runtime_symbol_search` / `runtime_eval_memory_path` / `runtime_correlate_source_and_state`) -> `TIER3_TEMPORAL_WATCH` (`runtime_capture_and_diff` / `runtime_watch_until_condition`).
+- **Use Tracking Signals**: Check `delta_from_last_call` on repeated calls to separate stuck threads/growing leaks from normal progress; follow `code_anchors` (`file:line`, `variable_path`) to jump directly into repository source files; follow `recovery_actions` if a lookup fails or returns empty; and rely on `tracking_context` to avoid repeating dead-end calls.

@@ -975,6 +975,62 @@ def build_suggested_actions(
                 "expected_value_ko": "모든 스레드의 정확한 소스 프레임과 락 대기 관계를 확인합니다.",
             })
 
+        _has_temporal_gap = any(
+            any(k in r.upper() for k in (
+                "FD_LEAK", "THREAD_LEAK", "MAPPING_GROWTH", "LOCK_CONTENTION",
+                "HEAP_RETENTION", "MEMORY_GROWTH", "HEAP_GROWTH", "VARIABLE_CHANGES"
+            ))
+            for r in _inconclusive_rids
+        )
+        if _has_temporal_gap:
+            _ps = (profile.get("summary") or {}) if isinstance(profile, dict) else {}
+            _cur_rss = _ps.get("rss_kb")
+            _cur_fds = _ps.get("open_fds")
+            _cur_thr = _ps.get("thread_count")
+            _cond_hint = (
+                f"rss_kb > {int(round(float(_cur_rss) * 1.15))}" if isinstance(_cur_rss, (int, float)) and _cur_rss > 0 else
+                f"open_fds > {int(_cur_fds) + 20}" if isinstance(_cur_fds, int) and _cur_fds >= 0 else
+                f"thread_count > {int(_cur_thr) + 5}" if isinstance(_cur_thr, int) and _cur_thr > 0 else
+                "rss_kb > 0"
+            )
+            _add({
+                "id": "drilldown_temporal_capture_and_diff",
+                "priority": "medium",
+                "category": "temporal_escalation",
+                "title_en": "Escalate to temporal before/after diff capture (5s window)",
+                "title_ko": "시간축 전후 비교 캡처(5초 구간)로 간헐·저속 이상 추적 승격",
+                "reason_en": "Growth/contention checks were inconclusive in a short snapshot; capture a before/after diff over 5s to observe sustained deltas.",
+                "reason_ko": "단기 스냅샷에서 성장·경합 판정이 불충분했으므로 5초 간격 전후 비교 캡처로 지속 변화량을 확인하세요.",
+                "mcp_tool": "runtime_capture_and_diff",
+                "mcp_args": {**base_narrow_args, "wait_ms": 5000},
+                "next_hop_tool": "runtime_correlate_source_and_state",
+                "estimated_cost": "medium",
+                "expected_evidence": "Before/after memory, thread, FD, and variable deltas across a 5s window",
+                "risk_level": "read_only_zero_stop",
+                "requires_user_approval": False,
+                "expected_value_en": "Separates transient jitter from real slow leaks or stalls.",
+                "expected_value_ko": "일시적 변동과 실제 저속 누수·지연을 구분합니다.",
+            })
+            if debug_image:
+                _add({
+                    "id": "drilldown_watch_until_condition",
+                    "priority": "medium",
+                    "category": "temporal_escalation",
+                    "title_en": f"Arm condition-triggered watch ({_cond_hint}) for intermittent reproduction",
+                    "title_ko": f"간헐적 재현 포착용 조건 감시 설정 ({_cond_hint})",
+                    "reason_en": "If the fault only triggers under load, arm a zero-stop condition watch to capture state the moment thresholds cross.",
+                    "reason_ko": "부하 시에만 재현되는 문제라면 무중단 조건 감시를 걸어 임계치 초과 순간의 상태를 자동 포착하세요.",
+                    "mcp_tool": "runtime_watch_until_condition",
+                    "mcp_args": {**base_narrow_args, "condition": _cond_hint, "timeout_ms": 30000},
+                    "next_hop_tool": "runtime_correlate_source_and_state",
+                    "estimated_cost": "medium",
+                    "expected_evidence": "Exact runtime state snapshot captured when the anomaly threshold triggers",
+                    "risk_level": "read_only_zero_stop",
+                    "requires_user_approval": False,
+                    "expected_value_en": "Captures intermittent spikes without stopping the target process.",
+                    "expected_value_ko": "프로세스를 중단하지 않고 간헐적 이상 발생 순간을 포착합니다.",
+                })
+
         if _has_var_gap and debug_image:
             _add({
                 "id": "drilldown_symbol_search",
@@ -1159,6 +1215,24 @@ def build_inconclusive_drilldown(
                 "runtime_inspect_thread_callstack_and_locks",
                 act.get("mcp_args") if act else {},
                 "runtime_watch_until_condition",
+            )
+        temp_inc = [
+            str(c.get("recipe_id")) for c in inc_checks
+            if any(k in str(c.get("recipe_id") or "").upper() for k in (
+                "FD_LEAK", "THREAD_LEAK", "MAPPING_GROWTH", "LOCK_CONTENTION",
+                "HEAP_RETENTION", "MEMORY_GROWTH", "HEAP_GROWTH", "VARIABLE_CHANGES"
+            ))
+        ]
+        if temp_inc:
+            act = _find_action("runtime_capture_and_diff") or _find_action("runtime_watch_until_condition")
+            _add_cause(
+                "temporal_window_too_short",
+                temp_inc,
+                "Trend/contention checks could not decide in a short single window; escalate to runtime_capture_and_diff or runtime_watch_until_condition.",
+                "짧은 단일 관측 창에서 추세·경합 판정이 어려웠습니다. runtime_capture_and_diff 또는 runtime_watch_until_condition으로 시간축 추적을 이어가세요.",
+                act.get("mcp_tool") if act else "runtime_capture_and_diff",
+                act.get("mcp_args") if act else {},
+                "runtime_correlate_source_and_state",
             )
         if other_inc:
             act = _find_action("runtime_symbol_search") or _find_action("runtime_explain_process_behavior")
@@ -1527,5 +1601,148 @@ def build_narrow_tool_next_steps(
                 "risk_level": "read_only_zero_stop",
                 "requires_user_approval": False,
             }, target_dict))
+
+    elif tool_name == "runtime_eval_memory_path":
+        if companion_elf:
+            out.append(validate_suggested_action({
+                "id": "chain_eval_to_source_bridge",
+                "priority": "high",
+                "category": "source_code_bridge",
+                "title_en": "Correlate evaluated runtime values with repository source code",
+                "title_ko": "조회된 런타임 변수 값을 소스 코드 위치와 직접 대조",
+                "reason_en": "Map the observed runtime variable/struct state to exact file:line declarations and mutation sites.",
+                "reason_ko": "관측된 런타임 변수·구조체 상태를 실제 소스 파일(file:line) 선언 및 갱신 지점과 연결하세요.",
+                "mcp_tool": "runtime_correlate_source_and_state",
+                "mcp_args": dict(base_args),
+                "estimated_cost": "low",
+                "expected_evidence": "Source-code file:line anchors and correlated live state",
+                "risk_level": "read_only_zero_stop",
+                "requires_user_approval": False,
+            }, target_dict))
+        out.append(validate_suggested_action({
+            "id": "chain_eval_to_capture_diff",
+            "priority": "medium",
+            "category": "temporal_escalation",
+            "title_en": "Capture a 3s before/after diff to see if the evaluated state is mutating or stuck",
+            "title_ko": "3초 전후 비교 캡처로 해당 상태의 변화·정체 여부 확인",
+            "reason_en": "Comparing two snapshots separates live progress from permanently stuck state.",
+            "reason_ko": "두 시점의 스냅샷을 비교해 정상 진행 중인지 영구 정체 상태인지 판별하세요.",
+            "mcp_tool": "runtime_capture_and_diff",
+            "mcp_args": {**base_args, "wait_ms": 3000},
+            "estimated_cost": "medium",
+            "expected_evidence": "Before/after diff of live variables and thread progress",
+            "risk_level": "read_only_zero_stop",
+            "requires_user_approval": False,
+        }, target_dict))
+
+    elif tool_name == "runtime_scan_heap_objects":
+        objs = payload.get("objects") or payload.get("instances") or []
+        addrs = [str(o.get("address")).strip() for o in objs[:6] if isinstance(o, dict) and str(o.get("address") or "").startswith("0x")]
+        if addrs:
+            out.append(validate_suggested_action({
+                "id": "chain_vtable_to_heap_owner",
+                "priority": "high",
+                "category": "scope_narrowing",
+                "title_en": f"Trace owning variables for {len(addrs)} scanned C++ object address(es)",
+                "title_ko": f"스캔된 C++ 객체 주소 {len(addrs)}건의 소유 변수 역추적",
+                "reason_en": "Reverse-reference lookup identifies which container or global retains these C++ instances.",
+                "reason_ko": "역참조 추적으로 어떤 컨테이너나 전역 변수가 이 C++ 인스턴스를 유지하는지 확인하세요.",
+                "mcp_tool": "runtime_heap_owner_lookup",
+                "mcp_args": {**base_args, "addresses": addrs, "include_typed_locals": True},
+                "estimated_cost": "medium",
+                "expected_evidence": "Owning container/global paths for scanned C++ objects",
+                "risk_level": "read_only_zero_stop",
+                "requires_user_approval": False,
+            }, target_dict))
+        elif companion_elf:
+            out.append(validate_suggested_action({
+                "id": "chain_vtable_to_source_correlate",
+                "priority": "medium",
+                "category": "source_code_bridge",
+                "title_en": "Correlate process state with source code",
+                "title_ko": "프로세스 상태와 소스 코드 위치 대조",
+                "reason_en": "Map current runtime anomalies to source file:line anchors.",
+                "reason_ko": "현재 런타임 상태를 소스 코드 위치와 연결해 분석하세요.",
+                "mcp_tool": "runtime_correlate_source_and_state",
+                "mcp_args": dict(base_args),
+                "estimated_cost": "low",
+                "expected_evidence": "Source-code anchors for active subsystems",
+                "risk_level": "read_only_zero_stop",
+                "requires_user_approval": False,
+            }, target_dict))
+
+    elif tool_name == "runtime_build_dependency_graph":
+        blockers = payload.get("root_blocker_nodes") or []
+        out.append(validate_suggested_action({
+            "id": "chain_depgraph_to_callstacks",
+            "priority": "high" if blockers else "medium",
+            "category": "scope_narrowing",
+            "title_en": (
+                f"Inspect call stacks for {len(blockers)} root blocker node(s)"
+                if blockers else "Inspect per-thread call stacks and lock owners"
+            ),
+            "title_ko": (
+                f"근본 차단 노드 {len(blockers)}건의 스레드 콜스택 및 락 소유자 조회"
+                if blockers else "스레드별 콜스택 및 락 소유자 조회"
+            ),
+            "reason_en": "Verify exact source frames of the root blocker threads identified in the dependency graph.",
+            "reason_ko": "의존성 그래프에서 식별된 근본 차단 스레드의 정확한 소스 프레임을 확인하세요.",
+            "mcp_tool": "runtime_inspect_thread_callstack_and_locks",
+            "mcp_args": dict(base_args),
+            "estimated_cost": "low",
+            "expected_evidence": "Exact stack frames and mutex ownership for root blockers",
+            "risk_level": "read_only_zero_stop",
+            "requires_user_approval": False,
+        }, target_dict))
+
+    elif tool_name == "runtime_explain_process_behavior":
+        out.append(validate_suggested_action({
+            "id": "chain_explain_to_callstacks",
+            "priority": "medium",
+            "category": "scope_narrowing",
+            "title_en": "Drill down into active thread call stacks and lock waits",
+            "title_ko": "활성 스레드 콜스택 및 락 대기 상태 심층 조회",
+            "reason_en": "Follow high-level behavior synthesis with concrete per-thread stack frames and lock edges.",
+            "reason_ko": "상위 행위 요약에 이어 스레드별 실제 콜스택과 락 대기 관계를 확인하세요.",
+            "mcp_tool": "runtime_inspect_thread_callstack_and_locks",
+            "mcp_args": dict(base_args),
+            "estimated_cost": "low",
+            "expected_evidence": "Per-thread source frames and wait channels",
+            "risk_level": "read_only_zero_stop",
+            "requires_user_approval": False,
+        }, target_dict))
+
+    elif tool_name in ("runtime_capture_and_diff", "runtime_watch_until_condition"):
+        if companion_elf:
+            out.append(validate_suggested_action({
+                "id": "chain_temporal_to_source_bridge",
+                "priority": "high",
+                "category": "source_code_bridge",
+                "title_en": "Correlate captured temporal delta with source code locations",
+                "title_ko": "포착된 시간축 변화량을 소스 코드 위치와 연결",
+                "reason_en": "Bridge the captured runtime mutation/threshold event directly to the owning file:line in source.",
+                "reason_ko": "포착된 런타임 변화·임계치 이벤트를 소스 코드의 해당 file:line 위치로 바로 연결하세요.",
+                "mcp_tool": "runtime_correlate_source_and_state",
+                "mcp_args": dict(base_args),
+                "estimated_cost": "low",
+                "expected_evidence": "Source-code file:line anchors matching the observed temporal delta",
+                "risk_level": "read_only_zero_stop",
+                "requires_user_approval": False,
+            }, target_dict))
+        out.append(validate_suggested_action({
+            "id": "chain_temporal_to_callstacks",
+            "priority": "medium",
+            "category": "scope_narrowing",
+            "title_en": "Inspect thread call stacks at the captured state",
+            "title_ko": "포착 시점의 스레드 콜스택 및 락 상태 확인",
+            "reason_en": "Correlate the temporal change with active thread call stacks.",
+            "reason_ko": "시간축 변화와 현재 활성 스레드 콜스택을 대조하세요.",
+            "mcp_tool": "runtime_inspect_thread_callstack_and_locks",
+            "mcp_args": dict(base_args),
+            "estimated_cost": "low",
+            "expected_evidence": "Per-thread stack frames explaining the observed change",
+            "risk_level": "read_only_zero_stop",
+            "requires_user_approval": False,
+        }, target_dict))
 
     return out
