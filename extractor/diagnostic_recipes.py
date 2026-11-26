@@ -1169,7 +1169,7 @@ class DiagnosticRecipeRegistry:
 
         if not prerequisites_met or observation_data.get("prerequisites_missing"):
             missing = list(observation_data.get("missing_prerequisites") or recipe.required_prerequisites)
-            return RecipeEvaluationResult(
+            res = RecipeEvaluationResult(
                 recipe_id=recipe_id,
                 status=RECIPE_STATUS_INSUFFICIENT_EVIDENCE,
                 confidence=0.0,
@@ -1179,9 +1179,104 @@ class DiagnosticRecipeRegistry:
                 recommended_action=f"Ensure prerequisites ({', '.join(missing)}) are satisfied before re-evaluating.",
                 details={"prerequisites_met": False},
             )
+            return _attach_tiered_fallback(recipe, res)
 
         # Dispatch deterministic evaluation logic per recipe
-        return _evaluate_specific_recipe(recipe, observation_data)
+        res = _evaluate_specific_recipe(recipe, observation_data)
+        return _attach_tiered_fallback(recipe, res)
+
+
+def _tiered_fallback_ladder_for_recipe(recipe: DiagnosticRecipe) -> List[Dict[str, str]]:
+    """Return a concrete multi-tier MCP scope-narrowing fallback ladder for an inconclusive recipe."""
+    rid = str(recipe.recipe_id or "").upper()
+    cat = str(getattr(recipe, "category", None) or getattr(recipe, "name", "") or "").upper()
+    if any(k in rid for k in ("HEAP", "LEAK", "MEMORY", "UAF", "USE_AFTER_FREE", "ALLOC", "FRAGMENT")) or "MEMORY" in cat:
+        return [
+            {
+                "tier": "TIER2_BOUNDED_SAMPLING",
+                "tool": "runtime_heap_leak_candidates",
+                "purpose": "Rank top growing/retained heap size classes and candidate addresses without a full heap walk",
+            },
+            {
+                "tier": "TIER3_OWNERSHIP_TRACE",
+                "tool": "runtime_heap_owner_lookup",
+                "purpose": "Trace pointer ownership chains for top candidate addresses from Tier 2",
+            },
+            {
+                "tier": "TIER4_SYMBOL_VERIFICATION",
+                "tool": "runtime_eval_memory_path",
+                "purpose": "Inspect specific owning structs, allocator headers, or global counters directly",
+            },
+        ]
+    if any(k in rid for k in ("LOCK", "DEADLOCK", "MUTEX", "THREAD", "HANG", "STARV", "SPIN", "CPU", "FUTEX")) or any(
+        k in cat for k in ("LOCK", "THREAD", "CONCURRENCY", "CPU", "DEADLOCK")
+    ):
+        return [
+            {
+                "tier": "TIER2_THREAD_LOCK_INSPECTION",
+                "tool": "runtime_inspect_thread_callstack_and_locks",
+                "purpose": "Capture exact waiting TID callstacks, futex wait addresses, and lock owners",
+            },
+            {
+                "tier": "TIER3_SYMBOL_DISCOVERY",
+                "tool": "runtime_symbol_search",
+                "purpose": "Locate mutex, queue, or state globals matching the blocked callstack frames",
+            },
+            {
+                "tier": "TIER4_STATE_INSPECTION",
+                "tool": "runtime_eval_memory_path",
+                "purpose": "Read lock owner fields, refcounts, or condition state directly",
+            },
+        ]
+    if any(k in rid for k in ("IPC", "PIPE", "SOCKET", "FD", "IO", "NET")) or "IPC" in cat or "IO" in cat:
+        return [
+            {
+                "tier": "TIER2_IPC_PIPELINE_TRACE",
+                "tool": "runtime_trace_ipc_pipeline",
+                "purpose": "Trace pipe/socket/FD peer chains and blocked producer/consumer endpoints",
+            },
+            {
+                "tier": "TIER3_THREAD_CALLSTACK",
+                "tool": "runtime_inspect_thread_callstack_and_locks",
+                "purpose": "Correlate blocked I/O file descriptors with thread stacks",
+            },
+        ]
+    return [
+        {
+            "tier": "TIER2_BEHAVIOR_EXPLANATION",
+            "tool": "runtime_explain_process_behavior",
+            "purpose": "Synthesize dominant process behavior, active wait states, and subsystem clues",
+        },
+        {
+            "tier": "TIER3_SYMBOL_DISCOVERY",
+            "tool": "runtime_symbol_search",
+            "purpose": "Discover relevant global state variables or queues for targeted inspection",
+        },
+        {
+            "tier": "TIER4_DIRECT_MEMORY_EVAL",
+            "tool": "runtime_eval_memory_path",
+            "purpose": "Verify a specific hypothesis by reading targeted runtime struct fields",
+        },
+    ]
+
+
+def _attach_tiered_fallback(recipe: DiagnosticRecipe, res: RecipeEvaluationResult) -> RecipeEvaluationResult:
+    """Attach multi-tier fallback metadata and concrete next-tool action on inconclusive/ambiguous results."""
+    if res.status not in (RECIPE_STATUS_INSUFFICIENT_EVIDENCE, RECIPE_STATUS_AMBIGUOUS):
+        return res
+    ladder = _tiered_fallback_ladder_for_recipe(recipe)
+    details = dict(res.details or {})
+    if "fallback_ladder" not in details:
+        details["fallback_ladder"] = ladder
+    if "next_fallback_tool" not in details and ladder:
+        details["next_fallback_tool"] = ladder[0]["tool"]
+    res.details = details
+    if not (res.recommended_action or "").strip() and ladder:
+        chain = " -> ".join(step["tool"] for step in ladder[:2])
+        res.recommended_action = (
+            f"Narrow scope via tiered fallback ({chain}): {ladder[0]['purpose']}."
+        )
+    return res
 
 
 # -----------------------------------------------------------------------------
@@ -1294,12 +1389,21 @@ def _evaluate_leak_investigation(recipe: "DiagnosticRecipe", data: Dict[str, Any
         lims = lims + ["growth observed, not established as a leak: RSS %+d KB but in-use heap %+d KB over the "
                        "walks (fragmentation, file / anonymous mappings outside malloc, or allocator caching)"
                        % (int(trend.get("rss_growth_kb") or 0), int(li.get("in_use_growth_bytes") or 0) // 1024)]
+    next_action = (
+        "RSS grew without in-use malloc heap growth; call runtime_heap_leak_candidates(pid=...) and "
+        "runtime_explain_process_behavior(pid=...) to distinguish mmap/allocator caching from a live heap leak."
+        if (verdict == "NO_GROWTH" and rss_grew) else
+        "Full leak attribution was inconclusive; narrow scope with runtime_heap_leak_candidates(pid=...) "
+        "then trace top candidate addresses with runtime_heap_owner_lookup(addresses=[...])."
+    )
     return RecipeEvaluationResult(
         recipe_id=rid, status=RECIPE_STATUS_INSUFFICIENT_EVIDENCE, confidence=0.3,
         confidence_basis="; ".join(lims) or str(li.get("summary") or verdict),
         missing_evidence=["heap_growth_attributed_to_unreachable_blocks_or_an_owner"],
         limitations=lims,
-        details={"growth_confirmed": False, "leak_verdict": verdict, "limitations": lims},
+        recommended_action=next_action,
+        details={"growth_confirmed": False, "leak_verdict": verdict, "limitations": lims,
+                 "next_fallback_tool": "runtime_heap_leak_candidates"},
     )
 
 
@@ -1356,7 +1460,16 @@ def _evaluate_integrity_investigation(recipe: "DiagnosticRecipe", data: Dict[str
         [g["description"] for g in glob]
     stack_facts = [w["description"] for w in stack_w]
     confirmed = any(d.get("status") == "confirmed" for d in defects)
-    base = {"memory_integrity_mode": mi.get("mode"), "heap_check_status": heap.get("status"), "limitations": lims}
+    base = {
+        "memory_integrity_mode": mi.get("mode"),
+        "heap_check_status": heap.get("status"),
+        "limitations": lims,
+    }
+    if heap.get("sampling_tier"):
+        base["sampling_tier"] = heap.get("sampling_tier")
+    _sm = heap.get("sampling_summary") or heap.get("sampling_metadata")
+    if isinstance(_sm, dict):
+        base["sampling_metadata"] = _sm
     if facts:
         d = dict(base, finding_category=CATEGORY_MEMORY_CORRUPTION, corruption_confirmed=confirmed,
                  finding_summary="; ".join(facts[:4]))
@@ -1414,12 +1527,44 @@ def _evaluate_integrity_investigation(recipe: "DiagnosticRecipe", data: Dict[str
             contradicting_facts=[txt], limitations=lims,
             recommended_action="Refute heap metadata corruption in the walked heap.",
             details=dict(base, corruption_confirmed=False))
+    if heap.get("status") == "PARTIAL_SAMPLED" and not hint:
+        sm = heap.get("sampling_summary") or heap.get("sampling_metadata") or {}
+        chk = heap.get("checked") or {}
+        txt = (
+            "Tier-2 bounded heap sampling checked %d active arena(s), %d tcache entries, %d fastbin entries, "
+            "and %d head chunk(s) with no defects; full heap walk was skipped (%s)"
+            % (
+                int(sm.get("sampled_arenas") or sm.get("arenas_sampled") or chk.get("arenas") or 0),
+                int(sm.get("tcache_entries_checked") or sm.get("tcache_entries_sampled") or 0),
+                int(sm.get("fastbin_entries_checked") or sm.get("fastbin_entries_sampled") or 0),
+                int(sm.get("chunks_sampled") or sm.get("boundary_chunks_checked") or chk.get("chunks") or 0),
+                str(heap.get("not_checked_reason") or "heap_cap_or_budget"),
+            )
+        )
+        return RecipeEvaluationResult(
+            recipe_id=rid, status=RECIPE_STATUS_INSUFFICIENT_EVIDENCE, confidence=0.35,
+            confidence_basis=txt,
+            missing_evidence=["full_heap_integrity_walk"],
+            limitations=lims,
+            recommended_action=(
+                "Tier-2 active arena/tcache/fastbin sampling found no defects, but full heap walk exceeded budget. "
+                "Narrow scope with runtime_heap_leak_candidates(pid=...) -> runtime_heap_owner_lookup(addresses=[...]) "
+                "or re-run with a targeted symbol/address inspection."
+            ),
+            details=dict(base, corruption_confirmed=False, tiered_fallback_applied=True,
+                         next_fallback_tool="runtime_heap_leak_candidates"),
+        )
     if hint:
         return None                          # legacy (capped) rule for the name/poison hint
     return RecipeEvaluationResult(
         recipe_id=rid, status=RECIPE_STATUS_INSUFFICIENT_EVIDENCE, confidence=0.2,
         confidence_basis="; ".join(lims) or "heap integrity not checked",
-        missing_evidence=["heap_integrity_walk"], limitations=lims, details=dict(base, corruption_confirmed=False))
+        missing_evidence=["heap_integrity_walk"], limitations=lims,
+        recommended_action=(
+            "Full heap integrity walk did not run; narrow scope with runtime_heap_leak_candidates(pid=...) "
+            "or inspect specific allocator/object symbols via runtime_symbol_search -> runtime_eval_memory_path."
+        ),
+        details=dict(base, corruption_confirmed=False, next_fallback_tool="runtime_heap_leak_candidates"))
 
 
 def _evaluate_specific_recipe(recipe: DiagnosticRecipe, data: Dict[str, Any]) -> RecipeEvaluationResult:

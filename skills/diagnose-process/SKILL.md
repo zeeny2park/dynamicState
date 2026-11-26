@@ -110,13 +110,13 @@ untagged applies to both. (`dynamic-state skill install` installs this file as i
   - you need a variable name you do not have: find it in the debug info, do not guess.
 [mcp]     `runtime_symbol_search(companion_elf, query, pid)`.
 [cli]     There is no keyword symbol search on the command line; `dynamic-state fuzzy-resolve -p PID -d ELF -q "words describing it" --corpus DIR` resolves a described concept to DWARF symbols and live values.
-- INCONCLUSIVE: read `not_covered` and act on the cause.
-  - target_unreadable: ask the user to fix permissions (same user, or ptrace allowed) or confirm the PID.
-  - missing_debug_image / no DWARF: ask for the debug ELF of the running build (remote: the matching unstripped ELF on this machine).
-  - target_unreachable: SSH to the host failed (the reason is in `not_covered`); ask the user to check host, user, port, key and that the board is up. Do not retry with other credentials you were not given.
-  - remote_limitation: things a remote diagnosis cannot examine (thread-local storage, stacks of threads that were running, symbols of libraries that could not be fetched). State them as not examined.
-  - unsupported_on_target: say the feature is not supported there; do not substitute a guess.
-  - no findings: if you passed a symptom, re-run the diagnosis once without `symptom` (general health check); then offer the narrower follow-ups above for the user's symptom.
+- INCONCLUSIVE (**DO NOT STOP AT ONE CALL**): immediately inspect `agent_summary.inconclusive_drilldown` (`should_continue`, `causes[]`, `scope_narrowing_ladder[]`) and `not_covered`, then execute the highest-priority narrowing tool before concluding:
+  - `target_unreadable` / `target_unreachable`: external permission/ptrace/SSH blocker — report the exact error and ask the user to fix access; do not retry blindly.
+  - `missing_debug_image` / no DWARF: ask for the matching unstripped ELF, and in parallel run symbol-free narrowing (`runtime_inspect_thread_callstack_and_locks` or `runtime_explain_process_behavior`) to capture live thread/I/O state.
+  - `large_heap_tiered_sampling` (heap > 8 MiB baseline cap or > 50 MiB read budget): Tier-2 bounded sampling checks active arenas, `tcache`, `fastbins`, and top-N chunks first. Follow the ladder: `runtime_heap_leak_candidates` -> `runtime_heap_owner_lookup(addresses=[...])` -> `runtime_eval_memory_path`.
+  - `inconclusive_memory_checks` / `inconclusive_thread_lock_checks` / `inconclusive_state_checks`: execute `agent_summary.inconclusive_drilldown.scope_narrowing_ladder` step 2 (`runtime_heap_leak_candidates`, `runtime_inspect_thread_callstack_and_locks`, `runtime_symbol_search`, or `runtime_explain_process_behavior`), then follow `next_drilldown` returned by that tool to step 3 (`runtime_heap_owner_lookup`, `runtime_eval_memory_path`, `runtime_trace_ipc_pipeline`, `runtime_watch_until_condition`).
+  - `remote_limitation` / `unsupported_on_target`: state clearly what is not supported; do not guess.
+  - no findings after a narrow symptom: re-run once without `symptom` (general health check) or follow `suggested_actions[0]` to narrow by domain.
 - HEALTHY: say it is healthy within the checked scope, then name `healthy_scope.not_checked` (e.g. long waits whose expectedness was not judged, heap integrity above the walk cap, use-after-free). Nothing outside that scope is claimed.
 - ABORTED: report why (`not_covered`, `summary`) and ask how to proceed.
 

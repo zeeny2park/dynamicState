@@ -181,7 +181,7 @@ def _heap_cap_scope_limit(c: Any) -> Optional[Dict[str, Any]]:
     if not isinstance(mi, dict):
         return None
     heap = mi.get("heap") or {}
-    if heap.get("status") != "NOT_CHECKED" or heap.get("not_checked_reason") != "above_baseline_cap":
+    if heap.get("status") not in ("NOT_CHECKED", "PARTIAL_SAMPLED") or heap.get("not_checked_reason") != "above_baseline_cap":
         return None
     if (mi.get("globals") or {}).get("status") != "COMPLETED" or (mi.get("stacks") or {}).get("status") != "COMPLETED":
         return None

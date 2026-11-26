@@ -563,6 +563,7 @@ class HeapWalkResult:
     mappings: List[Dict[str, Any]] = field(default_factory=list)
     heap_ranges: List[Tuple[int, int]] = field(default_factory=list)   # arena segments + mmapped chunks
     stats: Dict[str, Any] = field(default_factory=dict)
+    sampling_metadata: Optional[Dict[str, Any]] = None
 
     @property
     def ok(self) -> bool:
@@ -579,7 +580,7 @@ class HeapWalkResult:
         return {"chunks": len(self.chunks), "by_state": by_state, "in_use_chunk_bytes": int(in_use_bytes)}
 
     def summary(self) -> Dict[str, Any]:
-        return {
+        out = {
             "status": self.status,
             "message": self.message,
             "abi": self.abi,
@@ -596,6 +597,9 @@ class HeapWalkResult:
             "warnings": self.warnings,
             "stats": self.stats,
         }
+        if self.sampling_metadata is not None:
+            out["sampling_metadata"] = self.sampling_metadata
+        return out
 
 
 def _u64(b: bytes, off: int) -> int:
@@ -1044,6 +1048,308 @@ class HeapWalker:
         res.stats = {"wall_ms": round((time.monotonic() - t0) * 1000.0, 2), **self.reader.stats(),
                      "snapshot_bytes": res.snapshot.total_bytes}
         return res
+
+    def walk_sampled(
+        self,
+        *,
+        max_arenas: int = 4,
+        max_tcache_entries: int = 128,
+        max_fastbin_entries: int = 128,
+        max_chunks_per_arena: int = 256,
+        max_segment_bytes: int = 262144,
+    ) -> HeapWalkResult:
+        """Tier-2 bounded hot-path heap sampling for large heaps (> cap / > 50 MiB).
+
+        Instead of skipping heap inspection entirely when the full heap exceeds
+        budget, inspects:
+        1. Active arenas (up to ``max_arenas``, reading only ``malloc_state`` headers),
+        2. Top-N ``fastbinsY`` entries per active arena (cycle / size corruption detection),
+        3. Per-arena ``tcache_perthread_struct`` entries (top-N cached chunks, cycle / size check),
+        4. Bounded head/tail chunk windows per active arena (up to ``max_chunks_per_arena``).
+        """
+        t0 = time.monotonic()
+        try:
+            self._maps = list(self.adapter.get_proc_maps(self.pid) or [])
+        except Exception as exc:  # noqa: BLE001
+            return HeapWalkResult(status=STATUS_TARGET_UNREADABLE, message=f"cannot read memory maps: {exc}")
+        refused = self._gate()
+        if refused is not None:
+            refused.stats = {"wall_ms": round((time.monotonic() - t0) * 1000.0, 2), **self.reader.stats()}
+            self.result = refused
+            return refused
+        abi = self.abi
+        ver = parse_glibc_version(abi.libc_version)
+        res = HeapWalkResult(
+            status=STATUS_PARTIAL,
+            abi=abi.to_dict(),
+            support=check_support(abi, FEATURE_ALLOCATOR_CHUNKS).to_dict(),
+            mappings=self._maps,
+        )
+        self.result = res
+        anomalies: List[Dict[str, Any]] = []
+        tcache_entries_checked = 0
+        fastbin_entries_checked = 0
+        tcache_structs_checked = 0
+        boundary_chunks_checked = 0
+        try:
+            main_arena, layout, loc = self._locate_main_arena(abi, ver)
+            res.arena_location = loc
+            res.layout = layout
+            if main_arena is None or layout is None:
+                res.status = STATUS_ARENA_NOT_FOUND
+                res.message = "main_arena could not be located during Tier-2 heap sampling"
+                return self._finish(res, t0)
+            loc["main_arena"] = "0x%x" % main_arena
+            valid = False
+            for _attempt in range(self.max_retries + 1):
+                if self._arena_bytes(main_arena, layout) is not None and                         self._validate_arena_struct(main_arena, layout, main=True):
+                    valid = True
+                    break
+                fresh = self.reader.read(main_arena, layout.ms_size)
+                if fresh is not None and len(fresh) >= layout.ms_size:
+                    res.snapshot.add(main_arena, fresh)
+            if not valid:
+                res.status = STATUS_ARENA_NOT_FOUND
+                res.message = f"main_arena candidate 0x{main_arena:x} failed malloc_state validation"
+                return self._finish(res, t0)
+
+            arenas = [main_arena]
+            cur = _u64(self._arena_bytes(main_arena, layout), layout.ms["next"])
+            cap_arenas = max(1, min(int(max_arenas), int(self.max_arenas)))
+            while cur != main_arena and len(arenas) < cap_arenas:
+                if cur in arenas or self._arena_bytes(cur, layout) is None:
+                    res.warnings.append(f"arena ring broken at 0x{cur:x}")
+                    break
+                arenas.append(cur)
+                cur = _u64(self._arena_bytes(cur, layout), layout.ms["next"])
+
+            self._layout = layout
+            self._arena_addrs = list(arenas)
+            sampled_addrs = set()
+
+            for ai, a in enumerate(arenas):
+                is_main = (ai == 0)
+                ab = self._arena_bytes(a, layout)
+                top = _u64(ab, layout.ms["top"])
+                info: Dict[str, Any] = {
+                    "index": ai,
+                    "address": "0x%x" % a,
+                    "is_main": is_main,
+                    "top": "0x%x" % top,
+                    "system_mem": _u64(ab, layout.ms["system_mem"]),
+                    "segments": [],
+                    "sampled": True,
+                }
+                res.arenas.append(info)
+                if top == layout.bin_at(a, 1):
+                    info["note"] = "arena never used"
+                    continue
+
+                # 1. Sample fastbinsY (top-N entries per active arena)
+                fb_count = 0
+                for b in range(layout.nfastbins):
+                    if fastbin_entries_checked >= max_fastbin_entries:
+                        break
+                    p = _u64(ab, layout.ms["fastbinsY"] + 8 * b)
+                    want = layout.min_chunk + b * layout.malloc_alignment
+                    seen_bin = set()
+                    while p and fastbin_entries_checked < max_fastbin_entries:
+                        if p in seen_bin:
+                            anomalies.append({
+                                "kind": "fastbin_cycle_double_free",
+                                "arena_index": ai,
+                                "bin": b,
+                                "address": "0x%x" % p,
+                                "description": f"fastbin {b} in arena {ai} contains a cycle/duplicate chunk at 0x{p:x}",
+                            })
+                            break
+                        seen_bin.add(p)
+                        hdr = self.reader.read(p, 32)
+                        if hdr is None or len(hdr) < 24:
+                            break
+                        csize = _u64(hdr, 8) & ~7
+                        fastbin_entries_checked += 1
+                        fb_count += 1
+                        if csize != want:
+                            anomalies.append({
+                                "kind": "fastbin_size_corruption",
+                                "arena_index": ai,
+                                "bin": b,
+                                "address": "0x%x" % p,
+                                "expected_size": want,
+                                "observed_size": csize,
+                                "description": f"fastbin {b} chunk 0x{p:x} has size {csize}, expected {want}",
+                            })
+                            break
+                        if p not in sampled_addrs:
+                            sampled_addrs.add(p)
+                            res.chunks.append(p, csize, ST_FASTBIN, ai)
+                        raw_fd = _u64(hdr, 16)
+                        p = self._demangle(layout, p + 16, raw_fd)
+                info["fastbin_chunks"] = fb_count
+
+                # 2. Locate first segment for tcache_perthread_struct & head/tail boundary chunk sampling
+                seg_bounds = None
+                if is_main:
+                    for m in self._maps:
+                        if (m.get("pathname") or "") == "[heap]":
+                            seg_bounds = _map_bounds(m)
+                            break
+                else:
+                    hbase = top & ~(layout.heap_max_size - 1)
+                    for m in self._maps:
+                        ms, me = _map_bounds(m)
+                        if ms <= top < me and "w" in (m.get("permissions") or ""):
+                            seg_bounds = (max(ms, hbase + layout.heap_info_size), me)
+                            break
+
+                if seg_bounds is not None:
+                    seg_start, seg_end = seg_bounds
+                    win_len = min(max(0, seg_end - seg_start), max(4096, int(max_segment_bytes)))
+                    info["segments"].append({
+                        "start": "0x%x" % seg_start,
+                        "end": "0x%x" % seg_end,
+                        "sampled_bytes": win_len,
+                        "first_chunk": "0x%x" % seg_start,
+                    })
+                    head_buf = self.reader.read(seg_start, win_len) if win_len > 0 else None
+                    if head_buf:
+                        res.snapshot.add(seg_start, head_buf)
+                        # 2a. Check tcache_perthread_struct at first chunk if present
+                        if len(head_buf) >= 16 + layout.tcache_struct_size:
+                            fc_size = _u64(head_buf, 8) & ~7
+                            if fc_size == layout.tcache_chunk_size:
+                                tcache_structs_checked += 1
+                                user = seg_start + 16
+                                width = layout.tcache_count_width
+                                cfmt = "<%d%s" % (layout.tcache_bins, "H" if width == 2 else "B")
+                                counts = struct.unpack_from(cfmt, head_buf, 16)
+                                entries = struct.unpack_from(
+                                    "<%dQ" % layout.tcache_bins,
+                                    head_buf,
+                                    16 + layout.tcache_entries_off,
+                                )
+                                tc_members = 0
+                                for b in range(layout.tcache_bins):
+                                    if tcache_entries_checked >= max_tcache_entries:
+                                        break
+                                    cnt, ent = counts[b], entries[b]
+                                    if cnt == 0 or ent == 0:
+                                        continue
+                                    want = layout.min_chunk + b * layout.malloc_alignment
+                                    seen_tc = set()
+                                    cur_u = ent
+                                    for _step in range(min(cnt, max_tcache_entries - tcache_entries_checked)):
+                                        if cur_u == 0:
+                                            break
+                                        if cur_u in seen_tc:
+                                            anomalies.append({
+                                                "kind": "tcache_cycle_double_free",
+                                                "arena_index": ai,
+                                                "bin": b,
+                                                "address": "0x%x" % cur_u,
+                                                "description": f"tcache bin {b} in arena {ai} has cycle/duplicate at 0x{cur_u:x}",
+                                            })
+                                            break
+                                        seen_tc.add(cur_u)
+                                        ch_addr = cur_u - 16
+                                        ch_hdr = self.reader.read(ch_addr, 32)
+                                        if ch_hdr is None or len(ch_hdr) < 24:
+                                            break
+                                        csz = _u64(ch_hdr, 8) & ~7
+                                        tcache_entries_checked += 1
+                                        tc_members += 1
+                                        if csz != want:
+                                            anomalies.append({
+                                                "kind": "tcache_size_corruption",
+                                                "arena_index": ai,
+                                                "bin": b,
+                                                "address": "0x%x" % ch_addr,
+                                                "expected_size": want,
+                                                "observed_size": csz,
+                                                "description": f"tcache bin {b} chunk 0x{ch_addr:x} has size {csz}, expected {want}",
+                                            })
+                                            break
+                                        if ch_addr not in sampled_addrs:
+                                            sampled_addrs.add(ch_addr)
+                                            res.chunks.append(ch_addr, csz, ST_TCACHE, ai)
+                                        raw_next = _u64(ch_hdr, 16)
+                                        cur_u = self._demangle(layout, cur_u, raw_next)
+                                res.tcache_structs.append({
+                                    "address": "0x%x" % user,
+                                    "cached_chunks": tc_members,
+                                    "arena_index": ai,
+                                    "validated": "tier2_sampled",
+                                })
+
+                        # 2b. Walk top-N head chunks in the bounded window
+                        off = 0
+                        arena_chunks = 0
+                        while off + 16 <= len(head_buf) and arena_chunks < max_chunks_per_arena:
+                            ch_addr = seg_start + off
+                            if ch_addr == top:
+                                break
+                            sz_word = _u64(head_buf, off + 8)
+                            csz = sz_word & ~7
+                            if csz < layout.min_chunk or (csz & (layout.malloc_alignment - 1)) != 0 or ch_addr + csz > seg_end:
+                                anomalies.append({
+                                    "kind": "chunk_header_corruption",
+                                    "arena_index": ai,
+                                    "address": "0x%x" % ch_addr,
+                                    "observed_size": csz,
+                                    "description": f"invalid chunk header at 0x{ch_addr:x} (size={csz}) in arena {ai}",
+                                })
+                                break
+                            if ch_addr not in sampled_addrs:
+                                sampled_addrs.add(ch_addr)
+                                res.chunks.append(ch_addr, csz, ST_IN_USE, ai)
+                            arena_chunks += 1
+                            boundary_chunks_checked += 1
+                            off += csz
+
+                # 3. Validate top chunk header directly
+                if top and top != layout.bin_at(a, 1):
+                    top_hdr = self.reader.read(top, 16)
+                    if top_hdr and len(top_hdr) >= 16:
+                        top_sz = _u64(top_hdr, 8) & ~7
+                        if top_sz < layout.min_chunk or (top_sz & 7) != 0:
+                            anomalies.append({
+                                "kind": "top_chunk_corruption",
+                                "arena_index": ai,
+                                "address": "0x%x" % top,
+                                "observed_size": top_sz,
+                                "description": f"corrupted top chunk at 0x{top:x} (size={top_sz}) in arena {ai}",
+                            })
+
+            res.chunks.finalize()
+        except HeapWalkBudgetExhausted as exc:
+            res.warnings.append(f"Tier-2 sampling hit budget limit: {exc}")
+            res.chunks.finalize()
+
+        res.sampling_metadata = {
+            "tier": "TIER2_BOUNDED_SAMPLING",
+            "sampled_arenas": len(res.arenas),
+            "tcache_structs_checked": tcache_structs_checked,
+            "tcache_entries_checked": tcache_entries_checked,
+            "fastbin_entries_checked": fastbin_entries_checked,
+            "boundary_chunks_checked": boundary_chunks_checked,
+            "chunks_sampled": len(res.chunks),
+            "anomalies_detected": anomalies,
+            "limits": {
+                "max_arenas": max_arenas,
+                "max_tcache_entries": max_tcache_entries,
+                "max_fastbin_entries": max_fastbin_entries,
+                "max_chunks_per_arena": max_chunks_per_arena,
+                "max_segment_bytes": max_segment_bytes,
+            },
+        }
+        res.message = (
+            f"Tier-2 bounded heap sample checked {len(res.arenas)} arena(s), "
+            f"{tcache_entries_checked} tcache + {fastbin_entries_checked} fastbin + "
+            f"{boundary_chunks_checked} head chunk(s), {len(anomalies)} anomaly(ies)"
+        )
+        return self._finish(res, t0)
+
 
     def _walk_arena(self, ai: int, a: int, layout: GlibcMallocLayout, is_main: bool) -> None:
         res = self.result

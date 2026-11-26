@@ -45,6 +45,12 @@ class IntegrityConfig:
     wall_fraction: float = 0.6
     stability_reads: int = 2
     stability_interval_s: float = 0.03
+    tiered_sampling_enabled: bool = True
+    sampled_max_arenas: int = 4
+    sampled_max_chunks_per_arena: int = 256
+    sampled_max_tcache_entries: int = 128
+    sampled_max_fastbin_entries: int = 128
+    sampled_min_budget_bytes: int = 256 * 1024
 
 
 def _remaining(budget: Any):
@@ -137,21 +143,109 @@ def run_integrity(adapter: Any, pid: int, companion_elf: Optional[str], cfg: Int
             reader = BudgetedReader(adapter, pid, rb, profile_id="heap_integrity")
     else:
         walk = walker = None
-    if walk is None and mode == "baseline" and est > cfg.baseline_heap_cap_bytes:
-        heap["status"] = "NOT_CHECKED"
-        # structured reason (the HEALTHY rule reads it): a declared cost limit of the baseline, not a failure
-        heap["not_checked_reason"] = "above_baseline_cap"
-        heap["baseline_cap_bytes"] = int(cfg.baseline_heap_cap_bytes)
-        rec["limitations"].append(
-            "heap integrity not checked: heap larger than baseline cap (%.1f MiB > %.1f MiB); a memory-corruption or "
-            "crash symptom, or targeting RECIPE_HEAP_METADATA_CORRUPTION, runs the full walk"
-            % (est / 1048576.0, cfg.baseline_heap_cap_bytes / 1048576.0) + remote_cost_note(adapter))
-    elif walk is None and bytes_allow < est + 65536:
-        heap["status"] = "NOT_CHECKED"
-        heap["not_checked_reason"] = "byte_budget"
-        rec["limitations"].append("heap integrity not checked: the observation byte budget left (%d bytes) is below "
-                                  "the heap size (%d bytes)" % (bytes_allow, est) + remote_cost_note(adapter))
+    if walk is None and ((mode == "baseline" and est > cfg.baseline_heap_cap_bytes) or bytes_allow < est + 65536):
+        is_cap = (mode == "baseline" and est > cfg.baseline_heap_cap_bytes)
+        heap["not_checked_reason"] = "above_baseline_cap" if is_cap else "byte_budget"
+        heap["full_walk_skipped"] = True
+        if is_cap:
+            heap["baseline_cap_bytes"] = int(cfg.baseline_heap_cap_bytes)
+
+        # Tier-2 fallback: instead of skipping large heaps completely, sample active arenas,
+        # tcache, fastbins, and top-N head chunks within a small bounded read budget.
+        sampled_ran = False
+        if cfg.tiered_sampling_enabled and bytes_allow >= cfg.sampled_min_budget_bytes:
+            sample_budget_bytes = min(bytes_allow, 4 * 1024 * 1024)
+            hb = ObservationBudgetTracker(ObservationBudgetLimits(
+                max_wall_clock_ms=max(100.0, wall_allow * 1000.0),
+                max_bytes_read=max(65536, sample_budget_bytes),
+                max_samples=1 << 30,
+                max_bytes_per_observation=1 << 40,
+                max_consecutive_read_failures=1 << 20,
+                max_total_read_failures=1 << 20,
+            ))
+            reader = BudgetedReader(adapter, pid, hb, profile_id="heap_integrity_tier2")
+            walker = HeapWalker(adapter, pid, budget=hb, reader=reader, use_libc_debug_info=False)
+            swalk = walker.walk_sampled(
+                max_arenas=cfg.sampled_max_arenas,
+                max_tcache_entries=cfg.sampled_max_tcache_entries,
+                max_fastbin_entries=cfg.sampled_max_fastbin_entries,
+                max_chunks_per_arena=cfg.sampled_max_chunks_per_arena,
+            )
+            heap["cost"] = {
+                "bytes_read": int(reader.bytes_read),
+                "walk_wall_ms": (swalk.stats or {}).get("wall_ms"),
+            }
+            rec["cost"]["bytes_read"] += heap["cost"]["bytes_read"]
+            if swalk.sampling_metadata is not None:
+                sampled_ran = True
+                sm = swalk.sampling_metadata
+                heap["sampling_tier"] = sm.get("tier", "TIER2_BOUNDED_SAMPLING")
+                heap["sampling_summary"] = sm
+                heap["walk_source"] = "tiered hot-path sample (active arenas, tcache, fastbins, top-N chunks)"
+                heap["walk_status"] = swalk.status
+                heap["walk_message"] = swalk.message
+                anoms = list(sm.get("anomalies_detected") or [])
+                defects = [
+                    {
+                        "status": "probable",
+                        "kind": str(a.get("kind") or "heap_metadata_anomaly"),
+                        "address": a.get("address"),
+                        "arena_index": a.get("arena_index"),
+                        "description": str(a.get("description") or "Tier-2 sampled heap metadata anomaly"),
+                        "sampling_tier": "TIER2_BOUNDED_SAMPLING",
+                    }
+                    for a in anoms
+                ]
+                heap["defects"] = defects
+                heap["checked"] = {
+                    "sampled_arenas": sm.get("sampled_arenas", 0),
+                    "tcache_structs": sm.get("tcache_structs_checked", 0),
+                    "tcache_entries": sm.get("tcache_entries_checked", 0),
+                    "fastbin_entries": sm.get("fastbin_entries_checked", 0),
+                    "chunks": sm.get("chunks_sampled", 0),
+                }
+                heap["status"] = "SAMPLED_DEFECTS_FOUND" if defects else "PARTIAL_SAMPLED"
+                if is_cap:
+                    rec["limitations"].append(
+                        "full heap walk skipped (%.1f MiB > %.1f MiB baseline cap); Tier-2 bounded sampling checked "
+                        "%d arena(s), %d tcache + %d fastbin + %d head chunk(s) (%d anomaly(ies))"
+                        % (
+                            est / 1048576.0,
+                            cfg.baseline_heap_cap_bytes / 1048576.0,
+                            sm.get("sampled_arenas", 0),
+                            sm.get("tcache_entries_checked", 0),
+                            sm.get("fastbin_entries_checked", 0),
+                            sm.get("boundary_chunks_checked", 0),
+                            len(defects),
+                        ) + remote_cost_note(adapter)
+                    )
+                else:
+                    rec["limitations"].append(
+                        "full heap walk exceeded read budget (%d bytes < %d bytes heap); Tier-2 bounded sampling "
+                        "checked %d arena(s), %d tcache + %d fastbin + %d head chunk(s) (%d anomaly(ies))"
+                        % (
+                            bytes_allow,
+                            est,
+                            sm.get("sampled_arenas", 0),
+                            sm.get("tcache_entries_checked", 0),
+                            sm.get("fastbin_entries_checked", 0),
+                            sm.get("boundary_chunks_checked", 0),
+                            len(defects),
+                        ) + remote_cost_note(adapter)
+                    )
+
+        if not sampled_ran:
+            heap["status"] = "NOT_CHECKED"
+            if is_cap:
+                rec["limitations"].append(
+                    "heap integrity not checked: heap larger than baseline cap (%.1f MiB > %.1f MiB); a memory-corruption or "
+                    "crash symptom, or targeting RECIPE_HEAP_METADATA_CORRUPTION, runs the full walk"
+                    % (est / 1048576.0, cfg.baseline_heap_cap_bytes / 1048576.0) + remote_cost_note(adapter))
+            else:
+                rec["limitations"].append("heap integrity not checked: the observation byte budget left (%d bytes) is below "
+                                          "the heap size (%d bytes)" % (bytes_allow, est) + remote_cost_note(adapter))
     else:
+        heap["sampling_tier"] = "TIER1_FULL_WALK"
         if walk is None:
             hb = ObservationBudgetTracker(ObservationBudgetLimits(
                 max_wall_clock_ms=max(100.0, wall_allow * 1000.0), max_bytes_read=max(65536, bytes_allow),

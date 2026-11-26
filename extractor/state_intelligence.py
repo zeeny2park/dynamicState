@@ -875,7 +875,315 @@ def build_suggested_actions(
             "expected_value_ko": "이전 저장 기준선 대비 RSS·힙·스레드·FD·주의 항목 증감을 비교합니다.",
         })
 
+    # J) INCONCLUSIVE / blocking-gap drill-down actions (prevent 1-call agent stop)
+    _verdict = str(cov.get("verdict") or res.get("verdict") or "").upper()
+    _blocking_gaps = list(detail.get("blocking_gaps") or [])
+    _inconclusive_rids = [
+        str(c.get("recipe_id") or c.get("item") or "")
+        for c in (res.get("checks_run") or [])
+        if isinstance(c, dict) and str(c.get("status") or "").upper() in ("INCONCLUSIVE", "ERROR", "TIMEOUT")
+    ]
+    _has_mem_gap = any(
+        any(k in r.upper() for k in ("HEAP", "MEMORY", "ALLOCATION", "UAF", "FREE", "LEAK"))
+        for r in _inconclusive_rids
+    )
+    _has_thread_gap = any(
+        any(k in r.upper() for k in ("THREAD", "LOCK", "DEADLOCK", "BLOCKED", "SHARED_STATE"))
+        for r in _inconclusive_rids
+    )
+    _has_var_gap = any(
+        any(k in r.upper() for k in ("VARIABLE", "STATE", "POINTER", "BOUNDARY"))
+        for r in _inconclusive_rids
+    )
+    _is_unreadable = any(
+        g.get("kind") in ("target_unreadable", "target_unreachable", "process_exited")
+        for g in _blocking_gaps
+    )
+
+    if not _is_unreadable and (_verdict == "INCONCLUSIVE" or _blocking_gaps):
+        if _has_mem_gap:
+            _add({
+                "id": "drilldown_heap_leak_candidates",
+                "priority": "high",
+                "category": "inconclusive_drilldown",
+                "title_en": "Drill down into inconclusive memory/heap checks via targeted heap leak & arena scan",
+                "title_ko": "판정 불가 메모리·힙 검사를 표적 힙 누수·아레나 스캔으로 심층 분석",
+                "reason_en": "Memory/heap checks were inconclusive in broad triage; targeted heap scan narrows to top growing/leaking chunks (next hop: runtime_heap_owner_lookup).",
+                "reason_ko": "1차 진단에서 메모리·힙 검사가 판정 불가였으므로 표적 힙 스캔으로 상위 의심 청크를 추출한 뒤 runtime_heap_owner_lookup으로 소유 변수를 역추적하세요.",
+                "mcp_tool": "runtime_heap_leak_candidates",
+                "mcp_args": dict(base_narrow_args),
+                "next_hop_tool": "runtime_heap_owner_lookup",
+                "estimated_cost": "medium",
+                "expected_evidence": "Top unreferenced/growing heap chunk clusters and sample addresses for owner lookup",
+                "risk_level": "read_only_zero_stop",
+                "requires_user_approval": False,
+                "cli_command": _fmt_cmd(["dynamic-state", "heap-leaks", "-p", str(pid)] + (["-d", str(debug_image)] if debug_image else []) + _remote_cli_flags(target)),
+                "expected_value_en": "Narrows inconclusive memory checks to concrete chunk addresses and leak clusters.",
+                "expected_value_ko": "판정 불가 메모리 검사를 구체적인 청크 주소와 누수 클러스터로 좁혀줍니다.",
+            })
+
+        if _has_thread_gap or _verdict == "INCONCLUSIVE":
+            # Extract concrete waiting TIDs if available
+            _wait_tids = [
+                int(nc["tid"])
+                for nc in (res.get("not_covered") or [])
+                if isinstance(nc, dict) and nc.get("kind") == "long_wait_not_judged" and nc.get("tid")
+            ]
+            _tid_note_en = f" (focus TIDs: {_wait_tids[:4]})" if _wait_tids else ""
+            _tid_note_ko = f" (주목 TID: {_wait_tids[:4]})" if _wait_tids else ""
+            _add({
+                "id": "drilldown_callstacks_and_locks",
+                "priority": "high" if _has_thread_gap else "medium",
+                "category": "inconclusive_drilldown",
+                "title_en": f"Drill down into thread call stacks and lock ownership{_tid_note_en}",
+                "title_ko": f"스레드 콜스택 및 락 소유 관계 심층 조회{_tid_note_ko}",
+                "reason_en": "Broad diagnosis was inconclusive; direct per-thread stack unwinding and lock-owner inspection reveals stalls, waits, or hidden contention.",
+                "reason_ko": "1차 진단이 판정 불가였으므로 스레드별 콜스택과 락 소유 체인을 직접 조회해 대기·지연·경합 원인을 좁혀야 합니다.",
+                "mcp_tool": "runtime_inspect_thread_callstack_and_locks",
+                "mcp_args": dict(base_narrow_args),
+                "next_hop_tool": "runtime_eval_memory_path",
+                "estimated_cost": "low",
+                "expected_evidence": "Exact per-thread call stacks, blocking syscalls, and mutex owner/waiter chains",
+                "risk_level": "read_only_zero_stop",
+                "requires_user_approval": False,
+                "cli_command": _fmt_cmd(["dynamic-state", "callstacks", "-p", str(pid)] + (["-d", str(debug_image)] if debug_image else []) + _remote_cli_flags(target, style="remote_long")),
+                "expected_value_en": "Shows exact source frames and lock wait edges for every thread.",
+                "expected_value_ko": "모든 스레드의 정확한 소스 프레임과 락 대기 관계를 확인합니다.",
+            })
+
+        if _has_var_gap and debug_image:
+            _add({
+                "id": "drilldown_symbol_search",
+                "priority": "medium",
+                "category": "inconclusive_drilldown",
+                "title_en": "Search DWARF symbols to inspect suspect variables directly",
+                "title_ko": "DWARF 심볼 검색 후 의심 변수·상태 구조체 직접 조회",
+                "reason_en": "Variable/state checks were inconclusive without target expressions; find exact global/struct symbol names first, then call runtime_eval_memory_path.",
+                "reason_ko": "변수·상태 검사는 대상 심볼 지정이 필요하므로 먼저 심볼을 검색한 뒤 runtime_eval_memory_path로 실시간 값을 읽으세요.",
+                "mcp_tool": "runtime_symbol_search",
+                "mcp_args": {"companion_elf": str(debug_image), "query": "state queue cache", "pid": int(pid), **rm_mcp},
+                "next_hop_tool": "runtime_eval_memory_path",
+                "estimated_cost": "low",
+                "expected_evidence": "Concrete DWARF global/struct symbol names ready for runtime_eval_memory_path",
+                "risk_level": "read_only_zero_stop",
+                "requires_user_approval": False,
+                "cli_command": _fmt_cmd(["dynamic-state", "fuzzy-resolve", "-p", str(pid), "-d", str(debug_image), "-q", "state queue"]),
+                "expected_value_en": "Discovers exact symbol names for targeted live memory evaluation.",
+                "expected_value_ko": "실시간 메모리 경로 평가에 사용할 정확한 심볼 이름을 찾아냅니다.",
+            })
+
+        # Behavior explanation gives a fast high-level map when broad diagnosis is inconclusive
+        _add({
+            "id": "drilldown_explain_behavior",
+            "priority": "medium",
+            "category": "inconclusive_drilldown",
+            "title_en": "Summarize live process behavior, active subsystems, and hot threads",
+            "title_ko": "프로세스 실시간 동작 요약 및 활성 서브시스템·스레드 파악",
+            "reason_en": "When 1-call diagnosis is inconclusive, mapping active threads, syscalls, and memory regions narrows which domain tool to invoke next.",
+            "reason_ko": "1차 진단이 판정 불가일 때 프로세스의 현재 역할·활성 스레드·메모리 구성을 파악하면 다음 표적 도구를 정확히 선택할 수 있습니다.",
+            "mcp_tool": "runtime_explain_process_behavior",
+            "mcp_args": dict(base_narrow_args),
+            "next_hop_tool": "runtime_eval_memory_path",
+            "estimated_cost": "low",
+            "expected_evidence": "High-level behavioral breakdown of active threads, I/O, and memory subsystems",
+            "risk_level": "read_only_zero_stop",
+            "requires_user_approval": False,
+            "cli_command": _fmt_cmd(["dynamic-state", "diagnose", "-p", str(pid)] + (["-d", str(debug_image)] if debug_image else []) + _remote_cli_flags(target)),
+            "expected_value_en": "Maps what the process is currently doing so the agent can drill down accurately.",
+            "expected_value_ko": "프로세스가 현재 수행 중인 작업을 요약해 후속 정밀 분석 대상을 좁혀줍니다.",
+        })
+
+    # Sort by priority (high -> medium -> low) while preserving insertion order within each tier
+    _prio_rank = {"high": 0, "medium": 1, "low": 2}
+    actions.sort(key=lambda a: _prio_rank.get(str(a.get("priority") or "low").lower(), 3))
+
     return actions
+
+
+def build_inconclusive_drilldown(
+    result: Dict[str, Any],
+    profile: Optional[Dict[str, Any]] = None,
+    coverage: Optional[Dict[str, Any]] = None,
+    suggested_actions: Optional[List[Dict[str, Any]]] = None,
+    lang: str = "en",
+) -> Dict[str, Any]:
+    """Build a structured, actionable scope-narrowing guide whenever verdict is INCONCLUSIVE
+    or significant coverage/heap-cap gaps remain. Prevents coding agents from stopping after 1 call.
+    """
+    res = result if isinstance(result, dict) else {}
+    cov = coverage if isinstance(coverage, dict) else classify_coverage(res)
+    actions = [a for a in (suggested_actions or []) if isinstance(a, dict)]
+    detail = cov.get("detail") or {}
+    blocking = list(detail.get("blocking_gaps") or [])
+    policy_skipped = list(detail.get("policy_skipped") or [])
+    verdict = str(cov.get("verdict") or res.get("verdict") or "INCONCLUSIVE").upper()
+    ko = lang == "ko"
+
+    causes: List[Dict[str, Any]] = []
+    seen_codes = set()
+
+    def _add_cause(code: str, affected: List[str], why_en: str, why_ko: str,
+                   next_tool: Optional[str], mcp_args: Optional[Dict[str, Any]] = None,
+                   next_hop: Optional[str] = None) -> None:
+        if code in seen_codes:
+            return
+        seen_codes.add(code)
+        causes.append({
+            "cause_code": code,
+            "affected_checks": affected[:6],
+            "why": why_ko if ko else why_en,
+            "next_tool": next_tool,
+            "mcp_args": mcp_args or {},
+            "next_hop_tool": next_hop,
+        })
+
+    def _find_action(tool_name: str, id_prefix: str = "") -> Optional[Dict[str, Any]]:
+        for a in actions:
+            if a.get("mcp_tool") == tool_name and (not id_prefix or str(a.get("id") or "").startswith(id_prefix)):
+                return a
+        return None
+
+    # 1. Target unreadable / unreachable (hard external blocker)
+    unreadable = [g for g in blocking if g.get("kind") in ("target_unreadable", "target_unreachable", "process_exited")]
+    if unreadable:
+        _add_cause(
+            "target_access_blocked",
+            [str(g.get("item") or g.get("kind")) for g in unreadable],
+            "Target process memory or transport could not be read; fix permissions/ptrace/SSH before drilling down.",
+            "대상 프로세스 메모리 또는 원격 전송 접근이 차단되어 있습니다. 권한·ptrace·SSH 연결을 먼저 해결하세요.",
+            None,
+        )
+
+    # 2. Missing debug image
+    missing_dbg = [g for g in blocking if g.get("kind") == "missing_debug_image"]
+    if missing_dbg:
+        act = _find_action("runtime_diagnose_process", "provide_debug_image") or _find_action("runtime_inspect_thread_callstack_and_locks")
+        _add_cause(
+            "missing_debug_image",
+            [str(g.get("item") or "debug_image") for g in missing_dbg],
+            "Unstripped DWARF debug ELF is missing; pass debug_image or use symbol-free callstack/behavior tools first.",
+            "디버그 심볼(DWARF ELF)이 없어 변수·소스 라인 해석이 제한됩니다. debug_image를 지정하거나 심볼 없이 동작하는 콜스택·동작 요약 도구를 먼저 호출하세요.",
+            act.get("mcp_tool") if act else "runtime_inspect_thread_callstack_and_locks",
+            act.get("mcp_args") if act else {},
+            "runtime_eval_memory_path",
+        )
+
+    # 3. Large heap cap / Tier-2 bounded sampling
+    heap_gaps = [p for p in policy_skipped if p.get("kind") in ("integrity_not_checked", "uaf_not_checked", "double_free_not_checked")]
+    if heap_gaps:
+        act = _find_action("runtime_heap_leak_candidates")
+        _add_cause(
+            "large_heap_tiered_sampling",
+            [str(g.get("item") or g.get("kind")) for g in heap_gaps],
+            "Full heap walk exceeded baseline cap/budget (Tier-2 hot-path sampling covers active arenas/tcache/fastbins only). Narrow with runtime_heap_leak_candidates -> runtime_heap_owner_lookup.",
+            "힙 크기가 기본 풀-스캔 상한을 초과해 Tier-2 핫패스(활성 아레나·tcache·fastbin) 샘플링만 수행되었습니다. runtime_heap_leak_candidates -> runtime_heap_owner_lookup 순으로 범위를 좁히세요.",
+            "runtime_heap_leak_candidates",
+            act.get("mcp_args") if act else {},
+            "runtime_heap_owner_lookup",
+        )
+
+    # 4. Inconclusive recipes in checks_run
+    inc_checks = [
+        c for c in (res.get("checks_run") or [])
+        if isinstance(c, dict) and str(c.get("status") or "").upper() in ("INCONCLUSIVE", "ERROR", "TIMEOUT")
+    ]
+    if inc_checks and not unreadable:
+        mem_inc = [str(c.get("recipe_id")) for c in inc_checks if any(k in str(c.get("recipe_id") or "").upper() for k in ("HEAP", "MEMORY", "ALLOC", "UAF", "FREE"))]
+        thr_inc = [str(c.get("recipe_id")) for c in inc_checks if any(k in str(c.get("recipe_id") or "").upper() for k in ("THREAD", "LOCK", "DEADLOCK", "BLOCKED", "SHARED"))]
+        other_inc = [str(c.get("recipe_id")) for c in inc_checks if str(c.get("recipe_id")) not in mem_inc and str(c.get("recipe_id")) not in thr_inc]
+
+        if mem_inc:
+            act = _find_action("runtime_heap_leak_candidates")
+            _add_cause(
+                "inconclusive_memory_checks",
+                mem_inc,
+                "Memory/leak checks were inconclusive in the short broad window; run targeted heap leak scan and owner lookup.",
+                "단기 광역 진단에서 메모리·누수 검사가 판정 불가였습니다. 표적 힙 누수 스캔 후 소유자 역추적으로 좁히세요.",
+                "runtime_heap_leak_candidates",
+                act.get("mcp_args") if act else {},
+                "runtime_heap_owner_lookup",
+            )
+        if thr_inc:
+            act = _find_action("runtime_inspect_thread_callstack_and_locks")
+            _add_cause(
+                "inconclusive_thread_lock_checks",
+                thr_inc,
+                "Thread/lock checks were inconclusive; unwind per-thread call stacks and inspect mutex wait edges directly.",
+                "스레드·락 검사가 판정 불가였습니다. 스레드별 콜스택과 뮤텍스 대기 관계를 직접 조회해 원인을 좁히세요.",
+                "runtime_inspect_thread_callstack_and_locks",
+                act.get("mcp_args") if act else {},
+                "runtime_watch_until_condition",
+            )
+        if other_inc:
+            act = _find_action("runtime_symbol_search") or _find_action("runtime_explain_process_behavior")
+            _add_cause(
+                "inconclusive_state_checks",
+                other_inc,
+                "State/variable checks lacked target symbol expressions; discover symbols via runtime_symbol_search or map behavior first, then evaluate with runtime_eval_memory_path.",
+                "변수·상태 검사는 대상 심볼이 지정되지 않아 판정 불가였습니다. runtime_symbol_search 또는 runtime_explain_process_behavior로 대상을 특정한 뒤 runtime_eval_memory_path로 확인하세요.",
+                act.get("mcp_tool") if act else "runtime_explain_process_behavior",
+                act.get("mcp_args") if act else {},
+                "runtime_eval_memory_path",
+            )
+
+    executable_actions = [a for a in actions if a.get("executable", True) and not a.get("requires_user_approval")]
+    top = executable_actions[0] if executable_actions else (actions[0] if actions else None)
+    should_continue = bool(
+        not unreadable
+        and (verdict == "INCONCLUSIVE" or bool(blocking) or bool(heap_gaps))
+        and top is not None
+    )
+
+    ladder: List[Dict[str, Any]] = [
+        {"step": 1, "stage": "broad_triage", "tool": "runtime_diagnose_process", "status": "completed", "verdict": verdict},
+    ]
+    if top is not None:
+        ladder.append({
+            "step": 2,
+            "stage": "narrow_domain",
+            "tool": top.get("mcp_tool"),
+            "mcp_args": top.get("mcp_args") or {},
+            "reason": top.get("reason_ko" if ko else "reason_en"),
+        })
+        hop = top.get("next_hop_tool")
+        if not hop:
+            _t = str(top.get("mcp_tool") or "")
+            hop = {
+                "runtime_heap_leak_candidates": "runtime_heap_owner_lookup",
+                "runtime_inspect_thread_callstack_and_locks": "runtime_eval_memory_path",
+                "runtime_symbol_search": "runtime_eval_memory_path",
+                "runtime_explain_process_behavior": "runtime_eval_memory_path",
+            }.get(_t)
+        if hop:
+            ladder.append({
+                "step": 3,
+                "stage": "deep_root_cause",
+                "tool": hop,
+                "when": "Use concrete addresses/TIDs/symbols returned by step 2",
+            })
+
+    if unreadable:
+        directive = (
+            "접근 권한/전송 차단으로 추가 도구를 실행할 수 없습니다. 사용자에게 차단 원인을 보고하세요."
+            if ko else "Target access is blocked; report the permission/transport error to the user before retrying."
+        )
+    elif should_continue and top is not None:
+        directive = (
+            f"INCONCLUSIVE/제한 관측에서 멈추지 마세요. 다음으로 `{top.get('mcp_tool')}`을(를) 호출해 원인을 좁히세요."
+            if ko else f"DO NOT STOP on {verdict}/limited coverage. Call `{top.get('mcp_tool')}` next with the provided mcp_args to narrow scope."
+        )
+    else:
+        directive = (
+            "현재 판정에 대한 필수 드릴다운 항목이 없습니다."
+            if ko else "No mandatory drill-down required; optional follow-up actions are available in suggested_actions."
+        )
+
+    return {
+        "should_continue": should_continue,
+        "agent_directive": directive,
+        "causes": causes,
+        "scope_narrowing_ladder": ladder,
+    }
 
 
 # ------------------------------------------------------------------ 4. LLM-Agent Friendly Summary
@@ -942,6 +1250,8 @@ def build_agent_summary(
     if isinstance(baseline_diff, dict) and baseline_diff.get("available"):
         baseline_status = baseline_diff.get("summary_ko" if ko else "summary_en")
 
+    drilldown = build_inconclusive_drilldown(res, prof, cov, actions, lang=lang)
+
     return {
         "verdict": cov["verdict"],
         "verdict_qualifier": cov["verdict_qualifier"],
@@ -955,4 +1265,139 @@ def build_agent_summary(
         "baseline_status": baseline_status,
         "next_actions_count": len(actions),
         "top_action": actions[0] if actions else None,
+        "inconclusive_drilldown": drilldown,
     }
+
+
+def build_narrow_tool_next_steps(
+    tool_name: str,
+    payload: Dict[str, Any],
+    *,
+    pid: Optional[int] = None,
+    companion_elf: Optional[str] = None,
+    remote_target: Optional[Dict[str, Any]] = None,
+) -> List[Dict[str, Any]]:
+    """Build concrete 2nd/3rd-hop drill-down tool suggestions from a narrow MCP tool's output."""
+    if not isinstance(payload, dict) or not pid:
+        return []
+    target_dict: Dict[str, Any] = {"pid": int(pid)}
+    if isinstance(remote_target, dict):
+        target_dict.update({k: v for k, v in remote_target.items() if v is not None})
+    if companion_elf:
+        target_dict["debug_image"] = str(companion_elf)
+    rm_mcp = _remote_mcp_args(target_dict)
+    base_args: Dict[str, Any] = {"pid": int(pid), **rm_mcp}
+    if companion_elf:
+        base_args["companion_elf"] = str(companion_elf)
+
+    out: List[Dict[str, Any]] = []
+    if tool_name == "runtime_heap_leak_candidates":
+        candidates = (
+            payload.get("candidates")
+            or payload.get("classes")
+            or payload.get("top_candidates")
+            or payload.get("size_classes")
+            or []
+        )
+        addrs: List[str] = []
+        seen = set()
+        if isinstance(candidates, list):
+            for c in candidates:
+                if not isinstance(c, dict):
+                    continue
+                single_addr = c.get("address")
+                if isinstance(single_addr, int) and single_addr > 0:
+                    s_single = hex(single_addr)
+                    if s_single not in seen:
+                        seen.add(s_single)
+                        addrs.append(s_single)
+                elif isinstance(single_addr, str) and single_addr.strip().lower().startswith("0x"):
+                    s_single = single_addr.strip()
+                    if s_single not in seen:
+                        seen.add(s_single)
+                        addrs.append(s_single)
+                for key in ("example_addresses", "sample_addresses", "addresses", "examples"):
+                    vals = c.get(key)
+                    if isinstance(vals, list):
+                        for v in vals:
+                            s = hex(v) if isinstance(v, int) and v > 0 else (str(v).strip() if isinstance(v, str) else "")
+                            if s and s.lower().startswith("0x") and s not in seen:
+                                seen.add(s)
+                                addrs.append(s)
+                            if len(addrs) >= 8:
+                                break
+                if len(addrs) >= 8:
+                    break
+        if addrs:
+            out.append(validate_suggested_action({
+                "id": "chain_heap_owner_lookup",
+                "priority": "high",
+                "category": "scope_narrowing",
+                "title_en": f"Trace owning globals/containers for {len(addrs)} leak candidate address(es)",
+                "title_ko": f"누수 의심 주소 {len(addrs)}건의 소유 변수·컨테이너 역추적",
+                "reason_en": "Leak candidate addresses were found; reverse-reference lookup identifies which global/thread/container retains them.",
+                "reason_ko": "누수 의심 주소가 확보되었으므로 역참조 추적으로 어떤 전역 변수·스레드·컨테이너가 참조를 유지하는지 특정하세요.",
+                "mcp_tool": "runtime_heap_owner_lookup",
+                "mcp_args": {**base_args, "addresses": addrs, "include_typed_locals": True},
+                "estimated_cost": "medium",
+                "expected_evidence": "Owning variable paths and container retention chains",
+                "risk_level": "read_only_zero_stop",
+                "requires_user_approval": False,
+            }, target_dict))
+        else:
+            out.append(validate_suggested_action({
+                "id": "chain_scan_memory_pool",
+                "priority": "medium",
+                "category": "scope_narrowing",
+                "title_en": "Check custom/mmap memory pools or watch variable growth",
+                "title_ko": "커스텀 메모리 풀 또는 변수 상태 변화 감시로 범위 전환",
+                "reason_en": "No unreachable glibc heap leak candidates found; growth may live in reachable containers or custom pools.",
+                "reason_ko": "미참조 glibc 힙 누수 후보가 없으므로 도달 가능한 컨테이너 누적 또는 커스텀 풀을 확인하세요.",
+                "mcp_tool": "runtime_explain_process_behavior",
+                "mcp_args": dict(base_args),
+                "estimated_cost": "low",
+                "expected_evidence": "High-level memory & subsystem attribution",
+                "risk_level": "read_only_zero_stop",
+                "requires_user_approval": False,
+            }, target_dict))
+
+    elif tool_name == "runtime_inspect_thread_callstack_and_locks":
+        threads = payload.get("threads") if isinstance(payload.get("threads"), list) else []
+        waiting_locks = [t for t in threads if isinstance(t, dict) and t.get("waiting_on_lock")]
+        io_wait = [
+            t for t in threads
+            if isinstance(t, dict) and str(t.get("syscall") or "").lower() in ("epoll_wait", "poll", "ppoll", "recvfrom", "recvmsg", "read", "accept", "accept4")
+        ]
+        if waiting_locks and companion_elf:
+            out.append(validate_suggested_action({
+                "id": "chain_watch_lock_state",
+                "priority": "medium",
+                "category": "scope_narrowing",
+                "title_en": "Inspect lock-holding subsystem variables or arm condition watch",
+                "title_ko": "락 보유 스레드 관련 변수 조회 또는 조건 감시 설정",
+                "reason_en": f"{len(waiting_locks)} thread(s) are waiting on locks; evaluate owning state variables via DWARF symbols.",
+                "reason_ko": f"스레드 {len(waiting_locks)}개가 락 대기 중이므로 관련 상태 변수를 DWARF 심볼로 조회하세요.",
+                "mcp_tool": "runtime_symbol_search",
+                "mcp_args": {"companion_elf": str(companion_elf), "query": "mutex lock queue state", "pid": int(pid), **rm_mcp},
+                "estimated_cost": "low",
+                "expected_evidence": "Exact symbol names for mutexes and guarded state structures",
+                "risk_level": "read_only_zero_stop",
+                "requires_user_approval": False,
+            }, target_dict))
+        if io_wait:
+            out.append(validate_suggested_action({
+                "id": "chain_trace_ipc_pipeline",
+                "priority": "medium",
+                "category": "scope_narrowing",
+                "title_en": f"Trace IPC/socket peers for {len(io_wait)} I/O-waiting thread(s)",
+                "title_ko": f"I/O 대기 스레드 {len(io_wait)}개의 소켓·파이프·공유메모리 피어 추적",
+                "reason_en": "Threads are blocked in I/O syscalls; tracing IPC peers reveals whether an upstream/downstream process is stalled.",
+                "reason_ko": "스레드가 I/O 시스템콜에서 대기 중이므로 피어 프로세스 통신 경로를 추적해 외부 지연 여부를 확인하세요.",
+                "mcp_tool": "runtime_trace_ipc_pipeline",
+                "mcp_args": dict(base_args),
+                "estimated_cost": "low",
+                "expected_evidence": "Connected peer PIDs, sockets, pipes, and shared memory endpoints",
+                "risk_level": "read_only_zero_stop",
+                "requires_user_approval": False,
+            }, target_dict))
+    return out

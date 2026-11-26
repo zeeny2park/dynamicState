@@ -2093,6 +2093,8 @@ def runtime_inspect_thread_callstack_and_locks(
     """Zero-stop replacement for `gdb thread apply all bt` + mutex deadlock detector (zero-stop read; the target is not suspended).
     Unwinds active thread callstacks via stack return addresses & DWARF subprograms, decodes `pthread_mutex_t`
     (`__owner` TID), matches `futex` wait addresses to mutexes, and detects circular deadlock cycles.
+    SCOPE-NARROWING: Call after `runtime_diagnose_process` reports deadlock, long-wait threads, or INCONCLUSIVE
+    thread/lock checks. NEXT TOOL: `runtime_eval_memory_path` (inspect guarded state) or `runtime_trace_ipc_pipeline`.
     """
     try:
         if pid is None or companion_elf is None or runtime.watch_session_manager.get_active_target_context().get('pid') == pid:
@@ -2111,7 +2113,13 @@ def runtime_inspect_thread_callstack_and_locks(
             ssh_key=ssh_key,
             ssh_proxy_jump=ssh_proxy_jump,
         )
-        return _format_watch_result({"success": True, **res})
+        from extractor.state_intelligence import build_narrow_tool_next_steps
+        _rm = {"remote_host": remote_host, "ssh_user": ssh_user, "ssh_port": ssh_port, "ssh_key": ssh_key, "ssh_proxy_jump": ssh_proxy_jump} if remote_host else None
+        _next = build_narrow_tool_next_steps("runtime_inspect_thread_callstack_and_locks", res, pid=pid, companion_elf=companion_elf, remote_target=_rm)
+        out = {"success": True, **res}
+        if _next:
+            out["next_drilldown"] = _next
+        return _format_watch_result(out)
     except Exception as e:
         return _format_watch_result({"success": False, "error": str(e), "error_code": type(e).__name__})
 
@@ -2481,19 +2489,28 @@ def runtime_heap_leak_candidates(
     conservative stacks / module data / anonymous mappings / contents of reachable chunks), grouped by
     chunk size class with example addresses. Freed blocks (tcache, fastbin, bins) are never candidates.
     Zero-stop and budgeted; refused with an explicit status on non-glibc / unsupported targets.
+    SCOPE-NARROWING: Call after `runtime_diagnose_process` reports memory growth, large-heap Tier-2 sampling,
+    or INCONCLUSIVE memory checks. NEXT TOOL: pass returned example addresses to `runtime_heap_owner_lookup`.
     """
     try:
         an = _heap_ownership_analysis(pid, companion_elf, analysis_id, include_typed_locals, max_bytes_read,
                                       max_wall_clock_ms, remote_host, ssh_user, ssh_port, ssh_key, ssh_proxy_jump)
         summary = an.summary()
-        return _format_watch_result({
+        lrep = an.leak_report(max_examples_per_class=max(1, int(max_examples_per_class)))
+        from extractor.state_intelligence import build_narrow_tool_next_steps
+        _rm = {"remote_host": remote_host, "ssh_user": ssh_user, "ssh_port": ssh_port, "ssh_key": ssh_key, "ssh_proxy_jump": ssh_proxy_jump} if remote_host else None
+        _next = build_narrow_tool_next_steps("runtime_heap_leak_candidates", lrep, pid=pid, companion_elf=companion_elf, remote_target=_rm)
+        out = {
             "success": an.ok,
             "analysis_id": an.analysis_id,
             "heap_counts": (summary.get("heap_walk") or {}).get("counts"),
             "reachability": summary.get("reachability"),
             "cost": summary.get("cost"),
-            **an.leak_report(max_examples_per_class=max(1, int(max_examples_per_class))),
-        })
+            **lrep,
+        }
+        if _next:
+            out["next_drilldown"] = _next
+        return _format_watch_result(out)
     except Exception as e:
         return _format_watch_result({"success": False, "error": str(e), "error_code": type(e).__name__})
 
