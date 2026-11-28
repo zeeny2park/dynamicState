@@ -157,6 +157,10 @@ untagged applies to both. (`dynamic-state skill install` installs this file as i
 - **Loop Discipline**: Never relax the `exit_predicate`. On each iteration, run one narrowing tool, inspect `tracking_context.loop_state` (`predicate_status`, `decision_log`), pivot immediately when `predicate_status == "PIVOT_REQUIRED"`, and stop only on `MET`, `BLOCKED`, or `EXHAUSTED`.
 <!-- end:mcp -->
 <!-- begin:cli -->
+### Continuous Tracking & Tool Tiers (Multi-Hop Coding-Agent Protocol)
+- **Tool Progression**: Follow `TIER0_ENTRY` (`dynamic-state diagnose`) -> `TIER1_NARROWING` (`dynamic-state callstacks` / `dynamic-state heap-leaks`) -> `TIER2_DEEP_INSPECT` (`dynamic-state heap-owner` / `dynamic-state eval` / `dynamic-state fuzzy-resolve`).
+- **Use Tracking Signals**: Check `delta_from_last_call` on repeated calls to separate stuck threads/growing leaks from normal progress; follow `code_anchors` (`file:line`, `variable_path`) to jump directly into repository source files; follow `recovery_actions` if a lookup fails or returns empty; and rely on `tracking_context` to avoid repeating dead-end calls.
+
 ### Problem-Specific Playbooks & Loop Contract (`pstack`-style)
 - **Front-Door Routing**: Run `dynamic-state playbook --symptom "<goal>" --json` to auto-select one of 6 playbooks (`memory-leak-and-growth`, `heap-corruption-and-uaf`, `hang-deadlock-and-contention`, `fd-and-ipc-stall`, `state-and-variable-bug`, `intermittent-temporal-bug`) under `skills/diagnose-process/playbooks/`.
 - **Autonomous Loop**: Run `dynamic-state loop -p <pid> --symptom "<goal>" --strict-exit-codes --json` to execute the playbook loop with `delta_from_last_call`, `code_anchors`, `recovery_actions`, `tracking_context`, plateau->pivot transitions, and standard CI exit codes (`0` healthy, `2` fault, `3` degraded, `4` inconclusive, `5` blocked).

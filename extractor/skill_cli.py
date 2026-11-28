@@ -11,11 +11,14 @@ Each command prints the same JSON object as the MCP tool of the same purpose:
 
 import argparse
 import json
+import logging
 import os
 import sys
 from typing import Any, Dict, List, Optional
 
 from .agent_skill import SKILL_NAME, install_skill, skill_body, skill_dir
+
+logger = logging.getLogger(__name__)
 
 
 def _add_remote_arguments(p: argparse.ArgumentParser) -> None:
@@ -86,12 +89,14 @@ def _heap_analysis(args):
     if elf is None:
         ctx = wm.resolve_target_context(pid=pid, companion_elf_path=None, **_remote_kwargs(args))
         pid, elf = ctx["pid"], ctx["companion_elf_path"]
+    resolved_elf = os.path.abspath(elf) if elf else None
     adapter = wm._resolve_adapter(pid=pid, **_remote_kwargs(args))
-    return analyze_heap_ownership(
-        pid=int(pid), companion_elf_path=elf, adapter=adapter, manager=wm,
+    an = analyze_heap_ownership(
+        pid=int(pid), companion_elf_path=resolved_elf, adapter=adapter, manager=wm,
         include_typed_locals=not args.no_typed_locals,
         budget_limits={"max_bytes_read": int(args.max_bytes_read), "max_wall_clock_ms": float(args.max_wall_clock_ms)},
     )
+    return an, resolved_elf
 
 
 def _enrich_cli_heap_output(
@@ -99,30 +104,33 @@ def _enrich_cli_heap_output(
     out: Dict[str, Any],
     source_payload: Dict[str, Any],
     args,
+    companion_elf: Optional[str] = None,
     extra_args: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Attach next_drilldown, recovery_actions, and tracking_context to match MCP parity."""
     rm = _remote_kwargs(args) if getattr(args, "remote_host", None) else None
+    elf = companion_elf if companion_elf is not None else (os.path.abspath(args.debug_image) if args.debug_image else None)
     try:
         from .state_intelligence import build_narrow_tool_next_steps
         _next = build_narrow_tool_next_steps(
-            tool_name, source_payload, pid=args.pid, companion_elf=args.debug_image, remote_target=rm
+            tool_name, source_payload, pid=args.pid, companion_elf=elf, remote_target=rm
         )
         if _next:
             out["next_drilldown"] = _next
     except Exception:
-        pass
+        logger.debug("build_narrow_tool_next_steps failed for %s", tool_name, exc_info=True)
     try:
         from .tracking_ledger import enrich_tool_response
         return enrich_tool_response(
             tool_name,
             out,
             pid=args.pid,
-            companion_elf=args.debug_image,
+            companion_elf=elf,
             args=extra_args,
             remote_target=rm,
         )
     except Exception:
+        logger.debug("enrich_tool_response failed for %s", tool_name, exc_info=True)
         return out
 
 
@@ -132,7 +140,7 @@ def run_heap_owner(args) -> int:
         addrs = [int(a.strip(), 0) for a in raw]
         if not addrs:
             return _fail("--addresses needs at least one address", "INVALID_PARAM")
-        an = _heap_analysis(args)
+        an, resolved_elf = _heap_analysis(args)
         summary = an.summary()
         out = {
             "success": an.ok, "analysis_id": an.analysis_id, "status": an.status, "message": an.message,
@@ -142,7 +150,7 @@ def run_heap_owner(args) -> int:
             "cost": summary.get("cost"), "results": [an.lookup(a) for a in addrs],
         }
         out = _enrich_cli_heap_output(
-            "runtime_heap_owner_lookup", out, out, args, extra_args={"addresses": raw[:8]}
+            "runtime_heap_owner_lookup", out, out, args, companion_elf=resolved_elf, extra_args={"addresses": raw[:8]}
         )
     except Exception as exc:
         return _fail(str(exc), type(exc).__name__)
@@ -152,7 +160,7 @@ def run_heap_owner(args) -> int:
 
 def run_heap_leaks(args) -> int:
     try:
-        an = _heap_analysis(args)
+        an, resolved_elf = _heap_analysis(args)
         summary = an.summary()
         lrep = an.leak_report(max_examples_per_class=max(1, int(args.max_examples)))
         out = {
@@ -161,7 +169,7 @@ def run_heap_leaks(args) -> int:
             "reachability": summary.get("reachability"), "cost": summary.get("cost"),
             **lrep,
         }
-        out = _enrich_cli_heap_output("runtime_heap_leak_candidates", out, lrep, args)
+        out = _enrich_cli_heap_output("runtime_heap_leak_candidates", out, lrep, args, companion_elf=resolved_elf)
     except Exception as exc:
         return _fail(str(exc), type(exc).__name__)
     print(json.dumps(out, indent=2, ensure_ascii=False, default=str))
