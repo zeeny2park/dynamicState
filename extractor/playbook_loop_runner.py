@@ -179,6 +179,7 @@ def run_playbook_loop(
     ledger_store: Optional[TrackingLedgerStore] = None,
     on_iteration: Optional[Callable[[Dict[str, Any]], None]] = None,
     clock: Optional[Callable[[], float]] = None,
+    resume: bool = False,
 ) -> Dict[str, Any]:
     """Execute a problem-specific playbook autonomously on the server/CLI side.
 
@@ -200,7 +201,8 @@ def run_playbook_loop(
     pb = select_playbook(symptom=symptom, lang=lang)
     explicit_max_it: Optional[int] = max(1, int(max_iterations)) if max_iterations is not None else None
     explicit_time_budget: Optional[float] = float(time_budget_s) if time_budget_s is not None else None
-    ledger.activate_playbook(pb, max_iterations=explicit_max_it)
+    had_prior_slot = bool(resume and ledger.get_playbook_slot(pb["playbook_id"]) is not None)
+    ledger.activate_playbook(pb, max_iterations=explicit_max_it, resume=resume)
 
     rm_args = (
         {k: v for k, v in remote_target.items() if v is not None}
@@ -214,6 +216,10 @@ def run_playbook_loop(
     pivots = list(pb.get("pivot_rules") or [])
     step_idx = 0
     pivot_idx = 0
+    if had_prior_slot and ledger.iteration > 0:
+        completed_tools = {str(d.get("tool") or "") for d in (ledger.decision_log or []) if isinstance(d, dict)}
+        while step_idx < len(steps) and str(steps[step_idx].get("tool") or "") in completed_tools:
+            step_idx += 1
     step_summaries: List[Dict[str, Any]] = []
     tool_errors: List[Dict[str, Any]] = []
     key_deltas: List[str] = []
@@ -375,6 +381,7 @@ def run_playbook_loop(
         "symptom": symptom,
         "playbook_id": pb["playbook_id"],
         "playbook_title": pb["title"],
+        "resumed": had_prior_slot,
         "exit_predicate": pb["exit_predicate"],
         "final_status": final_ls["predicate_status"],
         "hypothesis_status": final_ls["hypothesis_status"],

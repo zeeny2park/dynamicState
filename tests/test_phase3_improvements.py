@@ -208,5 +208,172 @@ class TestRemoteTier2CoveragePrecision(unittest.TestCase):
         self.assertIn("Recommended playbook:", dd["agent_directive"])
 
 
+
+class TestPlaybookResumeAndCorruptionSafety(unittest.TestCase):
+    def test_resume_playbook_and_activate_with_resume_restores_persisted_slot(self):
+        with tempfile.TemporaryDirectory() as td:
+            tkey = make_target_key(3141)
+            pb_mem = select_playbook(symptom="memory leak")
+            pb_hang = select_playbook(symptom="deadlock hang")
+
+            store_a = TrackingLedgerStore(persist_dir=td)
+            la = store_a.get_or_create(tkey)
+            la.activate_playbook(pb_mem)
+            la.record(
+                "runtime_heap_leak_candidates",
+                {"pid": 3141},
+                {"success": True, "candidates": [{"chunk_size": 64, "count": 10}]},
+            )
+            la.activate_playbook(pb_hang)
+            la.record(
+                "runtime_inspect_thread_callstack_and_locks",
+                {"pid": 3141},
+                {"success": True, "threads": [{"tid": 1, "state": "S"}]},
+            )
+            self.assertTrue(store_a.save(tkey))
+
+            # Fresh store simulates restart: resume_playbook restores pb_mem state instead of resetting to 0
+            store_b = TrackingLedgerStore(persist_dir=td)
+            lb = store_b.get_or_create(tkey)
+            resumed_mem = lb.resume_playbook(pb_mem["playbook_id"])
+            self.assertIsNotNone(resumed_mem)
+            self.assertEqual(resumed_mem["playbook_id"], pb_mem["playbook_id"])
+            self.assertEqual(resumed_mem["iteration"], 1)
+            self.assertEqual(len(resumed_mem["decision_log"]), 1)
+
+            # activate_playbook(..., resume=True) restores pb_hang slot
+            resumed_hang = lb.activate_playbook(pb_hang, resume=True)
+            self.assertEqual(resumed_hang["playbook_id"], pb_hang["playbook_id"])
+            self.assertEqual(resumed_hang["iteration"], 1)
+
+            # Default activate_playbook(..., resume=False) still starts fresh
+            fresh_hang = lb.activate_playbook(pb_hang)
+            self.assertEqual(fresh_hang["iteration"], 0)
+
+    def test_run_playbook_loop_resumes_persisted_slot_without_restarting_step0(self):
+        from extractor.playbook_loop_runner import run_playbook_loop
+
+        with tempfile.TemporaryDirectory() as td:
+            executed = []
+
+            def fake_exec(tool_name, args):
+                executed.append(tool_name)
+                return {"success": True, "verdict": "INCONCLUSIVE"}
+
+            store1 = TrackingLedgerStore(persist_dir=td)
+            r1 = run_playbook_loop(
+                pid=4242,
+                symptom="memory leak",
+                executor=fake_exec,
+                max_iterations=1,
+                ledger_store=store1,
+            )
+            self.assertFalse(r1["resumed"])
+            self.assertEqual(r1["iterations_run"], 1)
+            self.assertEqual(len(executed), 1)
+            first_tool = executed[0]
+
+            # Restart with a fresh store and resume=True
+            store2 = TrackingLedgerStore(persist_dir=td)
+            r2 = run_playbook_loop(
+                pid=4242,
+                symptom="memory leak",
+                executor=fake_exec,
+                max_iterations=2,
+                ledger_store=store2,
+                resume=True,
+            )
+            self.assertTrue(r2["resumed"])
+            self.assertEqual(r2["iterations_run"], 2)
+            self.assertEqual(len(executed), 2)
+            self.assertNotEqual(executed[1], first_tool)
+
+    def test_corrupt_ledger_file_is_quarantined_and_not_silently_overwritten(self):
+        with tempfile.TemporaryDirectory() as td:
+            tkey = make_target_key(7777)
+            store = TrackingLedgerStore(persist_dir=td)
+            path = store._ledger_path(tkey)
+            self.assertIsNotNone(path)
+            corrupt_bytes = "{broken json"
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(corrupt_bytes)
+
+            ledger = store.get_or_create(tkey)
+            self.assertEqual(ledger.iteration, 0)
+            ev = store.get_corruption_event(tkey)
+            self.assertIsNotNone(ev)
+            self.assertIsNotNone(ev["quarantine_path"])
+            self.assertTrue(os.path.isfile(ev["quarantine_path"]))
+            with open(ev["quarantine_path"], "r", encoding="utf-8") as f:
+                self.assertEqual(f.read(), corrupt_bytes)
+
+            # Subsequent save writes a clean ledger while preserving the quarantined corrupt file
+            ledger.activate_playbook(select_playbook(symptom="memory leak"))
+            self.assertTrue(store.save(tkey))
+            self.assertTrue(os.path.isfile(path))
+            self.assertTrue(os.path.isfile(ev["quarantine_path"]))
+
+    def test_parallel_barrier_save_same_revision_same_playbook_merges_both_writers(self):
+        with tempfile.TemporaryDirectory() as td:
+            tkey = make_target_key(8888)
+            pb_a = select_playbook(symptom="memory leak")
+
+            seed = TrackingLedgerStore(persist_dir=td)
+            l_seed = seed.get_or_create(tkey)
+            l_seed.activate_playbook(pb_a)
+            self.assertTrue(seed.save(tkey))
+
+            store_a = TrackingLedgerStore(persist_dir=td)
+            store_b = TrackingLedgerStore(persist_dir=td)
+            la = store_a.get_or_create(tkey)
+            lb = store_b.get_or_create(tkey)
+            self.assertEqual(la.revision, lb.revision)
+
+            la.record(
+                "runtime_heap_leak_candidates",
+                {"pid": 8888},
+                {"success": True, "candidates": [{"chunk_size": 128, "count": 5}]},
+            )
+            lb.record(
+                "runtime_scan_heap_objects",
+                {"pid": 8888},
+                {"success": True, "objects": [{"type": "Session", "count": 42}]},
+            )
+            self.assertEqual(la.revision, lb.revision)
+            pre_save_rev = la.revision
+
+            barrier = threading.Barrier(2)
+
+            def _worker(st):
+                barrier.wait(timeout=5.0)
+                return st.save(tkey)
+
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                fa = pool.submit(_worker, store_a)
+                fb = pool.submit(_worker, store_b)
+                self.assertTrue(fa.result(timeout=10.0))
+                self.assertTrue(fb.result(timeout=10.0))
+
+            final = TrackingLedgerStore(persist_dir=td).get(tkey)
+            self.assertIsNotNone(final)
+            slot = final.get_playbook_slot(pb_a["playbook_id"])
+            self.assertIsNotNone(slot)
+            tools_in_log = {row["tool"] for row in slot["decision_log"]}
+            self.assertIn("runtime_heap_leak_candidates", tools_in_log)
+            self.assertIn("runtime_scan_heap_objects", tools_in_log)
+            self.assertGreaterEqual(slot["iteration"], 2)
+            self.assertGreater(slot["revision"], pre_save_rev)
+
+    def test_boot_id_fail_closed_patch_holds_even_after_cache_warmed(self):
+        from extractor.capture_backend import ProcessIdentityUnavailableError, resolve_current_boot_id
+        import extractor.trust_store as ts_mod
+
+        with patch.object(ts_mod, "_CURRENT_BOOT_ID_CACHE", "cached-boot-id"):
+            self.assertEqual(resolve_current_boot_id(), "cached-boot-id")
+            with patch("os.path.exists", return_value=False):
+                with patch("extractor.trust_store._CURRENT_BOOT_ID_CACHE", None):
+                    with self.assertRaises(ProcessIdentityUnavailableError):
+                        resolve_current_boot_id()
+
 if __name__ == "__main__":
     unittest.main()

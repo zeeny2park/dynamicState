@@ -7,6 +7,7 @@ from __future__ import annotations
 import contextlib
 import hashlib
 import json
+import logging
 import os
 import threading
 import time
@@ -22,6 +23,16 @@ except ImportError:  # pragma: no cover - non-POSIX
 _MAX_TARGETS = 32
 _MAX_CALLS_PER_TARGET = 24
 _MAX_ANCHORS_PER_TARGET = 32
+
+_LOGGER = logging.getLogger(__name__)
+
+_PREDICATE_SEVERITY_RANK: Dict[str, int] = {
+    "OPEN": 0,
+    "PIVOT_REQUIRED": 1,
+    "EXHAUSTED": 2,
+    "MET": 3,
+    "BLOCKED": 4,
+}
 
 # Tools that are intentionally called repeatedly to observe time progression
 _TEMPORAL_REPEAT_TOOLS = frozenset({
@@ -539,12 +550,65 @@ class TargetTrackingLedger:
         self.updated_at_epoch: float = time.time()
         self._disk_mtime_ns: int = 0
 
+    def _restore_from_slot(
+        self,
+        slot: Dict[str, Any],
+        *,
+        playbook: Optional[Dict[str, Any]] = None,
+        max_iterations: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        slot_pb = slot.get("active_playbook")
+        if isinstance(playbook, dict):
+            self.active_playbook = dict(playbook)
+        elif isinstance(slot_pb, dict):
+            self.active_playbook = dict(slot_pb)
+        if max_iterations is not None:
+            self.max_iterations = max(1, int(max_iterations))
+        else:
+            raw_max = slot.get("max_iterations")
+            self.max_iterations = int(raw_max) if raw_max is not None else None
+        self.iteration = int(slot.get("iteration") or 0)
+        self.consecutive_plateaus = int(slot.get("consecutive_plateaus") or 0)
+        restored_ps = str(slot.get("predicate_status") or "OPEN")
+        if restored_ps == "EXHAUSTED" and (self.max_iterations is None or self.iteration < self.max_iterations):
+            restored_ps = "OPEN"
+        self.predicate_status = restored_ps
+        self.hypothesis_status = str(slot.get("hypothesis_status") or "UNVALIDATED")
+        self.evidence_provenance = list(slot.get("evidence_provenance") or [])[-_MAX_CALLS_PER_TARGET:]
+        if isinstance(slot.get("exit_predicate_evaluation"), dict):
+            self.exit_predicate_evaluation = dict(slot["exit_predicate_evaluation"])
+        self.decision_log = list(slot.get("decision_log") or [])[-_MAX_CALLS_PER_TARGET:]
+        self.revision = max(self.revision, int(slot.get("revision") or 0))
+        self.updated_at_epoch = max(self.updated_at_epoch, float(slot.get("updated_at_epoch") or 0.0))
+        self._sync_active_playbook_slot()
+        return self.loop_state()
+
+    def resume_playbook(
+        self,
+        playbook_id: str,
+        *,
+        max_iterations: Optional[int] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Restore a previously persisted playbook slot as the active playbook."""
+        slot = self.playbook_slots.get(str(playbook_id).strip())
+        if not isinstance(slot, dict):
+            return None
+        return self._restore_from_slot(slot, max_iterations=max_iterations)
+
     def activate_playbook(
         self,
         playbook: Dict[str, Any],
         *,
         max_iterations: Optional[int] = None,
+        resume: bool = False,
     ) -> Dict[str, Any]:
+        pb_id = str((playbook or {}).get("playbook_id") or "").strip()
+        if resume and pb_id and isinstance(self.playbook_slots.get(pb_id), dict):
+            return self._restore_from_slot(
+                self.playbook_slots[pb_id],
+                playbook=playbook,
+                max_iterations=max_iterations,
+            )
         self.active_playbook = dict(playbook)
         # Only enforce an iteration limit when explicitly configured by the caller
         self.max_iterations = max(1, int(max_iterations)) if max_iterations is not None else None
@@ -951,6 +1015,14 @@ class TrackingLedgerStore:
         self._max_targets = max_targets
         self._persist_dir = persist_dir
         self._ledgers: "OrderedDict[str, TargetTrackingLedger]" = OrderedDict()
+        self._corruption_events: Dict[str, Dict[str, Any]] = {}
+
+    def get_corruption_event(self, target_key: str) -> Optional[Dict[str, Any]]:
+        ev = self._corruption_events.get(str(target_key))
+        return dict(ev) if isinstance(ev, dict) else None
+
+    def list_corruption_events(self) -> Dict[str, Dict[str, Any]]:
+        return {k: dict(v) for k, v in self._corruption_events.items()}
 
     def _effective_persist_dir(self) -> Optional[str]:
         return self._persist_dir or os.environ.get("DYNAMICSTATE_LEDGER_DIR") or None
@@ -994,6 +1066,60 @@ class TrackingLedgerStore:
         ledger._disk_mtime_ns = mtime_ns
         return ledger
 
+    @staticmethod
+    def _merge_dict_list(primary: List[Dict[str, Any]], secondary: List[Dict[str, Any]], limit: int) -> List[Dict[str, Any]]:
+        merged: List[Dict[str, Any]] = []
+        seen = set()
+        for item in list(primary or []) + list(secondary or []):
+            if not isinstance(item, dict):
+                continue
+            key = json.dumps(item, sort_keys=True, ensure_ascii=False, default=str)
+            if key not in seen:
+                seen.add(key)
+                merged.append(item)
+        return merged[-limit:]
+
+    @classmethod
+    def _merge_same_playbook_slot(cls, mslot: Dict[str, Any], dslot: Dict[str, Any]) -> Dict[str, Any]:
+        """Merge two concurrent updates to the same playbook slot without silently dropping either writer."""
+        m_rev = int(mslot.get("revision") or 0)
+        d_rev = int(dslot.get("revision") or 0)
+        m_ts = float(mslot.get("updated_at_epoch") or 0.0)
+        d_ts = float(dslot.get("updated_at_epoch") or 0.0)
+        # Prefer the side with higher revision (or newer timestamp on tie) as base
+        base, other = (dict(dslot), mslot) if (d_rev > m_rev or (d_rev == m_rev and d_ts > m_ts)) else (dict(mslot), dslot)
+
+        merged_prov = cls._merge_dict_list(
+            other.get("evidence_provenance") or [],
+            base.get("evidence_provenance") or [],
+            _MAX_CALLS_PER_TARGET,
+        )
+        merged_dlog = cls._merge_dict_list(
+            other.get("decision_log") or [],
+            base.get("decision_log") or [],
+            _MAX_CALLS_PER_TARGET,
+        )
+        base["evidence_provenance"] = merged_prov
+        base["decision_log"] = merged_dlog
+        base["iteration"] = max(int(mslot.get("iteration") or 0), int(dslot.get("iteration") or 0), len(merged_dlog))
+
+        m_ps = str(mslot.get("predicate_status") or "OPEN")
+        d_ps = str(dslot.get("predicate_status") or "OPEN")
+        if _PREDICATE_SEVERITY_RANK.get(d_ps, 0) > _PREDICATE_SEVERITY_RANK.get(m_ps, 0):
+            base["predicate_status"] = d_ps
+            if isinstance(dslot.get("exit_predicate_evaluation"), dict):
+                base["exit_predicate_evaluation"] = dict(dslot["exit_predicate_evaluation"])
+            base["hypothesis_status"] = str(dslot.get("hypothesis_status") or base.get("hypothesis_status") or "UNVALIDATED")
+        elif _PREDICATE_SEVERITY_RANK.get(m_ps, 0) > _PREDICATE_SEVERITY_RANK.get(d_ps, 0):
+            base["predicate_status"] = m_ps
+            if isinstance(mslot.get("exit_predicate_evaluation"), dict):
+                base["exit_predicate_evaluation"] = dict(mslot["exit_predicate_evaluation"])
+            base["hypothesis_status"] = str(mslot.get("hypothesis_status") or base.get("hypothesis_status") or "UNVALIDATED")
+
+        base["revision"] = max(m_rev, d_rev) + 1
+        base["updated_at_epoch"] = max(m_ts, d_ts, time.time())
+        return base
+
     def _merge_newer_disk(self, mem: TargetTrackingLedger, disk: TargetTrackingLedger) -> None:
         """Merge newer disk state into in-memory ledger without losing either side's anchors, logs, or playbook slots."""
         for a in disk.code_anchors:
@@ -1004,17 +1130,31 @@ class TrackingLedgerStore:
                 mem._anchor_keys.add(ak)
                 mem.code_anchors.append(a)
         mem.dead_end_signatures.update(disk.dead_end_signatures)
-        # Merge per-playbook state slots without losing concurrent distinct playbooks
+        mem.calls = self._merge_dict_list(disk.calls, mem.calls, _MAX_CALLS_PER_TARGET)
+
+        active_pb_id = str((mem.active_playbook or {}).get("playbook_id") or "").strip()
+        # Merge per-playbook state slots without losing concurrent distinct or same-playbook updates
         for pb_id, dslot in (disk.playbook_slots or {}).items():
             if not isinstance(dslot, dict):
                 continue
             mslot = mem.playbook_slots.get(pb_id)
-            if mslot is None or int(dslot.get("revision") or 0) > int(mslot.get("revision") or 0):
+            if mslot is None:
                 mem.playbook_slots[pb_id] = dict(dslot)
-        if disk.revision > mem.revision:
-            mem.revision = disk.revision + 1
-            if len(disk.decision_log) > len(mem.decision_log):
-                mem.decision_log = (disk.decision_log + mem.decision_log[-1:])[-_MAX_CALLS_PER_TARGET:]
+            elif dslot != mslot:
+                merged_slot = self._merge_same_playbook_slot(mslot, dslot)
+                mem.playbook_slots[pb_id] = merged_slot
+                if pb_id == active_pb_id:
+                    mem.iteration = int(merged_slot.get("iteration") or mem.iteration)
+                    mem.predicate_status = str(merged_slot.get("predicate_status") or mem.predicate_status)
+                    mem.hypothesis_status = str(merged_slot.get("hypothesis_status") or mem.hypothesis_status)
+                    mem.evidence_provenance = list(merged_slot.get("evidence_provenance") or mem.evidence_provenance)
+                    if isinstance(merged_slot.get("exit_predicate_evaluation"), dict):
+                        mem.exit_predicate_evaluation = dict(merged_slot["exit_predicate_evaluation"])
+                    mem.decision_log = list(merged_slot.get("decision_log") or mem.decision_log)
+
+        if disk.revision >= mem.revision:
+            mem.revision = max(disk.revision, mem.revision) + 1
+            mem.decision_log = self._merge_dict_list(disk.decision_log, mem.decision_log, _MAX_CALLS_PER_TARGET)
 
     @contextlib.contextmanager
     def _file_lock(self, path: str) -> Iterator[None]:
@@ -1034,7 +1174,38 @@ class TrackingLedgerStore:
             finally:
                 os.close(fd)
 
-    def _try_load(self, target_key: str) -> Optional[TargetTrackingLedger]:
+    def _quarantine_corrupt_file(self, target_key: str, path: str, reason: str) -> Optional[str]:
+        """Preserve a corrupted ledger file under a `.corrupt.<ts>` suffix rather than silently overwriting it."""
+        ts_ms = int(time.time() * 1000)
+        qpath = f"{path}.corrupt.{ts_ms}"
+        suffix = 0
+        while os.path.exists(qpath):
+            suffix += 1
+            qpath = f"{path}.corrupt.{ts_ms}.{suffix}"
+        quarantined: Optional[str] = None
+        try:
+            os.replace(path, qpath)
+            quarantined = qpath
+        except OSError:
+            quarantined = None
+        ev = {
+            "target_key": target_key,
+            "original_path": path,
+            "quarantine_path": quarantined,
+            "reason": str(reason),
+            "detected_at_epoch": time.time(),
+        }
+        self._corruption_events[str(target_key)] = ev
+        _LOGGER.warning(
+            "Quarantined corrupted tracking ledger for %s (%s): %s -> %s",
+            target_key,
+            reason,
+            path,
+            quarantined or "<failed-to-quarantine>",
+        )
+        return quarantined
+
+    def _try_load(self, target_key: str, *, quarantine_on_corrupt: bool = True) -> Optional[TargetTrackingLedger]:
         path = self._ledger_path(target_key)
         if not path or not os.path.isfile(path):
             return None
@@ -1043,10 +1214,34 @@ class TrackingLedgerStore:
             with open(path, "r", encoding="utf-8") as f:
                 data = json.load(f)
             if not isinstance(data, dict) or data.get("target_key") != target_key:
+                if quarantine_on_corrupt:
+                    self._quarantine_corrupt_file(target_key, path, "invalid_schema_or_target_key_mismatch")
                 return None
             return self._deserialize(target_key, data, mtime_ns=st.st_mtime_ns)
-        except Exception:
+        except (json.JSONDecodeError, UnicodeDecodeError, ValueError, TypeError) as exc:
+            if quarantine_on_corrupt:
+                self._quarantine_corrupt_file(target_key, path, f"{type(exc).__name__}: {exc}")
             return None
+        except OSError as exc:
+            _LOGGER.warning("Failed to read tracking ledger %s: %s", path, exc)
+            return None
+
+    @staticmethod
+    def _fsync_parent_dir(path: str) -> None:
+        parent = os.path.dirname(os.path.abspath(path))
+        if not parent:
+            return
+        flags = os.O_RDONLY
+        if hasattr(os, "O_DIRECTORY"):
+            flags |= os.O_DIRECTORY
+        try:
+            dir_fd = os.open(parent, flags)
+            try:
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
+        except OSError:
+            pass
 
     def save(self, target_key: str) -> bool:
         path = self._ledger_path(target_key)
@@ -1059,20 +1254,26 @@ class TrackingLedgerStore:
             try:
                 with self._file_lock(path):
                     # Guard against stale in-memory state overwriting newer disk state or concurrent playbooks
-                    disk_existing = self._try_load(target_key)
-                    _has_newer_disk_slot = (
+                    disk_existing = self._try_load(target_key, quarantine_on_corrupt=True)
+                    _has_divergent_disk_slot = (
                         disk_existing is not None
                         and any(
                             isinstance(dslot, dict)
-                            and int(dslot.get("revision") or 0) > int((ledger.playbook_slots.get(pb_id) or {}).get("revision") or 0)
+                            and (
+                                pb_id not in ledger.playbook_slots
+                                or int(dslot.get("revision") or 0) > int((ledger.playbook_slots.get(pb_id) or {}).get("revision") or 0)
+                                or (
+                                    int(dslot.get("revision") or 0) == int((ledger.playbook_slots.get(pb_id) or {}).get("revision") or 0)
+                                    and dslot != ledger.playbook_slots.get(pb_id)
+                                )
+                            )
                             for pb_id, dslot in (disk_existing.playbook_slots or {}).items()
                         )
                     )
                     if disk_existing is not None and (
                         disk_existing.revision > ledger.revision
-                        or bool(set(disk_existing.playbook_slots) - set(ledger.playbook_slots))
-                        or _has_newer_disk_slot
-                        or (disk_existing._disk_mtime_ns > ledger._disk_mtime_ns and disk_existing.updated_at_epoch > ledger.updated_at_epoch)
+                        or _has_divergent_disk_slot
+                        or (disk_existing._disk_mtime_ns > ledger._disk_mtime_ns and disk_existing.updated_at_epoch >= ledger.updated_at_epoch)
                     ):
                         self._merge_newer_disk(ledger, disk_existing)
                     data = {
@@ -1094,12 +1295,25 @@ class TrackingLedgerStore:
                         "calls": ledger.calls[-_MAX_CALLS_PER_TARGET:],
                     }
                     os.makedirs(os.path.dirname(path), exist_ok=True)
-                    tmp = f"{path}.{os.getpid()}.{threading.get_ident()}.tmp"
-                    with open(tmp, "w", encoding="utf-8") as f:
-                        json.dump(data, f, ensure_ascii=False, indent=2)
-                        f.flush()
-                        os.fsync(f.fileno())
-                    os.replace(tmp, path)
+                    tmp = f"{path}.{os.getpid()}.{threading.get_ident()}.{time.monotonic_ns()}.tmp"
+                    open_flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+                    if hasattr(os, "O_NOFOLLOW"):
+                        open_flags |= os.O_NOFOLLOW
+                    fd = os.open(tmp, open_flags, 0o600)
+                    try:
+                        with os.fdopen(fd, "w", encoding="utf-8") as f:
+                            json.dump(data, f, ensure_ascii=False, indent=2)
+                            f.flush()
+                            os.fsync(f.fileno())
+                        os.replace(tmp, path)
+                        self._fsync_parent_dir(path)
+                    except BaseException:
+                        try:
+                            if os.path.exists(tmp):
+                                os.unlink(tmp)
+                        except OSError:
+                            pass
+                        raise
                     try:
                         ledger._disk_mtime_ns = os.stat(path).st_mtime_ns
                     except OSError:

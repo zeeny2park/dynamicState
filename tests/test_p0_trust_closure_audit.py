@@ -230,7 +230,7 @@ class TestP01CanonicalReplayIdentity(unittest.TestCase):
 
         # 3. Kernel boot_id resolution fails closed when file unavailable
         with patch("os.path.exists", return_value=False):
-            with patch("extractor.capture_backend._CURRENT_BOOT_ID_CACHE", None):
+            with patch("extractor.trust_store._CURRENT_BOOT_ID_CACHE", None):
                 with self.assertRaises(ProcessIdentityUnavailableError):
                     resolve_current_boot_id()
 
@@ -295,7 +295,7 @@ class TestP01CanonicalReplayIdentity(unittest.TestCase):
     def test_resolve_boot_id_fails_closed_without_boot_default_fallback(self):
         """Missing boot_id must fail closed with ProcessIdentityUnavailableError, never falling back to boot-default."""
         with patch("os.path.exists", return_value=False):
-            with patch("extractor.capture_backend._CURRENT_BOOT_ID_CACHE", None):
+            with patch("extractor.trust_store._CURRENT_BOOT_ID_CACHE", None):
                 with self.assertRaises(ProcessIdentityUnavailableError):
                     resolve_current_boot_id()
 
