@@ -94,6 +94,38 @@ def _heap_analysis(args):
     )
 
 
+def _enrich_cli_heap_output(
+    tool_name: str,
+    out: Dict[str, Any],
+    source_payload: Dict[str, Any],
+    args,
+    extra_args: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Attach next_drilldown, recovery_actions, and tracking_context to match MCP parity."""
+    rm = _remote_kwargs(args) if getattr(args, "remote_host", None) else None
+    try:
+        from .state_intelligence import build_narrow_tool_next_steps
+        _next = build_narrow_tool_next_steps(
+            tool_name, source_payload, pid=args.pid, companion_elf=args.debug_image, remote_target=rm
+        )
+        if _next:
+            out["next_drilldown"] = _next
+    except Exception:
+        pass
+    try:
+        from .tracking_ledger import enrich_tool_response
+        return enrich_tool_response(
+            tool_name,
+            out,
+            pid=args.pid,
+            companion_elf=args.debug_image,
+            args=extra_args,
+            remote_target=rm,
+        )
+    except Exception:
+        return out
+
+
 def run_heap_owner(args) -> int:
     try:
         raw = [a for a in args.addresses.replace(";", ",").split(",") if a.strip()]
@@ -109,6 +141,9 @@ def run_heap_owner(args) -> int:
             "reachability": summary.get("reachability"), "root_sources": summary.get("root_sources"),
             "cost": summary.get("cost"), "results": [an.lookup(a) for a in addrs],
         }
+        out = _enrich_cli_heap_output(
+            "runtime_heap_owner_lookup", out, out, args, extra_args={"addresses": raw[:8]}
+        )
     except Exception as exc:
         return _fail(str(exc), type(exc).__name__)
     print(json.dumps(out, indent=2, ensure_ascii=False, default=str))
@@ -119,12 +154,14 @@ def run_heap_leaks(args) -> int:
     try:
         an = _heap_analysis(args)
         summary = an.summary()
+        lrep = an.leak_report(max_examples_per_class=max(1, int(args.max_examples)))
         out = {
             "success": an.ok, "analysis_id": an.analysis_id,
             "heap_counts": (summary.get("heap_walk") or {}).get("counts"),
             "reachability": summary.get("reachability"), "cost": summary.get("cost"),
-            **an.leak_report(max_examples_per_class=max(1, int(args.max_examples))),
+            **lrep,
         }
+        out = _enrich_cli_heap_output("runtime_heap_leak_candidates", out, lrep, args)
     except Exception as exc:
         return _fail(str(exc), type(exc).__name__)
     print(json.dumps(out, indent=2, ensure_ascii=False, default=str))

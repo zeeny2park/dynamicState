@@ -23,6 +23,8 @@ import unittest
 from pathlib import Path
 from types import SimpleNamespace
 
+from tests.support.fixture_process import fixture_popen
+
 from extractor.competing_hypotheses import (
     CompetingHypothesis,
     VERDICT_INCONCLUSIVE,
@@ -64,7 +66,7 @@ class TestPillar1NativeCollectorSignalSafety(unittest.TestCase):
     def test_daemon_handles_broken_stdout_pipe_without_sigpipe_crash(self):
         if not os.path.exists(self.collector_bin):
             self.skipTest("Native collector binary not built")
-        proc = subprocess.Popen(
+        proc = fixture_popen(
             [self.collector_bin, "--daemon"],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
@@ -90,7 +92,7 @@ class TestPillar1NativeCollectorSignalSafety(unittest.TestCase):
     def test_daemon_exits_cleanly_on_sigterm(self):
         if not os.path.exists(self.collector_bin):
             self.skipTest("Native collector binary not built")
-        proc = subprocess.Popen(
+        proc = fixture_popen(
             [self.collector_bin, "--daemon"],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,

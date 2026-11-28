@@ -15,6 +15,7 @@ from extractor.runtime_evidence_provider import (
 )
 from extractor.target_adapter import RemoteSshTargetAdapter
 from extractor.thread_sampler import ThreadSampler, ThreadSamplingConfig
+from tests.support.fixture_process import fixture_popen
 
 
 class TestRemoteCollectionBoundsAndIsolation(unittest.TestCase):
@@ -40,7 +41,7 @@ class TestRemoteCollectionBoundsAndIsolation(unittest.TestCase):
                 """
             )
         subprocess.run(["gcc", "-g", "-O0", self.src_path, "-o", self.bin_path], check=True)
-        self.proc = subprocess.Popen([self.bin_path])
+        self.proc = fixture_popen([self.bin_path])
         time.sleep(0.05)
 
     def tearDown(self):

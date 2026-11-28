@@ -16,6 +16,7 @@ from extractor.expert_diagnostic_engine import (
 )
 from extractor.recipe_plugins.mapping_growth import _proc_sample, _thread_counts
 from extractor.web.server import WebApiAdapter
+from tests.support.fixture_process import fixture_popen
 
 
 class TestContinueCollectedDiagnosis(unittest.TestCase):
@@ -41,7 +42,7 @@ class TestContinueCollectedDiagnosis(unittest.TestCase):
                 """
             )
         subprocess.run(["gcc", "-g", "-O0", self.src_path, "-o", self.bin_path], check=True)
-        self.proc = subprocess.Popen([self.bin_path])
+        self.proc = fixture_popen([self.bin_path])
         time.sleep(0.05)
 
     def tearDown(self):

@@ -23,6 +23,7 @@ from extractor.temporal_observation_window import (
     MemorySample,
     ObservationWindow,
 )
+from tests.support.fixture_process import fixture_popen
 
 
 class TestRemoteDeadlineBoundaries(unittest.TestCase):
@@ -211,7 +212,7 @@ class TestNativeCollectorRepeatedLifecycle(unittest.TestCase):
         if not os.path.exists(self.collector_bin):
             self.skipTest("Native collector binary not built")
         for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGTERM):
-            proc = subprocess.Popen(
+            proc = fixture_popen(
                 [self.collector_bin, "--daemon"],
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,

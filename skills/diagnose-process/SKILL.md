@@ -112,9 +112,16 @@ untagged applies to both. (`dynamic-state skill install` installs this file as i
 [cli]     There is no keyword symbol search on the command line; `dynamic-state fuzzy-resolve -p PID -d ELF -q "words describing it" --corpus DIR` resolves a described concept to DWARF symbols and live values.
 - INCONCLUSIVE (**DO NOT STOP AT ONE CALL**): immediately inspect `agent_summary.inconclusive_drilldown` (`should_continue`, `causes[]`, `scope_narrowing_ladder[]`) and `not_covered`, then execute the highest-priority narrowing tool before concluding:
   - `target_unreadable` / `target_unreachable`: external permission/ptrace/SSH blocker — report the exact error and ask the user to fix access; do not retry blindly.
+<!-- begin:mcp -->
   - `missing_debug_image` / no DWARF: ask for the matching unstripped ELF, and in parallel run symbol-free narrowing (`runtime_inspect_thread_callstack_and_locks` or `runtime_explain_process_behavior`) to capture live thread/I/O state.
   - `large_heap_tiered_sampling` (heap > 8 MiB baseline cap or > 50 MiB read budget): Tier-2 bounded sampling checks active arenas, `tcache`, `fastbins`, and top-N chunks first. Follow the ladder: `runtime_heap_leak_candidates` -> `runtime_heap_owner_lookup(addresses=[...])` -> `runtime_eval_memory_path`.
   - `inconclusive_memory_checks` / `inconclusive_thread_lock_checks` / `inconclusive_state_checks`: execute `agent_summary.inconclusive_drilldown.scope_narrowing_ladder` step 2 (`runtime_heap_leak_candidates`, `runtime_inspect_thread_callstack_and_locks`, `runtime_symbol_search`, or `runtime_explain_process_behavior`), then follow `next_drilldown` returned by that tool to step 3 (`runtime_heap_owner_lookup`, `runtime_eval_memory_path`, `runtime_trace_ipc_pipeline`, `runtime_watch_until_condition`).
+<!-- end:mcp -->
+<!-- begin:cli -->
+  - `missing_debug_image` / no DWARF: ask for the matching unstripped ELF, and in parallel run symbol-free narrowing (`dynamic-state callstacks`) to capture live thread/I/O state.
+  - `large_heap_tiered_sampling` (heap > 8 MiB baseline cap or > 50 MiB read budget): Tier-2 bounded sampling checks active arenas, `tcache`, `fastbins`, and top-N chunks first. Follow the ladder: `dynamic-state heap-leaks` -> `dynamic-state heap-owner` -> `dynamic-state eval`.
+  - `inconclusive_memory_checks` / `inconclusive_thread_lock_checks` / `inconclusive_state_checks`: execute `agent_summary.inconclusive_drilldown.scope_narrowing_ladder` step 2 (`dynamic-state heap-leaks`, `dynamic-state callstacks`, or `dynamic-state fuzzy-resolve`), then follow `next_drilldown` returned by that command to step 3 (`dynamic-state heap-owner`, `dynamic-state eval`).
+<!-- end:cli -->
   - `remote_limitation` / `unsupported_on_target`: state clearly what is not supported; do not guess.
   - no findings after a narrow symptom: re-run once without `symptom` (general health check) or follow `suggested_actions[0]` to narrow by domain.
 - HEALTHY: say it is healthy within the checked scope, then name `healthy_scope.not_checked` (e.g. long waits whose expectedness was not judged, heap integrity above the walk cap, use-after-free). Nothing outside that scope is claimed.
@@ -140,6 +147,7 @@ untagged applies to both. (`dynamic-state skill install` installs this file as i
 - Heap tools support glibc ptmalloc only.
 - The diagnosis also runs against a remote target over SSH (ARM64 / x86-64 glibc board, host-side analysis); every heap byte then crosses the link, so heap checks are capped and slower, and the remote gaps listed in `not_covered` apply. Key authentication only (no passwords).
 
+<!-- begin:mcp -->
 ### Continuous Tracking & Tool Tiers (Multi-Hop Coding-Agent Protocol)
 - **Tool Progression**: Follow `TIER0_ENTRY` (`runtime_diagnose_process` / `runtime_explain_process_behavior`) -> `TIER1_NARROWING` (`runtime_inspect_thread_callstack_and_locks` / `runtime_heap_leak_candidates` / `runtime_trace_ipc_pipeline` / `runtime_build_dependency_graph`) -> `TIER2_DEEP_INSPECT` (`runtime_heap_owner_lookup` / `runtime_symbol_search` / `runtime_eval_memory_path` / `runtime_correlate_source_and_state`) -> `TIER3_TEMPORAL_WATCH` (`runtime_capture_and_diff` / `runtime_watch_until_condition`).
 - **Use Tracking Signals**: Check `delta_from_last_call` on repeated calls to separate stuck threads/growing leaks from normal progress; follow `code_anchors` (`file:line`, `variable_path`) to jump directly into repository source files; follow `recovery_actions` if a lookup fails or returns empty; and rely on `tracking_context` to avoid repeating dead-end calls.
@@ -147,3 +155,9 @@ untagged applies to both. (`dynamic-state skill install` installs this file as i
 ### Problem-Specific Playbooks & Loop Contract (`pstack`-style)
 - **Front-Door Routing**: Call `runtime_get_playbook(symptom="<goal>", pid=<pid>)` to auto-select one of 6 playbooks (`memory-leak-and-growth`, `heap-corruption-and-uaf`, `hang-deadlock-and-contention`, `fd-and-ipc-stall`, `state-and-variable-bug`, `intermittent-temporal-bug`) under `skills/diagnose-process/playbooks/` and activate its loop state machine.
 - **Loop Discipline**: Never relax the `exit_predicate`. On each iteration, run one narrowing tool, inspect `tracking_context.loop_state` (`predicate_status`, `decision_log`), pivot immediately when `predicate_status == "PIVOT_REQUIRED"`, and stop only on `MET`, `BLOCKED`, or `EXHAUSTED`.
+<!-- end:mcp -->
+<!-- begin:cli -->
+### Problem-Specific Playbooks & Loop Contract (`pstack`-style)
+- **Front-Door Routing**: Run `dynamic-state playbook --symptom "<goal>" --json` to auto-select one of 6 playbooks (`memory-leak-and-growth`, `heap-corruption-and-uaf`, `hang-deadlock-and-contention`, `fd-and-ipc-stall`, `state-and-variable-bug`, `intermittent-temporal-bug`) under `skills/diagnose-process/playbooks/`.
+- **Autonomous Loop**: Run `dynamic-state loop -p <pid> --symptom "<goal>" --strict-exit-codes --json` to execute the playbook loop with `delta_from_last_call`, `code_anchors`, `recovery_actions`, `tracking_context`, plateau->pivot transitions, and standard CI exit codes (`0` healthy, `2` fault, `3` degraded, `4` inconclusive, `5` blocked).
+<!-- end:cli -->

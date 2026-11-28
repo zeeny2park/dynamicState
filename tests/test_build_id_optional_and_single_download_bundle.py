@@ -22,6 +22,7 @@ from extractor.capture_backend import (
     MissingIdentityFieldError,
 )
 from extractor.debug_image import inspect_elf
+from tests.support.fixture_process import fixture_popen
 from extractor.target_adapter import (
     LocalTargetAdapter,
     PIDReusedError,
@@ -45,7 +46,7 @@ class TestBuildIdOptionalAndSingleDownloadBundle(unittest.TestCase):
             info = inspect_elf(exe)
             self.assertIsNone(info.build_id, "Fixture must have no GNU Build-ID")
 
-            proc = subprocess.Popen([exe])
+            proc = fixture_popen([exe])
             try:
                 store_path = os.path.join(td, "trust.json")
                 ad = LocalTargetAdapter()

@@ -47,6 +47,7 @@ from extractor.expert_diagnostic_engine import (
     diagnose,
 )
 from extractor.target_adapter import RemoteSshTargetAdapter
+from tests.support.fixture_process import fixture_popen
 
 TARGETS_DIR = os.path.join(ROOT_DIR, "benchmarks", "diagnosis_accuracy", "targets")
 
@@ -86,11 +87,10 @@ def _compile_target_file(c_filename: str, output_path: str) -> str:
 
 def _launch_proc(bin_path: str, args: Optional[List[str]] = None) -> subprocess.Popen:
     cmd = [bin_path] + (args or [])
-    proc = subprocess.Popen(
+    proc = fixture_popen(
         cmd,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
-        preexec_fn=os.setsid if hasattr(os, "setsid") else None,
     )
     time.sleep(0.05)
     return proc

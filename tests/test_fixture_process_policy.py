@@ -45,6 +45,7 @@ ALLOWED_POPEN = {
 
 # multiprocessing workers: short, finite Python work (no allocation loops), joined with timeouts by the tests.
 ALLOWED_MULTIPROCESSING = {
+    "tests/test_phase2_0_a_3_17_closure_matrix.py",
     "tests/test_phase2_0_a_3_18_deterministic_multiprocess_barriers.py",
     "tests/test_phase2_0_a_3_19_multiprocess_crash_repaired.py",
 }
