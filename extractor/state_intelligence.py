@@ -463,6 +463,20 @@ def classify_coverage(
         "ABORTED": "진단 중단",
     }.get(qualifier, verdict)
 
+    target_meta = res.get("target") if isinstance(res.get("target"), dict) else {}
+    remote_limits = [m for m in mode_unsupported if m.get("kind") == "remote_limitation"]
+    is_remote = bool(target_meta.get("transport") == "ssh" or target_meta.get("host") or remote_limits)
+    heap_capped = any(
+        p.get("kind") in ("integrity_not_checked", "uaf_not_checked", "double_free_not_checked")
+        for p in policy_skipped
+    )
+    remote_coverage = {
+        "is_remote": is_remote,
+        "remote_limitations_count": len(remote_limits),
+        "remote_limitations": [str(m.get("item") or m.get("reason") or "") for m in remote_limits],
+        "heap_walk_capped_by_link_budget": bool(is_remote and heap_capped),
+    }
+
     return {
         "verdict": verdict,
         "verdict_qualifier": qualifier,
@@ -476,6 +490,7 @@ def classify_coverage(
             "mode_or_target_unsupported": mode_unsupported,
             "blocking_gaps": blocking_gaps,
             "inherent_limits": inherent_limits,
+            "remote_coverage": remote_coverage,
         },
     }
 
@@ -1148,18 +1163,45 @@ def build_inconclusive_drilldown(
             "runtime_eval_memory_path",
         )
 
-    # 3. Large heap cap / Tier-2 bounded sampling
+    # 3. Large heap cap / Tier-2 bounded sampling (distinguish remote SSH link-budget cap vs local cap)
+    remote_cov = detail.get("remote_coverage") if isinstance(detail.get("remote_coverage"), dict) else {}
+    mode_unsup = list(detail.get("mode_or_target_unsupported") or [])
+    is_remote_target = bool(remote_cov.get("is_remote"))
     heap_gaps = [p for p in policy_skipped if p.get("kind") in ("integrity_not_checked", "uaf_not_checked", "double_free_not_checked")]
     if heap_gaps:
         act = _find_action("runtime_heap_leak_candidates")
+        if is_remote_target:
+            _add_cause(
+                "remote_heap_tiered_sampling",
+                [str(g.get("item") or g.get("kind")) for g in heap_gaps],
+                "Remote SSH heap walk was capped by the link/observation budget (64 KiB slices; Tier-2 hot-path sampling only). Narrow with runtime_heap_leak_candidates -> runtime_heap_owner_lookup.",
+                "원격 SSH 링크·관측 예산(64 KiB 슬라이스) 상한으로 전체 힙 순회가 생략되고 Tier-2 핫패스 샘플링만 수행되었습니다. runtime_heap_leak_candidates -> runtime_heap_owner_lookup 순으로 범위를 좁히세요.",
+                "runtime_heap_leak_candidates",
+                act.get("mcp_args") if act else {},
+                "runtime_heap_owner_lookup",
+            )
+        else:
+            _add_cause(
+                "large_heap_tiered_sampling",
+                [str(g.get("item") or g.get("kind")) for g in heap_gaps],
+                "Full heap walk exceeded baseline cap/budget (Tier-2 hot-path sampling covers active arenas/tcache/fastbins only). Narrow with runtime_heap_leak_candidates -> runtime_heap_owner_lookup.",
+                "힙 크기가 기본 풀-스캔 상한을 초과해 Tier-2 핫패스(활성 아레나·tcache·fastbin) 샘플링만 수행되었습니다. runtime_heap_leak_candidates -> runtime_heap_owner_lookup 순으로 범위를 좁히세요.",
+                "runtime_heap_leak_candidates",
+                act.get("mcp_args") if act else {},
+                "runtime_heap_owner_lookup",
+            )
+
+    # 3b. Remote SSH transport limitations (TLS/running-thread stacks/remote symbols)
+    remote_limit_items = [m for m in mode_unsup if m.get("kind") == "remote_limitation"]
+    if remote_limit_items and verdict == "INCONCLUSIVE":
         _add_cause(
-            "large_heap_tiered_sampling",
-            [str(g.get("item") or g.get("kind")) for g in heap_gaps],
-            "Full heap walk exceeded baseline cap/budget (Tier-2 hot-path sampling covers active arenas/tcache/fastbins only). Narrow with runtime_heap_leak_candidates -> runtime_heap_owner_lookup.",
-            "힙 크기가 기본 풀-스캔 상한을 초과해 Tier-2 핫패스(활성 아레나·tcache·fastbin) 샘플링만 수행되었습니다. runtime_heap_leak_candidates -> runtime_heap_owner_lookup 순으로 범위를 좁히세요.",
-            "runtime_heap_leak_candidates",
-            act.get("mcp_args") if act else {},
-            "runtime_heap_owner_lookup",
+            "remote_limitation",
+            [str(m.get("item") or m.get("reason") or "remote_limitation") for m in remote_limit_items],
+            "Remote SSH collection omits TLS/TCB discovery, running-thread stacks, and un-fetched library symbols; rely on local unstripped debug_image and targeted narrowing.",
+            "원격 SSH 수집에서는 TLS/TCB 탐색, 실행 중 스레드 스택, 미전송 라이브러리 심볼이 제한됩니다. 로컬 비스트립 debug_image와 표적 도구를 활용하세요.",
+            "runtime_inspect_thread_callstack_and_locks",
+            {},
+            "runtime_eval_memory_path",
         )
 
     # 4. Inconclusive recipes in checks_run
@@ -1305,6 +1347,12 @@ def build_inconclusive_drilldown(
         coverage=cov,
         lang=lang,
     )
+    if should_continue and isinstance(rec_pb, dict) and rec_pb.get("playbook_id"):
+        pb_id = rec_pb["playbook_id"]
+        if ko:
+            directive = f"{directive} (추천 플레이북: `{pb_id}`)"
+        else:
+            directive = f"{directive} (Recommended playbook: `{pb_id}`)"
     return {
         "should_continue": should_continue,
         "agent_directive": directive,

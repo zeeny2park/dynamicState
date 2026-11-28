@@ -5527,6 +5527,7 @@ def diagnose(
     continue_collected_only: bool = False,
     force_fresh: bool = False,
     compare_baseline: Optional[str] = None,
+    broad_fallback: bool = True,
 ) -> DiagnoseResult:
     """Diagnose live process ``pid`` end to end in one call and return a :class:`DiagnoseResult`.
 
@@ -5657,7 +5658,7 @@ def diagnose(
                               "matching unstripped ELF. No conclusion was reached.")
         if remote and continue_collected_only:
             pass
-        return _diagnose_run(pid, debug_image, symptom, adapter=adapter, corpus_dir=corpus_dir,
+        res = _diagnose_run(pid, debug_image, symptom, adapter=adapter, corpus_dir=corpus_dir,
                              time_limit_s=time_limit_s, max_steps=max_steps, include_report=include_report,
                              engine=engine, extra_target=extra_target, pre_nc=pre_nc, t0=t0, remote=remote,
                              symptom_fields=symptom_fields, default_check_budget_s=default_check_budget_s,
@@ -5665,6 +5666,35 @@ def diagnose(
                              resume_investigation_id=resume_investigation_id,
                              continue_collected_only=continue_collected_only,
                              force_fresh=force_fresh)
+        # If a narrow free-text symptom returned INCONCLUSIVE with no findings and no hard blocker,
+        # run a single broad-screening fallback when budget permits so generic phrasing never hides a fault.
+        _norm_sym = (symptom or "").strip().lower()
+        _blocker_kinds = {"target_unreadable", "target_unreachable", "missing_debug_image", "process_exited", "invalid_target", "invalid_symptom_fields"}
+        _has_blocker = any(isinstance(n, dict) and n.get("kind") in _blocker_kinds for n in (res.not_covered or []))
+        _eff_budget = float(time_limit_s) if time_limit_s is not None else (120.0 if remote else 20.0)
+        if (
+            broad_fallback
+            and not continue_collected_only
+            and symptom_fields is None
+            and _norm_sym not in ("", "general health check", "health check", "전반적 상태 점검")
+            and str(res.verdict or "").upper() == "INCONCLUSIVE"
+            and not res.findings
+            and not _has_blocker
+            and (time.monotonic() - t0) < (_eff_budget * 0.6)
+        ):
+            fb = _diagnose_run(
+                pid, debug_image, "general health check", adapter=adapter, corpus_dir=corpus_dir,
+                time_limit_s=time_limit_s, max_steps=max_steps, include_report=include_report,
+                engine=engine, extra_target=extra_target, pre_nc=pre_nc, t0=t0, remote=remote,
+                symptom_fields=None, default_check_budget_s=default_check_budget_s,
+                default_check_max_s=default_check_max_s, enable_tracing=enable_tracing,
+                resume_investigation_id=None, continue_collected_only=False, force_fresh=True,
+            )
+            if fb.findings or str(fb.verdict or "").upper() in ("CONFIRMED_FAULT", "PROBABLE_FAULT", "FAULT", "DEGRADED"):
+                base_summary = (fb.summary or "").strip() or f"Verdict {fb.verdict}"
+                fb.summary = f"{base_summary} (discovered via broad-screening fallback after narrow symptom '{symptom}' was inconclusive)"
+                return fb
+        return res
     finally:
         if _diag_bg_pool is not None:
             try:

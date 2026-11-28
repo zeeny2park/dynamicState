@@ -4,13 +4,19 @@ and Self-Recovery Action Builder for continuous LLM coding-agent troubleshooting
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import os
 import threading
 import time
 from collections import OrderedDict
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterator, List, Optional, Tuple
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - non-POSIX
+    fcntl = None  # type: ignore[assignment]
 
 
 _MAX_TARGETS = 32
@@ -513,6 +519,7 @@ class TargetTrackingLedger:
         self._anchor_keys: set = set()
         # Playbook Loop State Machine
         self.active_playbook: Optional[Dict[str, Any]] = None
+        self.playbook_slots: Dict[str, Dict[str, Any]] = {}
         self.max_iterations: Optional[int] = None  # None = no arbitrary cap unless explicitly configured
         self.iteration: int = 0
         self.consecutive_plateaus: int = 0
@@ -555,7 +562,38 @@ class TargetTrackingLedger:
         }
         self.revision += 1
         self.updated_at_epoch = time.time()
+        self._sync_active_playbook_slot()
         return self.loop_state()
+
+    def _sync_active_playbook_slot(self) -> None:
+        """Persist the active playbook's isolated state slot keyed by playbook_id."""
+        pb = self.active_playbook
+        if not isinstance(pb, dict):
+            return
+        pb_id = str(pb.get("playbook_id") or "").strip()
+        if not pb_id:
+            return
+        self.playbook_slots[pb_id] = {
+            "playbook_id": pb_id,
+            "active_playbook": dict(pb),
+            "max_iterations": self.max_iterations,
+            "iteration": self.iteration,
+            "consecutive_plateaus": self.consecutive_plateaus,
+            "predicate_status": self.predicate_status,
+            "hypothesis_status": self.hypothesis_status,
+            "evidence_provenance": list(self.evidence_provenance[-_MAX_CALLS_PER_TARGET:]),
+            "exit_predicate_evaluation": dict(self.exit_predicate_evaluation),
+            "decision_log": list(self.decision_log[-_MAX_CALLS_PER_TARGET:]),
+            "revision": self.revision,
+            "updated_at_epoch": self.updated_at_epoch,
+        }
+
+    def get_playbook_slot(self, playbook_id: str) -> Optional[Dict[str, Any]]:
+        slot = self.playbook_slots.get(str(playbook_id))
+        return dict(slot) if isinstance(slot, dict) else None
+
+    def list_playbook_slots(self) -> List[str]:
+        return sorted(self.playbook_slots.keys())
 
     def _has_corroborated_root_anchor(self) -> bool:
         """True when at least one code anchor carries file:line, variable_path, or symbol."""
@@ -871,6 +909,7 @@ class TargetTrackingLedger:
 
         self.revision += 1
         self.updated_at_epoch = time.time()
+        self._sync_active_playbook_slot()
         return delta, new_anchors
 
     def filter_actions(self, actions: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], List[str]]:
@@ -897,6 +936,7 @@ class TargetTrackingLedger:
             "dead_end_calls_suppressed_ready": len(self.dead_end_signatures),
             "code_anchors_collected": len(self.code_anchors),
             "top_code_anchors": self.code_anchors[:5],
+            "playbook_slots": self.list_playbook_slots(),
             "loop_state": self.loop_state(),
         }
 
@@ -927,6 +967,11 @@ class TrackingLedgerStore:
     def _deserialize(self, target_key: str, data: Dict[str, Any], mtime_ns: int = 0) -> TargetTrackingLedger:
         ledger = TargetTrackingLedger(target_key)
         ledger.active_playbook = data.get("active_playbook")
+        raw_slots = data.get("playbook_slots")
+        if isinstance(raw_slots, dict):
+            ledger.playbook_slots = {
+                str(k): dict(v) for k, v in raw_slots.items() if isinstance(v, dict)
+            }
         raw_max = data.get("max_iterations")
         ledger.max_iterations = int(raw_max) if raw_max is not None else None
         ledger.iteration = int(data.get("iteration") or 0)
@@ -950,7 +995,7 @@ class TrackingLedgerStore:
         return ledger
 
     def _merge_newer_disk(self, mem: TargetTrackingLedger, disk: TargetTrackingLedger) -> None:
-        """Merge newer disk state into in-memory ledger without losing either side's anchors or logs."""
+        """Merge newer disk state into in-memory ledger without losing either side's anchors, logs, or playbook slots."""
         for a in disk.code_anchors:
             if not isinstance(a, dict):
                 continue
@@ -959,10 +1004,35 @@ class TrackingLedgerStore:
                 mem._anchor_keys.add(ak)
                 mem.code_anchors.append(a)
         mem.dead_end_signatures.update(disk.dead_end_signatures)
+        # Merge per-playbook state slots without losing concurrent distinct playbooks
+        for pb_id, dslot in (disk.playbook_slots or {}).items():
+            if not isinstance(dslot, dict):
+                continue
+            mslot = mem.playbook_slots.get(pb_id)
+            if mslot is None or int(dslot.get("revision") or 0) > int(mslot.get("revision") or 0):
+                mem.playbook_slots[pb_id] = dict(dslot)
         if disk.revision > mem.revision:
             mem.revision = disk.revision + 1
             if len(disk.decision_log) > len(mem.decision_log):
                 mem.decision_log = (disk.decision_log + mem.decision_log[-1:])[-_MAX_CALLS_PER_TARGET:]
+
+    @contextlib.contextmanager
+    def _file_lock(self, path: str) -> Iterator[None]:
+        """Cross-process advisory lock protecting read-merge-replace on ledger persistence."""
+        if fcntl is None:
+            yield
+            return
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        lock_path = f"{path}.lock"
+        fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            yield
+        finally:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            finally:
+                os.close(fd)
 
     def _try_load(self, target_key: str) -> Optional[TargetTrackingLedger]:
         path = self._ledger_path(target_key)
@@ -986,43 +1056,55 @@ class TrackingLedgerStore:
             ledger = self._ledgers.get(target_key)
             if ledger is None:
                 return False
-            # Guard against stale in-memory state overwriting newer disk state
-            disk_existing = self._try_load(target_key)
-            if disk_existing is not None and (
-                disk_existing.revision > ledger.revision
-                or (disk_existing._disk_mtime_ns > ledger._disk_mtime_ns and disk_existing.updated_at_epoch > ledger.updated_at_epoch)
-            ):
-                self._merge_newer_disk(ledger, disk_existing)
-            data = {
-                "target_key": ledger.target_key,
-                "revision": ledger.revision,
-                "updated_at_epoch": ledger.updated_at_epoch,
-                "active_playbook": ledger.active_playbook,
-                "max_iterations": ledger.max_iterations,
-                "iteration": ledger.iteration,
-                "consecutive_plateaus": ledger.consecutive_plateaus,
-                "predicate_status": ledger.predicate_status,
-                "hypothesis_status": ledger.hypothesis_status,
-                "evidence_provenance": ledger.evidence_provenance[-_MAX_CALLS_PER_TARGET:],
-                "exit_predicate_evaluation": ledger.exit_predicate_evaluation,
-                "decision_log": ledger.decision_log[-_MAX_CALLS_PER_TARGET:],
-                "code_anchors": ledger.code_anchors[:_MAX_ANCHORS_PER_TARGET],
-                "dead_end_signatures": sorted(ledger.dead_end_signatures),
-                "calls": ledger.calls[-_MAX_CALLS_PER_TARGET:],
-            }
             try:
-                os.makedirs(os.path.dirname(path), exist_ok=True)
-                tmp = f"{path}.{os.getpid()}.{threading.get_ident()}.tmp"
-                with open(tmp, "w", encoding="utf-8") as f:
-                    json.dump(data, f, ensure_ascii=False, indent=2)
-                    f.flush()
-                    os.fsync(f.fileno())
-                os.replace(tmp, path)
-                try:
-                    ledger._disk_mtime_ns = os.stat(path).st_mtime_ns
-                except OSError:
-                    pass
-                return True
+                with self._file_lock(path):
+                    # Guard against stale in-memory state overwriting newer disk state or concurrent playbooks
+                    disk_existing = self._try_load(target_key)
+                    _has_newer_disk_slot = (
+                        disk_existing is not None
+                        and any(
+                            isinstance(dslot, dict)
+                            and int(dslot.get("revision") or 0) > int((ledger.playbook_slots.get(pb_id) or {}).get("revision") or 0)
+                            for pb_id, dslot in (disk_existing.playbook_slots or {}).items()
+                        )
+                    )
+                    if disk_existing is not None and (
+                        disk_existing.revision > ledger.revision
+                        or bool(set(disk_existing.playbook_slots) - set(ledger.playbook_slots))
+                        or _has_newer_disk_slot
+                        or (disk_existing._disk_mtime_ns > ledger._disk_mtime_ns and disk_existing.updated_at_epoch > ledger.updated_at_epoch)
+                    ):
+                        self._merge_newer_disk(ledger, disk_existing)
+                    data = {
+                        "target_key": ledger.target_key,
+                        "revision": ledger.revision,
+                        "updated_at_epoch": ledger.updated_at_epoch,
+                        "active_playbook": ledger.active_playbook,
+                        "playbook_slots": ledger.playbook_slots,
+                        "max_iterations": ledger.max_iterations,
+                        "iteration": ledger.iteration,
+                        "consecutive_plateaus": ledger.consecutive_plateaus,
+                        "predicate_status": ledger.predicate_status,
+                        "hypothesis_status": ledger.hypothesis_status,
+                        "evidence_provenance": ledger.evidence_provenance[-_MAX_CALLS_PER_TARGET:],
+                        "exit_predicate_evaluation": ledger.exit_predicate_evaluation,
+                        "decision_log": ledger.decision_log[-_MAX_CALLS_PER_TARGET:],
+                        "code_anchors": ledger.code_anchors[:_MAX_ANCHORS_PER_TARGET],
+                        "dead_end_signatures": sorted(ledger.dead_end_signatures),
+                        "calls": ledger.calls[-_MAX_CALLS_PER_TARGET:],
+                    }
+                    os.makedirs(os.path.dirname(path), exist_ok=True)
+                    tmp = f"{path}.{os.getpid()}.{threading.get_ident()}.tmp"
+                    with open(tmp, "w", encoding="utf-8") as f:
+                        json.dump(data, f, ensure_ascii=False, indent=2)
+                        f.flush()
+                        os.fsync(f.fileno())
+                    os.replace(tmp, path)
+                    try:
+                        ledger._disk_mtime_ns = os.stat(path).st_mtime_ns
+                    except OSError:
+                        pass
+                    return True
             except OSError:
                 return False
 

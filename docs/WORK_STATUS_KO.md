@@ -86,4 +86,5 @@
 | 2026-11-14 08:05 | 3단계 선택적 추적 모드(eBPF/uprobe) 통합 완료 (`tracing_mode.py`, 동적 역량 관리, CLI/MCP/Web 연동, 정적 후보 ↔ 추적 관측 분리), 11개 단위테스트 통과, 벤치마크 21/21 무회귀 확인 |
 | 2026-11-26 13:53 | 어댑터 레지스트리(`extractor/adapters/`), `TargetIdentityPolicy`, 다단계 힙 샘플링, `TargetTrackingLedger`, 6종 플레이북 라우터·자율 루프(`playbook_loop_runner.py`) 및 종료 술어 클로저(`7ffbeab`) 반영 |
 | 2026-11-28 03:39 | Phase 1 안정화 완료(`58fd508`): `SKILL.md` `[mcp]`/`[cli]` 전송 블록 분리 및 `skill_cli.py` 출력 동기화, `test_fixture_process_policy.py` 전수 준수(`fixture_popen` 전환), 루트 untracked `.patch`/잔여물 정리 (`52 passed`) |
-| 2026-11-28 03:44 | Phase 2 구조 정리: `pyproject.toml` pytest 스위트 계층 마커(`unit`/`live_target`/`integration`/`policy`/`slow`) 도입, 미참조 과거 Phase/Closure 리포트 34건 `docs/history/` 아카이브, `capture_backend.py`에서 `trust_store.py` 책임 분리(100% re-export 하위 호환) |
+| 2026-11-28 03:44 | Phase 2 구조 정리(`7b6cbd8`): `pyproject.toml` pytest 스위트 계층 마커(`unit`/`live_target`/`integration`/`policy`/`slow`) 도입, 미참조 과거 Phase/Closure 리포트 34건 `docs/history/` 아카이브, `capture_backend.py`에서 `trust_store.py` 책임 분리(100% re-export 하위 호환) |
+| 2026-11-28 04:20 | Phase 3 고도화: `TrackingLedgerStore` `fcntl.flock` + `playbook_slots` 동시성 무손실 병합, `diagnose()` 광역 스크리닝 폴백 및 `recommended_playbook` 안내, 원격(SSH) Tier-2 링크 예산/커버리지 정밀도 개선 (`test_phase3_improvements.py` 추가) |
