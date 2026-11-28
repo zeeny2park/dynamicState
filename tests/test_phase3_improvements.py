@@ -375,5 +375,20 @@ class TestPlaybookResumeAndCorruptionSafety(unittest.TestCase):
                     with self.assertRaises(ProcessIdentityUnavailableError):
                         resolve_current_boot_id()
 
+    def test_cli_and_mcp_expose_resume_parameter(self):
+        import inspect
+        import scripts.mcp_server as mcp_server
+        from extractor.cli import build_parser
+
+        parser = build_parser()
+        ns = parser.parse_args(["loop", "-p", "1234", "--symptom", "memory leak", "--resume"])
+        self.assertTrue(ns.resume)
+        ns_default = parser.parse_args(["loop", "-p", "1234", "--symptom", "memory leak"])
+        self.assertFalse(ns_default.resume)
+
+        loop_sig = inspect.signature(mcp_server.runtime_run_playbook_loop)
+        self.assertIn("resume", loop_sig.parameters)
+        self.assertIs(loop_sig.parameters["resume"].default, False)
+
 if __name__ == "__main__":
     unittest.main()

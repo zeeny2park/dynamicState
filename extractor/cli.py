@@ -45,7 +45,7 @@ def _ensure_cli_capture_key(corpus_dir: str) -> None:
     except Exception:
         pass
 
-def main():
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="dynamic-state",
         description="dynamicState: Runtime State Exploration & Low-Impact Memory Capture CLI"
@@ -419,6 +419,7 @@ def main():
     loop_p.add_argument("--handoff-md", default=None, help="Write coding-agent handoff Markdown brief to this file")
     loop_p.add_argument("--fail-on", default=None, help="Comma-separated verdicts to fail CI on (e.g. fault,degraded,inconclusive,blocked)")
     loop_p.add_argument("--strict-exit-codes", action="store_true", help="Return standard exit codes (0=HEALTHY, 2=FAULT, 3=DEGRADED, 4=INCONCLUSIVE, 5=BLOCKED)")
+    loop_p.add_argument("--resume", action="store_true", help="Resume a previously persisted playbook slot for this target if present")
     loop_p.add_argument("--lang", choices=["en", "ko"], default="en", help="Output language")
     loop_p.add_argument("--json", action="store_true", help="Print structured JSON output")
 
@@ -612,9 +613,14 @@ def main():
 
     from .skill_cli import add_parsers as _add_skill_parsers, dispatch as _skill_dispatch
     _add_skill_parsers(subparsers)
+    return parser
 
+
+def main():
+    parser = build_parser()
     args = parser.parse_args()
 
+    from .skill_cli import dispatch as _skill_dispatch
     _rc = _skill_dispatch(args)
     if _rc is not None:
         sys.exit(_rc)
@@ -1678,6 +1684,7 @@ def main():
             time_budget_s=args.time_budget,
             language=args.lang,
             compact=True,
+            resume=bool(getattr(args, "resume", False)),
         )
         data = json.loads(raw_res) if isinstance(raw_res, str) else raw_res
         if args.handoff_md and data.get("handoff_markdown"):

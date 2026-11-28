@@ -3421,6 +3421,7 @@ def runtime_get_playbook(
     max_iterations: Optional[int] = None,
     language: str = "en",
     remote_host: Optional[str] = None,
+    resume: bool = False,
 ) -> str:
     """Front-door playbook router & investigation loop starter (pstack-inspired).
     - With no arguments: returns the general diagnosis playbook, tool tiers, and all 6 problem-specific playbooks.
@@ -3449,7 +3450,7 @@ def runtime_get_playbook(
             from extractor.tracking_ledger import GLOBAL_TRACKING_LEDGER, make_target_key
             rm = {"remote_host": remote_host} if remote_host else None
             ledger = GLOBAL_TRACKING_LEDGER.get_or_create(make_target_key(int(pid), rm))
-            out["loop_state"] = ledger.activate_playbook(selected, max_iterations=max_iterations)
+            out["loop_state"] = ledger.activate_playbook(selected, max_iterations=max_iterations, resume=bool(resume))
     return _format_watch_result(out)
 
 
@@ -3467,6 +3468,7 @@ def runtime_run_playbook_loop(
     ssh_port: int = 22,
     ssh_key: Optional[str] = None,
     ssh_proxy_jump: Optional[str] = None,
+    resume: bool = False,
 ) -> str:
     """Single-call server-side autonomous playbook loop (pstack-inspired).
     Routes `symptom` to the matching diagnostic playbook, executes read-only narrowing steps
@@ -3525,6 +3527,7 @@ def runtime_run_playbook_loop(
         time_budget_s=time_budget_s,
         lang=lang,
         remote_target=rm,
+        resume=bool(resume),
     )
     if compact:
         res = compact_payload(res, max_items=10)

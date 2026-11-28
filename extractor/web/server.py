@@ -4306,7 +4306,8 @@ class DynamicStateRequestHandler(http.server.BaseHTTPRequestHandler):
                             rm = {"remote_host": q_param("remote_host")} if q_param("remote_host") else None
                             ledger = GLOBAL_TRACKING_LEDGER.get_or_create(make_target_key(int(pid_q), rm))
                             max_it = int(q_param("max_iterations") or sel.get("default_max_iterations") or 6)
-                            payload_pb["loop_state"] = ledger.activate_playbook(sel, max_iterations=max_it)
+                            resume_q = str(q_param("resume", "")).lower() in ("1", "true", "yes")
+                            payload_pb["loop_state"] = ledger.activate_playbook(sel, max_iterations=max_it, resume=resume_q)
                         except (TypeError, ValueError):
                             pass
                 self._send_json(payload_pb)

@@ -2024,8 +2024,9 @@ class AdaptiveInvestigationSession:
         if any(k in r_id for k in ("GROWTH", "TREND", "SERIES", "TEMPORAL")):
             return None, []
         
+        collected = getattr(self, "collected_evidence_records", None) or ()
         matching = [
-            r for r in self.collected_evidence_records
+            r for r in collected
             if getattr(r, "target_pid", None) == self.pid
             and getattr(r, "collection_method", "") == r_id
             and getattr(r, "collection_status", "") == "SUCCESS"
