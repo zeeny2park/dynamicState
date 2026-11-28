@@ -11,6 +11,12 @@ import sys
 import tempfile
 import unittest
 
+try:
+    import pytest
+    pytestmark = pytest.mark.unit
+except ImportError:  # pragma: no cover
+    pass
+
 import scripts.mcp_server as mcp_srv
 from extractor.playbook_loop_runner import (
     EXIT_BLOCKED,

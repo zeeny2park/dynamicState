@@ -1,6 +1,6 @@
 # 작업 진행 현황
 
-마지막 갱신: 2026-11-14 10:52 UTC · 브랜치 `main` · PR #1 병합 완료 및 main 동기화 완료
+마지막 갱신: 2026-11-28 · 브랜치 `main` · 기준 커밋 `58fd508` (이후 Phase 2 구조 정리 진행 중)
 
 로드맵은 `docs/IMPROVEMENT_STRATEGY_AND_ROADMAP_KO.md`에 있습니다. 이 문서는 지금 돌고 있는 작업, 아직 시작하지 않은 작업,
 처리하지 않은 항목만 추적하고, 작업이 진행될 때마다 갱신합니다.
@@ -84,3 +84,6 @@
 | 2026-11-14 05:28 | PR 자동 리뷰 의견(32비트/비-glibc 대상 mapping_growth ABI 체크 및 미지원 대상 오탐 방지) 처리 완료, `/tmp` 실험 파일 정리, `ok_sawtooth` 판단불가 확정 |
 | 2026-11-14 07:15 | 베이스라인 회귀 303개 파일 통과(0 failures), `lock_hotspot` HEALTHY 오판 차단 완료, 반복 판정 일치율 `--repeat 5` 100%(29/29) 달성 |
 | 2026-11-14 08:05 | 3단계 선택적 추적 모드(eBPF/uprobe) 통합 완료 (`tracing_mode.py`, 동적 역량 관리, CLI/MCP/Web 연동, 정적 후보 ↔ 추적 관측 분리), 11개 단위테스트 통과, 벤치마크 21/21 무회귀 확인 |
+| 2026-11-26 13:53 | 어댑터 레지스트리(`extractor/adapters/`), `TargetIdentityPolicy`, 다단계 힙 샘플링, `TargetTrackingLedger`, 6종 플레이북 라우터·자율 루프(`playbook_loop_runner.py`) 및 종료 술어 클로저(`7ffbeab`) 반영 |
+| 2026-11-28 03:39 | Phase 1 안정화 완료(`58fd508`): `SKILL.md` `[mcp]`/`[cli]` 전송 블록 분리 및 `skill_cli.py` 출력 동기화, `test_fixture_process_policy.py` 전수 준수(`fixture_popen` 전환), 루트 untracked `.patch`/잔여물 정리 (`52 passed`) |
+| 2026-11-28 03:44 | Phase 2 구조 정리: `pyproject.toml` pytest 스위트 계층 마커(`unit`/`live_target`/`integration`/`policy`/`slow`) 도입, 미참조 과거 Phase/Closure 리포트 34건 `docs/history/` 아카이브, `capture_backend.py`에서 `trust_store.py` 책임 분리(100% re-export 하위 호환) |

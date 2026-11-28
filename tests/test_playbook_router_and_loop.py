@@ -9,6 +9,12 @@ import os
 import subprocess
 import sys
 import unittest
+
+try:
+    import pytest
+    pytestmark = pytest.mark.unit
+except ImportError:  # pragma: no cover
+    pass
 import urllib.request
 
 import scripts.mcp_server as mcp_srv

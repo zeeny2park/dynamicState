@@ -10,6 +10,12 @@ import os
 import re
 import unittest
 
+try:
+    import pytest
+    pytestmark = pytest.mark.policy
+except ImportError:  # pragma: no cover
+    pass
+
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PY_ROOTS = ("tests", "benchmarks", "scripts", "examples")
 

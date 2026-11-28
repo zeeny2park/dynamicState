@@ -17,6 +17,12 @@ import os
 import subprocess
 import tempfile
 import unittest
+
+try:
+    import pytest
+    pytestmark = pytest.mark.policy
+except ImportError:  # pragma: no cover
+    pass
 import yaml
 
 

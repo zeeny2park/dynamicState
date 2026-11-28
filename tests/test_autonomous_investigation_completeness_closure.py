@@ -11,6 +11,12 @@ import os
 import tempfile
 import threading
 import unittest
+
+try:
+    import pytest
+    pytestmark = pytest.mark.unit
+except ImportError:  # pragma: no cover
+    pass
 from unittest import mock
 
 import scripts.mcp_server as mcp_srv

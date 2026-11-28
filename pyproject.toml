@@ -37,3 +37,13 @@ dynamicstate_skills = "skills"
 [tool.setuptools.package-data]
 "extractor.web" = ["ui/*"]
 dynamicstate_skills = ["*/SKILL.md", "*/*.md"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "unit: Fast pure-Python unit and contract tests (no C/C++ compilation or live target processes)",
+    "live_target: Tests that compile C/C++ fixtures or inspect live target processes",
+    "integration: Multi-component, Web UI, or MCP server end-to-end integration tests",
+    "policy: Repository hygiene, workflow parity, and fixture process policy checks",
+    "slow: Long-running or timing-sensitive tests",
+]
